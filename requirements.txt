@@ -1,0 +1,3 @@
+# Only the Stage C CP-SAT tools (E555_topper.py, E555_ender.py) need OR-Tools.
+# Stage A, the viewer, and the normalizer are pure standard library.
+ortools>=9.8

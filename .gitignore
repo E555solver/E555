@@ -1,0 +1,37 @@
+# Build products
+bin/
+*.x
+*.o
+CLAUDE.md
+
+# Solver run products
+beam_out/
+round_out/
+roundhouse_out/
+final_out/
+stage_c_out/
+topper_out/
+pipeline_out/
+farm/
+tests/out/
+rotations.csv
+backtracked.csv
+*.db_cache
+db_cache*.bin
+sweep_checkpoint.txt
+*.checkpoint.csv
+*.status.csv
+runs/
+under_development/
+old/
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Editors / OS
+*.swp
+.DS_Store
+*:Zone.Identifier
