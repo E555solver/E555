@@ -78,10 +78,18 @@
 /* -- soft-center-139 tuning -------------------------------------------------- */
 /* Piece 139 (the published center clue) is barred from rows 1..RELEASE_ROW-1,
    and any board that happens to place it on one of the four true center cells
-   -- (row,col) in {7,8}x{7,8} -- earns BONUS_139 on every subsequent score, so
-   the lineage is promoted all the way up while it keeps finding matches. */
+   -- (row,col) in {7,8}x{7,8} -- earns --bonus_139 on every subsequent score, so
+   the lineage is promoted all the way up while it keeps finding matches.
+
+   The bonus is additive on a score measured in nats of log record count, so its
+   value IS a claimed factor in continuability: the historical 10.0 asserted that
+   a center-139 board is worth e^10 ~ 2.2e4 times one without, which no amount of
+   real fan-out difference can overcome. It then persists in every descendant
+   from row 6 while frac_rand_eff returns 0 from row 8, so the late beam became a
+   near-monoculture of 139 lineages. The default is now 1.0 -- about one standard
+   deviation of the color term -- so it breaks near-ties in favour of a 139
+   lineage without overriding a board that is genuinely more continuable. */
 #define SOFT_CENTER_RELEASE_ROW 6
-#define BONUS_139               10.0
 
 /* Beam-row segment-B retries: if a conflict-free B chain admits no conflict-free
    C completion, try the next conflict-free B, up to this many, before giving up
@@ -100,6 +108,16 @@ static uint32_t g_beam_expand     = 5;
 static uint32_t g_beam_expand_row = 8;
 static double   g_lambda_maha     = 0.0;
 static double   g_frac_rand       = 0.75;
+static double   g_bonus_139       = 1.0;
+static bool     g_score_model_J   = false;  /* --score_model J (default legacy) */
+static double   g_lambda_J        = 1.0;
+static bool     g_avail_correct   = false;
+static bool     g_free_demand     = true;   /* --no_free_demand turns it off */
+static uint32_t g_supply_check    = 0;      /* first row tested; 0 = off */
+static double   g_gumbel_tau0     = 0.0;    /* 0 = off (exact legacy selection) */
+static double   g_gumbel_tau1     = 0.0;
+static uint32_t g_bc_nB           = 1;      /* --bc_window nB,nC (1,1 = legacy) */
+static uint32_t g_bc_nC           = 1;
 static uint32_t g_parent_cap      = 5;
 static uint32_t g_pool_factor     = 8;
 static uint32_t g_scan_factor     = 1024;
@@ -198,6 +216,28 @@ static double frac_rand_eff(int row) {
     return 0.0;
 }
 
+/* Selection temperature (--gumbel_tau0/--gumbel_tau1), interpolated linearly
+   from tau0 at row 1 to tau1 at --stop_row. 0 = off, which is the default and
+   restores the legacy path exactly (frac_rand's uniform band plus greedy
+   top-K). Because the score is already a log record count, tau = 1 samples
+   boards in proportion to their estimated number of completions; tau -> 0 is
+   pure greedy and large tau is near-uniform. */
+static double gumbel_tau_eff(int row) {
+    if (g_gumbel_tau0 <= 0.0 && g_gumbel_tau1 <= 0.0) return 0.0;
+    if (g_stop_row <= 1) return g_gumbel_tau0;
+    double f = (double)(row - 1) / (double)(g_stop_row - 1);
+    if (f < 0.0) f = 0.0; else if (f > 1.0) f = 1.0;
+    double tau = g_gumbel_tau0 + f * (g_gumbel_tau1 - g_gumbel_tau0);
+    return tau > 0.0 ? tau : 0.0;
+}
+
+/* Gumbel(0,1) = -log(-log U). The 53-bit draw is nudged off both endpoints so
+   the double logarithm is always finite. */
+static inline double gumbel_noise(RNG *r) {
+    double u = ((double)(rng_next(r) >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    return -log(-log(u));
+}
+
 /* Per-parent offspring cap in the score band: doubled once the beam widens, so
    successful parents can actually fill the extra slots (0 = uncapped). */
 static uint32_t parent_cap_eff(int row) {
@@ -230,6 +270,33 @@ static void beam_init_border(BeamEntry *p, const BottomOrder *bot, const LeftOrd
         }
         for (int c = COLOR_MIN; c <= COLOR_MAX; c++)
             p->req_exposed[c] = (int16_t)(p->req_exposed[c] + g_top_border_inner_count[c]);
+    } else if (g_free_demand) {
+        /* Free mode owes exactly the same demands; only the bookkeeping differs.
+           An edge piece carries ONE inner color, and in either remaining role --
+           frame-right (inner side faces left) or frame-up (inner side faces down)
+           -- it exposes exactly that one inner half-edge into the interior. So
+           which unplaced edge becomes a right edge and which becomes a top border
+           piece does not change the demand multiset at all, and free mode's
+           demands are computable exactly without enumerating the split.
+
+           The left column is placed but its inner sides face rows 1..14, so it
+           still owes 14 interfaces -- placed is not the same as satisfied. The
+           edge pool then covers every remaining right edge AND the whole top
+           border in one used-tested loop (free mode puts all 56 non-corner edges
+           in g_edge_term, and g_top_border_inner_count is all-zero here).
+
+           Count at depth r: 14 frontier + (14-r) left + (28-r) unplaced edges
+           = 56-2r, which is exactly what the fixed-mode branch above produces.
+           Fixed mode is that same rule with the roles pre-assigned. */
+        for (int r = 1; r <= EDGE_LEN; r++) {
+            int cr = lft->right[r];
+            if (color_is_inner(cr)) p->req_exposed[cr]++;
+        }
+        for (int t = 0; t < g_edge_term_count; t++) {
+            if (used_test(p->used, g_edge_term[t].piece_id)) continue;  /* already placed */
+            int cl = g_edge_term[t].left;
+            if (color_is_inner(cl)) p->req_exposed[cl]++;
+        }
     }
     if (g_soft_center_139) used_set(p->used, SOFT_CENTER_139_PIECE);
 }
@@ -259,7 +326,7 @@ static void commit_row(BeamEntry *p, int row, const RowChoice *rc) {
     }
     for (int c = 0; c < PUZZLE_SIDE; c++) p->rtop[c] = new_top[c];
 
-    if (!g_free_edges) {
+    if (!g_free_edges || g_free_demand) {
         int la = g_cur_left->right[row];           /* segment-A interface satisfied */
         if (color_is_inner(la)) p->req_exposed[la]--;
         int tl = term->left;                       /* right-edge interface satisfied */
@@ -274,13 +341,44 @@ static void commit_row(BeamEntry *p, int row, const RowChoice *rc) {
         p->flags |= FLAG_BONUS_139;
 }
 
-/* Color parity: every inner color's surplus must be non-negative (and even when
-   the top/side assignment is locked, i.e. fixed edges). */
+/* Color parity: every inner color's surplus must be non-negative, and even
+   whenever the demand vector is complete. S_c counts the free half-edges of
+   color c -- those not spoken for by any committed interface -- and they can
+   only be spent pairing with EACH OTHER, so an odd S_c proves the board cannot
+   complete. That holds under fixed edges, and also in free mode once
+   --no_free_demand is not in force (see beam_init_border: the demands are exact
+   there too). With an incomplete demand vector S is overstated and its parity
+   is meaningless, which is why the test was originally skipped in free mode. */
 static bool parity_ok(const BeamEntry *p) {
+    const bool demand_exact = (!g_free_edges || g_free_demand);
     for (int c = COLOR_MIN; c <= COLOR_MAX; c++) {
         int S = g_inner_color_total[c] - p->color_consumed[c] - p->req_exposed[c];
         if (S < 0) return false;
-        if (!g_free_edges && (S & 1)) return false;
+        if (demand_exact && (S & 1)) return false;
+    }
+    return true;
+}
+
+/* Piece-supply certificate (Hall's condition, singleton case; --supply_check).
+   Each of the 14 frontier columns needs a DISTINCT remaining inner piece
+   carrying its exposed top color. Columns demanding the same color have
+   identical candidate sets, so Hall's condition binds first on whole color
+   classes: if a color is wanted by more columns than there are unused pieces
+   carrying it anywhere, no perfect matching exists and the board is dead.
+   This counts PIECES where parity_ok counts HALF-EDGES, so neither implies the
+   other -- a piece with two sides of color c adds 2 to that color's surplus but
+   can still serve only one column. */
+static bool supply_ok(const BeamEntry *p) {
+    int need[NUM_COLORS_TOTAL] = {0};
+    for (int c = 1; c <= EDGE_LEN; c++) need[p->rtop[c]]++;   /* always inner */
+    for (int col = COLOR_MIN; col <= COLOR_MAX; col++) {
+        if (!need[col]) continue;
+        const uint64_t *m = g_color_pieces[col];
+        int have = __builtin_popcountll(m[0] & ~p->used[0])
+                 + __builtin_popcountll(m[1] & ~p->used[1])
+                 + __builtin_popcountll(m[2] & ~p->used[2])
+                 + __builtin_popcountll(m[3] & ~p->used[3]);
+        if (have < need[col]) return false;
     }
     return true;
 }
@@ -545,6 +643,92 @@ static inline double maha_term(const BeamEntry *t, int row) {
     return sched * g_lambda_maha * d2n;
 }
 
+/* -- The J objective: exact pairing combinatorics (--score_model J) ---------- */
+/* Every free inner half-edge must eventually meet another of the SAME color. Of
+ * the (2A-1)!! ways to pair up 2A = sum_c S_c free half-edges, prod_c (S_c-1)!!
+ * are color-consistent, so
+ *
+ *     P = prod_c (S_c-1)!! / (2A-1)!!
+ *
+ * which is zero exactly when some S_c is odd -- parity_ok's evenness test and
+ * this objective are one formula, hard part and soft part. Stirling turns its
+ * log into -A*H(pi), i.e. (up to a constant at fixed depth)
+ *
+ *     J_conc = A_tot * KL(pi || uniform),   pi_c = S_c / sum_d S_d
+ *
+ * "how far this board's remaining color mix has drifted from flat, weighted by
+ * how many pairings are left to make". It is convex, so it rewards EXTREME
+ * profiles -- exhausting some colors -- without ever naming which: at a balanced
+ * start it is identically zero and has no preference to express. J_dem is the
+ * companion term for demands already committed (frontier tops, side interfaces,
+ * top border): each must find a half-edge of its color in the residual supply R,
+ * which is a safety rail against burning a color the frontier still needs.
+ *
+ * Both are written centred (S_c/Sbar, R_c/Rbar). Both sums are constant across
+ * siblings at a given row, so centring cannot change the ranking; it keeps the
+ * value near 0 instead of near 1600 nats, so --bonus_139 and any swept weight
+ * keep their meaning when --score_model is flipped.
+ *
+ * Unlike maha_term this reads S and R off the board, so it needs no assumption
+ * that n = 14*row matches the real piece count -- it is exact from a partial. */
+#define LOGTAB_N 801                    /* > 784 = every inner half-edge */
+static double g_logtab[LOGTAB_N];
+
+static void build_logtab(void) {
+    g_logtab[0] = 0.0;                  /* the x*log(x) -> 0 limit at x = 0 */
+    for (int i = 1; i < LOGTAB_N; i++) g_logtab[i] = log((double)i);
+}
+
+static inline double j_term(const BeamEntry *t) {
+    int S[NUM_INNER_COLORS], R[NUM_INNER_COLORS], D[NUM_INNER_COLORS];
+    int sumS = 0, sumR = 0;
+    for (int ci = 0; ci < NUM_INNER_COLORS; ci++) {
+        int c = COLOR_MIN + ci;
+        R[ci] = g_inner_color_total[c] - t->color_consumed[c];
+        D[ci] = t->req_exposed[c];
+        S[ci] = R[ci] - D[ci];
+        sumR += R[ci]; sumS += S[ci];
+    }
+    const double logSbar = (sumS > 0) ? log((double)sumS / NUM_INNER_COLORS) : 0.0;
+    const double logRbar = (sumR > 0) ? log((double)sumR / NUM_INNER_COLORS) : 0.0;
+    double conc = 0.0, dem = 0.0;
+    for (int ci = 0; ci < NUM_INNER_COLORS; ci++) {
+        if (S[ci] > 0) conc += (double)S[ci] * (g_logtab[S[ci]] - logSbar);
+        if (D[ci] > 0) dem  += (double)D[ci] * (g_logtab[R[ci]] - logRbar);
+    }
+    return g_lambda_J * (0.5 * conc + dem);
+}
+
+/* Availability correction (--avail_correct). fB and fC come from db_seg_fanout,
+ * which sums record counts over all 17 left colors with NO reference to used[],
+ * so two boards with identical exposed tops but disjoint remaining piece sets
+ * score identically -- a mild overcount at row 3, a large and board-dependent
+ * one at row 11 where most counted records are already unbuildable.
+ *
+ * alpha_c = R_c/tot_c is the fraction of color-c inner half-edges still in the
+ * reservoir, so a chain sitting on colors b1..b5 survives with probability
+ * ~ prod_k alpha_{b_k} to first order. Summed in log space over the 14 inner
+ * frontier colors that is one term per segment-A/B/C bottom (segment C's fifth
+ * bottom is an edge-interface color, whose terminals come from a different
+ * pool). No record is decoded and no cell is scanned: this is a closed-form
+ * discount on numbers already looked up, and it is self-scheduling -- alpha ~ 1
+ * early, biting only as the reservoir empties. */
+static inline double avail_term(const BeamEntry *t) {
+    double s = 0.0;
+    for (int c = 1; c <= EDGE_LEN; c++) {
+        int col = t->rtop[c];                       /* inner: checked by the caller */
+        int R = g_inner_color_total[col] - t->color_consumed[col];
+        if (R <= 0) return -1000.0;                 /* unreachable: parity_ok rejects S<0 */
+        s += g_logtab[R] - g_logtab[g_inner_color_total[col]];
+    }
+    return s;
+}
+
+/* The color-structure part of the score, under whichever model is selected. */
+static inline double color_term(const BeamEntry *t, int row) {
+    return g_score_model_J ? j_term(t) : maha_term(t, row);
+}
+
 /* -- Scoring (one-row lookahead + heuristic terms) --------------------------- */
 
 /* The child's exposed tops key the next row. Segment A's next cell uses the
@@ -568,8 +752,9 @@ static bool score_child(const BeamEntry *t, int row, float *out) {
     if (fC == 0) return false;
 
     double s = log((double)cA->n) + log1p((double)fB) + log1p((double)fC)
-               + maha_term(t, row);
-    if (t->flags & FLAG_BONUS_139) s += BONUS_139;
+               + color_term(t, row);
+    if (g_avail_correct) s += avail_term(t);
+    if (t->flags & FLAG_BONUS_139) s += g_bonus_139;
     *out = (float)s;
     return true;
 }
@@ -622,11 +807,18 @@ static inline void pool_flush(BeamCtx *ctx, Scratch *sc) {
     }
     sc->buf_n = 0;
 }
+/* ...with the signature supplied, for the --bc_window path, which must remember
+   a candidate's signature while it keeps looking for a better sibling (the
+   scratch board it was computed from is overwritten by the next candidate). */
+static inline void pool_append_sig(BeamCtx *ctx, Scratch *sc, uint64_t sig,
+                                   uint32_t parent_idx, float score, const RowChoice *mv) {
+    PoolEntry *pe = &sc->buf[sc->buf_n++];
+    pe->score = score; pe->parent = parent_idx; pe->sig = sig; pe->mv = *mv;
+    if (sc->buf_n == POOL_BATCH) pool_flush(ctx, sc);
+}
 static inline void pool_append(BeamCtx *ctx, Scratch *sc, const BeamEntry *t,
                                uint32_t parent_idx, float score, const RowChoice *mv) {
-    PoolEntry *pe = &sc->buf[sc->buf_n++];
-    pe->score = score; pe->parent = parent_idx; pe->sig = frontier_sig(t); pe->mv = *mv;
-    if (sc->buf_n == POOL_BATCH) pool_flush(ctx, sc);
+    pool_append_sig(ctx, sc, frontier_sig(t), parent_idx, score, mv);
 }
 
 /* Decode segment B record jb at cell cB; returns true and fills ciB/la_C for the
@@ -731,9 +923,10 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
                 if (!parity_ok(t)) continue;
                 /* No lookahead gate at the stop row: every board that completes
                    it is emitted -- whether a row fits above is deliberately the
-                   next stage's problem. Rank by the heuristic terms only. */
-                float score = (float)(maha_term(t, e->row)
-                              + ((t->flags & FLAG_BONUS_139) ? BONUS_139 : 0.0));
+                   next stage's problem, so --supply_check does not apply here
+                   either. Rank by the heuristic terms only. */
+                float score = (float)(color_term(t, e->row)
+                              + ((t->flags & FLAG_BONUS_139) ? g_bonus_139 : 0.0));
                 pool_append(ctx, sc, t, e->parent_idx, score, &mv);
                 e->quota--;
                 ab_full = true;
@@ -744,9 +937,21 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
         return;
     }
 
-    /* Beam row: up to B_TRY conflict-free B chains, first conflict-free C. */
+    /* Beam row: up to B_TRY conflict-free B chains, first conflict-free C.
+       With --bc_window nB,nC (default 1,1) the row's B and C segments -- 10 of
+       its 14 pieces -- stop being whatever the database's global, board-blind
+       fan-out sort offered first: up to nB workable B chains x nC C completions
+       are scored and only the best is kept, so the objective steers generation
+       instead of merely filtering it. At 1,1 the first accepted child ends the
+       search immediately, exactly as before; the B_TRY retry on a B chain whose
+       C fails is orthogonal and unchanged. */
+    const bool window = (g_bc_nB > 1 || g_bc_nC > 1);
+    const bool supply = (g_supply_check && (uint32_t)e->row >= g_supply_check);
+    RowChoice best_mv; float best_score = 0.0f; uint64_t best_sig = 0;
+    bool have_best = false;
+    uint32_t nb_done = 0;
     int b_left = B_TRY;
-    for (uint32_t jb = 0; jb < cB->n && b_left > 0; jb++) {
+    for (uint32_t jb = 0; jb < cB->n && b_left > 0 && nb_done < g_bc_nB; jb++) {
         uint16_t ciB[CHAIN_LEN]; int la_C;
         if (!pick_segB(cB, jb, rt + 6, forbidA, ciB, la_B, &la_C)) continue;
         b_left--;
@@ -757,7 +962,8 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
         uint64_t maskB[4]; mask_of_chain(ciB, CHAIN_LEN, maskB);
         uint64_t forbidB[4] = { forbidA[0]|maskB[0], forbidA[1]|maskB[1],
                                 forbidA[2]|maskB[2], forbidA[3]|maskB[3] };
-        for (uint32_t jc = 0; jc < cC->n; jc++) {
+        uint32_t nc_done = 0;
+        for (uint32_t jc = 0; jc < cC->n && nc_done < g_bc_nC; jc++) {
             uint16_t ciC[CHAIN_LEN-1]; uint8_t rterm;
             if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
             memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));
@@ -765,12 +971,25 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
             mv.rterm = rterm;
             *t = *p; commit_row(t, e->row, &mv);
             if (!parity_ok(t)) continue;
+            if (supply && !supply_ok(t)) continue;
             float score;
             if (!score_child(t, e->row, &score)) continue;
-            pool_append(ctx, sc, t, e->parent_idx, score, &mv);
-            e->quota--;
-            return;
+            if (!window) {                      /* legacy: first hit wins */
+                pool_append(ctx, sc, t, e->parent_idx, score, &mv);
+                e->quota--;
+                return;
+            }
+            nc_done++;
+            if (!have_best || score > best_score) {
+                best_score = score; best_mv = mv; best_sig = frontier_sig(t);
+                have_best = true;
+            }
         }
+        if (nc_done) nb_done++;                 /* a B chain that produced a child */
+    }
+    if (have_best) {
+        pool_append_sig(ctx, sc, best_sig, e->parent_idx, best_score, &best_mv);
+        e->quota--;
     }
 }
 
@@ -876,7 +1095,8 @@ static void sort_recs_desc(SortRec *a, SortRec *tmp, uint32_t n, int nt) {
    with the survivors' pool indices, best score first; returns the count. */
 static int g_dedup_drop_warned = 0;
 
-static uint32_t dedup_and_rank(BeamCtx *ctx, uint64_t pool_n, int nt) {
+static uint32_t dedup_and_rank(BeamCtx *ctx, uint64_t pool_n, int nt,
+                               double tau, RNG *rng) {
     /* Size the table to the pool actually in hand, not to the worst case the
        arena was reserved for. ctx->sig_sz is next_pow2(2*pool_cap) -- 33.5 M
        slots at default settings -- so using all of it every row costs a 268 MB
@@ -934,12 +1154,31 @@ static uint32_t dedup_and_rank(BeamCtx *ctx, uint64_t pool_n, int nt) {
                 (unsigned long long)dropped, sz, (unsigned long long)pool_n);
     }
 
+    /* The SORT KEY only. At tau > 0 each survivor's key is score/tau plus an
+       independent Gumbel draw, whose top-K is provably a sample of K DISTINCT
+       boards drawn without replacement with probability proportional to
+       exp(score/tau) (Kool, van Hoof & Welling 2019). That replaces the uniform
+       random band -- which is blind to the score and switched off entirely from
+       beam_expand_row on -- with one score-aware, monotone knob. The pool's own
+       scores are untouched, so the beam, the emission order and every reported
+       score stay real. */
     uint32_t kept = 0;
-    for (size_t h = 0; h < sz; h++) {
-        if (!ctx->sig_key[h]) continue;
-        ctx->srt[kept].score = ctx->sig_score[h];
-        ctx->srt[kept].idx   = ctx->sig_idx[h];
-        kept++;
+    if (tau > 0.0) {
+        const double inv_tau = 1.0 / tau;
+        for (size_t h = 0; h < sz; h++) {
+            if (!ctx->sig_key[h]) continue;
+            ctx->srt[kept].score = (float)((double)ctx->sig_score[h] * inv_tau
+                                           + gumbel_noise(rng));
+            ctx->srt[kept].idx   = ctx->sig_idx[h];
+            kept++;
+        }
+    } else {
+        for (size_t h = 0; h < sz; h++) {
+            if (!ctx->sig_key[h]) continue;
+            ctx->srt[kept].score = ctx->sig_score[h];
+            ctx->srt[kept].idx   = ctx->sig_idx[h];
+            kept++;
+        }
     }
     sort_recs_desc(ctx->srt, ctx->srt_tmp, kept, nt);
     for (uint32_t i = 0; i < kept; i++) ctx->keep[i] = ctx->srt[i].idx;
@@ -1040,7 +1279,11 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
             break;
         }
 
-        uint32_t kept = dedup_and_rank(ctx, pool_n, nt);
+        /* No perturbation at the stop row: ctx->keep drives emit_stop_row, and
+           emission is deliberately ranked by the real score. */
+        RNG gum_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFEu, 2u);
+        double tau = ((uint32_t)row == g_stop_row) ? 0.0 : gumbel_tau_eff(row);
+        uint32_t kept = dedup_and_rank(ctx, pool_n, nt, tau, &gum_rng);
         g_stats.t_select += omp_get_wtime() - t_exp;
         res.row = (uint32_t)row;
         g_stats.rows_advanced++;
@@ -1064,8 +1307,11 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
 
         RNG sel_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFFu, 1u);
         uint32_t eff_K = beam_eff_K(row);
+        /* At tau > 0 the Gumbel perturbation IS the exploration, so the uniform
+           band stands down rather than randomizing an already-random order. */
+        double fr = (tau > 0.0) ? 0.0 : frac_rand_eff(row);
         uint32_t n_sel = select_beam(ctx, kept, beam_n, eff_K,
-                                     parent_cap_eff(row), frac_rand_eff(row), &sel_rng);
+                                     parent_cap_eff(row), fr, &sel_rng);
         double t0 = omp_get_wtime();
         materialize_beam(ctx, cur, nxt, n_sel, row);
         g_stats.t_mat += omp_get_wtime() - t0;
@@ -1074,9 +1320,11 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
 
         if (g_verbose) {
             double dt = omp_get_wtime() - t_row;
+            /* The real best score of the row, read from the pool -- ctx->srt
+               holds the Gumbel-perturbed sort key when --gumbel_tau0 is on. */
             printf("[beam] %s row=%d cands=%" PRIu64 " uniq=%u beam=%u/%u smax=%.2f t=%.2fs (%.0f kc/s)\n",
                    g_config_id_str, row, pool_n, kept, beam_n, eff_K,
-                   (double)ctx->srt[0].score, dt, (double)pool_n/dt/1e3);
+                   (double)ctx->pool[ctx->keep[0]].score, dt, (double)pool_n/dt/1e3);
             fflush(stdout);
         }
     }
@@ -1219,19 +1467,57 @@ static void usage(const char *a0) {
 "                         granted one row earlier (default 8)\n"
 "\n"
 "Scoring / selection:\n"
+"  --score_model M        color-structure term: 'legacy' (the Mahalanobis bonus below)\n"
+"                         or 'J', the objective derived from pairing combinatorics --\n"
+"                         A_tot*KL(free-color mix || flat) plus a demand term, both in\n"
+"                         nats like the fan-out terms, no schedule (default legacy)\n"
+"  --lambda_J F           weight of the J terms; 1 = as derived (default 1)\n"
 "  --lambda_Mahalanobis F weight of the color-usage atypicality bonus, active in\n"
-"                         rows 3..9 and peaking at row 6 (default 0)\n"
+"                         rows 3..9 and peaking at row 6; legacy model only (default 0)\n"
+"  --avail_correct        discount the B/C fan-out counts by the fraction of each\n"
+"                         frontier color still unplaced, so the lookahead stops being\n"
+"                         blind to which pieces are gone (default off)\n"
+"  --bonus_139 F          score bonus while piece 139 sits on a center cell, added\n"
+"                         to a log-count score (default 1; was 10 before, which is a\n"
+"                         claimed factor of e^10 and swamped every other term)\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by\n"
 "                         score; halved at beam_expand_row-1, zero from\n"
 "                         beam_expand_row on (default 0.75)\n"
+"  --gumbel_tau0 T        selection temperature at row 1, falling linearly to\n"
+"  --gumbel_tau1 T        --gumbel_tau1 at --stop_row. Above 0 the beam is chosen by\n"
+"                         top-K of score/tau + Gumbel noise, which samples K distinct\n"
+"                         boards with probability proportional to exp(score/tau); as\n"
+"                         the score is a log record count, tau=1 samples in proportion\n"
+"                         to estimated completions. Replaces --frac_rand's uniform\n"
+"                         band, which is blind to the score and off from\n"
+"                         beam_expand_row on. 0 = off, exact legacy (default 0)\n"
 "  --parent_cap N         max children per parent in the score-selected band;\n"
 "                         doubled from beam_expand_row-1 on; 0 = uncapped (default 5)\n"
+"\n"
+"Feasibility certificates:\n"
+"  --no_free_demand       DISABLE the free-mode demand accounting. On by default: an\n"
+"                         edge piece owes one inner half-edge of its own color whether\n"
+"                         it ends up a right edge or a top border piece, so free mode's\n"
+"                         demands -- and hence the color parity test -- are exact\n"
+"                         without knowing the split. Without this accounting free mode\n"
+"                         carries no color certificate at all\n"
+"  --supply_check R       from row R on, reject a board unless every frontier color is\n"
+"                         wanted by no more columns than there are unused pieces\n"
+"                         carrying it (Hall's condition on color classes; counts\n"
+"                         pieces where parity counts half-edges). 0 = off (default 0)\n"
 "\n"
 "Expansion effort:\n"
 "  --pool_factor N        candidate-pool target as a multiple of beam_width; more\n"
 "                         pool = more children scored per row (default 8)\n"
 "  --scan_factor N        decode-attempt budget per requested child; caps the time\n"
 "                         spent on parents with nearly-impossible rows (default 1024)\n"
+"  --bc_window nB,nC      per segment-A record, score up to nB workable B chains x nC\n"
+"                         C completions and keep only the best child, instead of\n"
+"                         taking the first that fits. This is where extra compute buys\n"
+"                         objective rather than more candidates -- but note the\n"
+"                         --scan_factor budget counts segment-A decodes only, so an\n"
+"                         open window multiplies the work it does not see\n"
+"                         (default 1,1 = the first fit, as before)\n"
 "\n"
 "Sweep control:\n"
 "  --top_bottoms N        bottom-row orderings tried per border row, best-ranked\n"
@@ -1290,6 +1576,25 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--beam_expand") && i+1 < argc) g_beam_expand = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--beam_expand_row") && i+1 < argc) g_beam_expand_row = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lambda_Mahalanobis") && i+1 < argc) g_lambda_maha = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--score_model") && i+1 < argc) {
+            const char *m = argv[++i];
+            if      (!strcmp(m, "legacy")) g_score_model_J = false;
+            else if (!strcmp(m, "J"))      g_score_model_J = true;
+            else fatal("--score_model must be 'legacy' or 'J'");
+        }
+        else if (!strcmp(argv[i], "--lambda_J")    && i+1 < argc) g_lambda_J = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--avail_correct"))             g_avail_correct = true;
+        else if (!strcmp(argv[i], "--no_free_demand"))            g_free_demand = false;
+        else if (!strcmp(argv[i], "--supply_check") && i+1 < argc) g_supply_check = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--bonus_139")   && i+1 < argc) g_bonus_139 = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--gumbel_tau0") && i+1 < argc) g_gumbel_tau0 = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--gumbel_tau1") && i+1 < argc) g_gumbel_tau1 = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--bc_window")   && i+1 < argc) {
+            unsigned nb = 0, nc = 0;
+            if (sscanf(argv[++i], "%u,%u", &nb, &nc) != 2 || nb < 1 || nc < 1)
+                fatal("--bc_window needs nB,nC with both >= 1 (e.g. 8,4)");
+            g_bc_nB = nb; g_bc_nC = nc;
+        }
         else if (!strcmp(argv[i], "--frac_rand")   && i+1 < argc) g_frac_rand = atof(argv[++i]);
         else if (!strcmp(argv[i], "--parent_cap")  && i+1 < argc) g_parent_cap = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pool_factor") && i+1 < argc) g_pool_factor = (uint32_t)atoi(argv[++i]);
@@ -1321,6 +1626,12 @@ int main(int argc, char *argv[]) {
     if (g_stop_row == 0 || g_stop_row > (uint32_t)MAX_DRILL_DEPTH)
         fatal("--stop_row must be in 1..%d (rows 14-15 belong to Stage C)", MAX_DRILL_DEPTH);
     if (!(fabs(g_lambda_maha) <= 1e6)) fatal("--lambda_Mahalanobis in [-1e6,1e6]");
+    if (!(fabs(g_lambda_J) <= 1e6))    fatal("--lambda_J in [-1e6,1e6]");
+    if (!(fabs(g_bonus_139) <= 1e6))   fatal("--bonus_139 in [-1e6,1e6]");
+    if (!(g_gumbel_tau0 >= 0.0 && g_gumbel_tau0 <= 1e6)) fatal("--gumbel_tau0 in [0,1e6]");
+    if (!(g_gumbel_tau1 >= 0.0 && g_gumbel_tau1 <= 1e6)) fatal("--gumbel_tau1 in [0,1e6]");
+    if (g_supply_check > (uint32_t)MAX_DRILL_DEPTH)
+        fatal("--supply_check must be in 0..%d (0 = off)", MAX_DRILL_DEPTH);
     if (g_frac_rand < 0.0 || g_frac_rand > 1.0) fatal("--frac_rand must be in [0,1]");
     if (g_pool_factor == 0) g_pool_factor = 1;
     if (g_scan_factor == 0) g_scan_factor = 1;
@@ -1349,8 +1660,14 @@ int main(int argc, char *argv[]) {
            g_fixed_corner_pid[2], g_fixed_corner_pid[3]);
     printf("[cfg] beam_width=%u stop_row=%u expand=%ux@row%u lambda_Maha=%.3f\n",
            g_beam_width, g_stop_row, g_beam_expand, g_beam_expand_row, g_lambda_maha);
-    printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u scan_factor=%u soft_center_139=%d\n",
-           g_frac_rand, g_parent_cap, g_pool_factor, g_scan_factor, g_soft_center_139?1:0);
+    printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u scan_factor=%u soft_center_139=%d bonus_139=%.3f\n",
+           g_frac_rand, g_parent_cap, g_pool_factor, g_scan_factor, g_soft_center_139?1:0,
+           g_bonus_139);
+    printf("[cfg] score_model=%s lambda_J=%.3f avail_correct=%d free_demand=%d supply_check=%u"
+           " gumbel_tau=%.2f->%.2f bc_window=%u,%u\n",
+           g_score_model_J ? "J" : "legacy", g_lambda_J, g_avail_correct?1:0,
+           g_free_demand?1:0, g_supply_check, g_gumbel_tau0, g_gumbel_tau1,
+           g_bc_nB, g_bc_nC);
     printf("[cfg] top_bottoms=%ld top_columns=%ld config_time=%.0fs max_wall=%.0fs max_partials=%" PRIu64 " db_file=%s\n",
            g_top_bottoms, g_top_columns, g_config_time_sec, g_max_wall_sec, g_max_partials,
            g_db_file ? g_db_file : "(none)");
@@ -1362,6 +1679,7 @@ int main(int argc, char *argv[]) {
     build_catalog_indices();
     build_inner_color_totals();
     build_maha_tables();
+    build_logtab();
 
     /* On a cache hit db_cache_load also fills the fan-out table and ranking
        totals from its index table, so no arena page is touched at startup. */

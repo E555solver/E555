@@ -290,6 +290,27 @@ effort there (K = `--beam_width`, E = `--beam_expand`, R = `--beam_expand_row`):
 Early rows explore (the heuristic knows little about an empty board); late
 rows are pure exploitation.
 
+**Gumbel top-K selection** (`--gumbel_tau0`, `--gumbel_tau1`; 0 = off, the
+default). The `frac_rand` band above is *uniform over survivors* -- blind to
+the score -- and it is switched off entirely from row R on, exactly where
+extinction pressure peaks. An alternative is to perturb the sort key instead:
+
+```
+key = score/tau + Gumbel(0,1),      Gumbel = -log(-log U)
+```
+
+Top-K of that is provably a sample of K **distinct** boards drawn without
+replacement with probability proportional to `exp(score/tau)` (Kool, van Hoof &
+Welling 2019) -- one RNG call per survivor, in a loop that already touches every
+survivor, replacing ~196 k serial rejection draws at default settings. Because
+the score is already a log record count, **tau = 1 samples in proportion to
+estimated completions**; tau -> 0 is greedy and large tau is near-uniform. Tau
+interpolates linearly from `tau0` at row 1 to `tau1` at `--stop_row`, so one
+monotone knob expresses the whole "trust the score more as the board fills"
+schedule. When tau > 0 the `frac_rand` band stands down; the pool's own scores
+are never perturbed, so the beam, the emission order and every reported score
+stay real.
+
 ### Scoring
 
 A child's score is the sum of three terms.
@@ -299,6 +320,47 @@ exact record count of the database cell the child's tops present to next-row
 segment A (whose left color is known), plus fan-out lookups for B and C. The
 log of an upper bound on next-row completions; any zero factor is an exact
 one-row proof of death and rejects the child (below the stop row).
+
+`f_B'` and `f_C'` come from `db_seg_fanout`, which sums record counts over all
+17 left colors **with no reference to `used[]`**: two boards with identical
+exposed tops but disjoint remaining piece sets score identically. At row 3 that
+is a mild overcount; at row 11, with 154 of 196 pieces consumed, most counted
+records are unbuildable and the overcount is large and board-dependent.
+`--avail_correct` discounts it by `sum over the 14 inner frontier colors of
+log(R_c/tot_c)` -- the fraction of each color's half-edges still in the
+reservoir, a first-order estimate of how many counted chains survive. It
+decodes nothing and scans nothing (that is what the fan-out table exists to
+avoid); it is a closed-form correction on numbers already looked up, and it is
+self-scheduling, since the ratios sit near 1 until the reservoir empties.
+
+**The J objective** (`--score_model J`, `--lambda_J`). An alternative to the
+Mahalanobis term below, derived rather than tuned. Every free inner half-edge
+must eventually meet another of the *same* color; of the `(2A-1)!!` ways to
+pair up `2A = sum_c S_c` free half-edges, `prod_c (S_c-1)!!` are
+color-consistent, so
+
+```
+P = prod_c (S_c - 1)!! / (2A - 1)!!
+```
+
+This vanishes exactly when some `S_c` is odd -- so the parity certificate below
+and this objective are one formula, its hard part and its soft part. Stirling
+turns the log into `-A*H(pi)`, i.e. (up to a constant at fixed depth)
+
+```
+J_conc = A_tot * KL(pi || uniform),   pi_c = S_c / sum_d S_d
+J_dem  = sum_c D_c * log(R_c / Rbar)
+```
+
+`J_conc` reads as "how far this board's remaining color mix has drifted from
+flat, weighted by how many pairings are left to make". It is convex, so it
+rewards *extreme* profiles -- exhausting some colors -- without naming which:
+at a balanced start it is identically zero and has no preference to express.
+`J_dem` is the safety rail, penalizing demand for a color whose supply is thin.
+Both are in nats, like the fan-out terms, so they add without a fudge factor,
+and both carry their own depth dependence -- there is no schedule. Cost is 34
+table lookups against `maha_term`'s 16x17 matrix-vector product, so the derived
+term is also the cheaper one.
 
 **Mahalanobis color-usage term** (`--lambda_Mahalanobis`, the project's main
 heuristic contribution). Let **x** be the 17-vector of inner-color occurrences
@@ -321,9 +383,17 @@ penalized exactly the pattern the Mahalanobis term rewards, hard infeasibility
 is already caught by the parity check, and supply health is already encoded in
 the fan-out lookahead.)
 
-**Center-139 bonus** (`--soft_center_139`). Clue piece 139 is barred from rows
-1-5; a board that later places it on one of the four true center cells carries
-a +10 score flag on every subsequent row, promoting that lineage.
+**Center-139 bonus** (`--soft_center_139`, `--bonus_139`). Clue piece 139 is
+barred from rows 1-5; a board that later places it on one of the four true
+center cells carries a score flag on every subsequent row, promoting that
+lineage. The bonus is additive on a score measured in nats of log record count,
+so its value *is* a claimed factor in continuability: the historical +10
+asserted a center-139 board was worth `e^10 ~ 2.2e4` times one without, which
+no real fan-out difference can overcome, and it then persisted in every
+descendant from row 6 while the random band shut off at row 8. The default is
+now **1.0** -- roughly one standard deviation of the color term -- so it breaks
+near-ties in favour of a 139 lineage without overriding a board that is
+genuinely more continuable.
 
 ### Color-parity pruning
 
@@ -331,8 +401,56 @@ For every inner color c, let `S = total(c) - consumed(c) - required(c)`, where
 *required* counts frontier tops plus all committed future interfaces (left
 column, right terminals, top-border demands). Every side of every unplaced
 piece is either matched to a requirement or paired internally, so S >= 0
-always -- and S must be even when the border assignment is fixed. O(17) per
-child, checked before scoring.
+always, and S must be even. O(17) per child, checked before scoring.
+
+**Free mode is no longer exempt** (`--no_free_demand` restores the old
+behaviour). Free-edges mode used to zero the left, right and top-border demands
+and skip the evenness test, because it does not know which edge piece will end
+up on which side. It does not need to: an edge piece carries **one** inner
+color, and in either remaining role -- frame-right (inner side faces left) or
+frame-up (inner side faces down) -- it exposes exactly that one inner half-edge
+into the interior. The split therefore does not change the demand multiset at
+all, and free mode's demands are exact without enumerating it. The bookkeeping
+is one used-tested pass over the edge pool (which in free mode holds all 56
+non-corner edges) plus the left column, and it reproduces the fixed-mode count
+`sum_c D_c = 56 - 2r` exactly at every depth -- fixed mode is the same rule with
+the roles pre-assigned.
+
+**What the evenness bit is actually worth: nothing.** Writing `adj_c` for the
+interior adjacencies already formed and `B_c` for the number of edge pieces
+whose inner color is c, the same accounting gives
+
+```
+S_c = tot_c - B_c - 2*adj_c - 2*frontier_c
+```
+
+so `S_c = tot_c - B_c (mod 2)` for every board at depth >= 1 -- the parity of S
+is a property of the **seed**, not of the board. On `data/seed_Edge5.txt`
+`tot_c - B_c` is even for all 17 colors (it must be, for any seed admitting a
+solution), so the evenness test can never fire. Measured over 27.6 M checks in
+a free-mode finalizer run: 0 rejections on parity, 2720 on `S < 0` (0.01%). The
+test is kept because it costs nothing and would fire immediately on a
+malformed seed -- but it is not a source of pruning, and the exact free-mode
+demands matter only through the `S >= 0` half.
+
+### Piece-supply pruning (`--supply_check R`)
+
+A certificate that counts **pieces** where the parity test counts half-edges,
+so neither implies the other -- a piece with two sides of color c adds 2 to
+`S_c` but can still serve only one column. Each of the 14 frontier columns
+needs a distinct remaining inner piece carrying its exposed top color. Columns
+demanding the same color have identical candidate sets, so Hall's condition
+binds first on whole color classes, and the singleton case is
+
+```
+for each inner color c:  #{columns demanding c} <= #{unused inner pieces carrying c}
+```
+
+which is 4 `andn` + 4 `popcount` per demanded color against `g_color_pieces`.
+Off by default, and worth measuring before trusting: in the finalizer regime
+above it rejected 0 of 25 M candidates, because a color is carried by ~40 of
+the 196 inner pieces and 14 columns cannot exhaust that until the board is very
+nearly full.
 
 ### Random border mode (`--random_edges`)
 
@@ -373,11 +491,20 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--stop_row R` | 12 | last row filled (1-13) |
 | `--beam_expand E` | 5 | late-search width multiplier |
 | `--beam_expand_row R` | 8 | row with the full ExK width |
-| `--lambda_Mahalanobis F` | 0 | weight of the color-usage atypicality bonus |
+| `--score_model M` | `legacy` | color term: `legacy` (Mahalanobis) or `J` (pairing combinatorics) |
+| `--lambda_J F` | 1 | weight of the J terms (1 = as derived) |
+| `--lambda_Mahalanobis F` | 0 | weight of the color-usage atypicality bonus (legacy model) |
+| `--avail_correct` | off | discount B/C fan-out by each frontier color's remaining supply |
+| `--bonus_139 F` | 1 | center-139 score bonus (was a hard-coded 10) |
+| `--no_free_demand` | -- | **disable** the free-mode demand accounting (on by default) |
+| `--supply_check R` | 0 | piece-supply certificate from row R (0 = off) |
 | `--frac_rand F` | 0.75 | random selection band (halved at R-1, zero from R) |
+| `--gumbel_tau0 T` | 0 | selection temperature at row 1 (0 = off, exact legacy) |
+| `--gumbel_tau1 T` | 0 | selection temperature at `--stop_row` |
 | `--parent_cap N` | 5 | children per parent in the score band |
 | `--pool_factor N` | 8 | candidate-pool target, x beam width |
 | `--scan_factor N` | 1024 | decode budget per requested child |
+| `--bc_window nB,nC` | `1,1` | score up to nB x nC (B,C) completions per A record, keep the best |
 | `--top_bottoms N` | 300 | ranked bottom orderings tried per border row |
 | `--top_columns N` | 10 | ranked left columns per bottom |
 | `--config_time_sec S` | 600 | wall-time slice per configuration |
@@ -386,8 +513,19 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--resume` | off | continue from the sweep checkpoint |
 | `--threads N` | all | OpenMP threads |
 | `--seed S` | random | master RNG seed |
-| `--soft_center_139` | off | center-clue handling |
+| `--soft_center_139` | off | center-clue handling (see `--bonus_139`) |
 | `--verbose` | off | per-row `[beam]` progress lines |
+
+`--bc_window` is the one place where extra compute buys objective rather than
+more candidates. `try_A` normally commits to the **first** conflict-free (B, C)
+and returns, so segments B and C -- 10 of the row's 14 pieces -- are chosen by
+the database's global, board-blind fan-out sort: the score filters an unbiased
+sample but never steers it. With a window open, up to nB workable B chains x nC
+C completions are scored with the same `score_child` used for selection and only
+the best is kept. Note `--scan_factor`'s budget counts segment-A decodes only,
+so an open window multiplies work the budget does not see. There is no
+counterpart in the finalizer, whose beam rows already enumerate *every*
+conflict-free (B, C) -- the defect the window fixes does not exist there.
 
 ### Performance (reference set, 4 laptop threads)
 
@@ -442,17 +580,22 @@ certainty (the basis of the regression test in `tests/run_tests.sh`).
 **Sides from the annealer** (optional third positional, normally the very
 rotations CSV the beamer was given). Free mode is the price of an incomplete
 border, and it is steep: all 56 edges become candidates for the left column
-*and* for the right terminals, the top-border demands go to zero and the
-even-parity prune switches off -- discarding exactly the side structure Stage A
+*and* for the right terminals -- discarding exactly the side structure Stage A
 was run to produce. Given the rotations file, each partial's **locked** border
 (rows 0..`--finalize_from`, which are always fully placed) is compared against
 every row; the first row that assigns those same pieces to those same sides is
 re-imposed. The left column is then enumerated from the annealer's 14 left
-edges instead of 56, right terminals and top demands come from the row, and
-parity is back on -- while the column *ordering* is still searched, so
-`--top_columns 0` keeps its meaning. On the synthetic regression this cuts a
-`finalize_from 10 --stop_row 14` sweep from 593 legal left columns to 2, with
-the known solution still found.
+edges instead of 56, and right terminals and top demands come from the row --
+while the column *ordering* is still searched, so `--top_columns 0` keeps its
+meaning. On the synthetic regression this cuts a `finalize_from 10 --stop_row
+14` sweep from 593 legal left columns to 2, with the known solution still
+found.
+
+The saving is now purely in the size of the search space. It used to be larger
+on paper: free mode also zeroed the top-border demands and switched the
+even-parity prune off, so re-imposing a row restored a certificate as well. It
+no longer has to -- free mode's demands are exact in their own right (see
+**Color-parity pruning**), so both modes now carry the same colour tests.
 
 Only the locked border is compared, deliberately. Pieces above `finalize_from`
 return to the pool and are re-searched, and a beamer run with `--free_edges`
@@ -476,6 +619,15 @@ and the parity invariant holds with equality on a completed inner board.
 *every* conflict-free (B,C) completion of each segment-A record -- necessary
 over a sparse reduced database; (2) the first searched row always uses the
 full random band, so every repeat injects fresh variability.
+
+The scoring and certificate options are shared with the beamer and mean the
+same thing here, with one exception: **`--bc_window` does not exist in the
+finalizer**, because (1) above already does more than any window -- the defect
+the window fixes is the beamer's "take the first (B, C) that fits", and this
+loop never did. `--score_model J` is a better fit here than in the beamer:
+`maha_term` infers the placed-piece count from `n = 14*row`, whereas `J` reads
+the colour counts straight off the board and stays exact from a locked partial
+at any `--finalize_from`.
 
 **Output** appends to `beam_completions_finalized_<stop_row>.csv` with config
 ids `p<line>r<repeat>l<column>`; several instances on the same machine may

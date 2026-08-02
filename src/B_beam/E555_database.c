@@ -99,6 +99,7 @@ uint64_t g_db_exclude[4] = {0, 0, 0, 0};
 
 int g_top_border_inner_count[NUM_COLORS_TOTAL];
 int g_inner_color_total[NUM_COLORS_TOTAL];
+uint64_t g_color_pieces[NUM_COLORS_TOTAL][4];
 
 uint8_t *g_inner_arena = NULL;  size_t g_inner_arena_size = 0;
 uint8_t *g_edge_arena  = NULL;  size_t g_edge_arena_size  = 0;
@@ -397,12 +398,15 @@ void validate_color_constants(void) {
 
 void build_inner_color_totals(void) {
     memset(g_inner_color_total, 0, sizeof(g_inner_color_total));
+    memset(g_color_pieces, 0, sizeof(g_color_pieces));
     for (int k = 0; k < g_num_inner; k++) {
         int pid = g_inner_ids[k];
-        g_inner_color_total[g_seed_top[pid]]++;
-        g_inner_color_total[g_seed_right[pid]]++;
-        g_inner_color_total[g_seed_bottom[pid]]++;
-        g_inner_color_total[g_seed_left[pid]]++;
+        const int e[4] = { g_seed_top[pid], g_seed_right[pid],
+                           g_seed_bottom[pid], g_seed_left[pid] };
+        for (int s = 0; s < 4; s++) {
+            g_inner_color_total[e[s]]++;             /* half-edges: counts twice */
+            used_set(g_color_pieces[e[s]], (uint16_t)pid);   /* pieces: once */
+        }
     }
 }
 
