@@ -93,7 +93,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import E555_viewer as V                      # seed loading, row parsing, board build
 
-SIDE, N_PIECES, N_EDGES, UNPLACED, GREY = V.SIDE, V.N_PIECES, V.N_EDGES, V.UNPLACED, 0
+SIDE, N_PIECES, N_EDGES, GREY = V.SIDE, V.N_PIECES, V.N_EDGES, 0
 NORTH, EAST, SOUTH, WEST = 0, 1, 2, 3
 
 # Every internal junction as (cell_a, cell_b, side_of_a, side_of_b), the same
@@ -146,16 +146,21 @@ def _h(cell):
 
 
 def measure(pos, rot, seed):
-    """All ranking measures of one board, from its pos/rot arrays."""
+    """All ranking measures of one board, from its pos/rot arrays.
+
+    Raises ValueError if the board is not well formed -- a position outside
+    0..255 (or the 999 sentinel), a rotation outside 0..3, or two pieces on one
+    cell. Measuring such a board silently loses one of the colliding pieces, and
+    the numbers that come out then drive --sort, --rescore and --field as if
+    they meant something; read_boards turns the exception into a skipped row.
+    """
+    board = V.build_board(pos, rot)             # the one strict board validator
     colors = {}
-    n_placed = 0
-    for p in range(N_PIECES):
-        if pos[p] != UNPLACED:
-            colors[pos[p]] = V.rotate_edges(seed[p], rot[p])
-            n_placed += 1
-    if len(colors) != n_placed:                 # two pieces claiming one cell
-        print(f"[warn] board has {n_placed - len(colors)} duplicate cell(s); "
-              "measures are unreliable for it", file=sys.stderr)
+    for r, row in enumerate(board):
+        for c, cell in enumerate(row):
+            if cell is not None:
+                colors[r * SIDE + c] = V.rotate_edges(seed[cell[0]], cell[1])
+    n_placed = len(colors)
 
     # One pass over the junctions gives breaks, break cells and corner distance.
     # A cell touched by any break cannot be solid, which is precisely the
@@ -242,8 +247,16 @@ HIGH_IS_BETTER = {"score", "solid", "placed", "border",
 SORTABLE = tuple(k for k in COLUMNS if k != "span")
 
 
-def read_boards(paths, seed):
-    """Yield one record per board row of every input file, raw fields kept."""
+def read_boards(paths, seed, skipped):
+    """Yield one record per board row of every input file, raw fields kept.
+
+    A row that fails validation is reported on stderr and appended to `skipped`
+    rather than ranked: one malformed board in a large corpus must not cost the
+    caller every other board, but it must not pass silently either, so main()
+    exits nonzero when `skipped` is non-empty. This mirrors what the C tools do
+    with a board they cannot use (see the [skip] lines in E555_roundhouse.c and
+    E555_finalizer.c).
+    """
     for path in paths:
         idx = 0
         with open(path, newline="") as fh:
@@ -256,9 +269,18 @@ def read_boards(paths, seed):
                 # had them, so --rescore does not throw away a Stage B solution
                 # index while collapsing everything else into one score column.
                 canon_id = f"{cid}_{sol}" if sol not in ("", "?") else cid
+                try:
+                    m = measure(pos, rot, seed)
+                except ValueError as exc:
+                    # idx still advances: the number in the message is the row's
+                    # real position in the file, which is what the reader needs
+                    # to go and look at it.
+                    print(f"[skip] {path}:{idx}: {exc}", file=sys.stderr)
+                    skipped.append((path, idx))
+                    idx += 1
+                    continue
                 yield dict(file=Path(path).name, row=idx, id=cid,
-                           canon_id=canon_id, raw=raw, pos=pos, rot=rot,
-                           **measure(pos, rot, seed))
+                           canon_id=canon_id, raw=raw, pos=pos, rot=rot, **m)
                 idx += 1
 
 
@@ -292,6 +314,22 @@ def sort_records(records, spec):
         descending = (name in HIGH_IS_BETTER) != worst_first
         records.sort(key=lambda r, n=name: r[n], reverse=descending)
     return keys
+
+
+def _status(skipped):
+    """The process exit status, reported once after all output has been written.
+
+    Every return path in main() goes through this. Rejected boards have to leave
+    a nonzero status behind -- a pipeline stage that silently ranked 900 of its
+    1000 boards looks exactly like one that ranked all 1000 -- but the status is
+    settled last, so --field still prints its bare number for the shell to
+    capture before the run ends.
+    """
+    if not skipped:
+        return 0
+    print(f"[ERROR] {len(skipped)} board(s) failed validation and were left out "
+          "of the ranking", file=sys.stderr)
+    return 1
 
 
 def main():
@@ -333,13 +371,14 @@ def main():
                          f"choose from: {', '.join(SORTABLE)}")
 
     seed = V.load_seed(V.find_seed(args.seed))
-    records = list(read_boards(args.inputs, seed))
+    skipped = []
+    records = list(read_boards(args.inputs, seed, skipped))
     if not records:
         # --field is meant to be captured in a shell variable, so an empty
         # input has to leave that variable empty rather than printing an error
         # into it. Every other mode still fails loudly.
         if args.field:
-            return
+            return _status(skipped)
         raise SystemExit("[ERROR] no board rows found in the input")
     if args.border_only:
         n0 = len(records)
@@ -349,12 +388,12 @@ def main():
     keys = sort_records(records, args.sort)
     if args.field:
         print(records[0][args.field])
-        return
+        return _status(skipped)
     shown = records[:args.top] if args.top > 0 else records
     if not shown:
         if args.emit:
             write_emit(args.emit, [], args.rescore)
-        return
+        return _status(skipped)
 
     multi = len(args.inputs) > 1
     if args.csv:
@@ -364,7 +403,7 @@ def main():
         for r in shown:
             w.writerow(([r["file"]] if multi else []) + [r["row"], r["id"]]
                        + [r[k] for k in COLUMNS])
-        return
+        return _status(skipped)
 
     order = " then ".join(f"{n}{' (worst first)' if d else ''}" for n, d in keys) \
             or "input order"
@@ -392,7 +431,8 @@ def main():
 
     if args.emit:
         write_emit(args.emit, shown, args.rescore)
+    return _status(skipped)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

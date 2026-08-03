@@ -126,6 +126,23 @@ typedef struct {
     uint8_t  rec[];
 } Cell;
 
+/* Byte stride from one Cell to the next in an arena: the header plus n packed
+ * records, rounded up so every Cell keeps its own 4-byte alignment. The records
+ * themselves are read and written by rec_load/rec_store, which go through
+ * memcpy and do not care where they land -- but `n` is a uint32_t, so without
+ * this round-up a cell holding an odd number of 2-byte records (which is what
+ * both shipped seeds produce: g_lb_bits=3 -> g_rec_bytes_inner=2) leaves the
+ * NEXT cell at 2 mod 4, and reading its `n` is a misaligned load.
+ *
+ * Every arena size calculation, construction loop, cache write and cache load
+ * has to use this one function: they all encode the same layout, and an offset
+ * computed one way against an arena laid out the other way points into the
+ * middle of a record. */
+static inline uint64_t cell_stride(uint32_t n, int rec_bytes) {
+    uint64_t b = sizeof(Cell) + (uint64_t)n * (uint64_t)rec_bytes;
+    return (b + _Alignof(Cell) - 1) / _Alignof(Cell) * _Alignof(Cell);
+}
+
 typedef struct { uint64_t s[2]; } RNG;
 
 /* One enumerated bottom-row ordering (p[0]=cBL .. p[15]=cBR). rtop0[c] is that

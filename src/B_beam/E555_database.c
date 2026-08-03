@@ -568,7 +568,7 @@ static void db_layout(const uint32_t *cnt, bool inner_phase,
             if (color_is_inner((int)(fi % DIM_B5)) != inner_phase) continue;
             uint32_t n = cnt[fi];
             if (!n) continue;
-            bytes += sizeof(Cell) + (uint64_t)n*rb;
+            bytes += cell_stride(n, rb);
             total_recs += n; total_cells++;
             sum_sq += (uint64_t)n * (uint64_t)n;
             la_tot[fi / FANOUT_N] += n;
@@ -604,9 +604,9 @@ static void db_layout(const uint32_t *cnt, bool inner_phase,
             uint32_t n = cnt[fi];
             if (!n) continue;
             Cell *c = (Cell *)(arena + off);
-            c->n = n;
+            c->n = n; c->_pad = 0;
             flat[fi] = c;
-            off += sizeof(Cell) + (uint64_t)n*rb;
+            off += cell_stride(n, rb);
         }
     }
     free(chunk_off);
@@ -798,7 +798,11 @@ void build_db_edge_and_sort(void) {
  * in lazily as the search visits cells. */
 
 #define DB_CACHE_MAGIC   0x3142764244353545ULL   /* "E55DBvB1" */
-#define DB_CACHE_VERSION 1u
+/* Version 2: cell offsets are rounded up to _Alignof(Cell) (see cell_stride in
+   E555_database.h). A version-1 file packs them tightly, so every cell after the
+   first odd-length one sits at a different offset -- the loader must reject it
+   and rebuild rather than map the arena at the wrong stride. */
+#define DB_CACHE_VERSION 2u
 #define DB_CACHE_ALIGN   4096u
 
 typedef struct {
@@ -917,7 +921,7 @@ bool db_cache_load(const char *path) {
             munmap(arena, hdr.arena_bytes); free(tab); return false;
         }
         flat[fi] = (Cell *)(arena + off);
-        off += sizeof(Cell) + (uint64_t)n * g_rec_bytes_inner;
+        off += cell_stride(n, g_rec_bytes_inner);
         recs += n;
         g_fanout[fi % FANOUT_N] += n;
         g_la_total_inner[fi / FANOUT_N] += n;

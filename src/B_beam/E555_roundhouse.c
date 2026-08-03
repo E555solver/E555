@@ -555,7 +555,7 @@ static void build_chain_db(void) {
     uint64_t cells = 0;
     for (uint64_t fi = 0; fi < s_ncell; fi++) {
         if (!cnt[fi]) continue;
-        bytes += sizeof(Cell) + (uint64_t)cnt[fi]*s_rec_bytes;
+        bytes += cell_stride(cnt[fi], s_rec_bytes);
         s_records += cnt[fi]; cells++;
         if (cnt[fi] > s_max_cell_n) s_max_cell_n = cnt[fi];
     }
@@ -567,7 +567,7 @@ static void build_chain_db(void) {
         Cell *c = (Cell *)(s_arena + off);
         c->n = cnt[fi]; c->_pad = 0;
         s_db[fi] = c;
-        off += sizeof(Cell) + (uint64_t)cnt[fi]*s_rec_bytes;
+        off += cell_stride(cnt[fi], s_rec_bytes);
     }
     memset(cnt, 0, s_ncell * sizeof(uint32_t));
     db_pass(cnt, true);
