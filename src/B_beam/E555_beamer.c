@@ -485,38 +485,62 @@ static uint64_t board_fingerprint(const RowChoice rows[EDGE_LEN], int depth) {
     return fp ? fp : 1;
 }
 
-/* Emit one stop-row board: the parent's ancestry chain plus the final move.
-   Called serially, in rank order. */
-static void emit_partial(const BeamCtx *ctx, const BeamEntry *parent,
-                         const RowChoice *mv, int row) {
-    if (!g_completions_fp) return;
-    RowChoice rows[EDGE_LEN];
-    rows[row] = *mv;
-    collect_rows(ctx, parent, rows);
+/* -- Emission line formatting ------------------------------------------------ */
 
-    uint64_t fp = board_fingerprint(rows, row);
-    if (!htable_insert(fp)) return;
-    uint64_t sol_idx = g_solution_idx++;
-    g_stats.emitted_total++;
+/* Longest tail an emitted line can carry: 256 position fields (0..255, or the
+   999 unplaced sentinel -- 3 digits) and 256 rotation fields (1 digit), each
+   preceded by ", ", plus the newline: 256*5 + 256*3 + 1 = 2049 bytes. The
+   "<config>, <sol_idx>" prefix is written by the caller, which is the only place
+   sol_idx is known. */
+#define EMIT_LINE_MAX 3072
 
+/* Completion files are block-buffered rather than line-buffered: a line is ~2 KB
+   and line buffering spends one write() syscall per board. The trade is that a
+   SIGKILL can now lose the tail of the buffer instead of nothing, so the file is
+   flushed after every config, which bounds the loss to the config in flight. */
+#define EMIT_FILE_BUF (1u << 20)
+
+/* Decimal conversion. A board line is 512 of these and almost nothing else, so
+   it is worth not going through fprintf's general machinery: measured ~2x on the
+   exact emission pattern. */
+static inline char *u32a(char *p, uint32_t v) {
+    char t[10]; int k = 0;
+    do { t[k++] = (char)('0' + v % 10u); v /= 10u; } while (v);
+    while (k) *p++ = t[--k];
+    return p;
+}
+
+/* Flatten rows[0..row] into per-piece position/rotation vectors and write them
+   as the 512 comma-separated fields that follow a line's prefix. cmax_stop is
+   the last placed column of the TOP row -- PUZZLE_SIDE-1 for a completed stop
+   row, 10 for an --incomplete_top A+B partial whose cols 11..15 stay unplaced;
+   every row below it is full either way. Returns the byte count. */
+static int format_board_tail(const RowChoice rows[EDGE_LEN], int row,
+                             int cmax_stop, char *out) {
     uint32_t pos[NUM_PIECES], rot_arr[NUM_PIECES];
     for (int i = 0; i < NUM_PIECES; i++) { pos[i] = 999; rot_arr[i] = 0; }
-    for (int r = 0; r <= row; r++)
-        for (int c = 0; c < PUZZLE_SIDE; c++) {
+    for (int r = 0; r <= row; r++) {
+        int cmax = (r == row) ? cmax_stop : PUZZLE_SIDE - 1;
+        for (int c = 0; c <= cmax; c++) {
             uint16_t pid; uint8_t rot; board_cell(rows, r, c, &pid, &rot);
             pos[pid] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[pid] = rot;
         }
-    fprintf(g_completions_fp, "%s, %" PRIu64, g_config_id_str, sol_idx);
-    for (int i = 0; i < NUM_PIECES; i++) fprintf(g_completions_fp, ", %u", pos[i]);
-    for (int i = 0; i < NUM_PIECES; i++) fprintf(g_completions_fp, ", %u", rot_arr[i]);
-    fputc('\n', g_completions_fp);
+    }
+    char *p = out;
+    for (int i = 0; i < NUM_PIECES; i++) { *p++ = ','; *p++ = ' '; p = u32a(p, pos[i]); }
+    for (int i = 0; i < NUM_PIECES; i++) { *p++ = ','; *p++ = ' '; p = u32a(p, rot_arr[i]); }
+    *p++ = '\n';
+    return (int)(p - out);
 }
 
 /* Emit one --incomplete_top partial: the parent's ancestry plus segments A and B
    of the stop row (mv.ci[0..9]); columns 11..15 of that row are left unplaced
    (pos 999). Called from inside the parallel expansion, so the dedup + write are
-   guarded by an OpenMP critical; the fingerprint and board flatten are read-only
-   over expansion-stable state. */
+   guarded by an OpenMP critical -- but the ancestry walk, the fingerprint and the
+   512 field conversions are read-only over expansion-stable state and are nearly
+   all of the cost, so they happen BEFORE the lock is taken. A board that then
+   loses the dedup was formatted for nothing, which is cheap: that work is
+   parallel, whereas everything inside the critical stalls every other thread. */
 static void emit_incomplete(const BeamCtx *ctx, const BeamEntry *parent,
                             const RowChoice *mv, int row) {
     if (!g_partial_fp) return;
@@ -537,23 +561,15 @@ static void emit_incomplete(const BeamCtx *ctx, const BeamEntry *parent,
     }
     if (!fp) fp = 1;
 
+    char line[EMIT_LINE_MAX];
+    int len = format_board_tail(rows, row, 10, line);
+
     #pragma omp critical(e555_incomplete)
     {
         if (g_partial_fp && partial_htable_insert(fp)) {
             uint64_t sol_idx = g_partial_total++;
-            uint32_t pos[NUM_PIECES], rot_arr[NUM_PIECES];
-            for (int i = 0; i < NUM_PIECES; i++) { pos[i] = 999; rot_arr[i] = 0; }
-            for (int r = 0; r <= row; r++) {
-                int cmax = (r == row) ? 10 : PUZZLE_SIDE - 1;
-                for (int c = 0; c <= cmax; c++) {
-                    uint16_t pid; uint8_t rot; board_cell(rows, r, c, &pid, &rot);
-                    pos[pid] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[pid] = rot;
-                }
-            }
             fprintf(g_partial_fp, "%s, %" PRIu64, g_config_id_str, sol_idx);
-            for (int i = 0; i < NUM_PIECES; i++) fprintf(g_partial_fp, ", %u", pos[i]);
-            for (int i = 0; i < NUM_PIECES; i++) fprintf(g_partial_fp, ", %u", rot_arr[i]);
-            fputc('\n', g_partial_fp);
+            fwrite(line, 1, (size_t)len, g_partial_fp);
         }
     }
 }
@@ -1014,6 +1030,12 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
     if (quota_parent < 8) quota_parent = 8;
     uint64_t budget_parent = (uint64_t)quota_parent * g_scan_factor;
     if (budget_parent < MIN_DECODE_BUDGET) budget_parent = MIN_DECODE_BUDGET;
+    /* Slicing is a pure parallel decomposition: both scan phases below are
+       strided by n_slices and the quota/budget are divided by it, so a parent is
+       given the same total effort however many slices it is cut into -- and so
+       however many threads the run has. Capping the slice count by the quota
+       keeps the two floors just below from rounding that total up. */
+    if (n_slices > quota_parent) n_slices = quota_parent;
     uint32_t quota_slice = quota_parent / n_slices; if (quota_slice == 0) quota_slice = 1;
     uint64_t budget_slice = budget_parent / n_slices; if (budget_slice < 64) budget_slice = 64;
     const bool at_stop = ((uint32_t)row == g_stop_row);
@@ -1027,7 +1049,9 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
         Scratch *sc = scratch[omp_get_thread_num()];
         Expand e;
         if (!expand_prepare(&e, &beam[pi], pi, row, at_stop)) continue;
-        e.rng = rng_for(cfg_hash, (uint32_t)row, pi, sl);
+        /* Seeded per parent, NOT per slice: the slices of one parent have to
+           agree on the phase-2 permutation in order to divide it between them. */
+        e.rng = rng_for(cfg_hash, (uint32_t)row, pi, 0xFFFFFFFFu);
         e.quota = quota_slice; e.budget = budget_slice;
 
         /* Phase 1: this slice's stride of the cell in promise order (the cell is
@@ -1039,17 +1063,23 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
             if (e.quota == 0 || e.budget <= rand_budget) break;
             try_A(&e, ctx, (uint32_t)j, sc);
         }
-        /* Phase 2: a random full-cycle permutation of the cell (random start +
-           stride coprime to n visits every record exactly once), so random
-           exploration never re-generates the same child within a slice. */
+        /* Phase 2: one random full-cycle permutation of the cell (random start +
+           stride coprime to n visits every record exactly once), DIVIDED among
+           the parent's slices -- slice sl takes cycle positions sl, sl+n_slices,
+           ... so between them they still visit each record exactly once. Giving
+           every slice the whole cycle, as this did before, had two slices calling
+           try_A on the same record; try_A is deterministic in that record, so the
+           loser spent budget rebuilding a child the pool already held. It also
+           made a parent's work grow with the slice count, and so with --threads. */
         if (e.quota > 0 && e.budget > 0 && n > 1) {
             uint32_t start = rng_uniform(&e.rng, n);
             uint32_t step = 1;
             do step = 1 + rng_uniform(&e.rng, n - 1); while (gcd_u32(step, n) != 1);
-            uint64_t j = start;
-            for (uint32_t m = 0; m < n && e.quota > 0 && e.budget > 0; m++) {
+            uint64_t j = ((uint64_t)start + (uint64_t)sl * step) % n;
+            const uint64_t jump = ((uint64_t)n_slices * step) % n;
+            for (uint32_t m = sl; m < n && e.quota > 0 && e.budget > 0; m += n_slices) {
                 try_A(&e, ctx, (uint32_t)j, sc);
-                j += step; if (j >= n) j -= n;
+                j += jump; if (j >= n) j -= n;
             }
         }
         pool_flush(ctx, sc);
@@ -1226,7 +1256,9 @@ static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
     }
     ctx->log_n[row] = n_sel;
     int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
-    #pragma omp parallel for schedule(dynamic, 64) num_threads(nt)
+    /* Static, not dynamic-64: the per-board work here is uniform, and a chunk of
+       64 leaves a beam of a few hundred with fewer chunks than threads. */
+    #pragma omp parallel for schedule(static) num_threads(nt)
     for (uint32_t i = 0; i < n_sel; i++) {
         const PoolEntry *pe = &ctx->pool[ctx->keep[ctx->sel[i]]];
         BeamEntry *d = &dst[i];
@@ -1239,11 +1271,49 @@ static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
     }
 }
 
+/* Stop-row emission buffers, allocated on first use (emission is entered from
+   serial code). One tile is ~12.6 MB. */
+#define EMIT_TILE 4096
+static char     *g_emit_lines = NULL;    /* EMIT_TILE x EMIT_LINE_MAX */
+static uint64_t *g_emit_fps   = NULL;
+static int      *g_emit_lens  = NULL;
+
+/* Emit the stop-row boards, best-scored first. Reconstructing a board, hashing
+   it and converting its 512 fields is ~all of the cost and touches only
+   read-only state, so a tile of boards is built in parallel; the dedup, the
+   index draw and the write itself then run serially over that tile in rank
+   order, so the file is byte for byte what emitting one board at a time
+   produced. Boards losing the dedup were formatted for nothing -- parallel work
+   traded against serial work, which is the point. */
 static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, int row) {
+    if (!g_completions_fp) return;
     uint32_t n_emit = kept < EMIT_MAX ? kept : EMIT_MAX;
-    for (uint32_t i = 0; i < n_emit && !g_stop; i++) {
-        const PoolEntry *pe = &ctx->pool[ctx->keep[i]];
-        emit_partial(ctx, &beam[pe->parent], &pe->mv, row);
+    if (!g_emit_lines) {
+        g_emit_lines = xmalloc((size_t)EMIT_TILE * EMIT_LINE_MAX);
+        g_emit_fps   = xmalloc((size_t)EMIT_TILE * sizeof(uint64_t));
+        g_emit_lens  = xmalloc((size_t)EMIT_TILE * sizeof(int));
+    }
+    int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
+    for (uint32_t base = 0; base < n_emit && !g_stop; base += EMIT_TILE) {
+        uint32_t tile = n_emit - base < (uint32_t)EMIT_TILE
+                      ? n_emit - base : (uint32_t)EMIT_TILE;
+        #pragma omp parallel for schedule(static) num_threads(nt)
+        for (uint32_t k = 0; k < tile; k++) {
+            const PoolEntry *pe = &ctx->pool[ctx->keep[base + k]];
+            RowChoice rows[EDGE_LEN];
+            rows[row] = pe->mv;
+            collect_rows(ctx, &beam[pe->parent], rows);
+            g_emit_fps[k]  = board_fingerprint(rows, row);
+            g_emit_lens[k] = format_board_tail(rows, row, PUZZLE_SIDE - 1,
+                                               g_emit_lines + (size_t)k * EMIT_LINE_MAX);
+        }
+        for (uint32_t k = 0; k < tile; k++) {
+            if (!htable_insert(g_emit_fps[k])) continue;
+            fprintf(g_completions_fp, "%s, %" PRIu64, g_config_id_str, g_solution_idx++);
+            fwrite(g_emit_lines + (size_t)k * EMIT_LINE_MAX, 1,
+                   (size_t)g_emit_lens[k], g_completions_fp);
+            g_stats.emitted_total++;
+        }
     }
 }
 
@@ -1727,14 +1797,14 @@ int main(int argc, char *argv[]) {
         snprintf(comp_path, sizeof comp_path, "%s/beam_completions_random_%u.csv", g_out_dir, g_stop_row);
         g_completions_fp = fopen(comp_path, "a");
         if (!g_completions_fp) fatal("cannot open %s: %s", comp_path, strerror(errno));
-        setvbuf(g_completions_fp, NULL, _IOLBF, 0);
+        setvbuf(g_completions_fp, NULL, _IOFBF, EMIT_FILE_BUF);
         printf("[out] completions -> %s (append)\n", comp_path);
         if (g_incomplete_top) {
             char part_path[1024];
             snprintf(part_path, sizeof part_path, "%s/beam_completions_random_%u_partial.csv", g_out_dir, g_stop_row);
             g_partial_fp = fopen(part_path, "a");
             if (!g_partial_fp) fatal("cannot open %s: %s", part_path, strerror(errno));
-            setvbuf(g_partial_fp, NULL, _IOLBF, 0);
+            setvbuf(g_partial_fp, NULL, _IOFBF, EMIT_FILE_BUF);
             printf("[out] incomplete-top partials -> %s (append)\n", part_path);
         }
         fflush(stdout);
@@ -1773,6 +1843,8 @@ int main(int argc, char *argv[]) {
                        g_config_id_str, br.row, br.width, g_emit_count, g_partial_count, br.reason,
                        g_solution_idx, g_partial_total, omp_get_wtime()-tc0);
                 fflush(stdout);
+                if (g_completions_fp) fflush(g_completions_fp);
+                if (g_partial_fp)     fflush(g_partial_fp);
                 partials_budget_announce();
             }
         }
@@ -1810,14 +1882,14 @@ int main(int argc, char *argv[]) {
         snprintf(comp_path, sizeof comp_path, "%s/beam_completions_%u_%u.csv", g_out_dir, cur_row, g_stop_row);
         g_completions_fp = fopen(comp_path, "a");
         if (!g_completions_fp) fatal("cannot open %s: %s", comp_path, strerror(errno));
-        setvbuf(g_completions_fp, NULL, _IOLBF, 0);
+        setvbuf(g_completions_fp, NULL, _IOFBF, EMIT_FILE_BUF);
         printf("[out] completions -> %s (append)\n", comp_path);
         if (g_incomplete_top) {
             char part_path[1024];
             snprintf(part_path, sizeof part_path, "%s/beam_completions_%u_%u_partial.csv", g_out_dir, cur_row, g_stop_row);
             g_partial_fp = fopen(part_path, "a");
             if (!g_partial_fp) fatal("cannot open %s: %s", part_path, strerror(errno));
-            setvbuf(g_partial_fp, NULL, _IOLBF, 0);
+            setvbuf(g_partial_fp, NULL, _IOFBF, EMIT_FILE_BUF);
             printf("[out] incomplete-top partials -> %s (append)\n", part_path);
         }
         fflush(stdout);
@@ -1850,6 +1922,8 @@ int main(int argc, char *argv[]) {
                        g_config_id_str, br.row, br.width, g_emit_count, g_partial_count, br.reason,
                        g_solution_idx, g_partial_total, omp_get_wtime()-tc0);
                 fflush(stdout);
+                if (g_completions_fp) fflush(g_completions_fp);
+                if (g_partial_fp)     fflush(g_partial_fp);
                 partials_budget_announce();
                 write_checkpoint(ckpath, cur_row, (uint32_t)bi, (uint32_t)(li+1));
             }
