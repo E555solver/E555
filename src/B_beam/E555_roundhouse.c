@@ -716,7 +716,12 @@ static void oracle_backward(int round, int lo, int hi) {
         const int wall = g_wall[round][r];
         if (!color_is_inner(wall)) { memset(live, 0, g_live_words * sizeof(uint64_t)); continue; }
         const uint64_t base = (uint64_t)INNER_IDX(wall) * s_nsig;
-        #pragma omp parallel for schedule(static)
+        /* Dynamic, not static: the record scan below stops at the first survivor,
+           so a word of live signatures costs almost nothing while a word of dead
+           ones is scanned in full -- and dead signatures cluster, because
+           liveness follows the colours. A fixed contiguous quarter each left one
+           thread with far the heaviest share. */
+        #pragma omp parallel for schedule(dynamic, 8)
         for (long w = 0; w < (long)g_live_words; w++) {
             uint64_t bits = 0;
             for (int b = 0; b < 64; b++) {
