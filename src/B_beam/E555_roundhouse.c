@@ -464,7 +464,7 @@ static inline bool rh_decode(const Cell *cell, uint32_t j, int la_color,
     uint8_t loc[MAX_W]; int t_idx;
     rh_unpack(rec_load(cell->rec, j, s_rec_bytes), loc, &t_idx);
     uint64_t ignored[4] = {0,0,0,0};
-    if (!decode_inner_chain(loc, W - 1, la_color, bot, ci, ignored)) return false;
+    if (!decode_inner_chain(loc, W - 1, la_color, bot, ci, ignored, ignored)) return false;
     int cl = g_cat[ci[W-2]].right;
     if (t_idx >= g_edge_term_by_left_n[cl]) return false;
     *term = g_edge_term_by_left[cl][t_idx];

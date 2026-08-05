@@ -344,7 +344,7 @@ static inline void unpack_edge(uint32_t w, uint8_t f4[CHAIN_LEN-1], int *term_id
    false if a local index is out of range for its bucket (reliability). */
 static inline bool decode_inner_chain(const uint8_t loc[], int count, int start_left,
                                       const uint8_t bottoms[], uint16_t ci_out[],
-                                      uint64_t mask_inout[4]) {
+                                      uint64_t mask_inout[4], const uint64_t forbid[4]) {
     int cl = start_left;
     for (int i = 0; i < count; i++) {
         int b = bottoms[i];
@@ -354,7 +354,14 @@ static inline bool decode_inner_chain(const uint8_t loc[], int count, int start_
         ci_out[i] = (uint16_t)ci;
         cl = g_cat[ci].right;
         uint16_t pid = g_cat[ci].piece_id;
-        mask_inout[pid >> 6] |= piece_bit(pid);
+        uint64_t bit = piece_bit(pid);
+        /* The caller's own disjointness test, applied per piece instead of once
+           per finished chain. Cells hold ~142 records and deep rows have most
+           pieces placed, so most chains die on a conflict; decoding the other
+           four pieces first was the bulk of the expansion's work. Callers with
+           nothing to forbid pass an all-zero mask, which never fires. */
+        if (forbid[pid >> 6] & bit) return false;
+        mask_inout[pid >> 6] |= bit;
     }
     return true;
 }

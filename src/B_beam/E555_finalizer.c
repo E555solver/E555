@@ -928,7 +928,7 @@ static inline bool pick_segB(const Cell *cB, uint32_t jb, const uint8_t bottoms[
     uint32_t w = rec_load(cB->rec, jb, g_rec_bytes_inner);
     uint8_t f[CHAIN_LEN]; unpack_inner(w, f, g_lb_bits);
     uint64_t mask[4] = {0,0,0,0};
-    if (!decode_inner_chain(f, CHAIN_LEN, la_B, bottoms, ciB, mask)) return false;
+    if (!decode_inner_chain(f, CHAIN_LEN, la_B, bottoms, ciB, mask, forbid)) return false;
     if (masks_intersect4(forbid, mask)) return false;
     *la_C_out = g_cat[ciB[CHAIN_LEN-1]].right;
     return true;
@@ -943,7 +943,7 @@ static inline bool pick_segC(const Cell *cC, uint32_t jc, const uint8_t bottoms[
     uint32_t w = rec_load(cC->rec, jc, g_rec_bytes_edge);
     uint8_t f4[CHAIN_LEN-1]; int term_k; unpack_edge(w, f4, &term_k, g_lb_bits, g_term_bits);
     uint64_t mask[4] = {0,0,0,0};
-    if (!decode_inner_chain(f4, CHAIN_LEN-1, la_C, bottoms, ciC, mask)) return false;
+    if (!decode_inner_chain(f4, CHAIN_LEN-1, la_C, bottoms, ciC, mask, forbid)) return false;
     int cl = g_cat[ciC[CHAIN_LEN-2]].right;          /* terminal's required left color */
     if (cl < 0 || cl >= NUM_COLORS_TOTAL || term_k >= g_edge_term_by_left_n[cl]) return false;
     int t = g_edge_term_by_left[cl][term_k];
@@ -977,7 +977,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     uint32_t w = rec_load(e->cA->rec, j, g_rec_bytes_inner);
     uint8_t fA[CHAIN_LEN]; unpack_inner(w, fA, g_lb_bits);
     uint16_t ciA[CHAIN_LEN]; uint64_t maskA[4] = {0,0,0,0};
-    if (!decode_inner_chain(fA, CHAIN_LEN, e->la_A, rt + 1, ciA, maskA)) return;  /* bottoms rt[1..5] */
+    if (!decode_inner_chain(fA, CHAIN_LEN, e->la_A, rt + 1, ciA, maskA, p->used)) return;  /* bottoms rt[1..5] */
     if (masks_intersect4(p->used, maskA)) return;
 
     e->budget--;                                   /* a real decode attempt */
