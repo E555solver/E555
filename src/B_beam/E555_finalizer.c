@@ -128,6 +128,9 @@ static double   g_config_time_sec  = 600.0;
 static double   g_max_wall_sec     = 0.0;
 static uint64_t g_max_partials     = 0;   /* reported-board budget; 0 = unlimited */
 static long     g_top_columns      = 10;  /* sampled left columns per partial (free mode) */
+/* Selection temperature for the left-column rank, as in the beamer. 0 = off,
+   i.e. the published column is simply the best of the samples. */
+static double   g_tau_columns      = 0.0;
 static bool     g_opt_free_edges   = false;  /* --free_edges given (else auto per line) */
 
 /* Optional Stage A rotations CSV (3rd positional): every data row is a candidate
@@ -246,12 +249,8 @@ static double gumbel_tau_eff(int row) {
     return tau > 0.0 ? tau : 0.0;
 }
 
-/* Gumbel(0,1) = -log(-log U). The 53-bit draw is nudged off both endpoints so
-   the double logarithm is always finite. */
-static inline double gumbel_noise(RNG *r) {
-    double u = ((double)(rng_next(r) >> 11) + 0.5) * (1.0 / 9007199254740992.0);
-    return -log(-log(u));
-}
+/* gumbel_noise() and gumbel_key() are shared with the side samplers -- see
+   E555_database.h. */
 
 /* Per-parent offspring cap in the score band: doubled once the beam widens, so
    successful parents can actually fill the extra slots (0 = uncapped). */
@@ -2053,7 +2052,7 @@ static void fin_left_set(LeftOrder *lo, const Oriented seq[PUZZLE_SIDE],
     g_tr_reserved = TR.piece_id;
 }
 
-static bool fin_sample_left(RNG *rng, LeftOrder *lo) {
+static bool fin_sample_left(RNG *rng, double tau, LeftOrder *lo) {
     fin_build_side_pools();
     fin_left_prefix(lo);
     const int from = (int)g_finalize_from + 1;
@@ -2066,7 +2065,10 @@ static bool fin_sample_left(RNG *rng, LeftOrder *lo) {
 
     Oriented best[PUZZLE_SIDE], bestTL, bestTR;
     memset(&bestTL, 0, sizeof bestTL); memset(&bestTR, 0, sizeof bestTR);
-    double best_rank = -1.0;
+    /* have_best, not a negative sentinel: at tau > 0 the key is
+       rank/tau + Gumbel, which is frequently below zero. */
+    double best_key = 0.0, best_rank = 0.0;
+    bool have_best = false;
     uint64_t restarts = 0;
     for (int got = 0; got < RANDOM_SIDE_SAMPLES; ) {
         int tl_id, tr_id;
@@ -2120,12 +2122,14 @@ static bool fin_sample_left(RNG *rng, LeftOrder *lo) {
         for (int r = from; r <= EDGE_LEN; r++) right[r] = seq[r].right;
         right[PUZZLE_SIDE - 1] = TL.right;
         double rank = fin_left_rank(right);
-        if (rank > best_rank) {
+        double key  = gumbel_key(rank, tau, rng);
+        if (!have_best || key > best_key) {
             for (int r = from; r <= EDGE_LEN; r++) best[r] = seq[r];
-            bestTL = TL; bestTR = TR; best_rank = rank;
+            bestTL = TL; bestTR = TR;
+            best_key = key; best_rank = rank; have_best = true;
         }
     }
-    if (best_rank < 0.0) return false;
+    if (!have_best) return false;
 
     fin_left_set(lo, best, bestTL, bestTR);
     lo->rank = best_rank;
@@ -2369,6 +2373,13 @@ static void usage(const char *a0) {
 "                         N<=0 enumerates EVERY legal left column exhaustively (no\n"
 "                         sampling) -- for an exhaustive top-row search; pass a\n"
 "                         rotations.csv to enumerate only the annealer's left edges\n"
+"  --gumbel_tau_columns T selection temperature for the sampled left column: above 0\n"
+"                         the published column is drawn with probability proportional\n"
+"                         to exp(rank/tau) instead of being the best of the samples,\n"
+"                         which also makes the repeat-dedup exhaust the pool less\n"
+"                         often. That rank is symmetric in the row index, so trust it\n"
+"                         little and set tau high. No effect when --top_columns<=0\n"
+"                         enumerates exhaustively. 0 = off, exact legacy (default 0)\n"
 "  --config_time_sec S    wall-time slice per configuration (default 600)\n"
 "  --max_wall_sec S       total wall-time budget; 0 = unlimited (default 0)\n"
 "  --max_partials N       stop once N boards have been reported, counting both\n"
@@ -2427,6 +2438,7 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--pool_factor") && i+1 < argc) g_pool_factor = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--scan_factor") && i+1 < argc) g_scan_factor = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--top_columns") && i+1 < argc) g_top_columns = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--gumbel_tau_columns") && i+1 < argc) g_tau_columns = atof(argv[++i]);
         else if (!strcmp(argv[i], "--threads")     && i+1 < argc) g_nthreads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--seed")        && i+1 < argc) { unsigned long long s; if (!parse_u64_token(argv[++i], &s)) fatal("--seed needs an integer"); g_master_seed = (uint64_t)s; }
         else if (!strcmp(argv[i], "--config_time_sec") && i+1 < argc) g_config_time_sec = atof(argv[++i]);
@@ -2462,6 +2474,7 @@ int main(int argc, char *argv[]) {
     if (!(fabs(g_bonus_139) <= 1e6))   fatal("--bonus_139 in [-1e6,1e6]");
     if (!(g_gumbel_tau0 >= 0.0 && g_gumbel_tau0 <= 1e6)) fatal("--gumbel_tau0 in [0,1e6]");
     if (!(g_gumbel_tau1 >= 0.0 && g_gumbel_tau1 <= 1e6)) fatal("--gumbel_tau1 in [0,1e6]");
+    if (!(g_tau_columns >= 0.0 && g_tau_columns <= 1e6)) fatal("--gumbel_tau_columns in [0,1e6]");
     if (g_supply_check > (uint32_t)EDGE_LEN)
         fatal("--supply_check must be in 0..%d (0 = off)", EDGE_LEN);
     if (g_frac_rand < 0.0 || g_frac_rand > 1.0) fatal("--frac_rand must be in [0,1]");
@@ -2483,6 +2496,7 @@ int main(int argc, char *argv[]) {
            " gumbel_tau=%.2f->%.2f\n",
            g_score_model_J ? "J" : "legacy", g_lambda_J, g_avail_correct ? 1 : 0,
            g_free_demand ? 1 : 0, g_supply_check, g_gumbel_tau0, g_gumbel_tau1);
+    printf("[cfg] gumbel_tau_columns=%.2f\n", g_tau_columns);
     printf("[cfg] top_columns=%ld config_time=%.0fs max_wall=%.0fs max_partials=%" PRIu64 " free_edges=%s\n",
            g_top_columns, g_config_time_sec, g_max_wall_sec, g_max_partials,
            g_opt_free_edges ? "forced" : "auto (per line)");
@@ -2614,7 +2628,7 @@ int main(int argc, char *argv[]) {
                         bool fresh = false, any = false;
                         uint64_t h = 0;
                         for (int attempt = 0; attempt < 16 && !fresh; attempt++) {
-                            if (!fin_sample_left(&srng, &lft)) break;
+                            if (!fin_sample_left(&srng, g_tau_columns, &lft)) break;
                             any = true;
                             h = fin_left_hash(&lft);
                             fresh = true;

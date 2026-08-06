@@ -1044,10 +1044,13 @@ static double bottom_rank_of(const int rt[PUZZLE_SIDE]) {
     return log1p((double)a) + log1p((double)b) + log1p((double)c);
 }
 
-/* Rank a bottom row by the log fan-out of the three row-1 segments it presents. */
-void rank_bottoms(void) {
+/* Rank a bottom row by the log fan-out of the three row-1 segments it presents.
+   At tau > 0 the stored rank is the Gumbel-perturbed key, so taking the first
+   --top_bottoms entries samples that many DISTINCT bottoms without replacement
+   in proportion to exp(rank/tau) instead of skimming the greedy head. */
+void rank_bottoms(double tau, RNG *rng) {
     for (size_t i = 0; i < g_bottom_n; i++)
-        g_bottoms[i].rank = bottom_rank_of(g_bottoms[i].rtop0);
+        g_bottoms[i].rank = gumbel_key(bottom_rank_of(g_bottoms[i].rtop0), tau, rng);
     qsort(g_bottoms, g_bottom_n, sizeof(BottomOrder), cmp_bottom_rank);
 }
 
@@ -1080,11 +1083,18 @@ static double left_rank_of(const int right[PUZZLE_SIDE], const uint64_t la_total
     return s;
 }
 
-void rank_lefts(void) {
+/* At tau > 0, as rank_bottoms. This measure needs the perturbation more than
+   any other in the project: it is a sum over rows, so it is SYMMETRIC in the
+   row index -- two columns exposing the same colour multiset score identically
+   however they order it. The tie classes are therefore large, cmp_left_rank
+   settles them by memcmp, and taking the top L hands the sweep L
+   lexicographically adjacent columns. Perturbing the key breaks those ties
+   uniformly, which is most of the benefit here. */
+void rank_lefts(double tau, RNG *rng) {
     uint64_t la_total[DIM_INNER];
     compute_la_totals(la_total);
     for (size_t i = 0; i < g_left_n; i++)
-        g_lefts[i].rank = left_rank_of(g_lefts[i].right, la_total);
+        g_lefts[i].rank = gumbel_key(left_rank_of(g_lefts[i].right, la_total), tau, rng);
     qsort(g_lefts, g_left_n, sizeof(LeftOrder), cmp_left_rank);
 }
 
@@ -1243,9 +1253,12 @@ static bool attempt_random_bottom(RNG *rng, Oriented seq[PUZZLE_SIDE],
     return true;
 }
 
-bool sample_random_bottom(RNG *rng, BottomOrder *out) {
+bool sample_random_bottom(RNG *rng, double tau, BottomOrder *out) {
     build_side_pools();
-    Oriented best[PUZZLE_SIDE]; double best_rank = -1.0;
+    /* have_best, not a negative sentinel: at tau > 0 the comparison key is
+       rank/tau + Gumbel, which is below zero about a third of the time. */
+    Oriented best[PUZZLE_SIDE]; double best_key = 0.0, best_rank = 0.0;
+    bool have_best = false;
     int best_tl = -1, best_tr = -1;
     uint64_t restarts = 0;
     for (int got = 0; got < RANDOM_SIDE_SAMPLES; ) {
@@ -1258,12 +1271,14 @@ bool sample_random_bottom(RNG *rng, BottomOrder *out) {
         int rt[PUZZLE_SIDE];
         for (int c = 0; c < PUZZLE_SIDE; c++) rt[c] = seq[c].top;
         double rank = bottom_rank_of(rt);
-        if (rank > best_rank) {
+        double key  = gumbel_key(rank, tau, rng);
+        if (!have_best || key > best_key) {
             memcpy(best, seq, sizeof best);
-            best_rank = rank; best_tl = tl; best_tr = tr;
+            best_key = key; best_rank = rank; have_best = true;
+            best_tl = tl; best_tr = tr;
         }
     }
-    if (best_rank < 0.0) return false;
+    if (!have_best) return false;
 
     /* Publish: corners to the shared globals, edges to stable static storage. */
     g_cBL = best[0];              g_has_cBL = true;
@@ -1280,14 +1295,16 @@ bool sample_random_bottom(RNG *rng, BottomOrder *out) {
     return true;
 }
 
-bool sample_random_left(RNG *rng, const BottomOrder *bot, LeftOrder *out) {
+bool sample_random_left(RNG *rng, double tau, const BottomOrder *bot, LeftOrder *out) {
     Oriented TL, TR;
     if (s_tl_id < 0 || !orient_corner_role(s_tl_id, 2, &TL) || !orient_corner_role(s_tr_id, 3, &TR))
         fatal("sample_random_left called before sample_random_bottom");
     uint64_t la_total[DIM_INNER];
     compute_la_totals(la_total);
 
-    Oriented best[PUZZLE_SIDE]; double best_rank = -1.0;
+    /* have_best: see sample_random_bottom -- the Gumbel key goes negative. */
+    Oriented best[PUZZLE_SIDE]; double best_key = 0.0, best_rank = 0.0;
+    bool have_best = false;
     uint64_t restarts = 0;
     for (int got = 0; got < RANDOM_SIDE_SAMPLES; ) {
         Oriented seq[PUZZLE_SIDE];
@@ -1320,9 +1337,13 @@ bool sample_random_left(RNG *rng, const BottomOrder *bot, LeftOrder *out) {
         int right[PUZZLE_SIDE];
         for (int r = 0; r < PUZZLE_SIDE; r++) right[r] = seq[r].right;
         double rank = left_rank_of(right, la_total);
-        if (rank > best_rank) { memcpy(best, seq, sizeof best); best_rank = rank; }
+        double key  = gumbel_key(rank, tau, rng);
+        if (!have_best || key > best_key) {
+            memcpy(best, seq, sizeof best);
+            best_key = key; best_rank = rank; have_best = true;
+        }
     }
-    if (best_rank < 0.0) return false;
+    if (!have_best) return false;
 
     g_cTL = TL; g_has_cTL = true;
     g_cTR = TR; g_has_cTR = true;

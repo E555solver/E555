@@ -132,6 +132,14 @@ static double   g_max_wall_sec     = 0.0;
 static uint64_t g_max_partials     = 0;   /* reported-board budget; 0 = unlimited */
 static long     g_top_bottoms      = 300;   /* leading bottoms per border row (<1 = all) */
 static long     g_top_columns      = 10;    /* leading left columns per bottom (<1 = all) */
+/* Selection temperature for the border ranks themselves, the same Gumbel knob
+   the beam rows use. 0 = off, i.e. the greedy head of the ranking as before. */
+static double   g_tau_bottoms      = 0.0;
+static double   g_tau_columns      = 0.0;
+/* Abandon a bottom after this many consecutive columns that emitted nothing
+   (0 = never bail, run all --top_columns). */
+static uint32_t g_bail_columns     = 0;
+static bool     g_seed_given       = false;  /* --seed passed explicitly */
 static uint64_t g_resume_sol_idx   = 0;
 static uint32_t g_resume_bi = 0, g_resume_li = 0;
 static bool     g_resume_active = false;
@@ -231,12 +239,8 @@ static double gumbel_tau_eff(int row) {
     return tau > 0.0 ? tau : 0.0;
 }
 
-/* Gumbel(0,1) = -log(-log U). The 53-bit draw is nudged off both endpoints so
-   the double logarithm is always finite. */
-static inline double gumbel_noise(RNG *r) {
-    double u = ((double)(rng_next(r) >> 11) + 0.5) * (1.0 / 9007199254740992.0);
-    return -log(-log(u));
-}
+/* gumbel_noise() and gumbel_key() are shared with the border ranking and the
+   side samplers -- see E555_database.h. */
 
 /* Per-parent offspring cap in the score band: doubled once the beam widens, so
    successful parents can actually fill the extra slots (0 = uncapped). */
@@ -1593,7 +1597,24 @@ static void usage(const char *a0) {
 "  --top_bottoms N        bottom-row orderings tried per border row, best-ranked\n"
 "                         first (<1 = all; default 300)\n"
 "  --top_columns N        left-column orderings tried per bottom (<1 = all; default 10)\n"
-"  --config_time_sec S    wall-time slice per (bottom x left) config (default 600)\n"
+"  --gumbel_tau_bottoms T selection temperature for the bottom ranking: above 0 the\n"
+"                         --top_bottoms tried are a sample without replacement with\n"
+"                         probability proportional to exp(rank/tau) rather than the\n"
+"                         greedy head. 0 = off, exact legacy (default 0)\n"
+"  --gumbel_tau_columns T the same for the left-column ranking, where it matters more:\n"
+"                         that rank is a sum over rows and so is symmetric in the row\n"
+"                         index, giving huge tie classes that memcmp settles, so the\n"
+"                         top L are lexicographically adjacent. Trust that measure\n"
+"                         little and set tau high. 0 = off (default 0)\n"
+"  --bail_columns N       abandon a bottom after N consecutive columns that emitted\n"
+"                         nothing, instead of running all --top_columns. Most useful\n"
+"                         with --incomplete_top, which emits below the stop row; on\n"
+"                         completions alone at a high --stop_row emissions are rare\n"
+"                         enough that this acts as a cap of N columns per bottom.\n"
+"                         0 = never bail (default 0)\n"
+"  --config_time_sec S    wall-time slice per (bottom x left) config; a per-row\n"
+"                         deadline, so it only fires on a config that runs long\n"
+"                         (default 600)\n"
 "  --max_wall_sec S       total wall-time budget; 0 = unlimited (default 0)\n"
 "  --max_partials N       stop once N boards have been reported, counting both\n"
 "                         completions and --incomplete_top partials; the stop-row\n"
@@ -1671,8 +1692,11 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--scan_factor") && i+1 < argc) g_scan_factor = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--top_bottoms") && i+1 < argc) g_top_bottoms = atol(argv[++i]);
         else if (!strcmp(argv[i], "--top_columns") && i+1 < argc) g_top_columns = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--gumbel_tau_bottoms") && i+1 < argc) g_tau_bottoms = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--gumbel_tau_columns") && i+1 < argc) g_tau_columns = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--bail_columns") && i+1 < argc) g_bail_columns = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threads")     && i+1 < argc) g_nthreads = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--seed")        && i+1 < argc) { unsigned long long s; if (!parse_u64_token(argv[++i], &s)) fatal("--seed needs an integer"); g_master_seed = (uint64_t)s; }
+        else if (!strcmp(argv[i], "--seed")        && i+1 < argc) { unsigned long long s; if (!parse_u64_token(argv[++i], &s)) fatal("--seed needs an integer"); g_master_seed = (uint64_t)s; g_seed_given = true; }
         else if (!strcmp(argv[i], "--config_time_sec") && i+1 < argc) g_config_time_sec = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_wall_sec")    && i+1 < argc) g_max_wall_sec = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_partials")    && i+1 < argc) g_max_partials = strtoull(argv[++i], NULL, 10);
@@ -1700,6 +1724,8 @@ int main(int argc, char *argv[]) {
     if (!(fabs(g_bonus_139) <= 1e6))   fatal("--bonus_139 in [-1e6,1e6]");
     if (!(g_gumbel_tau0 >= 0.0 && g_gumbel_tau0 <= 1e6)) fatal("--gumbel_tau0 in [0,1e6]");
     if (!(g_gumbel_tau1 >= 0.0 && g_gumbel_tau1 <= 1e6)) fatal("--gumbel_tau1 in [0,1e6]");
+    if (!(g_tau_bottoms >= 0.0 && g_tau_bottoms <= 1e6)) fatal("--gumbel_tau_bottoms in [0,1e6]");
+    if (!(g_tau_columns >= 0.0 && g_tau_columns <= 1e6)) fatal("--gumbel_tau_columns in [0,1e6]");
     if (g_supply_check > (uint32_t)MAX_DRILL_DEPTH)
         fatal("--supply_check must be in 0..%d (0 = off)", MAX_DRILL_DEPTH);
     if (g_frac_rand < 0.0 || g_frac_rand > 1.0) fatal("--frac_rand must be in [0,1]");
@@ -1718,6 +1744,14 @@ int main(int argc, char *argv[]) {
         g_free_edges = true;               /* the border is not a fixed assignment */
         if (resume) fatal("--resume is not supported with --random_edges (borders are sampled fresh)");
     }
+    /* The checkpoint stores (border_row, bottom index, column index) into the
+       RANKED arrays. At tau > 0 that ranking is a Gumbel permutation drawn from
+       the master seed, which defaults to a clock/PID mixture -- so resuming
+       without pinning the seed would silently land on a different permutation,
+       re-running some configs and skipping others. */
+    if (resume && (g_tau_bottoms > 0.0 || g_tau_columns > 0.0) && !g_seed_given)
+        fatal("--resume with --gumbel_tau_bottoms/--gumbel_tau_columns needs the "
+              "original --seed (the checkpoint indexes a seed-dependent ordering)");
 
     printf("\n=== E555 beamer ===\n\n");
     printf("[cfg] seed_file=%s rotations_file=%s out_dir=%s\n",
@@ -1741,6 +1775,8 @@ int main(int argc, char *argv[]) {
     printf("[cfg] top_bottoms=%ld top_columns=%ld config_time=%.0fs max_wall=%.0fs max_partials=%" PRIu64 " db_file=%s\n",
            g_top_bottoms, g_top_columns, g_config_time_sec, g_max_wall_sec, g_max_partials,
            g_db_file ? g_db_file : "(none)");
+    printf("[cfg] gumbel_tau_bottoms=%.2f gumbel_tau_columns=%.2f bail_columns=%u\n",
+           g_tau_bottoms, g_tau_columns, g_bail_columns);
     fflush(stdout);
 
     double t_start = omp_get_wtime();
@@ -1813,13 +1849,14 @@ int main(int argc, char *argv[]) {
         RNG srng = rng_for(g_master_seed, 0xB07D0135u, 0, 0);
         BottomOrder bot; LeftOrder lft;
         for (size_t bi = 0; bi < run_b && !g_stop; bi++) {
-            if (!sample_random_bottom(&srng, &bot))
+            if (!sample_random_bottom(&srng, g_tau_bottoms, &bot))
                 fatal("random bottom sampling failed; seed edge pool too constrained");
             validate_color_constants();
+            uint32_t barren = 0;            /* consecutive columns that emitted nothing */
             for (size_t li = 0; li < run_l && !g_stop; li++) {
                 if (g_max_wall_sec > 0.0 && omp_get_wtime() - t_start >= g_max_wall_sec) { printf("[sweep] max_wall reached.\n"); g_stop = 1; break; }
                 if (partials_budget_spent()) { partials_budget_announce(); break; }
-                if (!sample_random_left(&srng, &bot, &lft)) {
+                if (!sample_random_left(&srng, g_tau_columns, &bot, &lft)) {
                     fprintf(stderr, "[warn] no left column fits bottom %zu; resampling bottom\n", bi);
                     break;
                 }
@@ -1846,6 +1883,13 @@ int main(int argc, char *argv[]) {
                 if (g_completions_fp) fflush(g_completions_fp);
                 if (g_partial_fp)     fflush(g_partial_fp);
                 partials_budget_announce();
+                barren = (g_emit_count + g_partial_count > 0) ? 0 : barren + 1;
+                if (g_bail_columns && barren >= g_bail_columns) {
+                    printf("[bail] rndb%zu: %u column(s) in a row emitted nothing, "
+                           "moving to the next bottom\n", bi, barren);
+                    fflush(stdout);
+                    break;
+                }
             }
         }
     } else
@@ -1864,8 +1908,12 @@ int main(int argc, char *argv[]) {
 
         enumerate_bottoms();
         enumerate_lefts();
-        rank_bottoms();
-        rank_lefts();
+        /* Separate streams per border row, so the bottoms drawn for one row do
+           not depend on how many columns the previous row happened to enumerate. */
+        RNG brng = rng_for(g_master_seed, cur_row, 0xB0770D15u, 0);
+        RNG lrng = rng_for(g_master_seed, cur_row, 0x1EF7C015u, 0);
+        rank_bottoms(g_tau_bottoms, &brng);
+        rank_lefts(g_tau_columns, &lrng);
 
         size_t nb = g_bottom_n, nl = g_left_n;
         size_t run_b = (g_top_bottoms >= 1 && (size_t)g_top_bottoms < nb) ? (size_t)g_top_bottoms : nb;
@@ -1899,6 +1947,7 @@ int main(int argc, char *argv[]) {
         else g_solution_idx = 0;
 
         for (size_t bi = start_bi; bi < run_b && !g_stop; bi++) {
+            uint32_t barren = 0;            /* consecutive columns that emitted nothing */
             for (size_t li = (bi == start_bi ? start_li : 0); li < run_l && !g_stop; li++) {
                 if (g_max_wall_sec > 0.0 && omp_get_wtime() - t_start >= g_max_wall_sec) { printf("[sweep] max_wall reached.\n"); g_stop = 1; break; }
                 if (partials_budget_spent()) { partials_budget_announce(); break; }
@@ -1926,6 +1975,17 @@ int main(int argc, char *argv[]) {
                 if (g_partial_fp)     fflush(g_partial_fp);
                 partials_budget_announce();
                 write_checkpoint(ckpath, cur_row, (uint32_t)bi, (uint32_t)(li+1));
+                barren = (g_emit_count + g_partial_count > 0) ? 0 : barren + 1;
+                if (g_bail_columns && barren >= g_bail_columns) {
+                    printf("[bail] r%ub%zu: %u column(s) in a row emitted nothing, "
+                           "moving to the next bottom\n", cur_row, bi, barren);
+                    fflush(stdout);
+                    /* Point the checkpoint at the next bottom, not at the column
+                       we stopped on -- otherwise --resume walks back into the
+                       bottom we just abandoned and undoes the saving. */
+                    write_checkpoint(ckpath, cur_row, (uint32_t)(bi+1), 0);
+                    break;
+                }
             }
         }
         g_resume_active = false;

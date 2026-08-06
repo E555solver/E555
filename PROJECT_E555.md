@@ -153,6 +153,20 @@ sweeps and the left count the number of left columns per bottom: the border
 a bottom of 400 means it sees three quarters of it. That is the argument for
 targets: you are sizing a search, not maximizing a number.
 
+**Allocating within that space** (`--bail_columns N`, 0 = off). Every
+(bottom x left) config gets the same budget, which is the weakest allocation
+when config quality varies by orders of magnitude. `--config_time_sec` does not
+help: it is a per-row *deadline*, so on a config that finishes in seconds it
+never fires, and being wall-clock based it would shift meaning with the core
+count anyway. `--bail_columns` is work-based instead -- abandon a bottom once N
+consecutive columns have emitted nothing, and move to the next. A productive
+column resets the streak, so a bottom that is producing keeps its full
+`--top_columns`; a barren one is cut short. Pair it with `--incomplete_top`:
+partials emit below the stop row, so the signal resets often enough to be
+adaptive. On completions alone at a high `--stop_row`, emissions are rare enough
+that this acts as a flat cap of N columns per bottom -- still a reasonable trade
+of depth for breadth, given how weak the column ranking is, but not adaptive.
+
 Measured over 8 seeds x 100k steps, targets 250/5000/5000/15000
 (bottom/left/right/top):
 
@@ -310,6 +324,33 @@ monotone knob expresses the whole "trust the score more as the board fills"
 schedule. When tau > 0 the `frac_rand` band stands down; the pool's own scores
 are never perturbed, so the beam, the emission order and every reported score
 stay real.
+
+**The same primitive on the borders** (`--gumbel_tau_bottoms`,
+`--gumbel_tau_columns`; 0 = off, the default; the finalizer takes the columns
+one). Choosing *which* borders to run has exactly the shape the perturbation is
+for -- the enumerated ranking is a top-K of `BottomOrder.rank`/`LeftOrder.rank`,
+and the `--random_edges` and finalizer samplers are the K=1 case, an argmax over
+32 draws. Above 0, `rank/tau + Gumbel` replaces the plain rank as the comparison
+key, so `--top_bottoms`/`--top_columns` become a sample without replacement
+rather than the greedy head.
+
+It is the **column** rank that needs this. `left_rank_of` is
+`sum_r log1p(la_total[c_r])`: a board-blind census that never looks at the
+bottom, and -- decisively -- a sum over rows, hence *symmetric in the row index*.
+Two columns exposing the same colour multiset score identically however they
+order it, though position is what matters (row 1 meets the bottom, row 14 the
+top border). The tie classes are therefore large, `cmp_left_rank` settles them
+by `memcmp`, and taking the top L hands the sweep L lexicographically adjacent
+columns -- correlated, which is worse than random. Breaking those ties uniformly
+is most of the benefit, so trust that measure little and set tau **high**
+(tens); `bottom_rank_of` is a genuine one-row lookahead and wants a much smaller
+one. Since the perturbation only decides which configs run, it costs no search
+time at all.
+
+Reproducibility note: at tau > 0 the ranked order is a seed-dependent
+permutation, and `sweep_checkpoint.txt` stores *indices* into it -- so `--resume`
+then requires the original `--seed`, and the beamer refuses the combination
+without one.
 
 ### Scoring
 
@@ -507,6 +548,9 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--bc_window nB,nC` | `1,1` | score up to nB x nC (B,C) completions per A record, keep the best |
 | `--top_bottoms N` | 300 | ranked bottom orderings tried per border row |
 | `--top_columns N` | 10 | ranked left columns per bottom |
+| `--gumbel_tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
+| `--gumbel_tau_columns T` | 0 | ditto for left columns; that rank is weak, so set it high |
+| `--bail_columns N` | 0 | abandon a bottom after N consecutive columns that emitted nothing (0 = off) |
 | `--config_time_sec S` | 600 | wall-time slice per configuration |
 | `--max_wall_sec S` | 0 | total budget (0 = unlimited) |
 | `--max_partials N` | 0 | stop after N boards reported -- completions **plus** `--incomplete_top` partials (0 = unlimited) |
@@ -619,6 +663,14 @@ and the parity invariant holds with equality on a completed inner board.
 *every* conflict-free (B,C) completion of each segment-A record -- necessary
 over a sparse reduced database; (2) the first searched row always uses the
 full random band, so every repeat injects fresh variability.
+
+`--gumbel_tau_columns` works here as in the beamer: above 0 the sampled left
+column is drawn in proportion to `exp(rank/tau)` rather than being the best of
+the 32 samples. It has a second use on this side -- repeats dedup the columns
+they have already tried, so a mode-seeking argmax keeps re-drawing the same
+winner and exhausts the pool early; sampling spreads the draws out. It does
+nothing under `--top_columns 0`, which enumerates exhaustively and is what the
+regression test uses.
 
 The scoring and certificate options are shared with the beamer and mean the
 same thing here, with one exception: **`--bc_window` does not exist in the

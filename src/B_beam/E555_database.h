@@ -65,6 +65,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <string.h>
+#include <math.h>
 
 /* -- Constants ----------------------------------------------------------- */
 
@@ -411,6 +412,27 @@ static inline RNG rng_for(uint64_t cfg_hash, uint32_t row,
     return r;
 }
 
+/* Gumbel(0,1) = -log(-log U). The 53-bit draw is nudged off both endpoints so
+   the double logarithm is always finite.
+
+   Adding this to score/tau and taking the top K samples K DISTINCT items
+   without replacement with probability proportional to exp(score/tau) (Kool,
+   van Hoof & Welling 2019). tau -> 0 is greedy, tau -> inf is uniform. The
+   beam selects its rows this way; the border ranking and the best-of-N side
+   samplers use the same perturbation, which is why this lives here rather than
+   in one of the three .c files that need it. NOTE the key is often NEGATIVE --
+   any caller tracking a best-so-far needs a real "have one" flag, not a
+   negative sentinel, since real ranks are sums of log1p and never go below 0. */
+static inline double gumbel_noise(RNG *r) {
+    double u = ((double)(rng_next(r) >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    return -log(-log(u));
+}
+
+/* The perturbed sort key, or the untouched rank when tau is 0 (selection off). */
+static inline double gumbel_key(double rank, double tau, RNG *r) {
+    return tau > 0.0 ? rank / tau + gumbel_noise(r) : rank;
+}
+
 /* -- Process utilities (defined in E555_database.c) -------------------- */
 
 void  fatal(const char *fmt, ...);
@@ -449,8 +471,13 @@ uint64_t db_seg_fanout(int c0, int c1, int c2, int c3, int c4raw);
 
 void enumerate_bottoms(void);            /* fills g_bottoms / g_bottom_n */
 void enumerate_lefts(void);              /* fills g_lefts / g_left_n */
-void rank_bottoms(void);                 /* needs the DB; sets BottomOrder.rank, sorts */
-void rank_lefts(void);                   /* needs the DB; sets LeftOrder.rank, sorts */
+/* Both need the DB; both set .rank and sort descending, so the caller's
+   "take the first --top_bottoms/--top_columns" is the selection. tau = 0 stores
+   the plain fan-out rank (greedy head, the default); tau > 0 stores the
+   Gumbel-perturbed key instead, turning that same prefix into a sample without
+   replacement. rng is unused at tau = 0. */
+void rank_bottoms(double tau, RNG *rng);
+void rank_lefts(double tau, RNG *rng);
 
 /* -- Random border sampling (--random_edges mode) -------------------------- */
 /* Instead of a Stage A rotation row, borders are drawn directly from the
@@ -462,8 +489,11 @@ void rank_lefts(void);                   /* needs the DB; sets LeftOrder.rank, s
    draws only from edges the bottom did not consume. Requires free-edges mode. */
 #define RANDOM_SIDE_SAMPLES 32
 
-bool sample_random_bottom(RNG *rng, BottomOrder *out);
-bool sample_random_left(RNG *rng, const BottomOrder *bot, LeftOrder *out);
+/* tau is the same selection temperature rank_bottoms/rank_lefts take: at 0 the
+   published border is the best of the samples, above 0 it is one of them drawn
+   in proportion to exp(rank/tau). */
+bool sample_random_bottom(RNG *rng, double tau, BottomOrder *out);
+bool sample_random_left(RNG *rng, double tau, const BottomOrder *bot, LeftOrder *out);
 
 /* Validate and resolve any user-pinned corners (g_fixed_corner_pid): each fixed
    role must name a genuine, distinct corner piece; with exactly 3 fixed the 4th
