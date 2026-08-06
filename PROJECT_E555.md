@@ -341,11 +341,26 @@ Two columns exposing the same colour multiset score identically however they
 order it, though position is what matters (row 1 meets the bottom, row 14 the
 top border). The tie classes are therefore large, `cmp_left_rank` settles them
 by `memcmp`, and taking the top L hands the sweep L lexicographically adjacent
-columns -- correlated, which is worse than random. Breaking those ties uniformly
-is most of the benefit, so trust that measure little and set tau **high**
-(tens); `bottom_rank_of` is a genuine one-row lookahead and wants a much smaller
-one. Since the perturbation only decides which configs run, it costs no search
-time at all.
+columns -- correlated, which is worse than random. Since the perturbation only
+decides which configs run, it costs no search time at all.
+
+**That argument is structural, and one measurement does not back it.** A
+240 s-per-arm, single-seed `--random_edges` run at `--stop_row 11
+--incomplete_top`:
+
+| arm | completions/min | partials/min |
+|---|---|---|
+| baseline | 2.25 | 55.5 |
+| `tau_columns 40` | **0.25** | 53.5 |
+| `tau_columns 40 tau_bottoms 5` | 7.78 | 67.9 |
+| + `bail_columns 3` | 3.87 | 61.0 |
+
+High `tau_columns` **alone came out worst**, which is the arm that tests the
+tie-breaking argument directly. The arm that did best changed two knobs at once,
+so it isolates nothing. And each arm samples entirely different random borders,
+so border luck -- not the knob -- may be most of the spread; with completion
+counts in single digits, none of this is significant. Treat the defaults of 0 as
+the known-good setting and measure on your own seed before moving either knob.
 
 Reproducibility note: at tau > 0 the ranked order is a seed-dependent
 permutation, and `sweep_checkpoint.txt` stores *indices* into it -- so `--resume`
@@ -549,7 +564,7 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--top_bottoms N` | 300 | ranked bottom orderings tried per border row |
 | `--top_columns N` | 10 | ranked left columns per bottom |
 | `--gumbel_tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
-| `--gumbel_tau_columns T` | 0 | ditto for left columns; that rank is weak, so set it high |
+| `--gumbel_tau_columns T` | 0 | ditto for left columns (measure before raising: see above) |
 | `--bail_columns N` | 0 | abandon a bottom after N consecutive columns that emitted nothing (0 = off) |
 | `--config_time_sec S` | 600 | wall-time slice per configuration |
 | `--max_wall_sec S` | 0 | total budget (0 = unlimited) |
