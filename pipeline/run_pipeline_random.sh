@@ -11,7 +11,7 @@
 #
 # Six stages, each feeding the next:
 #
-#   1  beamer       --random_edges, rows 0..STOP        -> 1_beam.csv
+#   1  beamer       --random_edges, sampled borders     -> 1_beam.csv
 #   2  finalizer    free the top rows and re-grow them  -> 2_final.csv
 #   3  roundhouse   rotate, refill a border strip       -> 3_strip.csv
 #   4  topper       herd breaks to the nearest corner   -> 4_topped.csv
@@ -24,7 +24,9 @@
 #   That is worth real time when you intend to drill ONE border hard. This
 #   pipeline does the opposite -- it plays many hands with fresh random borders
 #   -- so the annealer's guarantees buy little and cost minutes per run. Use
-#   run_pipeline_annealed.sh when you want the other trade.
+#   run_pipeline_annealed.sh when you want the other trade. The Gumbel
+#   temperatures below are set to match: sample the borders rather than skim the
+#   best-ranked, and spend the width on many frames instead of one.
 #
 # EVERY STAGE IS OPTIONAL AND RE-FEEDABLE
 #   All six read and write the same canonical CSV. If a stage produces nothing
@@ -51,7 +53,17 @@ BEAM_WIDTH="${BEAM_WIDTH:-200000}"
 BEAM_STOP="${BEAM_STOP:-11}"        # last row the beamer fills
 BEAM_BOARDS="${BEAM_BOARDS:-250}"   # stop once this many boards are written
 BEAM_WALL="${BEAM_WALL:-900}"       # seconds
-BEAM_COLUMNS="${BEAM_COLUMNS:-100}" # random left columns per random bottom row
+BEAM_COLUMNS="${BEAM_COLUMNS:-8}"   # random left columns per random bottom row
+# Selection temperatures (0 = off). Yield turned out to be a property of the
+# (bottom, column) PAIR, not of either ranking, so sampling the borders instead
+# of taking the best-ranked costs nothing measurable and spreads the run over
+# many more frames -- which is the whole point of the random-edges pipeline.
+# The beam's own band is the one that pays: 0.25 beat the --frac_rand 0.75
+# default by ~28% (a nonzero tau0/tau1 stands that band down).
+BEAM_TAU_BOTTOMS="${BEAM_TAU_BOTTOMS:-2}"
+BEAM_TAU_COLUMNS="${BEAM_TAU_COLUMNS:-4}"
+BEAM_TAU0="${BEAM_TAU0:-0.25}"
+BEAM_TAU1="${BEAM_TAU1:-0.25}"
 
 # ---- stage 2: finalizer -----------------------------------------------------
 FIN_STOP="${FIN_STOP:-12}"
@@ -126,6 +138,8 @@ BEAM_CMD=("$REPO/bin/E555_beamer" "$SEED" --random_edges
     --out_dir beam --threads "$THREADS"
     --beam_width "$BEAM_WIDTH" --stop_row "$BEAM_STOP"
     --border_row_N "$BEAM_BOARDS" --top_columns "$BEAM_COLUMNS"
+    --gumbel_tau_bottoms "$BEAM_TAU_BOTTOMS" --gumbel_tau_columns "$BEAM_TAU_COLUMNS"
+    --gumbel_tau0 "$BEAM_TAU0" --gumbel_tau1 "$BEAM_TAU1"
     --lambda_Mahalanobis 10 --incomplete_top
     --max_partials "$BEAM_BOARDS" --max_wall_sec "$BEAM_WALL" --verbose)
 [ -n "$DB_FILE" ] && BEAM_CMD+=(--db_file "$DB_FILE")
