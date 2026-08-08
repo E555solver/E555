@@ -542,7 +542,7 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--free_edges` | off | any edge piece may terminate a row (relaxed parity) |
 | `--random_edges` | off | sample borders from the seed; rotations CSV optional |
 | `--BL/--BR/--TL/--TR P` | -- | pin corner piece P (random mode) |
-| `--incomplete_top` | off | also emit stop-row boards with segments A+B only |
+| `--incomplete_top` | off | also emit stop-row boards holding two of the three segments -- A+B, A+C or B+C |
 | `--beam_width K` | 262144 | boards kept per row |
 | `--stop_row R` | 12 | last row filled (1-13) |
 | `--beam_expand E` | 5 | late-search width multiplier |

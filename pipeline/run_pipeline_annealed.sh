@@ -59,8 +59,8 @@ FIN_STOP_ROW="${FIN_STOP_ROW:-12}"
 FIN_MAX_PARTIALS="${FIN_MAX_PARTIALS:-10}"
 FIN_MAX_WALL="${FIN_MAX_WALL:-600}"
 # Lock rows 0..FIN_FROM, and keep it a few rows BELOW the beamer's stop row.
-# Two reasons: the incomplete boards of stage 2 have columns 11-15 of their top
-# row still empty and the finalizer skips any line with an unplaced cell at or
+# Two reasons: the incomplete boards of stage 2 have one 5-piece segment of their
+# top row still empty and the finalizer skips any line with an unplaced cell at or
 # below the lock; and locking right under the frontier only asks the finalizer
 # to redo the very row the beamer already failed to fill, with the same pieces.
 # Freeing four rows gives it a genuinely different way up.
@@ -141,7 +141,7 @@ echo "   best: $(head -1 1_rotations.csv)"
 banner "STAGE 2/7  beamer -- beam $BEAM_WIDTH up to row $BEAM_STOP_ROW"
 # -----------------------------------------------------------------------------
 echo "Growing boards row by row from every border. --incomplete_top also keeps"
-echo "the boards that fill row $BEAM_STOP_ROW except its last five columns, and"
+echo "the boards that fill row $BEAM_STOP_ROW except for one of its three segments, and"
 echo "--max_partials $BEAM_MAX_PARTIALS ends the sweep once that many boards have been written."
 echo "First run rebuilds the 6.4 GB chain database: expect a few quiet minutes."
 echo

@@ -167,6 +167,8 @@ static FILE      *g_partial_fp        = NULL;
 static uint64_t  *g_partial_htable    = NULL;
 static size_t     g_partial_htable_sz = 0, g_partial_count = 0;
 static size_t     g_partial_total     = 0;
+/* Run totals per partial kind, for the summary line. Indexed by ROWMASK_*. */
+static size_t     g_part_ab = 0, g_part_ac = 0, g_part_bc = 0;
 
 static volatile sig_atomic_t g_stop = 0;
 static void handle_stop(int sig) { (void)sig; g_stop = 1; }
@@ -601,17 +603,20 @@ static inline char *u32a(char *p, uint32_t v) {
 }
 
 /* Flatten rows[0..row] into per-piece position/rotation vectors and write them
-   as the 512 comma-separated fields that follow a line's prefix. cmax_stop is
-   the last placed column of the TOP row -- PUZZLE_SIDE-1 for a completed stop
-   row, 10 for an --incomplete_top A+B partial whose cols 11..15 stay unplaced;
-   every row below it is full either way. Returns the byte count. */
+   as the 512 comma-separated fields that follow a line's prefix. colmask says
+   which columns of the TOP row carry a piece (ROWMASK_FULL for a completed stop
+   row, ROWMASK_AB/AC/BC for an --incomplete_top partial); every row below it is
+   full either way. A mask rather than a last-placed column because the partial
+   kinds leave a hole in the MIDDLE of the row, not only at its right end.
+   Returns the byte count. */
 static int format_board_tail(const RowChoice rows[EDGE_LEN + 1], int row,
-                             int cmax_stop, char *out) {
+                             uint16_t colmask, char *out) {
     uint32_t pos[NUM_PIECES], rot_arr[NUM_PIECES];
     for (int i = 0; i < NUM_PIECES; i++) { pos[i] = 999; rot_arr[i] = 0; }
     for (int r = 0; r <= row; r++) {
-        int cmax = (r == row) ? cmax_stop : PUZZLE_SIDE - 1;
-        for (int c = 0; c <= cmax; c++) {
+        uint16_t m = (r == row) ? colmask : ROWMASK_FULL;
+        for (int c = 0; c < PUZZLE_SIDE; c++) {
+            if (!((m >> c) & 1u)) continue;
             uint16_t pid; uint8_t rot; board_cell(rows, r, c, &pid, &rot);
             pos[pid] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[pid] = rot;
         }
@@ -623,28 +628,33 @@ static int format_board_tail(const RowChoice rows[EDGE_LEN + 1], int row,
     return (int)(p - out);
 }
 
-/* Emit one --incomplete_top partial: the parent's ancestry plus segments A and B
-   of the stop row (mv.ci[0..9]); columns 11..15 of that row are left unplaced
-   (pos 999). Called from inside the parallel expansion, so the dedup + write are
+/* Emit one --incomplete_top partial: the parent's ancestry plus the two stop-row
+   segments named by colmask (ROWMASK_AB, ROWMASK_AC or ROWMASK_BC); the third
+   segment's five columns are left unplaced (pos 999). Only the mv.ci[] slots
+   under the mask are read -- the missing segment's are never filled in.
+   Called from inside the parallel expansion, so the dedup + write are
    guarded by an OpenMP critical -- but the ancestry walk, the fingerprint and the
    512 field conversions are read-only over expansion-stable state and are nearly
    all of the cost, so they happen BEFORE the lock is taken. A board that then
    loses the dedup was formatted for nothing, which is cheap: that work is
    parallel, whereas everything inside the critical stalls every other thread. */
 static void emit_incomplete(const BeamCtx *ctx, const BeamEntry *parent,
-                            const RowChoice *mv, int row) {
+                            const RowChoice *mv, int row, uint16_t colmask) {
     if (!g_partial_fp) return;
     RowChoice rows[EDGE_LEN + 1];
-    rows[row] = *mv;                        /* only ci[0..9] (A+B) are read below */
+    rows[row] = *mv;
     collect_rows(ctx, parent, rows);
 
-    /* Fingerprint over placed cells only: full rows below, plus cols 0..10 of the
-       partial stop row (left edge + segment A + segment B). */
+    /* Fingerprint over placed cells only: full rows below, plus the masked
+       columns of the partial stop row. The mask joins the hash so two kinds can
+       never collide even if they somehow placed the same pieces. */
     const uint64_t prime = 1099511628211ULL;
     uint64_t fp = 14695981039346656037ULL;
+    fp ^= colmask; fp *= prime;
     for (int r = 0; r <= row; r++) {
-        int cmax = (r == row) ? 10 : PUZZLE_SIDE - 1;
-        for (int c = 0; c <= cmax; c++) {
+        uint16_t m = (r == row) ? colmask : ROWMASK_FULL;
+        for (int c = 0; c < PUZZLE_SIDE; c++) {
+            if (!((m >> c) & 1u)) continue;
             uint16_t pid; uint8_t rot; board_cell(rows, r, c, &pid, &rot);
             fp ^= pid; fp *= prime; fp ^= rot; fp *= prime;
         }
@@ -652,11 +662,14 @@ static void emit_incomplete(const BeamCtx *ctx, const BeamEntry *parent,
     if (!fp) fp = 1;
 
     char line[EMIT_LINE_MAX];
-    int len = format_board_tail(rows, row, 10, line);
+    int len = format_board_tail(rows, row, colmask, line);
 
     #pragma omp critical(e555_incomplete)
     {
         if (g_partial_fp && partial_htable_insert(fp)) {
+            if      (colmask == ROWMASK_AB) g_part_ab++;
+            else if (colmask == ROWMASK_AC) g_part_ac++;
+            else                            g_part_bc++;
             uint64_t sol_idx = g_partial_total++;
             fprintf(g_partial_fp, "%s, %" PRIu64, g_config_id_str, sol_idx);
             fwrite(line, 1, (size_t)len, g_partial_fp);
@@ -970,6 +983,73 @@ static inline void mask_of_chain(const uint16_t ci[CHAIN_LEN], int count, uint64
    record: the first conflict-free C under the first workable of up to B_TRY
    conflict-free B chains. The stop row emits every conflict-free completion
    until the work item's quota is spent. */
+
+/* A+C partials (--incomplete_top): segment B is missing, so segment C has lost
+   its left key -- B's exposed right color -- and every inner color is a
+   candidate. Its bottom rt[11..15] is still pinned by the parent and the right
+   edge still falls out of the cell, so this is the ordinary pick_segC scan run
+   once per possible left color, against forbid = parent's used set plus segment
+   A. One db_seg_fanout() load is the count over all 17 lefts, so a zero there
+   skips the whole walk. */
+static void emit_AC_partials(const BeamCtx *ctx, const BeamEntry *p, RowChoice *mv,
+                             int row, const uint64_t forbid[4]) {
+    const uint8_t *rt = p->rtop;
+    if (db_seg_fanout(rt[11], rt[12], rt[13], rt[14], rt[15]) == 0) return;
+    for (int lci = 0; lci < DIM_INNER && !g_stop; lci++) {
+        const Cell *cC = g_db[lci][INNER_IDX(rt[11])][INNER_IDX(rt[12])]
+                             [INNER_IDX(rt[13])][INNER_IDX(rt[14])][rt[15]];
+        if (!cC) continue;
+        for (uint32_t jc = 0; jc < cC->n; jc++) {
+            uint16_t ciC[CHAIN_LEN-1]; uint8_t rterm;
+            if (!pick_segC(cC, jc, rt + 11, forbid, ciC, lci + COLOR_MIN, &rterm)) continue;
+            memcpy(&mv->ci[2*CHAIN_LEN], ciC, (CHAIN_LEN-1) * sizeof(uint16_t));
+            mv->rterm = rterm;
+            emit_incomplete(ctx, p, mv, row, ROWMASK_AC);
+        }
+    }
+}
+
+/* B+C partials (--incomplete_top): segment A is missing, so segment B has lost
+   its left key -- the border column's exposed right color -- and every inner
+   color is a candidate; C then chains off B exactly as it always does. This is
+   the only partial kind that needs no segment A, so it is driven per PARENT
+   rather than per A record: it is what rescues the boards whose segment-A cell
+   is empty or wholly conflicted, which try_A never even reaches. */
+static void try_BC(const BeamCtx *ctx, const BeamEntry *p, int row) {
+    const uint8_t *rt = p->rtop;
+    /* Only B's and C's bottoms constrain such a board: rt[1..5] lie under the
+       hole and the border column's color is irrelevant once A is gone. */
+    for (int c = 6; c <= 14; c++) if (!color_is_inner(rt[c])) return;
+    if (!color_is_edge_iface(rt[15])) return;
+    if (db_seg_fanout(rt[6], rt[7], rt[8], rt[9], rt[10]) == 0) return;
+
+    RowChoice mv;
+    for (int lbi = 0; lbi < DIM_INNER && !g_stop; lbi++) {
+        const Cell *cB = g_db[lbi][INNER_IDX(rt[6])][INNER_IDX(rt[7])]
+                             [INNER_IDX(rt[8])][INNER_IDX(rt[9])][rt[10]];
+        if (!cB) continue;
+        for (uint32_t jb = 0; jb < cB->n && !g_stop; jb++) {
+            uint16_t ciB[CHAIN_LEN]; int la_C;
+            if (!pick_segB(cB, jb, rt + 6, p->used, ciB, lbi + COLOR_MIN, &la_C)) continue;
+            if (!color_is_inner(la_C)) continue;
+            const Cell *cC = g_db[INNER_IDX(la_C)][INNER_IDX(rt[11])][INNER_IDX(rt[12])]
+                                 [INNER_IDX(rt[13])][INNER_IDX(rt[14])][rt[15]];
+            if (!cC) continue;
+            uint64_t maskB[4], forbidB[4];
+            mask_of_chain(ciB, CHAIN_LEN, maskB);
+            for (int k = 0; k < 4; k++) forbidB[k] = p->used[k] | maskB[k];
+            memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));
+            for (uint32_t jc = 0; jc < cC->n; jc++) {
+                uint16_t ciC[CHAIN_LEN-1]; uint8_t rterm;
+                if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
+                memcpy(&mv.ci[2*CHAIN_LEN], ciC, (CHAIN_LEN-1) * sizeof(uint16_t));
+                mv.rterm = rterm;
+                emit_incomplete(ctx, p, &mv, row, ROWMASK_BC);
+            }
+        }
+    }
+}
+
 static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     const BeamEntry *p = e->parent;
     const uint8_t *rt = p->rtop;
@@ -982,9 +1062,10 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     e->budget--;                                   /* a real decode attempt */
 
     int la_B = g_cat[ciA[CHAIN_LEN-1]].right;
-    if (!color_is_inner(la_B)) return;
-    const Cell *cB = segB_cell(p, la_B);
-    if (!cB) return;
+    const Cell *cB = color_is_inner(la_B) ? segB_cell(p, la_B) : NULL;
+    /* No B cell at all. Below the stop row that kills the child; at the stop row
+       a missing B is exactly what an A+C partial records, so fall through. */
+    if (!cB && !(e->at_stop && g_incomplete_top)) return;
 
     uint64_t forbidA[4] = { p->used[0]|maskA[0], p->used[1]|maskA[1],
                             p->used[2]|maskA[2], p->used[3]|maskA[3] };
@@ -993,18 +1074,18 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     memcpy(&mv.ci[0], ciA, CHAIN_LEN * sizeof(uint16_t));
 
     if (e->at_stop) {
-        for (uint32_t jb = 0; jb < cB->n && e->quota > 0; jb++) {
+        for (uint32_t jb = 0; cB && jb < cB->n && e->quota > 0; jb++) {
             uint16_t ciB[CHAIN_LEN]; int la_C;
             if (!pick_segB(cB, jb, rt + 6, forbidA, ciB, la_B, &la_C)) continue;
             memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));
             if (!color_is_inner(la_C)) {
-                if (g_incomplete_top) emit_incomplete(ctx, p, &mv, e->row);
+                if (g_incomplete_top) emit_incomplete(ctx, p, &mv, e->row, ROWMASK_AB);
                 continue;
             }
             const Cell *cC = g_db[INNER_IDX(la_C)][INNER_IDX(rt[11])][INNER_IDX(rt[12])]
                                  [INNER_IDX(rt[13])][INNER_IDX(rt[14])][rt[15]];
             if (!cC) {
-                if (g_incomplete_top) emit_incomplete(ctx, p, &mv, e->row);
+                if (g_incomplete_top) emit_incomplete(ctx, p, &mv, e->row, ROWMASK_AB);
                 continue;
             }
             uint64_t maskB[4], forbidB[4];
@@ -1029,10 +1110,12 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
                 ab_full = true;
             }
             /* Valid A+B but no completable C: keep the A+B partial if requested. */
-            if (g_incomplete_top && !ab_full) emit_incomplete(ctx, p, &mv, e->row);
+            if (g_incomplete_top && !ab_full) emit_incomplete(ctx, p, &mv, e->row, ROWMASK_AB);
         }
+        if (g_incomplete_top) emit_AC_partials(ctx, p, &mv, e->row, forbidA);
         return;
     }
+    if (!cB) return;                    /* stop-row-only fall-through ends above */
 
     /* Beam row: enumerate EVERY conflict-free (B, C) completion of this A
        record, quota permitting -- unlike the beamer, which keeps one child per
@@ -1110,6 +1193,10 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
         uint32_t pi = (uint32_t)(it / n_slices);
         uint32_t sl = (uint32_t)(it % n_slices);
         Scratch *sc = scratch[omp_get_thread_num()];
+        /* Before expand_prepare, whose guard would drop this parent when its
+           segment-A cell is empty -- exactly the case a B+C partial records.
+           Once per parent, not once per slice. */
+        if (at_stop && g_incomplete_top && sl == 0) try_BC(ctx, &beam[pi], row);
         Expand e;
         if (!expand_prepare(&e, &beam[pi], pi, row, at_stop)) continue;
         /* Seeded per parent, NOT per slice: the slices of one parent have to
@@ -1367,7 +1454,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
             rows[row] = pe->mv;
             collect_rows(ctx, &beam[pe->parent], rows);
             g_emit_fps[k]  = board_fingerprint(rows, row);
-            g_emit_lens[k] = format_board_tail(rows, row, PUZZLE_SIDE - 1,
+            g_emit_lens[k] = format_board_tail(rows, row, ROWMASK_FULL,
                                                g_emit_lines + (size_t)k * EMIT_LINE_MAX);
         }
         for (uint32_t k = 0; k < tile; k++) {
@@ -2257,7 +2344,8 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
     }
     printf("[sum] emitted unique boards: %" PRIu64 "\n", g_stats.emitted_total);
     if (g_incomplete_top)
-        printf("[sum] incomplete-top A+B partials: %zu\n", g_partial_total);
+        printf("[sum] incomplete-top partials: %zu  (A+B %zu, A+C %zu, B+C %zu)\n",
+               g_partial_total, g_part_ab, g_part_ac, g_part_bc);
     fflush(stdout);
 }
 
@@ -2302,9 +2390,13 @@ static void usage(const char *a0) {
 "  --free_edges           free every edge piece above finalize_from into a shared\n"
 "                         pool; activated automatically when the partial leaves a\n"
 "                         border piece unplaced (fixed sides need all 60 placed)\n"
-"  --incomplete_top       also emit boards that reach --stop_row with a valid segment\n"
-"                         A and B but no segment C, to a separate\n"
-"                         <...>_<stop_row>_partial.csv (cols 11-15 left unplaced).\n"
+"  --incomplete_top       also emit boards that reach --stop_row with only TWO of its\n"
+"                         three 5-piece segments -- 11 of the row's 16 pieces -- to a\n"
+"                         separate <...>_<stop_row>_partial.csv. All three shapes are\n"
+"                         kept: A+B (cols 11-15 unplaced), A+C (cols 6-10) and B+C\n"
+"                         (cols 1-5). The two segments that lost their left-hand\n"
+"                         neighbour are searched over all 17 inner colors, so expect\n"
+"                         roughly 10x the partials of A+B alone; --max_partials caps it\n"
 "                         Both CSVs are APPENDED to, never truncated: a fresh run\n"
 "                         adds to whatever the out_dir already holds\n"
 "\n"
