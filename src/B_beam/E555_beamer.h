@@ -37,6 +37,17 @@ typedef struct {
     uint8_t  rterm;          /* col 15 right edge (g_edge_term index) */
 } RowChoice;
 
+/* Which columns of the emitted TOP row carry a piece (bit c = column c). Rows
+   below the top are always full. A completed row uses ROWMASK_FULL; the three
+   --incomplete_top partials each place the col-0 left edge plus two of the three
+   segments -- 11 of the row's 16 pieces -- and leave the third segment's five
+   columns unplaced (pos 999). The mask is also what keeps the RowChoice.ci[]
+   slots of the missing segment, which are never filled in, from being read. */
+#define ROWMASK_FULL  0xFFFFu   /* cols 0..15                         */
+#define ROWMASK_AB    0x07FFu   /* cols 0..10   -- C (11..15) missing */
+#define ROWMASK_AC    0xF83Fu   /* cols 0..5,11..15 -- B (6..10) missing */
+#define ROWMASK_BC    0xFFC1u   /* cols 0,6..15 -- A (1..5) missing    */
+
 /* One beam board: only the resumable frontier state (counters + exposed tops).
    The per-row move history lives OUTSIDE the entry, in the beam context's
    ancestry log (RowLog); log_idx points at this board's own entry in the log of

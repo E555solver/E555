@@ -146,8 +146,9 @@ BEAM_CMD=("$REPO/bin/E555_beamer" "$SEED" --random_edges
 [ "$RNG_SEED" != "0" ] && BEAM_CMD+=(--seed "$RNG_SEED")
 "${BEAM_CMD[@]}"
 
-# --incomplete_top also keeps boards that fill the stop row except its last five
-# columns; those land in a separate _partial.csv.
+# --incomplete_top also keeps boards that fill the stop row except for one of its
+# three 5-piece segments -- the hole is at cols 11-15, 6-10 or 1-5; those land in
+# a separate _partial.csv.
 cat beam/beam_completions_random_"$BEAM_STOP".csv          > 1_beam.csv 2>/dev/null || true
 cat beam/beam_completions_random_"$BEAM_STOP"_partial.csv >> 1_beam.csv 2>/dev/null || true
 rm -rf beam
