@@ -1570,6 +1570,69 @@ static uint8_t parse_orients(const char *s) {
     return m;
 }
 
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* E555_SEG_VERIFY=1: assert that the pinned-segment walk with NO pin reproduces
+   the database cell for the same key, chain for chain. The walk reads the raw
+   (left,bottom) buckets while the cell holds packed records built by a separate
+   DFS, so agreeing on both the count and the exact multiset of chains is strong
+   evidence the walk enumerates the same object the beam already trusts.
+   Only meaningful with clues off: with them on the walk deliberately sees pieces
+   the database excludes, so it would legitimately find more. */
+static void verify_segment_enumerator(void) {
+    if (!getenv("E555_SEG_VERIFY")) return;
+    if (g_clue_mask) { printf("[segv] skipped (clues on: the walk sees excluded pieces)\n"); return; }
+    enum { CAP = 2048 };
+    static uint16_t out[CAP][CHAIN_LEN];
+    static uint64_t ha[CAP], hb[CAP];
+    RNG r = rng_for(0x5E6C0DE5u, 0, 0, 0);
+    const uint64_t zero[4] = {0,0,0,0};
+    int checked = 0, tried = 0, bad = 0; uint64_t chains = 0;
+    while (checked < 300 && tried < 200000) {
+        tried++;
+        int la = COLOR_MIN + (int)rng_uniform(&r, DIM_INNER);
+        uint8_t b[CHAIN_LEN];
+        for (int i = 0; i < CHAIN_LEN; i++) b[i] = (uint8_t)(COLOR_MIN + rng_uniform(&r, DIM_INNER));
+        const Cell *c = g_db[INNER_IDX(la)][INNER_IDX(b[0])][INNER_IDX(b[1])]
+                            [INNER_IDX(b[2])][INNER_IDX(b[3])][b[4]];
+        if (!c || c->n == 0 || c->n > CAP) continue;
+        checked++; chains += c->n;
+        for (uint32_t j = 0; j < c->n; j++) {          /* the database's chains */
+            uint32_t w = rec_load(c->rec, j, g_rec_bytes_inner);
+            uint8_t f[CHAIN_LEN]; unpack_inner(w, f, g_lb_bits);
+            uint16_t ci[CHAIN_LEN]; uint64_t m[4] = {0,0,0,0};
+            if (!decode_inner_chain(f, CHAIN_LEN, la, b, ci, m, zero)) { bad++; break; }
+            uint64_t h = 1469598103934665603ULL;
+            for (int i = 0; i < CHAIN_LEN; i++) { h ^= ci[i]; h *= 1099511628211ULL; }
+            ha[j] = h;
+        }
+        int n = enumerate_pinned_segment(la, b, CHAIN_LEN, -1, 0, zero, out, CAP);
+        if (n != (int)c->n) {
+            printf("[segv] COUNT MISMATCH la=%d b=%u,%u,%u,%u,%u  db=%u walk=%d\n",
+                   la, b[0], b[1], b[2], b[3], b[4], c->n, n);
+            bad++; continue;
+        }
+        for (int j = 0; j < n; j++) {
+            uint64_t h = 1469598103934665603ULL;
+            for (int i = 0; i < CHAIN_LEN; i++) { h ^= out[j][i]; h *= 1099511628211ULL; }
+            hb[j] = h;
+        }
+        qsort(ha, (size_t)n, sizeof ha[0], cmp_u64);
+        qsort(hb, (size_t)n, sizeof hb[0], cmp_u64);
+        if (memcmp(ha, hb, (size_t)n * sizeof ha[0]) != 0) {
+            printf("[segv] SET MISMATCH la=%d b=%u,%u,%u,%u,%u n=%d\n",
+                   la, b[0], b[1], b[2], b[3], b[4], n);
+            bad++;
+        }
+    }
+    printf("[segv] %d cells, %llu chains: %s\n", checked, (unsigned long long)chains,
+           bad ? "MISMATCHES FOUND" : "walk == database, exactly");
+    if (bad) fatal("segment enumerator disagrees with the database");
+}
+
 static void usage(const char *a0) {
     fprintf(stderr,
 "Usage: %s seed.txt rotation.csv [options]\n"
@@ -1909,6 +1972,8 @@ int main(int argc, char *argv[]) {
         sort_db_by_fanout();
         if (g_db_file) db_cache_save(g_db_file);
     }
+    verify_segment_enumerator();
+
     if (g_free_edges) {                       /* edge cells are border-independent */
         build_edge_terminal_pool();
         build_db_edge_and_sort();

@@ -213,6 +213,20 @@ extern int g_lb_bucket[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL][MAX_LB_BUCKET];
 extern int g_lb_count[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL];
 extern int g_cat_to_lb_local[CATALOG_SIZE];
 
+/* Enumerate conflict-free chains of `len` oriented inner pieces: left neighbour
+   exposes `la`, piece i presents bottoms[i] downward, and when pin_idx >= 0 the
+   catalog entry pin_ci sits at that position. A pinned CLUE piece is barred from
+   the database (g_db_exclude), so no stored chain can supply it -- this walk is
+   the only way a clue row's segment gets built. pin_ci is exempt from `forbid`
+   (clue pieces are reserved in the board's used set from the start), everything
+   else is tested against it. Writes up to max_out chains; returns how many.
+   pin_idx < 0 enumerates unpinned, which reproduces the database cell for the
+   same key and is what the self-check compares against. */
+int enumerate_pinned_segment(int la, const uint8_t bottoms[], int len,
+                             int pin_idx, uint16_t pin_ci,
+                             const uint64_t forbid[4],
+                             uint16_t (*out)[CHAIN_LEN], int max_out);
+
 /* Record field widths and byte sizes, chosen at build time from the bucket sizes.
    g_lb_bits: bits per inner-piece field. g_term_bits: bits for the edge-terminal
    field (index within its per-left terminal bucket). Inner record = 5*g_lb_bits

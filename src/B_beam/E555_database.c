@@ -799,6 +799,63 @@ void build_db_edge_and_sort(void) {
     sort_phase(false, "DB edge");
 }
 
+/* -- Pinned segment enumeration --------------------------------------------- */
+
+typedef struct {
+    const uint8_t *bottoms;
+    const uint64_t *forbid;
+    uint16_t (*out)[CHAIN_LEN];
+    int  len, pin_idx, max_out, n;
+    uint16_t pin_ci;
+    uint16_t cur[CHAIN_LEN];
+    uint64_t seg[4];                 /* pieces used inside this segment */
+} SegWalk;
+
+static void seg_walk(SegWalk *w, int i, int cl) {
+    if (w->n >= w->max_out) return;
+    if (i == w->len) {
+        memcpy(w->out[w->n++], w->cur, (size_t)w->len * sizeof(uint16_t));
+        return;
+    }
+    int b = w->bottoms[i];
+    if (cl < 0 || cl >= NUM_COLORS_TOTAL || b < 0 || b >= NUM_COLORS_TOTAL) return;
+
+    if (i == w->pin_idx) {
+        const Oriented *o = &g_cat[w->pin_ci];
+        if (o->left != cl || o->bottom != b) return;      /* the cheap early kill */
+        uint16_t pid = o->piece_id; uint64_t bit = piece_bit(pid);
+        if (w->seg[pid >> 6] & bit) return;               /* not forbid: see header */
+        w->seg[pid >> 6] |= bit; w->cur[i] = w->pin_ci;
+        seg_walk(w, i + 1, o->right);
+        w->seg[pid >> 6] &= ~bit;
+        return;
+    }
+    const int nb = g_lb_count[cl][b];
+    for (int k = 0; k < nb && w->n < w->max_out; k++) {
+        int ci = g_lb_bucket[cl][b][k];
+        const Oriented *o = &g_cat[ci];
+        uint16_t pid = o->piece_id; uint64_t bit = piece_bit(pid);
+        if ((w->forbid[pid >> 6] | w->seg[pid >> 6]) & bit) continue;
+        w->seg[pid >> 6] |= bit; w->cur[i] = (uint16_t)ci;
+        seg_walk(w, i + 1, o->right);
+        w->seg[pid >> 6] &= ~bit;
+    }
+}
+
+int enumerate_pinned_segment(int la, const uint8_t bottoms[], int len,
+                             int pin_idx, uint16_t pin_ci,
+                             const uint64_t forbid[4],
+                             uint16_t (*out)[CHAIN_LEN], int max_out) {
+    if (len < 1 || len > CHAIN_LEN || max_out <= 0) return 0;
+    SegWalk w;
+    w.bottoms = bottoms; w.forbid = forbid; w.out = out;
+    w.len = len; w.pin_idx = pin_idx; w.max_out = max_out; w.n = 0;
+    w.pin_ci = pin_ci;
+    w.seg[0] = w.seg[1] = w.seg[2] = w.seg[3] = 0;
+    seg_walk(&w, 0, la);
+    return w.n;
+}
+
 /* -- Inner-DB disk cache ---------------------------------------------------- */
 /* The inner cells (and their promise sort) depend only on the seed file, so
  * they can be built once and reused across runs. File layout:
