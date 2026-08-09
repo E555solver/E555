@@ -439,6 +439,56 @@ penalized exactly the pattern the Mahalanobis term rewards, hard infeasibility
 is already caught by the parity check, and supply health is already encoded in
 the fan-out lookahead.)
 
+### Eternity II clue pieces (`--clue_center`, `--clue_corners`)
+
+The five published hints, converted once into this repo's numbering (0-based
+ids, bottom-up rows, CCW spins) and validated against the classic piece table:
+all 256 pieces match under `our_id = classic - 1` with a complete, unique
+23-colour bijection.
+
+| our piece | cell | (row, col) at 0 deg | spin |
+|---|---|---|---|
+| 138 (centre) | 119 | (7, 7) | 0 |
+| 180 | 34 | (2, 2) | 0 |
+| 248 | 45 | (2, 13) | 3 |
+| 207 | 210 | (13, 2) | 3 |
+| 254 | 221 | (13, 13) | 1 |
+
+Each clue pins a cell **and** a spin. Rotating a solved board 90 degrees keeps
+the edge rules but moves the clues, so the clue-satisfying solution set is not
+rotation-closed; since our border is chosen by our own search, "which puzzle
+side is our row 0" is free and all four orientations must be searched. Every
+orientation places the centre plus two corner clues below row 12 and leaves the
+other two on row 13 -- which is why `--stop_row` is capped at 12 when a clue
+flag is on. The centre visits a different one of the four centre cells per
+orientation, so `{119,120,135,136}` are the four centre placements.
+
+A board is unassigned until it places its first clue, then owes that
+orientation for life; the orientation lives in `BeamEntry.flags` and joins the
+dedup signature, or boards owing different clue sets would merge. `select_beam`
+reserves a floor of `K/8` per orientation ahead of the score band, and hands
+whatever a thin orientation cannot fill back to merit.
+
+**The constraint bites one row early.** A clue's bottom face must meet the piece
+below it, so the row-2 corners demand two specific colours from row 1 -- 1/289
+per orientation, about 1.4% over the four. Those demands fall on segment A
+(col 2) and segment C (col 13) separately, so row 1 is generated with
+`TOPCOLOR` pins rather than filtered afterwards. That distinction is not
+cosmetic: the beam keeps roughly one child per A record, so rejecting 98.6% of
+finished children starves the row (measured: 22 boards at row 1 filtering, 3328
+pinning).
+
+**The database.** Clue pieces are barred from the chain database
+(`g_db_exclude`), so no chain can hold one; the pinned walk places them
+directly and is exempt from the board's reserved mask. Only the enabled clues
+are excluded -- `--clue_center` alone leaves the corner pieces as ordinary inner
+pieces, because two of them genuinely sit at row 2 in the solution and
+excluding them without forcing them would make the answer unreachable.
+Measured record counts: 3.119e9 with no clues, 3.042e9 centre only
+(predicted (195/196)^5), 2.730e9 with all five (predicted (191/196)^5). A cache
+carries a hash of its exclusion set and refuses a mismatched run, so **use a
+separate `--db_file` per clue setting**.
+
 ### Color-parity pruning
 
 For every inner color c, let `S = total(c) - consumed(c) - required(c)`, where
@@ -553,6 +603,8 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--gumbel_tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
 | `--gumbel_tau_columns T` | 0 | ditto for left columns (measure before raising: see above) |
 | `--bail_columns N` | 0 | abandon a bottom after N consecutive columns that emitted nothing (0 = off) |
+| `--clue_center` | off | force the published centre clue (piece 138) onto its cell, at its orientation's spin |
+| `--clue_corners` | off | force the two reachable corner clues (row 2); needs `--stop_row <= 12` |
 | `--config_time_sec S` | 600 | wall-time slice per configuration |
 | `--max_wall_sec S` | 0 | total budget (0 = unlimited) |
 | `--max_partials N` | 0 | stop after N boards reported -- completions **plus** `--incomplete_top` partials (0 = unlimited) |

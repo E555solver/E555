@@ -92,7 +92,11 @@ static uint32_t g_beam_expand     = 5;
 static uint32_t g_beam_expand_row = 8;
 static double   g_lambda_maha     = 0.0;
 static double   g_frac_rand       = 0.75;
-static double   g_clue_frac       = 0.5;   /* beam share reserved per orientation */
+/* Share of the beam reserved as a per-orientation floor, split evenly over the
+   four orientations (so K/8 each). Not a CLI knob: it exists to stop one
+   orientation crowding the others out, and unused floor is handed straight
+   back to the score ranking, so there is nothing to tune. */
+#define CLUE_FLOOR_FRAC 0.5
 /* Derived once from g_clue at startup. g_clue_need1[o][0/1] is the color the
    row-2 corner clues of orientation o demand from row 1 at columns 2 and 13 --
    a clue's own bottom face must meet the piece below it, so the constraint
@@ -1551,12 +1555,39 @@ static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t beam_n,
                             RNG *rng) {
     const uint32_t K = target_K;
     if (kept <= K) { for (uint32_t i = 0; i < kept; i++) ctx->sel[i] = i; return kept; }
-    uint32_t k_rand = (uint32_t)(frac_rand_now * K);
-    if (k_rand > K) k_rand = K;
-    uint32_t k_top = K - k_rand;
     memset(ctx->taken, 0, kept);
     memset(ctx->offspring, 0, (size_t)beam_n*sizeof(uint32_t));
     uint32_t n_sel = 0, got = 0;
+
+    /* Per-orientation floor. Each orientation is a different hypothesis about
+       which puzzle side is our row 0, and the score cannot compare them -- left
+       to pure merit one orientation crowds the rest out and the search silently
+       stops being complete. So each gets a guaranteed min(n_o, K/8) taken in its
+       own score order, and whatever a thin orientation cannot fill simply stays
+       unclaimed: the passes below run unchanged over the same taken[] array and
+       spend the remainder on merit. Clues off leaves n_sel at 0 and every count
+       below identical to what it was before this existed. */
+    if (g_clue_mask) {
+        const uint32_t floor_o = (uint32_t)(CLUE_FLOOR_FRAC * (double)K / 4.0);
+        for (int o = 0; o < 4 && floor_o; o++) {
+            uint32_t got_o = 0;
+            for (uint32_t i = 0; i < kept && got_o < floor_o; i++) {
+                if (ctx->taken[i]) continue;
+                const PoolEntry *pe = &ctx->pool[ctx->keep[i]];
+                if (!(pe->flags & FLAG_ORIENT_SET)) continue;
+                if ((pe->flags & FLAG_ORIENT_MASK) != (uint8_t)o) continue;
+                if (cap && ctx->offspring[pe->parent] >= cap) continue;
+                ctx->offspring[pe->parent]++;
+                ctx->taken[i] = 1; ctx->sel[n_sel++] = i; got_o++;
+            }
+        }
+    }
+
+    /* Split what is left the way the whole beam was split before. */
+    const uint32_t rem = (n_sel < K) ? K - n_sel : 0;
+    uint32_t k_rand = (uint32_t)(frac_rand_now * rem);
+    if (k_rand > rem) k_rand = rem;
+    uint32_t k_top = rem - k_rand;
     for (uint32_t i = 0; i < kept && got < k_top; i++) {
         uint32_t par = ctx->pool[ctx->keep[i]].parent;
         if (cap && ctx->offspring[par] >= cap) continue;
@@ -1827,20 +1858,6 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
 
 /* -- main ------------------------------------------------------------------- */
 
-/* "0,2" -> bitmask of enabled orientations. Rejects an empty or out-of-range
-   list rather than silently searching nothing. */
-static uint8_t parse_orients(const char *s) {
-    uint8_t m = 0;
-    for (const char *p = s; *p; p++) {
-        if (*p == ',' || *p == ' ') continue;
-        if (*p < '0' || *p > '3') fatal("--clue_orient takes digits 0..3, e.g. 0,2");
-        m |= (uint8_t)(1u << (*p - '0'));
-    }
-    if (!m) fatal("--clue_orient needs at least one orientation");
-    return m;
-}
-
-
 static int cmp_u64(const void *a, const void *b) {
     uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
     return (x > y) - (x < y);
@@ -1871,7 +1888,7 @@ static void verify_segment_enumerator(void) {
                             [INNER_IDX(b[2])][INNER_IDX(b[3])][b[4]];
         if (!c || c->n == 0 || c->n > CAP) continue;
         checked++; chains += c->n;
-        for (uint32_t j = 0; j < c->n; j++) {          /* the database's chains */
+        for (uint32_t j = 0; j < c->n; j++) {
             uint32_t w = rec_load(c->rec, j, g_rec_bytes_inner);
             uint8_t f[CHAIN_LEN]; unpack_inner(w, f, g_lb_bits);
             uint16_t ci[CHAIN_LEN]; uint64_t m[4] = {0,0,0,0};
@@ -1882,9 +1899,7 @@ static void verify_segment_enumerator(void) {
         }
         int n = enumerate_pinned_segment(la, b, CHAIN_LEN, -1, PIN_PIECE, 0, zero, out, CAP);
         if (n != (int)c->n) {
-            printf("[segv] COUNT MISMATCH la=%d b=%u,%u,%u,%u,%u  db=%u walk=%d\n",
-                   la, b[0], b[1], b[2], b[3], b[4], c->n, n);
-            bad++; continue;
+            printf("[segv] COUNT MISMATCH la=%d db=%u walk=%d\n", la, c->n, n); bad++; continue;
         }
         for (int j = 0; j < n; j++) {
             uint64_t h = 1469598103934665603ULL;
@@ -1894,9 +1909,7 @@ static void verify_segment_enumerator(void) {
         qsort(ha, (size_t)n, sizeof ha[0], cmp_u64);
         qsort(hb, (size_t)n, sizeof hb[0], cmp_u64);
         if (memcmp(ha, hb, (size_t)n * sizeof ha[0]) != 0) {
-            printf("[segv] SET MISMATCH la=%d b=%u,%u,%u,%u,%u n=%d\n",
-                   la, b[0], b[1], b[2], b[3], b[4], n);
-            bad++;
+            printf("[segv] SET MISMATCH la=%d n=%d\n", la, n); bad++;
         }
     }
     printf("[segv] %d cells, %llu chains: %s\n", checked, (unsigned long long)chains,
@@ -1966,13 +1979,6 @@ static void usage(const char *a0) {
 "  --clue_corners         force the two published corner clues the beam can reach,\n"
 "                         both on row 2; the other two sit on row 13 and are only\n"
 "                         reserved. Clue pieces leave the database entirely\n"
-"  --clue_orient LIST     comma-separated subset of the 4 board orientations to try\n"
-"                         (default 0,1,2,3). Each is a different hypothesis about\n"
-"                         which puzzle side is our row 0, so all four are needed for\n"
-"                         completeness -- restrict only to split work across runs\n"
-"  --clue_frac F          share of the beam reserved as a per-orientation floor, so a\n"
-"                         weak orientation is not crowded out; unused floor is given\n"
-"                         back to the score ranking (default 0.5, 0 = pure score)\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by\n"
 "                         score; halved at beam_expand_row-1, zero from\n"
 "                         beam_expand_row on (default 0.75)\n"
@@ -2100,8 +2106,6 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--supply_check") && i+1 < argc) g_supply_check = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--clue_center"))               g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(argv[i], "--clue_corners"))              g_clue_mask |= CLUE_CORNERS;
-        else if (!strcmp(argv[i], "--clue_frac")   && i+1 < argc) g_clue_frac = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--clue_orient") && i+1 < argc) g_clue_orients = parse_orients(argv[++i]);
         else if (!strcmp(argv[i], "--gumbel_tau0") && i+1 < argc) g_gumbel_tau0 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--gumbel_tau1") && i+1 < argc) g_gumbel_tau1 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--bc_window")   && i+1 < argc) {
@@ -2144,7 +2148,6 @@ int main(int argc, char *argv[]) {
         fatal("--stop_row must be in 1..%d (rows 14-15 belong to Stage C)", MAX_DRILL_DEPTH);
     if (!(fabs(g_lambda_maha) <= 1e6)) fatal("--lambda_Mahalanobis in [-1e6,1e6]");
     if (!(fabs(g_lambda_J) <= 1e6))    fatal("--lambda_J in [-1e6,1e6]");
-    if (!(g_clue_frac >= 0.0 && g_clue_frac <= 1.0)) fatal("--clue_frac in [0,1]");
     /* Row 13 carries two clues in every orientation and we deliberately do not
        enforce them, so the top clue row must stay out of reach by construction. */
     if (g_clue_mask && g_stop_row > 12)
@@ -2194,14 +2197,9 @@ int main(int argc, char *argv[]) {
            g_beam_width, g_stop_row, g_beam_expand, g_beam_expand_row, g_lambda_maha);
     printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u scan_factor=%u\n",
            g_frac_rand, g_parent_cap, g_pool_factor, g_scan_factor);
-    if (g_clue_mask) {
-        char ol[16], *q = ol;
-        for (int o = 0; o < 4; o++) if (g_clue_orients & (1u << o)) { if (q != ol) *q++ = ','; *q++ = (char)('0'+o); }
-        *q = 0;
-        printf("[cfg] clue_center=%d clue_corners=%d clue_orient=%s clue_frac=%.2f\n",
-               (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0,
-               ol, g_clue_frac);
-    }
+    if (g_clue_mask)
+        printf("[cfg] clue_center=%d clue_corners=%d (all 4 orientations)\n",
+               (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0);
     printf("[cfg] score_model=%s lambda_J=%.3f avail_correct=%d free_demand=%d supply_check=%u"
            " gumbel_tau=%.2f->%.2f bc_window=%u,%u\n",
            g_score_model_J ? "J" : "legacy", g_lambda_J, g_avail_correct?1:0,
