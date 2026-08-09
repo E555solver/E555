@@ -96,6 +96,17 @@ bool g_free_edges      = false;
    or the edge-terminal pool. All-zero (the default) means no exclusion. */
 uint64_t g_db_exclude[4] = {0, 0, 0, 0};
 
+/* Generated from the published clue data; see ClueCell in the header. Entry 0
+   of each row is the center clue, 1..2 the reachable corners, 3..4 row 13. */
+const ClueCell g_clue[4][CLUE_N] = {
+    { { 7, 7,138,0}, { 2, 2,180,0}, { 2,13,248,3}, {13, 2,207,3}, {13,13,254,1} },   /*   0 deg */
+    { { 8, 7,138,3}, { 2, 2,248,2}, { 2,13,254,0}, {13, 2,180,3}, {13,13,207,2} },   /*  90 deg */
+    { { 8, 8,138,2}, { 2, 2,254,3}, { 2,13,207,1}, {13, 2,248,1}, {13,13,180,2} },   /* 180 deg */
+    { { 7, 8,138,1}, { 2, 2,207,0}, { 2,13,180,1}, {13, 2,254,2}, {13,13,248,0} },   /* 270 deg */
+};
+uint32_t g_clue_mask    = 0;
+uint8_t  g_clue_orients = 0xF;
+
 int g_top_border_inner_count[NUM_COLORS_TOTAL];
 int g_inner_color_total[NUM_COLORS_TOTAL];
 uint64_t g_color_pieces[NUM_COLORS_TOTAL][4];

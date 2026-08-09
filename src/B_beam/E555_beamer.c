@@ -92,6 +92,7 @@ static uint32_t g_beam_expand     = 5;
 static uint32_t g_beam_expand_row = 8;
 static double   g_lambda_maha     = 0.0;
 static double   g_frac_rand       = 0.75;
+static double   g_clue_frac       = 0.5;   /* beam share reserved per orientation */
 static bool     g_score_model_J   = false;  /* --score_model J (default legacy) */
 static double   g_lambda_J        = 1.0;
 static bool     g_avail_correct   = false;
@@ -1556,6 +1557,19 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
 
 /* -- main ------------------------------------------------------------------- */
 
+/* "0,2" -> bitmask of enabled orientations. Rejects an empty or out-of-range
+   list rather than silently searching nothing. */
+static uint8_t parse_orients(const char *s) {
+    uint8_t m = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == ',' || *p == ' ') continue;
+        if (*p < '0' || *p > '3') fatal("--clue_orient takes digits 0..3, e.g. 0,2");
+        m |= (uint8_t)(1u << (*p - '0'));
+    }
+    if (!m) fatal("--clue_orient needs at least one orientation");
+    return m;
+}
+
 static void usage(const char *a0) {
     fprintf(stderr,
 "Usage: %s seed.txt rotation.csv [options]\n"
@@ -1613,6 +1627,18 @@ static void usage(const char *a0) {
 "  --avail_correct        discount the B/C fan-out counts by the fraction of each\n"
 "                         frontier color still unplaced, so the lookahead stops being\n"
 "                         blind to which pieces are gone (default off)\n"
+"  --clue_center          force the published center clue piece onto its cell, at its\n"
+"                         orientation's spin (piece 138; one of the 4 center cells)\n"
+"  --clue_corners         force the two published corner clues the beam can reach,\n"
+"                         both on row 2; the other two sit on row 13 and are only\n"
+"                         reserved. Clue pieces leave the database entirely\n"
+"  --clue_orient LIST     comma-separated subset of the 4 board orientations to try\n"
+"                         (default 0,1,2,3). Each is a different hypothesis about\n"
+"                         which puzzle side is our row 0, so all four are needed for\n"
+"                         completeness -- restrict only to split work across runs\n"
+"  --clue_frac F          share of the beam reserved as a per-orientation floor, so a\n"
+"                         weak orientation is not crowded out; unused floor is given\n"
+"                         back to the score ranking (default 0.5, 0 = pure score)\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by\n"
 "                         score; halved at beam_expand_row-1, zero from\n"
 "                         beam_expand_row on (default 0.75)\n"
@@ -1738,6 +1764,10 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--avail_correct"))             g_avail_correct = true;
         else if (!strcmp(argv[i], "--no_free_demand"))            g_free_demand = false;
         else if (!strcmp(argv[i], "--supply_check") && i+1 < argc) g_supply_check = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--clue_center"))               g_clue_mask |= CLUE_CENTER;
+        else if (!strcmp(argv[i], "--clue_corners"))              g_clue_mask |= CLUE_CORNERS;
+        else if (!strcmp(argv[i], "--clue_frac")   && i+1 < argc) g_clue_frac = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--clue_orient") && i+1 < argc) g_clue_orients = parse_orients(argv[++i]);
         else if (!strcmp(argv[i], "--gumbel_tau0") && i+1 < argc) g_gumbel_tau0 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--gumbel_tau1") && i+1 < argc) g_gumbel_tau1 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--bc_window")   && i+1 < argc) {
@@ -1780,6 +1810,12 @@ int main(int argc, char *argv[]) {
         fatal("--stop_row must be in 1..%d (rows 14-15 belong to Stage C)", MAX_DRILL_DEPTH);
     if (!(fabs(g_lambda_maha) <= 1e6)) fatal("--lambda_Mahalanobis in [-1e6,1e6]");
     if (!(fabs(g_lambda_J) <= 1e6))    fatal("--lambda_J in [-1e6,1e6]");
+    if (!(g_clue_frac >= 0.0 && g_clue_frac <= 1.0)) fatal("--clue_frac in [0,1]");
+    /* Row 13 carries two clues in every orientation and we deliberately do not
+       enforce them, so the top clue row must stay out of reach by construction. */
+    if (g_clue_mask && g_stop_row > 12)
+        fatal("--clue_center/--clue_corners need --stop_row <= 12 (row 13 holds the "
+              "two clues this build does not enforce)");
     if (!(g_gumbel_tau0 >= 0.0 && g_gumbel_tau0 <= 1e6)) fatal("--gumbel_tau0 in [0,1e6]");
     if (!(g_gumbel_tau1 >= 0.0 && g_gumbel_tau1 <= 1e6)) fatal("--gumbel_tau1 in [0,1e6]");
     if (!(g_tau_bottoms >= 0.0 && g_tau_bottoms <= 1e6)) fatal("--gumbel_tau_bottoms in [0,1e6]");
@@ -1824,6 +1860,14 @@ int main(int argc, char *argv[]) {
            g_beam_width, g_stop_row, g_beam_expand, g_beam_expand_row, g_lambda_maha);
     printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u scan_factor=%u\n",
            g_frac_rand, g_parent_cap, g_pool_factor, g_scan_factor);
+    if (g_clue_mask) {
+        char ol[16], *q = ol;
+        for (int o = 0; o < 4; o++) if (g_clue_orients & (1u << o)) { if (q != ol) *q++ = ','; *q++ = (char)('0'+o); }
+        *q = 0;
+        printf("[cfg] clue_center=%d clue_corners=%d clue_orient=%s clue_frac=%.2f\n",
+               (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0,
+               ol, g_clue_frac);
+    }
     printf("[cfg] score_model=%s lambda_J=%.3f avail_correct=%d free_demand=%d supply_check=%u"
            " gumbel_tau=%.2f->%.2f bc_window=%u,%u\n",
            g_score_model_J ? "J" : "legacy", g_lambda_J, g_avail_correct?1:0,

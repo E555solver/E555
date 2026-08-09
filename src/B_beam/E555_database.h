@@ -117,6 +117,25 @@ typedef struct {
     uint8_t  top, right, bottom, left;
 } Oriented;
 
+/* -- Eternity II clue pieces ------------------------------------------------ */
+/* One published hint: a piece pinned to a cell in a fixed orientation. Rows are
+   this repo's bottom-up rows, spins are CCW, piece ids are 0-based -- the
+   published data is 1-based and top-down, converted once (our_id = classic-1).
+
+   Orientation o is the hypothesis that our row 0 is the puzzle side reached by
+   rotating the published board o quarter-turns clockwise. Our border is chosen
+   by our own search, so which physical side is "the bottom" is free, and a
+   solution rotated 90 degrees satisfies the edge rules but NOT the clues -- so
+   completeness needs all four. Index 0 is the center clue; 1..2 are the two
+   corner clues a bottom-up beam can reach; 3..4 sit on row 13, above any legal
+   --stop_row, and are only ever RESERVED so the supply accounting stays exact. */
+typedef struct { uint8_t row, col; uint16_t piece; uint8_t spin; } ClueCell;
+
+#define CLUE_N            5      /* entries per orientation                   */
+#define CLUE_N_REACHABLE  3      /* entries 0..2 are placed; 3..4 are reserved */
+#define CLUE_CENTER   0x1u       /* --clue_center  : entry 0                  */
+#define CLUE_CORNERS  0x2u       /* --clue_corners : entries 1..2 (+3..4 held) */
+
 /* One DB cell: a flat array of n packed chain records. Record stride is
  * g_rec_bytes_inner for inner cells, g_rec_bytes_edge for edge cells (set at
  * build time). */
@@ -248,6 +267,13 @@ extern bool g_free_edges;
    or the edge-terminal pool (used e.g. to build a reduced database for a board
    whose lower rows are already fixed). All-zero (the default) = no exclusion. */
 extern uint64_t g_db_exclude[4];
+
+/* Clue state, set by the solver's main() before the database is built.
+   g_clue_mask is a CLUE_* bitmask (0 = clues off, the default); g_clue_orients
+   is a 4-bit set of enabled orientations. */
+extern const ClueCell g_clue[4][CLUE_N];
+extern uint32_t g_clue_mask;
+extern uint8_t  g_clue_orients;
 
 extern int g_top_border_inner_count[NUM_COLORS_TOTAL];
 extern int g_inner_color_total[NUM_COLORS_TOTAL];
