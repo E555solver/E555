@@ -520,7 +520,7 @@ static inline char *u32a(char *p, uint32_t v) {
    kinds leave a hole in the MIDDLE of the row, not only at its right end.
    Returns the byte count. */
 static int format_board_tail(const RowChoice rows[EDGE_LEN], int row,
-                             uint16_t colmask, char *out) {
+                             uint16_t colmask, int orient, char *out) {
     uint32_t pos[NUM_PIECES], rot_arr[NUM_PIECES];
     for (int i = 0; i < NUM_PIECES; i++) { pos[i] = 999; rot_arr[i] = 0; }
     for (int r = 0; r <= row; r++) {
@@ -531,6 +531,21 @@ static int format_board_tail(const RowChoice rows[EDGE_LEN], int row,
             pos[pid] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[pid] = rot;
         }
     }
+    /* --clue_corners: also show the two clue pieces the beam never reaches. They
+       sit on row 13, so with the search stopping at row 12 or below they land in
+       empty space, isolated -- which is the point: the viewer makes it obvious
+       the corners were pinned, and a hole-free Stage C solve has to build around
+       them. There is no choice of orientation here: the board committed to one
+       when it placed its row-2 corners, so its top pair follows from that.
+       Isolated cells touch no placed neighbour, so no adjacency is asserted and
+       the board's edge score is unchanged. */
+    if (orient >= 0 && (g_clue_mask & CLUE_CORNERS))
+        for (int k = 3; k < CLUE_N; k++) {
+            const ClueCell *cc = &g_clue[orient][k];
+            pos[cc->piece]     = (uint32_t)(cc->row * PUZZLE_SIDE + cc->col);
+            rot_arr[cc->piece] = cc->spin;
+        }
+
     char *p = out;
     for (int i = 0; i < NUM_PIECES; i++) { *p++ = ','; *p++ = ' '; p = u32a(p, pos[i]); }
     for (int i = 0; i < NUM_PIECES; i++) { *p++ = ','; *p++ = ' '; p = u32a(p, rot_arr[i]); }
@@ -572,7 +587,9 @@ static void emit_incomplete(const BeamCtx *ctx, const BeamEntry *parent,
     if (!fp) fp = 1;
 
     char line[EMIT_LINE_MAX];
-    int len = format_board_tail(rows, row, colmask, line);
+    int len = format_board_tail(rows, row, colmask,
+                                ENTRY_HAS_ORIENT(parent) ? (int)ENTRY_ORIENT(parent) : -1,
+                                line);
 
     #pragma omp critical(e555_incomplete)
     {
@@ -1665,6 +1682,8 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
             collect_rows(ctx, &beam[pe->parent], rows);
             g_emit_fps[k]  = board_fingerprint(rows, row);
             g_emit_lens[k] = format_board_tail(rows, row, ROWMASK_FULL,
+                                               (pe->flags & FLAG_ORIENT_SET)
+                                                   ? (int)(pe->flags & FLAG_ORIENT_MASK) : -1,
                                                g_emit_lines + (size_t)k * EMIT_LINE_MAX);
         }
         for (uint32_t k = 0; k < tile; k++) {

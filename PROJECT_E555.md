@@ -478,6 +478,17 @@ cosmetic: the beam keeps roughly one child per A record, so rejecting 98.6% of
 finished children starves the row (measured: 22 boards at row 1 filtering, 3328
 pinning).
 
+**The two unreachable corners are attached to the emitted board.** With
+`--clue_corners` on, every emitted board also carries its orientation's two
+row-13 clue pieces at their cells. The search never reaches row 13, so they land
+isolated in empty space -- which is the point: the viewer makes it obvious the
+corners were pinned, and a hole-free Stage C solve has to build around them.
+There is no orientation to choose: the board committed to one when it placed its
+row-2 corners. Isolated cells touch no placed neighbour, so no adjacency is
+asserted and the edge score is unchanged (verified: 294/480 with and without
+them). Stage C is free to unplace them -- the finalizer frees everything above
+`--finalize_from`, and the roundhouse frees its top band.
+
 **The database.** Clue pieces are barred from the chain database
 (`g_db_exclude`), so no chain can hold one; the pinned walk places them
 directly and is exempt from the board's reserved mask. Only the enabled clues
