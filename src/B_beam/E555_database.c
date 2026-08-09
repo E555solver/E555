@@ -812,7 +812,10 @@ void build_db_edge_and_sort(void) {
    E555_database.h). A version-1 file packs them tightly, so every cell after the
    first odd-length one sits at a different offset -- the loader must reject it
    and rebuild rather than map the arena at the wrong stride. */
-#define DB_CACHE_VERSION 2u
+/* Version 3: the header carries a hash of g_db_exclude. A clue-built cache has
+   the same seed, lb_bits and rec_bytes as a normal one but different CONTENTS
+   (the excluded pieces appear in no chain), so nothing else would catch it. */
+#define DB_CACHE_VERSION 3u
 #define DB_CACHE_ALIGN   4096u
 
 typedef struct {
@@ -822,7 +825,15 @@ typedef struct {
     uint64_t ncells;
     uint64_t arena_bytes;
     uint64_t arena_off;
+    uint64_t exclude_hash;
 } DbCacheHdr;
+
+/* Identifies the g_db_exclude set a cache was built with. */
+static uint64_t db_exclude_hash(void) {
+    uint64_t h = 0x9E3779B97F4A7C15ULL;
+    for (int k = 0; k < 4; k++) { h ^= g_db_exclude[k]; h *= 0x100000001B3ULL; }
+    return h;
+}
 
 typedef struct { uint64_t fi; uint32_t n; uint32_t _pad; } DbCacheCell;
 
@@ -847,6 +858,7 @@ void db_cache_save(const char *path) {
     hdr.max_cell_n = g_db_max_cell_n;
     hdr.seed_hash = g_seed_file_hash;  hdr.ncells = ncells;
     hdr.arena_bytes = g_inner_arena_size;
+    hdr.exclude_hash = db_exclude_hash();
     uint64_t meta = sizeof hdr + ncells * sizeof(DbCacheCell);
     hdr.arena_off = (meta + DB_CACHE_ALIGN - 1) / DB_CACHE_ALIGN * DB_CACHE_ALIGN;
 
@@ -888,6 +900,11 @@ bool db_cache_load(const char *path) {
     }
     if (hdr.seed_hash != g_seed_file_hash) {
         printf("[init] DB cache %s: different seed file; rebuilding\n", path); close(fd); return false;
+    }
+    if (hdr.exclude_hash != db_exclude_hash()) {
+        printf("[init] DB cache %s: built with a different clue/exclusion set; "
+               "rebuilding (use a separate --db_file per clue setting)\n", path);
+        close(fd); return false;
     }
     if (hdr.lb_bits != (uint32_t)g_lb_bits || hdr.rec_bytes != (uint32_t)g_rec_bytes_inner) {
         printf("[init] DB cache %s: record format mismatch; rebuilding\n", path); close(fd); return false;

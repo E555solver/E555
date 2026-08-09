@@ -1883,6 +1883,17 @@ int main(int argc, char *argv[]) {
     double t_start = omp_get_wtime();
     ensure_dir(g_out_dir);
     load_seed_and_catalog(seed_path);
+    /* Clue pieces leave the database entirely: no chain may contain one, so the
+       search never has to reject a chain for colliding with a clue. Must be set
+       BEFORE the build (and before the cache is consulted -- its exclude hash
+       is what stops a clue cache being reused for a normal run and back). */
+    if (g_clue_mask) {
+        for (int k = 0; k < CLUE_N; k++) {
+            bool is_center = (k == 0);
+            if (is_center ? !(g_clue_mask & CLUE_CENTER) : !(g_clue_mask & CLUE_CORNERS)) continue;
+            for (int o = 0; o < 4; o++) used_set(g_db_exclude, g_clue[o][k].piece);
+        }
+    }
     build_catalog_indices();
     build_inner_color_totals();
     build_maha_tables();
