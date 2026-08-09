@@ -77,8 +77,7 @@ if [ "$ANNEAL" = 1 ]; then
              --top_bottoms "$N_BOTTOMS" --top_columns "$N_COLUMNS")
     RESULT="$OUT_DIR/beam_completions_0_$STOP_ROW.csv"
 else
-    BORDERS=(--random_edges --border_row_N "$N_BOTTOMS" --top_columns "$N_COLUMNS"
-             --soft_center_139)
+    BORDERS=(--random_edges --border_row_N "$N_BOTTOMS" --top_columns "$N_COLUMNS")
     RESULT="$OUT_DIR/beam_completions_random_$STOP_ROW.csv"
 fi
 

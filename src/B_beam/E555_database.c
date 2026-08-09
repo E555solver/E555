@@ -90,7 +90,6 @@ LeftOrder   *g_lefts   = NULL;  size_t g_left_n   = 0;
 
 int  g_nthreads        = 0;
 bool g_verbose         = false;
-bool g_soft_center_139 = false;
 bool g_free_edges      = false;
 
 /* Pieces barred from the database: excluded pieces never enter a chain record

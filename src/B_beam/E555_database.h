@@ -93,7 +93,6 @@
  * sizes; see g_lb_bits / g_term_bits / g_rec_bytes_inner / g_rec_bytes_edge. */
 #define MAX_LB_BUCKET       64    /* cap on a single (left,bottom) bucket (assert) */
 #define MAX_EDGE_TERMINALS  56    /* non-corner edge pieces (free mode upper bound) */
-#define SOFT_CENTER_139_PIECE  139
 
 /* Stop-row ceiling. DB_5pieces is NOT dead-end pruned (a 5-chain's tops do not
    determine the next cell -- that needs the next row's left-neighbour color), so
@@ -243,7 +242,6 @@ extern LeftOrder   *g_lefts;    extern size_t g_left_n;
 /* Shared run flags, set by the solver's main() before the builds run. */
 extern int  g_nthreads;
 extern bool g_verbose;
-extern bool g_soft_center_139;
 extern bool g_free_edges;
 
 /* Pieces barred from the database: excluded pieces never enter a chain record

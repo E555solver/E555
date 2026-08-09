@@ -23,9 +23,6 @@
    a parent below this many full decode attempts. */
 #define MIN_DECODE_BUDGET   2048
 
-/* BeamEntry.flags bits. */
-#define FLAG_BONUS_139      0x1u   /* piece 139 sits on one of the 4 center cells */
-
 /* -- Beam state ------------------------------------------------------------ */
 
 /* One committed inner row: the 14 inner catalog indices for columns 1..14

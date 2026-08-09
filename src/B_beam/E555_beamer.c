@@ -24,7 +24,7 @@
  *                 automatically. Exact disjointness + color-parity checks.
  *     SCORE       each child is ranked by the options it keeps open one row up
  *                 (segment-A exact cell + B/C fan-out table) plus the Mahalanobis
- *                 color-usage term and the center-139 bonus.
+ *                 color-usage term.
  *     SELECT      pooled children are deduplicated by frontier signature (keeping
  *                 the best score per signature), ranked, and pruned to the row's
  *                 effective width by a score band with a per-parent offspring cap
@@ -75,22 +75,6 @@
 
 #include "E555_beamer.h"
 
-/* -- soft-center-139 tuning -------------------------------------------------- */
-/* Piece 139 (the published center clue) is barred from rows 1..RELEASE_ROW-1,
-   and any board that happens to place it on one of the four true center cells
-   -- (row,col) in {7,8}x{7,8} -- earns --bonus_139 on every subsequent score, so
-   the lineage is promoted all the way up while it keeps finding matches.
-
-   The bonus is additive on a score measured in nats of log record count, so its
-   value IS a claimed factor in continuability: the historical 10.0 asserted that
-   a center-139 board is worth e^10 ~ 2.2e4 times one without, which no amount of
-   real fan-out difference can overcome. It then persists in every descendant
-   from row 6 while frac_rand_eff returns 0 from row 8, so the late beam became a
-   near-monoculture of 139 lineages. The default is now 1.0 -- about one standard
-   deviation of the color term -- so it breaks near-ties in favour of a 139
-   lineage without overriding a board that is genuinely more continuable. */
-#define SOFT_CENTER_RELEASE_ROW 6
-
 /* Beam-row segment-B retries: if a conflict-free B chain admits no conflict-free
    C completion, try the next conflict-free B, up to this many, before giving up
    on the A record. Deep rows are conflict-dominated; without the fallback a
@@ -108,7 +92,6 @@ static uint32_t g_beam_expand     = 5;
 static uint32_t g_beam_expand_row = 8;
 static double   g_lambda_maha     = 0.0;
 static double   g_frac_rand       = 0.75;
-static double   g_bonus_139       = 1.0;
 static bool     g_score_model_J   = false;  /* --score_model J (default legacy) */
 static double   g_lambda_J        = 1.0;
 static bool     g_avail_correct   = false;
@@ -304,7 +287,6 @@ static void beam_init_border(BeamEntry *p, const BottomOrder *bot, const LeftOrd
             if (color_is_inner(cl)) p->req_exposed[cl]++;
         }
     }
-    if (g_soft_center_139) used_set(p->used, SOFT_CENTER_139_PIECE);
 }
 
 /* Commit one inner row (cols 1..15) into the board (counters + frontier only;
@@ -339,12 +321,6 @@ static void commit_row(BeamEntry *p, int row, const RowChoice *rc) {
         if (color_is_inner(tl)) p->req_exposed[tl]--;
     }
 
-    /* Center-139 bonus: rows 7/8, cols 7/8 are the board's four center cells
-       (ci[i] holds column i+1). The flag persists in every descendant. */
-    if (g_soft_center_139 && (row == 7 || row == 8) &&
-        (g_cat[rc->ci[6]].piece_id == SOFT_CENTER_139_PIECE ||
-         g_cat[rc->ci[7]].piece_id == SOFT_CENTER_139_PIECE))
-        p->flags |= FLAG_BONUS_139;
 }
 
 /* Color parity: every inner color's surplus must be non-negative, and even
@@ -699,8 +675,8 @@ static inline double maha_term(const BeamEntry *t, int row) {
  *
  * Both are written centred (S_c/Sbar, R_c/Rbar). Both sums are constant across
  * siblings at a given row, so centring cannot change the ranking; it keeps the
- * value near 0 instead of near 1600 nats, so --bonus_139 and any swept weight
- * keep their meaning when --score_model is flipped.
+ * value near 0 instead of near 1600 nats, so any swept weight keeps its
+ * meaning when --score_model is flipped.
  *
  * Unlike maha_term this reads S and R off the board, so it needs no assumption
  * that n = 14*row matches the real piece count -- it is exact from a partial. */
@@ -787,7 +763,6 @@ static bool score_child(const BeamEntry *t, int row, float *out) {
     double s = log((double)cA->n) + log1p((double)fB) + log1p((double)fC)
                + color_term(t, row);
     if (g_avail_correct) s += avail_term(t);
-    if (t->flags & FLAG_BONUS_139) s += g_bonus_139;
     *out = (float)s;
     return true;
 }
@@ -1025,8 +1000,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
                    it is emitted -- whether a row fits above is deliberately the
                    next stage's problem, so --supply_check does not apply here
                    either. Rank by the heuristic terms only. */
-                float score = (float)(color_term(t, e->row)
-                              + ((t->flags & FLAG_BONUS_139) ? g_bonus_139 : 0.0));
+                float score = (float)color_term(t, e->row);
                 pool_append(ctx, sc, t, e->parent_idx, score, &mv);
                 e->quota--;
                 ab_full = true;
@@ -1208,8 +1182,8 @@ static void sort_recs_desc(SortRec *a, SortRec *tmp, uint32_t n, int nt) {
 
 /* Deduplicate the pool by frontier signature, keeping the BEST score per
    signature (two boards with the same used-set and exposed tops have identical
-   futures, so only the top-scored representative -- e.g. the one holding the
-   center-139 bonus -- needs to survive). The hash table is region-sharded:
+   futures, so only the top-scored representative needs to survive). The hash
+   table is region-sharded:
    every signature belongs to exactly one thread's slot range, so threads insert
    without locks; probing wraps within the owner's range. Fills ctx->keep[]
    with the survivors' pool indices, best score first; returns the count. */
@@ -1423,9 +1397,6 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         if (g_stop)                      { res.reason = "interrupted"; break; }
         if (omp_get_wtime() >= deadline) { res.reason = "time";        break; }
         double t_row = omp_get_wtime();
-
-        if (g_soft_center_139 && row == SOFT_CENTER_RELEASE_ROW)
-            for (uint32_t i = 0; i < beam_n; i++) used_clear(cur[i].used, SOFT_CENTER_139_PIECE);
 
         expand_row(ctx, cur, beam_n, row, cfg_hash, scratch);
         double t_exp = omp_get_wtime();
@@ -1642,9 +1613,6 @@ static void usage(const char *a0) {
 "  --avail_correct        discount the B/C fan-out counts by the fraction of each\n"
 "                         frontier color still unplaced, so the lookahead stops being\n"
 "                         blind to which pieces are gone (default off)\n"
-"  --bonus_139 F          score bonus while piece 139 sits on a center cell, added\n"
-"                         to a log-count score (default 1; was 10 before, which is a\n"
-"                         claimed factor of e^10 and swamped every other term)\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by\n"
 "                         score; halved at beam_expand_row-1, zero from\n"
 "                         beam_expand_row on (default 0.75)\n"
@@ -1722,8 +1690,6 @@ static void usage(const char *a0) {
 "  --threads N            OpenMP threads (default: all cores)\n"
 "  --seed S               RNG seed; omitted or 0 = randomized from clock+pid and\n"
 "                         printed, so repeated runs are uncorrelated\n"
-"  --soft_center_139      keep clue piece 139 out of rows 1..5 and add a score bonus\n"
-"                         whenever it lands on one of the 4 center cells\n"
 "  --verbose              per-row beam progress lines\n"
 "  --help                 this text\n", a0);
 }
@@ -1772,7 +1738,6 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--avail_correct"))             g_avail_correct = true;
         else if (!strcmp(argv[i], "--no_free_demand"))            g_free_demand = false;
         else if (!strcmp(argv[i], "--supply_check") && i+1 < argc) g_supply_check = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--bonus_139")   && i+1 < argc) g_bonus_139 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--gumbel_tau0") && i+1 < argc) g_gumbel_tau0 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--gumbel_tau1") && i+1 < argc) g_gumbel_tau1 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--bc_window")   && i+1 < argc) {
@@ -1796,7 +1761,6 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--max_wall_sec")    && i+1 < argc) g_max_wall_sec = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_partials")    && i+1 < argc) g_max_partials = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--resume"))          resume = true;
-        else if (!strcmp(argv[i], "--soft_center_139")) g_soft_center_139 = true;
         else if (!strcmp(argv[i], "--verbose"))         g_verbose = true;
         else { fprintf(stderr, "Unknown argument: %s\n\n", argv[i]); usage(argv[0]); return 1; }
     }
@@ -1816,7 +1780,6 @@ int main(int argc, char *argv[]) {
         fatal("--stop_row must be in 1..%d (rows 14-15 belong to Stage C)", MAX_DRILL_DEPTH);
     if (!(fabs(g_lambda_maha) <= 1e6)) fatal("--lambda_Mahalanobis in [-1e6,1e6]");
     if (!(fabs(g_lambda_J) <= 1e6))    fatal("--lambda_J in [-1e6,1e6]");
-    if (!(fabs(g_bonus_139) <= 1e6))   fatal("--bonus_139 in [-1e6,1e6]");
     if (!(g_gumbel_tau0 >= 0.0 && g_gumbel_tau0 <= 1e6)) fatal("--gumbel_tau0 in [0,1e6]");
     if (!(g_gumbel_tau1 >= 0.0 && g_gumbel_tau1 <= 1e6)) fatal("--gumbel_tau1 in [0,1e6]");
     if (!(g_tau_bottoms >= 0.0 && g_tau_bottoms <= 1e6)) fatal("--gumbel_tau_bottoms in [0,1e6]");
@@ -1859,9 +1822,8 @@ int main(int argc, char *argv[]) {
            g_fixed_corner_pid[2], g_fixed_corner_pid[3]);
     printf("[cfg] beam_width=%u stop_row=%u expand=%ux@row%u lambda_Maha=%.3f\n",
            g_beam_width, g_stop_row, g_beam_expand, g_beam_expand_row, g_lambda_maha);
-    printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u scan_factor=%u soft_center_139=%d bonus_139=%.3f\n",
-           g_frac_rand, g_parent_cap, g_pool_factor, g_scan_factor, g_soft_center_139?1:0,
-           g_bonus_139);
+    printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u scan_factor=%u\n",
+           g_frac_rand, g_parent_cap, g_pool_factor, g_scan_factor);
     printf("[cfg] score_model=%s lambda_J=%.3f avail_correct=%d free_demand=%d supply_check=%u"
            " gumbel_tau=%.2f->%.2f bc_window=%u,%u\n",
            g_score_model_J ? "J" : "legacy", g_lambda_J, g_avail_correct?1:0,

@@ -439,18 +439,6 @@ penalized exactly the pattern the Mahalanobis term rewards, hard infeasibility
 is already caught by the parity check, and supply health is already encoded in
 the fan-out lookahead.)
 
-**Center-139 bonus** (`--soft_center_139`, `--bonus_139`). Clue piece 139 is
-barred from rows 1-5; a board that later places it on one of the four true
-center cells carries a score flag on every subsequent row, promoting that
-lineage. The bonus is additive on a score measured in nats of log record count,
-so its value *is* a claimed factor in continuability: the historical +10
-asserted a center-139 board was worth `e^10 ~ 2.2e4` times one without, which
-no real fan-out difference can overcome, and it then persisted in every
-descendant from row 6 while the random band shut off at row 8. The default is
-now **1.0** -- roughly one standard deviation of the color term -- so it breaks
-near-ties in favour of a 139 lineage without overriding a board that is
-genuinely more continuable.
-
 ### Color-parity pruning
 
 For every inner color c, let `S = total(c) - consumed(c) - required(c)`, where
@@ -551,7 +539,6 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--lambda_J F` | 1 | weight of the J terms (1 = as derived) |
 | `--lambda_Mahalanobis F` | 0 | weight of the color-usage atypicality bonus (legacy model) |
 | `--avail_correct` | off | discount B/C fan-out by each frontier color's remaining supply |
-| `--bonus_139 F` | 1 | center-139 score bonus (was a hard-coded 10) |
 | `--no_free_demand` | -- | **disable** the free-mode demand accounting (on by default) |
 | `--supply_check R` | 0 | piece-supply certificate from row R (0 = off) |
 | `--frac_rand F` | 0.75 | random selection band (halved at R-1, zero from R) |
@@ -572,7 +559,6 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--resume` | off | continue from the sweep checkpoint |
 | `--threads N` | all | OpenMP threads |
 | `--seed S` | random | master RNG seed |
-| `--soft_center_139` | off | center-clue handling (see `--bonus_139`) |
 | `--verbose` | off | per-row `[beam]` progress lines |
 
 `--bc_window` is the one place where extra compute buys objective rather than
@@ -841,8 +827,8 @@ rows deliberately.
 The geometry is forced, not chosen: requiring each rotation to land the next
 wall on column `15-W` gives core height `16-W` and core width `16-2W` uniquely
 (check: `(16-2W)(16-W) + 2W(16-W) + 15W + W = 256`). Note that all four center
-cells lie inside the `--rounds 3` core at every W, so clue piece 139's placement
-is inherited from the input and can never be created by a strip.
+cells lie inside the `--rounds 3` core at every W, so a center clue piece's
+placement is inherited from the input and can never be created by a strip.
 
 ### --rotate: which side each round attacks
 
