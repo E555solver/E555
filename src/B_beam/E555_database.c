@@ -805,8 +805,8 @@ typedef struct {
     const uint8_t *bottoms;
     const uint64_t *forbid;
     uint16_t (*out)[CHAIN_LEN];
-    int  len, pin_idx, max_out, n;
-    uint16_t pin_ci;
+    int  len, pin_idx, pin_kind, max_out, n;
+    uint16_t pin_val;
     uint16_t cur[CHAIN_LEN];
     uint64_t seg[4];                 /* pieces used inside this segment */
 } SegWalk;
@@ -820,20 +820,22 @@ static void seg_walk(SegWalk *w, int i, int cl) {
     int b = w->bottoms[i];
     if (cl < 0 || cl >= NUM_COLORS_TOTAL || b < 0 || b >= NUM_COLORS_TOTAL) return;
 
-    if (i == w->pin_idx) {
-        const Oriented *o = &g_cat[w->pin_ci];
+    if (i == w->pin_idx && w->pin_kind == PIN_PIECE) {
+        const Oriented *o = &g_cat[w->pin_val];
         if (o->left != cl || o->bottom != b) return;      /* the cheap early kill */
         uint16_t pid = o->piece_id; uint64_t bit = piece_bit(pid);
         if (w->seg[pid >> 6] & bit) return;               /* not forbid: see header */
-        w->seg[pid >> 6] |= bit; w->cur[i] = w->pin_ci;
+        w->seg[pid >> 6] |= bit; w->cur[i] = w->pin_val;
         seg_walk(w, i + 1, o->right);
         w->seg[pid >> 6] &= ~bit;
         return;
     }
+    const bool top_pin = (i == w->pin_idx && w->pin_kind == PIN_TOPCOLOR);
     const int nb = g_lb_count[cl][b];
     for (int k = 0; k < nb && w->n < w->max_out; k++) {
         int ci = g_lb_bucket[cl][b][k];
         const Oriented *o = &g_cat[ci];
+        if (top_pin && o->top != w->pin_val) continue;
         uint16_t pid = o->piece_id; uint64_t bit = piece_bit(pid);
         if ((w->forbid[pid >> 6] | w->seg[pid >> 6]) & bit) continue;
         w->seg[pid >> 6] |= bit; w->cur[i] = (uint16_t)ci;
@@ -843,14 +845,14 @@ static void seg_walk(SegWalk *w, int i, int cl) {
 }
 
 int enumerate_pinned_segment(int la, const uint8_t bottoms[], int len,
-                             int pin_idx, uint16_t pin_ci,
+                             int pin_idx, int pin_kind, uint16_t pin_val,
                              const uint64_t forbid[4],
                              uint16_t (*out)[CHAIN_LEN], int max_out) {
     if (len < 1 || len > CHAIN_LEN || max_out <= 0) return 0;
     SegWalk w;
     w.bottoms = bottoms; w.forbid = forbid; w.out = out;
-    w.len = len; w.pin_idx = pin_idx; w.max_out = max_out; w.n = 0;
-    w.pin_ci = pin_ci;
+    w.len = len; w.pin_idx = pin_idx; w.pin_kind = pin_kind;
+    w.max_out = max_out; w.n = 0; w.pin_val = pin_val;
     w.seg[0] = w.seg[1] = w.seg[2] = w.seg[3] = 0;
     seg_walk(&w, 0, la);
     return w.n;

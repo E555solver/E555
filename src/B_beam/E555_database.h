@@ -221,9 +221,17 @@ extern int g_cat_to_lb_local[CATALOG_SIZE];
    (clue pieces are reserved in the board's used set from the start), everything
    else is tested against it. Writes up to max_out chains; returns how many.
    pin_idx < 0 enumerates unpinned, which reproduces the database cell for the
-   same key and is what the self-check compares against. */
+   same key and is what the self-check compares against.
+
+   A TOPCOLOR pin constrains what the cell shows the row ABOVE. It is how the
+   row below a clue is generated: a clue's bottom face must meet the piece
+   under it, and filtering finished children instead is not equivalent in
+   effect -- the beam keeps about one child per A record, so rejecting 98.6%
+   of them starves the row rather than reshaping it. */
+#define PIN_PIECE     0   /* pin_val = catalog index of the oriented piece   */
+#define PIN_TOPCOLOR  1   /* pin_val = the color that cell must expose UPWARD */
 int enumerate_pinned_segment(int la, const uint8_t bottoms[], int len,
-                             int pin_idx, uint16_t pin_ci,
+                             int pin_idx, int pin_kind, uint16_t pin_val,
                              const uint64_t forbid[4],
                              uint16_t (*out)[CHAIN_LEN], int max_out);
 
