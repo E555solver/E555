@@ -44,6 +44,26 @@ EXAMPLE RUNS
     python3 E555_ender.py seed_Edge5.txt board.csv out.csv \
             --holes data/holes_open_border_TBLR.csv
 
+CLUE PIECES
+
+    --clue_center and --clue_corners hold the published Eternity II hint
+    pieces at their cells and spins, so a board that arrives with its clues
+    intact does not leave with them permuted. Without them this tool treats a
+    clue like any other piece: --mode ring opens the whole border ring, and
+    the centre clue sits inside any interior break box.
+
+    Orientation is not a choice -- a solution rotated 90 degrees satisfies
+    every edge rule but moves the clues, so a board commits to one of the four
+    when its first clue is placed. --clue_orient auto (the default) reads that
+    commitment off the input board; only a board carrying no clue at all needs
+    an explicit --clue_orient 0..3.
+
+    Clues change two things beyond the pins. The pool gains the cells a
+    displaced clue needs (its target cell and the cell its piece is in now),
+    since a permutation repair cannot place a piece it has not opened; and the
+    never-worse guard becomes lexicographic, clues before breaks, because a
+    clue repair is often break-neutral and a break-only test would discard it.
+
 INPUT / OUTPUT
 
     Input : any canonical E555 board CSV; pos/rot are read from the row tail,
@@ -58,6 +78,7 @@ INPUT / OUTPUT
 from __future__ import annotations
 import argparse, csv, collections, itertools, signal, sys, threading, time
 from dataclasses import dataclass
+from pathlib import Path
 try:
     from ortools.sat.python import cp_model
 except ImportError:
@@ -86,6 +107,24 @@ CORNER_ADJACENT_INNER = frozenset({SIDE + 1, 2 * SIDE - 2,
 MAX_INNER_POOL = 60            # hard cap on interior candidate cells (model stays sane)
 LADDER_START, LADDER_STEP = 4, 4   # change-budget ladder (was --changes-start/-step)
 
+
+def load_clues():
+    """The clue table and its helpers, from tools/E555_viewer.py.
+
+    That module is the toolkit's shared Python primitives (tools/E555_rank.py
+    imports it the same way), and it holds the one copy of the Eternity II clue
+    table -- the one datum where a second, independently typed copy could put a
+    wrong piece on a board that still matches every edge. Imported lazily, so a
+    run without --clue_center / --clue_corners has no dependency on tools/ and
+    still works from a lone copy of this script.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+    try:
+        import E555_viewer
+    except ImportError:
+        sys.exit("[ERROR] --clue_* needs tools/E555_viewer.py, which holds the "
+                 "clue table; run this script from inside the E555 tree.")
+    return E555_viewer
 
 def rotate_edges(base, spin):
     return (base[(NORTH + spin) & 3], base[(EAST + spin) & 3],
@@ -185,8 +224,19 @@ def _inner_box(break_cells, reach, cap):
             if (r * SIDE + c) not in BORDER_CELLS}
     return _inner_bfs(bbox, reach, cap)
 
-def build_pool(mode, break_cells, reach, holes, placed):
-    """The set of openable, currently-placed cells for one rung."""
+def build_pool(mode, break_cells, reach, holes, placed, clue_open=()):
+    """The set of openable, currently-placed cells for one rung.
+
+    `clue_open` names cells a clue repair needs open: the cell a displaced clue
+    must end up in, and the cell its piece currently sits in. This tool is a
+    permutation repair -- the piece domains are exactly the pieces already in
+    the pool -- so a clue whose piece is outside the pool cannot be pinned at
+    all, and pinning it anyway would make the model INFEASIBLE instead of
+    merely leaving the clue unsatisfied. Only clues that are actually wrong
+    contribute cells, so a board with its clues already in place opens nothing
+    extra. This is the one thing that widens a --holes mask, and only by the
+    handful of cells the clue you asked for cannot do without.
+    """
     if holes is not None:
         pool = set(holes)
     else:
@@ -195,7 +245,28 @@ def build_pool(mode, break_cells, reach, holes, placed):
         pool = set(BORDER_CELLS) | inner
         if mode == "patch":
             pool |= CORNER_ADJACENT_INNER
+    pool |= set(clue_open)
     return {c for c in pool if c in placed}          # a closer: skip empty cells
+
+
+def clue_open_cells(CL, mask, orient, pos, rot):
+    """Cells build_pool must open so the wrong clues of `orient` can be fixed.
+
+    A clue already at its cell and spin contributes nothing: leaving it locked
+    keeps the model small and spends none of the --max-changes budget. The
+    donor cell is only offered when it is an interior cell, which it always is
+    on a well-formed board (every clue piece is an inner piece); the guard just
+    stops a malformed input from pinning an inner piece into a border
+    commodity, where the pin would be infeasible.
+    """
+    out = set()
+    for cell, piece, spin in CL.clue_list(orient, mask):
+        if pos[piece] == cell and rot[piece] == spin:
+            continue
+        out.add(cell)
+        if pos[piece] != CSV_UNPLACED and pos[piece] not in BORDER_CELLS:
+            out.add(pos[piece])
+    return out
 
 def draw_pool(free, break_cells):
     """ASCII map of the open pool, row 15 (top) first, matching the viewer."""
@@ -219,7 +290,7 @@ W_AREA = NUM_EDGES + 1                      # 481  > max perimeter (<= 480)
 W_BREAK = W_AREA * (NUM_PIECES + 1)         # dominates area*256 + perimeter
 
 def solve_stage(pos, rot, tiles, free_cells, max_changes, compact,
-                max_time, stall_time, workers, rseed, verbose):
+                max_time, stall_time, workers, rseed, verbose, pins=()):
     model = cp_model.CpModel()
     maxc = max(max(t) for t in tiles)
     piece_at = {pos[p]: p for p in range(NUM_PIECES) if pos[p] != CSV_UNPLACED}
@@ -252,6 +323,19 @@ def solve_stage(pos, rot, tiles, free_cells, max_changes, compact,
     for cls in (corner_cells, edge_cells, inner_cells):        # 3 commodities
         if len(cls) > 1:
             model.AddAllDifferent([piece_of[c] for c in cls])
+
+    # Hard clue pins. Every clue cell is an interior cell and every clue piece
+    # is an inner piece, so this only ever touches the `inner` commodity, and
+    # the AddAllDifferent above already bars a pinned piece from every other
+    # pool cell -- fixing a clue therefore costs no extra variable and leaves
+    # the objective untouched. Repairing a displaced clue does spend at least
+    # two of `max_changes` (the clue cell and its donor), so the cheapest rungs
+    # of the ladder may come back infeasible on a clue-broken board; the ladder
+    # simply climbs to a wider budget, which is the behaviour it already has
+    # for any repair too big for the current rung.
+    for cell, piece, spin in pins:
+        model.Add(piece_of[cell] == piece)
+        model.Add(rot_of[cell] == spin)
 
     # change budget: at most `max_changes` cells differ from the incumbent
     kept = []
@@ -382,17 +466,29 @@ def make_ladder(reach, cmax):
     return rungs
 
 def solve_board(mode, partial, tiles, ladder, reach, holes,
-                max_time, stall_time, workers, base_seed, verbose):
+                max_time, stall_time, workers, base_seed, verbose,
+                CL=None, clue_mask=None, orient=None):
     pos, rot = list(partial.pos), list(partial.rot)
     placed = {pos[p] for p in range(NUM_PIECES) if pos[p] != CSV_UNPLACED}
     breaks = len(broken_junctions(pos, rot, tiles))
-    if breaks == 0:
+    clues_on = clue_mask and orient is not None
+
+    def clue_hits(p, r):
+        """Enabled clues of `orient` sitting at their cell and spin."""
+        if not clues_on:
+            return 0
+        return sum(1 for cell, piece, spin in CL.clue_list(orient, clue_mask)
+                   if p[piece] == cell and r[piece] == spin)
+
+    # A break-free board is still work if a clue is displaced and reachable.
+    if breaks == 0 and not (clues_on and clue_open_cells(CL, clue_mask, orient, pos, rot)):
         return pos, rot, 0, "input-solved", "-", 0.0
 
     # reachability check at the widest opening: a break with BOTH endpoints
     # outside the max pool cannot be healed here.
     bc0 = break_cells_of(pos, rot, tiles)
-    free_max = build_pool(mode, bc0, reach, holes, placed)
+    free_max = build_pool(mode, bc0, reach, holes, placed,
+                          clue_open_cells(CL, clue_mask, orient, pos, rot) if clues_on else ())
     unreachable = sum(1 for a, b in broken_junctions(pos, rot, tiles)
                       if a not in free_max and b not in free_max)
     if unreachable:
@@ -404,20 +500,37 @@ def solve_board(mode, partial, tiles, ladder, reach, holes,
         if _STOP:
             reason = "interrupted"; break
         bc = break_cells_of(pos, rot, tiles)               # re-centre on current breaks
-        free = build_pool(mode, bc, r, holes, placed)
+        # Both the pool and the pins are rebuilt every rung: the board changes
+        # under us, so a clue fixed by an earlier rung stops asking for cells.
+        pins = ()
+        if clues_on:
+            free = build_pool(mode, bc, r, holes, placed,
+                              clue_open_cells(CL, clue_mask, orient, pos, rot))
+            pins, locked_ok, skipped = CL.clue_pins(pos, rot, free, orient,
+                                                    clue_mask, unplaced_ok=False)
+            note = "; ".join(why for _c, _p, _s, why in skipped)
+            print(f"      [clue] orient={orient} | pin {len(pins)} | "
+                  f"locked-ok {locked_ok} | skip {len(skipped)}"
+                  + (f" ({note})" if note else ""), flush=True)
+        else:
+            free = build_pool(mode, bc, r, holes, placed)
         if verbose:
             draw_pool(free, bc)
         npos, nrot, nb, rsn, sec = solve_stage(
             pos, rot, tiles, free, m, mode == "patch",
-            max_time, stall_time, workers, base_seed + k, verbose)
+            max_time, stall_time, workers, base_seed + k, verbose, pins)
         total_t += sec
         tag = "   *** SOLVED 480/480 ***" if nb == 0 else ""
         print(f"      [r{r} m{m:<2}] {breaks:>3} -> {nb:>3} | {rsn:<8} | "
               f"{sec:5.1f}s | pool={len(free)}{tag}", flush=True)
-        if nb < breaks:
+        # Never-worse guard. With clues on this is lexicographic -- clues first,
+        # then breaks -- because a clue repair is usually break-neutral or
+        # slightly break-costly, and a plain `nb < breaks` test would throw the
+        # repaired board away and keep the one with the clue in the wrong place.
+        if (clue_hits(npos, nrot), -nb) > (clue_hits(pos, rot), -breaks):
             pos, rot, breaks = npos, nrot, nb
         stage_tag = f"r{r}m{m}"
-        if breaks == 0:
+        if breaks == 0 and not (clues_on and clue_open_cells(CL, clue_mask, orient, pos, rot)):
             reason = "solved"; break
         reason = rsn
     return pos, rot, breaks, reason, stage_tag, total_t
@@ -448,6 +561,14 @@ def main():
     ap.add_argument("--count", type=int, default=1000000,
                     help="how many rows to process; with --row, splits a board "
                          "list across array tasks")
+    ap.add_argument("--clue_center", action="store_true",
+                    help="Hold piece 138 at the board's centre clue cell and spin.")
+    ap.add_argument("--clue_corners", action="store_true",
+                    help="Hold the four corner clues at their cells and spins.")
+    ap.add_argument("--clue_orient", default="auto",
+                    choices=("auto", "0", "1", "2", "3"),
+                    help="Which of the four board orientations the clues follow; "
+                         "auto (default) reads it off each input board.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -460,6 +581,11 @@ def main():
     # With a fixed hole mask the pool does not grow with reach, so climb the
     # change-budget only (reach fixed at 1).
     ladder = make_ladder(1 if holes is not None else args.reach, args.max_changes)
+    CL = clue_mask = None
+    if args.clue_center or args.clue_corners:
+        CL = load_clues()
+        clue_mask = ((CL.CLUE_CENTER if args.clue_center else 0)
+                     | (CL.CLUE_CORNERS if args.clue_corners else 0))
     tiles = read_seed(args.seed)
     signal.signal(signal.SIGINT, _request_stop)
 
@@ -488,9 +614,21 @@ def main():
             bin_ = len(broken_junctions(partial.pos, partial.rot, tiles))
             print(f"\n[{i}] {partial.config_id} | input breaks {bin_}", flush=True)
 
+            orient = None
+            if clue_mask:
+                if args.clue_orient == "auto":
+                    orient, _n = CL.clue_orient(partial.pos, partial.rot, clue_mask)
+                else:
+                    orient = int(args.clue_orient)
+                if orient is None:
+                    print("      [WARN] board carries no clue: cannot tell which "
+                          "orientation to impose; pass --clue_orient 0..3. "
+                          "Solving this board unpinned.", flush=True)
+
             pos, rot, breaks, reason, stage, sec = solve_board(
                 args.mode, partial, tiles, ladder, args.reach, holes,
-                args.max_time, args.stall_time, args.workers, args.rng_seed, args.verbose)
+                args.max_time, args.stall_time, args.workers, args.rng_seed, args.verbose,
+                CL, clue_mask, orient)
 
             score = NUM_EDGES - breaks
             out_row = [partial.config_id, str(score)] + [str(x) for x in pos] + [str(x) for x in rot]

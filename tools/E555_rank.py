@@ -47,6 +47,12 @@ THE MEASURES  (a "break" is an internal junction whose two cells disagree;
                 the break count. Fine-grained, so it breaks ties that the
                 integer measures leave. Lower is better.
 
+    clues       how many of the five Eternity II clue pieces sit at their
+                published cell and spin, 0..5, for whichever of the four
+                board orientations the board matches. Higher is better. A
+                board that never carried clues reads 0; one from a clued
+                beam run reads 5 until some later stage moves a clue piece.
+
 CANONICAL OUTPUT  (--emit --rescore)
 
     Field 2 of a board row is NOT reliably the score. Stage B writes its
@@ -227,22 +233,30 @@ def measure(pos, rot, seed):
     else:
         span = "-"
 
+    # How many of the five Eternity II clue pieces sit at their published cell
+    # and spin, for whichever orientation the board matches. Always measured --
+    # it needs no flag, and a board that never had clues simply reads 0. Stage C
+    # can move clue pieces unless told not to, so this is what says whether a
+    # candidate still qualifies as a clue-satisfying solution.
+    _clue_o, n_clues = V.clue_orient(pos, rot)
+
     return dict(breaks=breaks, score=N_EDGES - breaks, solid=solid,
                 placed=len(colors), border=border,
                 break_rows=len(rows), break_cols=len(cols),
                 span=span, clean_b=clean_b, clean_t=clean_t,
-                clean_l=clean_l, clean_r=clean_r, corner_d=corner_d)
+                clean_l=clean_l, clean_r=clean_r, corner_d=corner_d,
+                clues=n_clues)
 
 
 # Printed left to right in this order; `span` is text, the rest are integers.
 COLUMNS = ("breaks", "score", "solid", "placed", "border", "break_rows",
            "break_cols", "span", "clean_b", "clean_t", "clean_l", "clean_r",
-           "corner_d")
+           "corner_d", "clues")
 
 # Which way is "better" for each measure. Sorting is always best-first, so
 # --sort solid puts the most solid board on top without any extra syntax; a
 # '-' prefix (--sort=-solid) asks for worst-first instead.
-HIGH_IS_BETTER = {"score", "solid", "placed", "border",
+HIGH_IS_BETTER = {"score", "solid", "placed", "border", "clues",
                   "clean_b", "clean_t", "clean_l", "clean_r"}
 SORTABLE = tuple(k for k in COLUMNS if k != "span")
 
@@ -427,7 +441,7 @@ def main():
           f"{b['break_cols']} col(s), span {b['span']}, solid {b['solid']}/256, "
           f"clean rows {b['clean_b']} from the bottom, {b['clean_t']} from the top")
     print("[note] lower is better: breaks break_rows break_cols corner_d   |   "
-          "higher is better: score solid placed border clean_*")
+          "higher is better: score solid placed border clues clean_*")
 
     if args.emit:
         write_emit(args.emit, shown, args.rescore)

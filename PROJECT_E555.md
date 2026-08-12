@@ -486,8 +486,33 @@ corners were pinned, and a hole-free Stage C solve has to build around them.
 There is no orientation to choose: the board committed to one when it placed its
 row-2 corners. Isolated cells touch no placed neighbour, so no adjacency is
 asserted and the edge score is unchanged (verified: 294/480 with and without
-them). Stage C is free to unplace them -- the finalizer frees everything above
-`--finalize_from`, and the roundhouse frees its top band.
+them). The finalizer and the roundhouse are still free to unplace them -- the
+finalizer frees everything above `--finalize_from`, and the roundhouse frees its
+top band -- but the two CP-SAT tools of Stage C are not, see below.
+
+**Stage C holds the clues too.** `E555_topper.py` and `E555_ender.py` take the
+same two flags, and without them they treat a clue like any other piece: the
+topper's `--side T --work-rows 4` band covers rows 12..15, exactly where the two
+row-13 clues sit, and the ender's `--mode ring` opens the whole border with the
+centre clue inside any interior break box. Measured on 40 clued row-11 partials,
+a single default topper pass drops every board from 5/5 clues to 3/5; with
+`--clue_center --clue_corners` all 40 keep 5/5.
+
+Three differences from the beamer are worth knowing. **All four corner clues are
+enforceable here**, not just the two on row 2, because Stage C sees the whole
+board -- this is the only place entries 3..4 of the table are ever constrained.
+**Orientation is inherited, never chosen**: `--clue_orient auto` (the default)
+reads off the input board which of the four orientations it committed to, and
+only a board carrying no clue at all needs an explicit `--clue_orient 0..3`
+(measured unambiguous -- each of 329 clued boards matched exactly one
+orientation, never two). And **a clue the open region cannot reach is reported
+and skipped**, not an error: an early window of a sliding-window sweep
+legitimately cannot touch the far side of the board.
+
+The clue table itself lives once, in `tools/E555_viewer.py`, transcribed
+verbatim from `g_clue` in `E555_database.c` -- the row/column and spin
+conventions are identical, so no conversion is involved. `tools/E555_rank.py`
+reads it for its `clues` column.
 
 **The database.** Clue pieces are barred from the chain database
 (`g_db_exclude`), so no chain can hold one; the pinned walk places them
@@ -1140,7 +1165,17 @@ duplicates, and the run summary says how often that happened: on a tight band
 the default `--beam_slack 1` often admits nothing at all (on
 `data/board_example_462.csv` with a 2-row band, the nearest distinct board
 costs 5 more breaks), so widen it when you want a genuinely wide beam. `--verbose` prints an ASCII map of the open band, and
-boards with nothing broken or empty inside the band skip the solver entirely.
+boards with nothing broken or empty inside the band skip the solver entirely
+(unless a clue inside the band is displaced, which is work whether or not the
+band holds a break).
+
+**`--clue_center` / `--clue_corners` / `--clue_orient`** hold the Eternity II
+hint pieces in place; see the clue section above for what they cover and why
+orientation is read off the board rather than chosen. Each pinned clue is two
+`Add` constraints on cells the model already has, so nothing about the
+objective, the break count or the corner pull changes. One consequence worth
+knowing: a pinned cell can never differ between beam ranks, so with clues on
+`--beam_diff` is effectively measured over the unpinned cells.
 
 Three drivers ship with it, in increasing depth and cost:
 
@@ -1240,6 +1275,18 @@ break can cascade all the way around the frame -- and the corners' three-way
 commodity symmetry falls out of the per-class `AddAllDifferent` for free.
 `--verbose` prints an ASCII map of the open pool per rung.
 
+It takes the same **`--clue_center` / `--clue_corners` / `--clue_orient`** as the
+topper, with two extras this tool needs. Its piece domains are exactly the
+pieces already in the pool -- it is a permutation repair, not a filler -- so a
+displaced clue also opens the cell its piece currently sits in, or the pin would
+be infeasible rather than merely unsatisfied; a clue already in place opens
+nothing. And its never-worse guard becomes lexicographic, clues before breaks,
+because a clue repair is often break-neutral and a break-only test would discard
+the repaired board. Both are recomputed per rung, so a clue fixed on one rung
+stops asking for cells on the next. Repairing a clue spends at least two of
+`--max-changes` (its cell and its donor), so the cheapest rungs of the ladder may
+come back infeasible on a clue-broken board and the ladder simply climbs.
+
 ---
 
 ## Tools
@@ -1247,7 +1294,10 @@ commodity symmetry falls out of the per-class `AddAllDifferent` for free.
 - **`tools/E555_viewer.py`** -- ASCII board (`#` marks broken junctions),
   placement/edge/solid statistics, frame-violation check, e2.bucas.name URL;
   `--diff A B` overlays two rows of a CSV. `--seed PATH` (defaults to
-  `./seed_Edge5.txt`, then the repo's `data/` copy).
+  `./seed_Edge5.txt`, then the repo's `data/` copy). It is also the toolkit's
+  shared Python module: `E555_rank.py` and the two Stage C CP-SAT tools import
+  it, and it holds the single copy of the Eternity II clue table
+  (`CLUE`, `clue_list`, `clue_orient`, `clue_pins`).
 - **`tools/E555_rank.py`** -- ranks and sorts board CSVs by what the score
   cannot see. Eighteen breaks spread over seven rows is a mess; the same
   eighteen packed into rows 14-15 is nearly finished. Per board it derives
@@ -1255,9 +1305,12 @@ commodity symmetry falls out of the per-class `AddAllDifferent` for free.
   `break_cols` (how many distinct lines hold a break -- the compactness
   measure), `span` (their bounding box), `clean_b/t/l/r` (contiguous
   break-free rows or columns from each border; `clean_b` is the old
-  "completed rows"), and `corner_d` (the distance the breaks still have to
+  "completed rows"), `corner_d` (the distance the breaks still have to
   travel to their nearest corner -- the quantity `E555_topper` minimizes
-  after the break count, and a good tie-breaker). `--sort` takes any of them,
+  after the break count, and a good tie-breaker), and `clues` (how many of the
+  five Eternity II clue pieces still sit at their published cell and spin,
+  0..5, for whichever orientation the board matches -- always measured, no flag,
+  and 0 for a board that never carried clues). `--sort` takes any of them,
   best board first, several files at once; `--emit` re-orders the input rows
   verbatim, so the canonical format never changes and old files rank fine.
   `--emit FILE --rescore` instead rewrites every row canonically

@@ -110,6 +110,97 @@ def rotate_edges(edges, spin):
     return tuple(edges[(d + spin) & 3] for d in range(4))
 
 
+# -- Eternity II clue pieces -------------------------------------------------
+#
+# The five published hint pieces, in this toolkit's numbering (our_id =
+# classic - 1), as {row, col, piece, spin} with rows counted bottom-up and
+# spins counter-clockwise -- copied verbatim from g_clue[4][CLUE_N] in
+# src/B_beam/E555_database.c, which is the single source of truth. No
+# conversion is needed: rotate_edges() above is the same formula the beamer
+# uses, and cell = row*SIDE + col is shared across the toolkit.
+#
+# A solution rotated 90 degrees still satisfies every edge rule but moves the
+# clues, so the clue-satisfying solution set is NOT rotation-closed and all
+# four orientations are legitimate. Index 0 is the centre clue; 1..4 are the
+# corner clues. A bottom-up beam can only ever reach entries 1..2 (row 2) --
+# entries 3..4 land on row 13, above any legal stop row, so Stage C is the
+# first place they can be enforced rather than merely reserved.
+CLUE = (
+    ((7, 7, 138, 0), (2, 2, 180, 0), (2, 13, 248, 3), (13, 2, 207, 3), (13, 13, 254, 1)),
+    ((8, 7, 138, 3), (2, 2, 248, 2), (2, 13, 254, 0), (13, 2, 180, 3), (13, 13, 207, 2)),
+    ((8, 8, 138, 2), (2, 2, 254, 3), (2, 13, 207, 1), (13, 2, 248, 1), (13, 13, 180, 2)),
+    ((7, 8, 138, 1), (2, 2, 207, 0), (2, 13, 180, 1), (13, 2, 254, 2), (13, 13, 248, 0)),
+)
+
+CLUE_CENTER = 0x1        # entry 0            (same bit values as E555_database.h)
+CLUE_CORNERS = 0x2       # entries 1..4
+CLUE_ALL = CLUE_CENTER | CLUE_CORNERS
+
+
+def clue_list(orient, mask=CLUE_ALL):
+    """The enabled clues of one orientation, as (cell, piece, spin) triples."""
+    return [(r * SIDE + c, p, s)
+            for k, (r, c, p, s) in enumerate(CLUE[orient])
+            if mask & (CLUE_CENTER if k == 0 else CLUE_CORNERS)]
+
+
+def clue_orient(pos, rot, mask=CLUE_ALL):
+    """(orientation, n_satisfied) for the orientation the board best matches.
+
+    Returns (None, 0) when the board satisfies no enabled clue at all, which is
+    the one case a caller cannot resolve on its own: an unclued board is
+    equally compatible with all four orientations, so the choice has to come
+    from the user. Ties above zero are broken toward the lower orientation;
+    they do not arise on real boards -- every one of the 271 clued boards
+    measured so far matched exactly one orientation.
+    """
+    best, best_n = None, 0
+    for o in range(4):
+        n = sum(1 for cell, p, s in clue_list(o, mask)
+                if pos[p] == cell and rot[p] == s)
+        if n > best_n:
+            best, best_n = o, n
+    return best, best_n
+
+
+def clue_pins(pos, rot, free, orient, mask=CLUE_ALL, unplaced_ok=True):
+    """Split the enabled clues of `orient` into what an open region can enforce.
+
+    `free` is the set of cells a solver may write. Returns
+    (pins, locked_ok, skipped): `pins` are (cell, piece, spin) triples to
+    constrain, `locked_ok` counts clues already correct outside the open region
+    and needing nothing, and `skipped` is (cell, piece, spin, why) for clues
+    this region cannot reach.
+
+    A pin is emitted only when BOTH the cell and the piece are inside the open
+    region, because the Stage C solvers build their piece domains from the
+    pieces currently in that region: pinning a piece that is locked elsewhere
+    yields an INFEASIBLE model rather than an unsatisfied clue. Pass
+    unplaced_ok=False for a solver whose domains come only from placed pieces
+    (E555_ender.py, a closer), True for one that also re-uses lifted pieces
+    (E555_topper.py).
+    """
+    pins, locked_ok, skipped = [], 0, []
+    for cell, piece, spin in clue_list(orient, mask):
+        at = pos[piece]
+        if cell not in free:
+            if at == cell and rot[piece] == spin:
+                locked_ok += 1
+            else:
+                skipped.append((cell, piece, spin, f"cell {cell} locked"))
+        elif at == UNPLACED:
+            if unplaced_ok:
+                pins.append((cell, piece, spin))
+            else:
+                skipped.append((cell, piece, spin, f"piece {piece} unplaced"))
+        elif at not in free:
+            skipped.append((cell, piece, spin,
+                            f"piece {piece} locked at cell {at}"))
+        else:
+            pins.append((cell, piece, spin))
+    return pins, locked_ok, skipped
+
+
 # -- CSV reading (positions/rotations anchored at the end of the row) ---------
 
 def parse_row(fields):
