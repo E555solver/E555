@@ -117,6 +117,9 @@ BEAM="${BEAM:-1}"                 # --report_best per board
 BEAM_DIFF="${BEAM_DIFF:-4}"       # cells by which beam ranks must differ
 BEAM_SLACK="${BEAM_SLACK:-1}"     # extra breaks a lower rank may cost
 EXTRA="${EXTRA:-}"                # appended to every topper call, e.g. --verbose
+CLUES="${CLUES:-0}"               # 1 = hold the Eternity II clue pieces in place
+
+CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 # -----------------------------------------------------------------------------
 
 case "$PRESET" in
@@ -164,7 +167,7 @@ run_pass() {  # side window locked
         --side "$side" --work-rows "$window" --unused_rows "$locked" \
         --workers "$WORKERS" --max-time "$MAX_TIME" --stall-time "$STALL_TIME" \
         --report_best "$BEAM" --beam_diff "$BEAM_DIFF" --beam_slack "$BEAM_SLACK" \
-        "${slice[@]}" $EXTRA | tee "$OUT_DIR/${TAG}_p${STEP}.log"
+        "${CLUE_ARG[@]}" "${slice[@]}" $EXTRA | tee "$OUT_DIR/${TAG}_p${STEP}.log"
     CUR="$out"
 
     # A board the topper calls "clean" had no break in the open band; one it

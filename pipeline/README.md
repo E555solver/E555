@@ -108,6 +108,40 @@ folded into three. The L-shaped bands are *worse* here -- `TL` at 4 deep opens
 ~112 cells, CP-SAT does not converge, and the same board came out at 49 breaks.
 Open one side.
 
+## Fixing the Eternity II clue pieces
+
+All four runners take **`CLUES=1`**, which passes `--clue_center --clue_corners`
+to every stage that supports them. It is off by default and changes nothing when
+unset.
+
+```bash
+CLUES=1 bash pipeline/run_pipeline_random.sh
+CLUES=1 INPUT=board.csv PRESET=window bash pipeline/topper_sweep.sh
+```
+
+It is one switch per run, not per stage, on purpose: a clue held by the beamer
+and then dropped by the finalizer is no better than never holding it, and that
+is exactly what happened before -- `FIN_FROM` is `BEAM_STOP_ROW - 5`, so the
+finalizer frees the centre clue's row on every run. The farm passes `CLUES`
+down to the production pipeline it drives.
+
+Two consequences worth knowing:
+
+* **The chain database differs.** A clued run excludes the clue pieces from the
+  chains, so its cache is not interchangeable with a normal one -- the beamer
+  refuses a cache whose exclusion set does not match. The runners therefore use
+  `$DB_FILE.clue` when `CLUES=1`, so the two coexist and neither is rebuilt on
+  every toggle.
+* **The backtracker stage is not clue-aware.** It only moves pieces in cells
+  named by `$HOLES`, but the shipped masks do free clue cells
+  (`holes_open_border_TR.csv`, the default, frees the one at row 13 col 13), so
+  the last stage can still displace a clue. Check with the ranker's `clues`
+  column, which counts how many of the five a board still holds:
+
+```bash
+python3 tools/E555_rank.py pipeline_out/FINAL_best.csv --sort clues,score --no-id
+```
+
 ## Reading the output
 
 Every stage writes the same canonical CSV, so any file here can be fed back into

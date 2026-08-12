@@ -56,6 +56,12 @@ PASS_CPSAT="${PASS_CPSAT:-45}"
 # iteration spends 2-3 minutes rebuilding the same 6.4 GB. Needs ~6.5 GB free
 # disk. Set DB_FILE= (empty) to disable.
 DB_FILE="${DB_FILE:-$FARM_DIR/chain.db}"
+CLUES="${CLUES:-0}"                     # 1 = hold the Eternity II clue pieces in
+                                        # place. Passed straight down to the
+                                        # production pipeline, which also derives
+                                        # the matching chain-database filename.
+
+CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 # -----------------------------------------------------------------------------
 
 mkdir -p "$FARM_DIR/records"
@@ -112,7 +118,7 @@ while true; do
             --finalize_from 7 --finalize_repeats 3 --stop_row 12 \
             --beam_width 150000 --top_columns 0 --lambda_Mahalanobis 10 \
             --border_row_N "$RESAMPLE_TOP" --incomplete_top \
-            --max_wall_sec "$PASS_FIN_WALL" 2>/dev/null
+            --max_wall_sec "$PASS_FIN_WALL" "${CLUE_ARG[@]}" 2>/dev/null
 
         # Rotate and refill a border strip. Alternate the direction between
         # phases so the retained core -- the one region a strip never touches --
@@ -121,14 +127,14 @@ while true; do
         "$REPO/bin/E555_roundhouse" "$SEED" "$RUN/in.csv" \
             --out_dir "$RUN/rh" --threads "$THREADS" \
             --rounds 1 --strip_width 5 --rotate "$ROT" \
-            --border_row_N "$RESAMPLE_TOP" --max_wall_sec 300 2>/dev/null
+            --border_row_N "$RESAMPLE_TOP" --max_wall_sec 300 "${CLUE_ARG[@]}" 2>/dev/null
 
         harvest "$RUN"/fin/*.csv "$RUN"/rh/*.csv
     else
         # ---------------- production phase: a whole new board ----------------
         echo
         echo "=== iteration $ITER: PRODUCE a new board ==="
-        RUN_DIR="$RUN" THREADS="$THREADS" SEED="$SEED" DB_FILE="$DB_FILE" \
+        RUN_DIR="$RUN" THREADS="$THREADS" SEED="$SEED" DB_FILE="$DB_FILE" CLUES="$CLUES" \
         RNG_SEED="$(( (RANDOM << 15) + RANDOM + ITER ))" \
         BEAM_WALL="$PASS_BEAM_WALL" FIN_WALL="$PASS_FIN_WALL" \
         CPSAT_TIME="$PASS_CPSAT" CPSAT_STALL="$(( PASS_CPSAT / 3 ))" \
