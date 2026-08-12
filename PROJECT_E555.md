@@ -486,11 +486,28 @@ corners were pinned, and a hole-free Stage C solve has to build around them.
 There is no orientation to choose: the board committed to one when it placed its
 row-2 corners. Isolated cells touch no placed neighbour, so no adjacency is
 asserted and the edge score is unchanged (verified: 294/480 with and without
-them). The finalizer and the roundhouse are still free to unplace them -- the
-finalizer frees everything above `--finalize_from`, and the roundhouse frees its
-top band -- but the two CP-SAT tools of Stage C are not, see below.
+them).
 
-**Stage C holds the clues too.** `E555_topper.py` and `E555_ender.py` take the
+**Every later stage can hold them too.** `E555_finalizer`, `E555_roundhouse`,
+`E555_topper.py` and `E555_ender.py` all take the same two flags, all default
+off, and each holds what its own geometry lets it hold:
+
+| tool | what it can hold | what it cannot |
+|---|---|---|
+| finalizer | the centre clue and any clue on a searched row, by pinning it during generation | the row-13 pair: reserved and attached, so row 13 must not be searched |
+| roundhouse | the four corner clues, by filtering the strip records that would misplace them | nothing -- the centre never leaves the core, so `--clue_center` only verifies it |
+| topper / ender | every clue its open region reaches, including all four corners | a clue outside the window, reported and skipped |
+
+The finalizer is the one that mattered most: the shipped pipelines run it at
+`--finalize_from = BEAM_STOP - 5` (6 at the default stop row 11), which frees
+rows 7 and 8 and so the centre clue's cell. Measured on the delivered clued
+boards at that exact setting, a run without the flags kept **2/5 clues on 2146
+boards and 3/5 on 226** -- never 5 -- while the same run with them kept **5/5 on
+all 222** it emitted. The roundhouse is as stark: a `--rounds 3 --strip_width 5`
+cut with `--max_breaks` returns complete boards holding **1/5** clues without the
+flags (only the centre, which it never frees) and **5/5** with them.
+
+**How Stage C holds them.** `E555_topper.py` and `E555_ender.py` take the
 same two flags, and without them they treat a clue like any other piece: the
 topper's `--side T --work-rows 4` band covers rows 12..15, exactly where the two
 row-13 clues sit, and the ender's `--mode ring` opens the whole border with the
@@ -699,7 +716,33 @@ outright: with half the board locked the chain DFS shrinks super-exponentially
 (a `finalize_from 10` database builds in ~2 s -- 5.5 M records vs 3.1 G) and
 contains no chain that could be rejected for reusing a locked piece. That is
 what makes rows 11-14 searchable at full width, in trivial memory, with no
-disk cache. Consecutive lines sharing a locked set skip the rebuild.
+disk cache. Consecutive lines sharing a locked set skip the rebuild -- with
+clues on, the reuse key is the locked set *plus the clue pieces*, since two
+partials can share a locked region and still owe different ones.
+
+**`--clue_center` / `--clue_corners`.** Both default off; with neither, this
+program behaves exactly as before. They matter here more than anywhere else in
+the pipeline, because the shipped `--finalize_from = BEAM_STOP - 5` frees the
+centre clue's row and the search then quietly refills that cell with something
+else (measured above: never 5/5 without the flags, always 5/5 with them).
+
+Unlike the beamer, which explores all four orientations at once and pays for it
+with orientation bits in the beam entry, a term in the frontier signature and a
+reserve pass in selection, the finalizer is always handed a board that already
+committed to one. It reads that orientation off the input line -- so none of
+that machinery exists here -- and folds it into the input-dedup hash, because
+everything freed above the lock collapses to one bucket there and two lines
+differing only in orientation would otherwise merge.
+
+A clue on a searched row is pinned during generation, via the same
+`enumerate_pinned_segment` walk the beamer uses; a clue on the row *above* a
+searched row pins a colour there instead, because a clue's bottom face has to
+meet whatever sits under it. Rows below the lock are checked, not searched: a
+partial whose locked region already contradicts a clue is skipped with the
+reason, since no row above it could repair the board. The row-13 pair is
+reserved and attached to the emitted board exactly as in the beamer, which is
+why row 13 must not be searched -- `--stop_row <= 12`, or `--finalize_from >= 13`
+so the row is locked with its clues already on it.
 
 **Side modes.** Without `--free_edges`, the partial's border placement is used
 as a fixed assignment (requires all 60 border pieces in the line; otherwise
@@ -917,6 +960,20 @@ wall on column `15-W` gives core height `16-W` and core width `16-2W` uniquely
 (check: `(16-2W)(16-W) + 2W(16-W) + 15W + W = 256`). Note that all four center
 cells lie inside the `--rounds 3` core at every W, so a center clue piece's
 placement is inherited from the input and can never be created by a strip.
+
+**`--clue_center` / `--clue_corners`** follow from exactly that. The centre is in
+the core at every width and round count, so `--clue_center` here can only verify
+it -- a board whose core contradicts a clue is skipped, since no strip could
+repair it. The four corner clues at (2,2) (2,13) (13,2) (13,13) *are* freed, and
+those the flags hold. Enforcement is a filter inside `strip_dfs`'s record loop,
+not a pinned enumerator: this search is exhaustive and has no beam to starve, so
+rejecting a record at the level its clue sits on simply prunes the subtree, and
+the "clue's bottom must meet the piece below" condition is already guaranteed by
+`rh_decode` matching every record against the level below. A second guard bars a
+clue piece from any cell but its own, so round 1 cannot spend a piece round 3
+still needs. `--max_breaks` respects both, or the dive would scatter the clues
+the proof engine just held. The oracle stays deliberately clue-blind: it solves
+the colour-only relaxation, and ignoring pins keeps it admissible.
 
 ### --rotate: which side each round attacks
 
