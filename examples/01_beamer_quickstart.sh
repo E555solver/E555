@@ -43,6 +43,8 @@ OUT_DIR="${OUT_DIR:-beam_out}"
 BEAM_WIDTH="${BEAM_WIDTH:-50000}"   # boards kept per row. Production: 262144
 STOP_ROW="${STOP_ROW:-10}"          # last row filled. Higher = harder = slower
 MAX_WALL="${MAX_WALL:-0}"           # seconds for the whole run, 0 = unlimited
+CLUES="${CLUES:-0}"                # 1 = hold the published Eternity II clue
+                                  # pieces on their cells and spins
 
 ANNEAL="${ANNEAL:-0}"               # 1 = anneal the borders first (Stage A)
 N_BOTTOMS="${N_BOTTOMS:-2}"         # bottom rows tried per border
@@ -81,7 +83,9 @@ else
     RESULT="$OUT_DIR/beam_completions_random_$STOP_ROW.csv"
 fi
 
-"$REPO/bin/E555_beamer" "$SEED" "${BORDERS[@]}" \
+CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
+
+"$REPO/bin/E555_beamer" "$SEED" "${BORDERS[@]}" "${CLUE_ARG[@]}" \
     --beam_width "$BEAM_WIDTH" \
     --stop_row "$STOP_ROW" \
     --lambda_Mahalanobis 8 \
