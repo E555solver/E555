@@ -55,6 +55,7 @@ int g_cat_to_local[CATALOG_SIZE];
 
 int g_lb_bucket[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL][MAX_LB_BUCKET];
 int g_lb_count[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL];
+uint32_t g_lb_step[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL][MAX_LB_BUCKET];
 int g_cat_to_lb_local[CATALOG_SIZE];
 int g_lb_bits = 0, g_term_bits = 0;
 int g_rec_bytes_inner = 0, g_rec_bytes_edge = 0;
@@ -270,6 +271,30 @@ void build_catalog_indices(void) {
     if (CHAIN_LEN * g_lb_bits > 32)
         fatal("inner record needs %d bits (>32); widen rec_load/store to 64-bit", CHAIN_LEN * g_lb_bits);
     g_rec_bytes_inner = (CHAIN_LEN * g_lb_bits + 7) / 8;
+
+    /* Flatten the buckets for the chain walk. A record's per-piece field is
+       g_lb_bits wide, so decode_inner_chain indexes the table with values up to
+       (1 << g_lb_bits) - 1 and does no bounds test of its own: that is safe only
+       while the field cannot outrun the table, which is checked here once. It
+       holds for every seed (bits_for caps at 6 for a 64-slot bucket) and would
+       only break if MAX_LB_BUCKET were raised to a non-power of two. */
+    if ((1 << g_lb_bits) > MAX_LB_BUCKET)
+        fatal("g_lb_bits=%d indexes %d slots but MAX_LB_BUCKET is %d; raise it to a power of two",
+              g_lb_bits, 1 << g_lb_bits, MAX_LB_BUCKET);
+    for (int L = 0; L < NUM_COLORS_TOTAL; L++)
+        for (int B = 0; B < NUM_COLORS_TOTAL; B++)
+            for (int k = 0; k < MAX_LB_BUCKET; k++) {
+                if (k >= g_lb_count[L][B]) { g_lb_step[L][B][k] = LBSTEP_DEAD; continue; }
+                int ci = g_lb_bucket[L][B][k];
+                const Oriented *o = &g_cat[ci];
+                if (ci > 0x3FF || o->right > 0x1F || o->piece_id > 0x1FF)
+                    fatal("g_lb_step packing overflow: ci=%d right=%u piece=%u",
+                          ci, o->right, o->piece_id);
+                g_lb_step[L][B][k] = (uint32_t)ci
+                                   | ((uint32_t)o->right    << 10)
+                                   | ((uint32_t)o->piece_id << 15);
+            }
+
     if (g_verbose) {
         printf("[init] catalog=%d  max(left,bottom) bucket=%d -> g_lb_bits=%d  inner record=%d B\n",
                g_cat_count, maxlb, g_lb_bits, g_rec_bytes_inner);

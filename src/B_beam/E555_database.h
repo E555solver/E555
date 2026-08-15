@@ -213,6 +213,24 @@ extern int g_lb_bucket[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL][MAX_LB_BUCKET];
 extern int g_lb_count[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL];
 extern int g_cat_to_lb_local[CATALOG_SIZE];
 
+/* The same buckets, flattened for the chain walk. Walking a chain asked three
+   questions per piece -- is this index inside the bucket (g_lb_count), which
+   catalog entry is it (g_lb_bucket), what are that piece's id and right color
+   (g_cat) -- and answered them with three dependent loads. Every answer is
+   fixed once the catalog is built, so they are packed into one word per
+   (left, bottom, index): the walk becomes a single load.
+
+   A slot past the end of its bucket carries DEAD, so "index out of range" is
+   the same test as "piece already used" and the bounds check disappears too.
+   Records decoded against a cell key they were not built for is exactly how
+   that arises, which is why the case is kept rather than assumed away.
+   23 x 23 x 64 x 4 B = 135 KB, built once by build_catalog_indices(). */
+#define LBSTEP_DEAD     0x80000000u
+#define LBSTEP_CI(s)    ((int)((s) & 0x3FFu))          /* catalog index, < 1024 */
+#define LBSTEP_RIGHT(s) ((int)(((s) >> 10) & 0x1Fu))   /* right color, < 32     */
+#define LBSTEP_PID(s)   ((uint16_t)(((s) >> 15) & 0x1FFu))  /* piece id, < 512  */
+extern uint32_t g_lb_step[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL][MAX_LB_BUCKET];
+
 /* Enumerate conflict-free chains of `len` oriented inner pieces: left neighbour
    exposes `la`, piece i presents bottoms[i] downward, and when pin_idx >= 0 the
    catalog entry pin_ci sits at that position. A pinned CLUE piece is barred from
@@ -385,10 +403,15 @@ static inline void unpack_edge(uint32_t w, uint8_t f4[CHAIN_LEN-1], int *term_id
     *term_idx = (int)((w >> (bits * (CHAIN_LEN-1))) & tm);
 }
 
-/* Walk an inner chain of `count` pieces from `start_left` color, indexing the
-   (left,bottom) bucket at each step. bottoms[i] is the RAW bottom color of piece i
+/* Walk an inner chain of `count` pieces from `start_left` color, reading one
+   g_lb_step word per piece. bottoms[i] is the RAW bottom color of piece i
    (= the cell key). Fills ci_out[] and OR-s the pieces into mask_inout[]. Returns
-   false if a local index is out of range for its bucket (reliability). */
+   false if a local index is out of range for its bucket (reliability): that slot
+   carries LBSTEP_DEAD.
+
+   loc[i] is a g_lb_bits-wide field and bits_for() never returns more bits than
+   MAX_LB_BUCKET has slots, so the index is always inside the table -- asserted
+   once at startup in build_catalog_indices() rather than tested here. */
 static inline bool decode_inner_chain(const uint8_t loc[], int count, int start_left,
                                       const uint8_t bottoms[], uint16_t ci_out[],
                                       uint64_t mask_inout[4], const uint64_t forbid[4]) {
@@ -396,11 +419,11 @@ static inline bool decode_inner_chain(const uint8_t loc[], int count, int start_
     for (int i = 0; i < count; i++) {
         int b = bottoms[i];
         if (cl < 0 || cl >= NUM_COLORS_TOTAL || b < 0 || b >= NUM_COLORS_TOTAL) return false;
-        if (loc[i] >= g_lb_count[cl][b]) return false;
-        int ci = g_lb_bucket[cl][b][loc[i]];
-        ci_out[i] = (uint16_t)ci;
-        cl = g_cat[ci].right;
-        uint16_t pid = g_cat[ci].piece_id;
+        uint32_t s = g_lb_step[cl][b][loc[i]];
+        if (s & LBSTEP_DEAD) return false;
+        ci_out[i] = (uint16_t)LBSTEP_CI(s);
+        cl = LBSTEP_RIGHT(s);
+        uint16_t pid = LBSTEP_PID(s);
         uint64_t bit = piece_bit(pid);
         /* The caller's own disjointness test, applied per piece instead of once
            per finished chain. Cells hold ~142 records and deep rows have most
