@@ -24,7 +24,7 @@
  *                 automatically. Exact disjointness + color-parity checks.
  *     SCORE       each child is ranked by the options it keeps open one row up
  *                 (segment-A exact cell + B/C fan-out table) plus the Mahalanobis
- *                 color-usage term and the center-139 bonus.
+ *                 color-usage term.
  *     SELECT      pooled children are deduplicated by frontier signature (keeping
  *                 the best score per signature), ranked, and pruned to the row's
  *                 effective width by a score band with a per-parent offspring cap
@@ -75,22 +75,6 @@
 
 #include "E555_beamer.h"
 
-/* -- soft-center-139 tuning -------------------------------------------------- */
-/* Piece 139 (the published center clue) is barred from rows 1..RELEASE_ROW-1,
-   and any board that happens to place it on one of the four true center cells
-   -- (row,col) in {7,8}x{7,8} -- earns --bonus_139 on every subsequent score, so
-   the lineage is promoted all the way up while it keeps finding matches.
-
-   The bonus is additive on a score measured in nats of log record count, so its
-   value IS a claimed factor in continuability: the historical 10.0 asserted that
-   a center-139 board is worth e^10 ~ 2.2e4 times one without, which no amount of
-   real fan-out difference can overcome. It then persists in every descendant
-   from row 6 while frac_rand_eff returns 0 from row 8, so the late beam became a
-   near-monoculture of 139 lineages. The default is now 1.0 -- about one standard
-   deviation of the color term -- so it breaks near-ties in favour of a 139
-   lineage without overriding a board that is genuinely more continuable. */
-#define SOFT_CENTER_RELEASE_ROW 6
-
 /* Beam-row segment-B retries: if a conflict-free B chain admits no conflict-free
    C completion, try the next conflict-free B, up to this many, before giving up
    on the A record. Deep rows are conflict-dominated; without the fallback a
@@ -108,7 +92,12 @@ static uint32_t g_beam_expand     = 5;
 static uint32_t g_beam_expand_row = 8;
 static double   g_lambda_maha     = 0.0;
 static double   g_frac_rand       = 0.75;
-static double   g_bonus_139       = 1.0;
+/* Share of the beam reserved as a per-orientation floor, split evenly over the
+   four orientations (so K/8 each). Not a CLI knob: it exists to stop one
+   orientation crowding the others out, and unused floor is handed straight
+   back to the score ranking, so there is nothing to tune. */
+#define CLUE_FLOOR_FRAC 0.5
+static uint16_t g_clue_ci[4][CLUE_N];      /* catalog index of each oriented clue */
 static bool     g_score_model_J   = false;  /* --score_model J (default legacy) */
 static double   g_lambda_J        = 1.0;
 static bool     g_avail_correct   = false;
@@ -304,7 +293,15 @@ static void beam_init_border(BeamEntry *p, const BottomOrder *bot, const LeftOrd
             if (color_is_inner(cl)) p->req_exposed[cl]++;
         }
     }
-    if (g_soft_center_139) used_set(p->used, SOFT_CENTER_139_PIECE);
+    /* Reserve every enabled clue piece. Two of the corner clues sit on row 13
+       and are never placed, so holding them makes --supply_check and the
+       free-demand accounting exact rather than optimistic. The pinned walk is
+       exempt from this mask, so a clue can still be placed on its own cell. */
+    for (int k = 0; k < CLUE_N; k++) {
+        if ((k == 0) ? !(g_clue_mask & CLUE_CENTER) : !(g_clue_mask & CLUE_CORNERS)) continue;
+        for (int o = 0; o < 4; o++)
+            if (g_clue_orients & (1u << o)) used_set(p->used, g_clue[o][k].piece);
+    }
 }
 
 /* Commit one inner row (cols 1..15) into the board (counters + frontier only;
@@ -339,12 +336,6 @@ static void commit_row(BeamEntry *p, int row, const RowChoice *rc) {
         if (color_is_inner(tl)) p->req_exposed[tl]--;
     }
 
-    /* Center-139 bonus: rows 7/8, cols 7/8 are the board's four center cells
-       (ci[i] holds column i+1). The flag persists in every descendant. */
-    if (g_soft_center_139 && (row == 7 || row == 8) &&
-        (g_cat[rc->ci[6]].piece_id == SOFT_CENTER_139_PIECE ||
-         g_cat[rc->ci[7]].piece_id == SOFT_CENTER_139_PIECE))
-        p->flags |= FLAG_BONUS_139;
 }
 
 /* Color parity: every inner color's surplus must be non-negative, and even
@@ -524,7 +515,7 @@ static inline char *u32a(char *p, uint32_t v) {
    kinds leave a hole in the MIDDLE of the row, not only at its right end.
    Returns the byte count. */
 static int format_board_tail(const RowChoice rows[EDGE_LEN], int row,
-                             uint16_t colmask, char *out) {
+                             uint16_t colmask, int orient, char *out) {
     uint32_t pos[NUM_PIECES], rot_arr[NUM_PIECES];
     for (int i = 0; i < NUM_PIECES; i++) { pos[i] = 999; rot_arr[i] = 0; }
     for (int r = 0; r <= row; r++) {
@@ -535,6 +526,21 @@ static int format_board_tail(const RowChoice rows[EDGE_LEN], int row,
             pos[pid] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[pid] = rot;
         }
     }
+    /* --clue_corners: also show the two clue pieces the beam never reaches. They
+       sit on row 13, so with the search stopping at row 12 or below they land in
+       empty space, isolated -- which is the point: the viewer makes it obvious
+       the corners were pinned, and a hole-free Stage C solve has to build around
+       them. There is no choice of orientation here: the board committed to one
+       when it placed its row-2 corners, so its top pair follows from that.
+       Isolated cells touch no placed neighbour, so no adjacency is asserted and
+       the board's edge score is unchanged. */
+    if (orient >= 0 && (g_clue_mask & CLUE_CORNERS))
+        for (int k = 3; k < CLUE_N; k++) {
+            const ClueCell *cc = &g_clue[orient][k];
+            pos[cc->piece]     = (uint32_t)(cc->row * PUZZLE_SIDE + cc->col);
+            rot_arr[cc->piece] = cc->spin;
+        }
+
     char *p = out;
     for (int i = 0; i < NUM_PIECES; i++) { *p++ = ','; *p++ = ' '; p = u32a(p, pos[i]); }
     for (int i = 0; i < NUM_PIECES; i++) { *p++ = ','; *p++ = ' '; p = u32a(p, rot_arr[i]); }
@@ -576,7 +582,9 @@ static void emit_incomplete(const BeamCtx *ctx, const BeamEntry *parent,
     if (!fp) fp = 1;
 
     char line[EMIT_LINE_MAX];
-    int len = format_board_tail(rows, row, colmask, line);
+    int len = format_board_tail(rows, row, colmask,
+                                ENTRY_HAS_ORIENT(parent) ? (int)ENTRY_ORIENT(parent) : -1,
+                                line);
 
     #pragma omp critical(e555_incomplete)
     {
@@ -699,8 +707,8 @@ static inline double maha_term(const BeamEntry *t, int row) {
  *
  * Both are written centred (S_c/Sbar, R_c/Rbar). Both sums are constant across
  * siblings at a given row, so centring cannot change the ranking; it keeps the
- * value near 0 instead of near 1600 nats, so --bonus_139 and any swept weight
- * keep their meaning when --score_model is flipped.
+ * value near 0 instead of near 1600 nats, so any swept weight keeps its
+ * meaning when --score_model is flipped.
  *
  * Unlike maha_term this reads S and R off the board, so it needs no assumption
  * that n = 14*row matches the real piece count -- it is exact from a partial. */
@@ -769,6 +777,126 @@ static inline double color_term(const BeamEntry *t, int row) {
    table (their next left neighbour is unknown until A/B are chosen). Any
    NULL/zero is an exact one-row death -> the child is rejected. Applied on beam
    rows only: stop-row boards are emitted without this gate (see try_A). */
+/* -- Clue plumbing ---------------------------------------------------------- */
+
+static bool g_clue_debug  = false;   /* E555_CLUE_DEBUG=1 */
+static uint64_t g_dbg_nA[EDGE_LEN+2], g_dbg_nB[EDGE_LEN+2], g_dbg_nC[EDGE_LEN+2], g_dbg_calls[EDGE_LEN+2];
+static int  g_clue_first[4];         /* lowest row that owes a pin, per orientation */
+static int  g_clue_last_assign = -1; /* last row at which a board may still commit */
+
+static uint16_t cat_index_of(uint16_t pid, uint8_t spin) {
+    for (int i = 0; i < g_cat_count; i++)
+        if (g_cat[i].piece_id == pid && g_cat[i].rotation == spin) return (uint16_t)i;
+    fatal("clue piece %u spin %u is not in the oriented catalog", pid, spin);
+    return 0;
+}
+
+/* Is this clue entry active under the current flags? Entry 0 is the center. */
+static inline bool clue_on(int k) {
+    return (k == 0) ? (g_clue_mask & CLUE_CENTER) != 0 : (g_clue_mask & CLUE_CORNERS) != 0;
+}
+
+static void init_clue_tables(void) {
+    if (!g_clue_mask) return;
+    g_clue_debug = getenv("E555_CLUE_DEBUG") != NULL;
+    for (int o = 0; o < 4; o++) {
+        for (int k = 0; k < CLUE_N; k++)
+            g_clue_ci[o][k] = cat_index_of(g_clue[o][k].piece, g_clue[o][k].spin);
+        /* The table's shape is load-bearing everywhere below; assert it once. */
+        if (g_clue[o][1].row != 2 || g_clue[o][1].col != 2 ||
+            g_clue[o][2].row != 2 || g_clue[o][2].col != 13)
+            fatal("clue table: entries 1,2 must be the row-2 corners");
+        if (g_clue[o][3].row != 13 || g_clue[o][4].row != 13)
+            fatal("clue table: entries 3,4 must sit on row 13");
+        /* The first row at which o demands anything is the PUSH-DOWN row, one
+           below its lowest clue -- that is where a board commits, not the clue's
+           own row. Corners put it at row 1, the center at 6 or 7. */
+        g_clue_first[o] = 99;
+        for (int k = 0; k < CLUE_N; k++) {
+            if (!clue_on(k)) continue;
+            int r = g_clue[o][k].row - 1;
+            if (r < 1) r = 1;
+            if (r < g_clue_first[o]) g_clue_first[o] = r;
+        }
+    }
+    for (int o = 0; o < 4; o++)
+        if ((g_clue_orients & (1u << o)) && g_clue_first[o] < 99 &&
+            g_clue_first[o] > g_clue_last_assign) g_clue_last_assign = g_clue_first[o];
+}
+
+/* Pins owed by `row` under orientation o: pin_idx[s] is the position within
+   segment s (0=A,1=B,2=C) that is nailed down, or -1. Returns true if o owes
+   anything, in which case the row must go through expand_clued.
+
+   Two rules, and the second is the one that is easy to miss: a clue ON this row
+   fixes a piece, and a clue on the row ABOVE fixes a COLOR here, because a
+   clue's bottom face has to meet whatever sits under it. Demanding that color
+   while the segments are being generated is what keeps the row alive; filtering
+   finished children instead is not equivalent in effect, because the beam keeps
+   about one child per A record, so rejecting the ~94% that miss starves the row
+   rather than reshaping it. Measured on the row-2 corners: 22 surviving boards
+   filtering against 3328 pinning.
+
+   Driving both rules off the table rather than hard-coding the row-1 case makes
+   them cover every clue: the center's row 6-or-7 push-down, which is what the
+   beam pays for most (without it the center row kept 1075 boards of 104833), and
+   row 12 under the row-13 pair, whose pieces are attached to any board emitted
+   at --stop_row 12 and would otherwise meet row 12 on a color nothing chose.
+
+   Only one pin per segment is representable. Within a single orientation no row
+   ever wants two -- rows 2 and 13 put their pair in segments A and C, the center
+   is alone in B -- and init asserts the table shape that guarantees it. */
+static bool clue_pins_for(int row, int o, int pin_idx[3], int pin_kind[3],
+                          uint16_t pin_val[3]) {
+    pin_idx[0] = pin_idx[1] = pin_idx[2] = -1;
+    pin_kind[0] = pin_kind[1] = pin_kind[2] = PIN_PIECE;
+    pin_val[0] = pin_val[1] = pin_val[2] = 0;
+
+    bool any = false;
+    for (int k = 0; k < CLUE_N; k++) {
+        if (!clue_on(k)) continue;
+        const ClueCell *cc = &g_clue[o][k];
+        int c = -1, kind = PIN_PIECE; uint16_t val = 0;
+        if (cc->row == row && k < CLUE_N_REACHABLE) {    /* the clue itself */
+            c = cc->col; kind = PIN_PIECE; val = g_clue_ci[o][k];
+        } else if (cc->row == row + 1) {                 /* the color it will sit on */
+            c = cc->col; kind = PIN_TOPCOLOR; val = g_cat[g_clue_ci[o][k]].bottom;
+        }
+        if (c < 1 || c > EDGE_LEN) continue;             /* cols 1..14 are the segments */
+        int s = (c - 1) / CHAIN_LEN;
+        if (pin_idx[s] >= 0) fatal("clue table: row %d wants two pins in segment %d", row, s);
+        pin_idx[s] = (c - 1) % CHAIN_LEN; pin_kind[s] = kind; pin_val[s] = val;
+        any = true;
+    }
+    return any;
+}
+
+/* E555_CLUE_DEBUG=1: the whole pin schedule, once, before any search runs.
+   Rows 11 and 12 are reached so rarely that a live run is a poor way to check
+   what they owe, and the schedule is entirely determined by the table -- so
+   print it instead of hunting for a board that gets there. */
+static void clue_dump_schedule(void) {
+    if (!g_clue_mask || !g_clue_debug) return;
+    for (int o = 0; o < 4; o++) {
+        if (!(g_clue_orients & (1u << o))) continue;
+        printf("[clue] orientation %d commits at row %d\n", o, g_clue_first[o]);
+        for (int r = 1; r <= EDGE_LEN; r++) {
+            int pi[3], pk[3]; uint16_t pv[3];
+            if (!clue_pins_for(r, o, pi, pk, pv)) continue;
+            printf("[clue]   row %2d:", r);
+            for (int s = 0; s < 3; s++) {
+                if (pi[s] < 0) continue;
+                if (pk[s] == PIN_PIECE)
+                    printf("  seg%c[%d] = piece %u", 'A' + s, pi[s], g_cat[pv[s]].piece_id);
+                else
+                    printf("  seg%c[%d] = color %u below a clue", 'A' + s, pi[s], pv[s]);
+            }
+            printf("\n");
+        }
+    }
+    fflush(stdout);
+}
+
 static bool score_child(const BeamEntry *t, int row, float *out) {
     const uint8_t *rt = t->rtop;
     for (int c = 1; c <= EDGE_LEN; c++) if (!color_is_inner(rt[c])) return false;
@@ -787,13 +915,16 @@ static bool score_child(const BeamEntry *t, int row, float *out) {
     double s = log((double)cA->n) + log1p((double)fB) + log1p((double)fC)
                + color_term(t, row);
     if (g_avail_correct) s += avail_term(t);
-    if (t->flags & FLAG_BONUS_139) s += g_bonus_139;
     *out = (float)s;
     return true;
 }
 
 static inline uint64_t frontier_sig(const BeamEntry *b) {
     uint64_t h = 0x6BEA6BEA6BEA6BEAULL, w;
+    /* Orientation joins the hash, or two boards that differ only in which clue
+       set they owe would dedup into one and the loser's lineage would vanish
+       silently. Guarded so the no-clue signature is unchanged. */
+    if (g_clue_mask) h = splitmix64(h ^ (uint64_t)b->flags);
     memcpy(&w, &b->rtop[0], 8); h = splitmix64(h ^ w);
     memcpy(&w, &b->rtop[8], 8); h = splitmix64(h ^ w);
     for (int k = 0; k < 4; k++) h = splitmix64(h ^ b->used[k]);
@@ -844,14 +975,16 @@ static inline void pool_flush(BeamCtx *ctx, Scratch *sc) {
    a candidate's signature while it keeps looking for a better sibling (the
    scratch board it was computed from is overwritten by the next candidate). */
 static inline void pool_append_sig(BeamCtx *ctx, Scratch *sc, uint64_t sig,
-                                   uint32_t parent_idx, float score, const RowChoice *mv) {
+                                   uint32_t parent_idx, float score, const RowChoice *mv,
+                                   uint8_t flags) {
     PoolEntry *pe = &sc->buf[sc->buf_n++];
     pe->score = score; pe->parent = parent_idx; pe->sig = sig; pe->mv = *mv;
+    pe->flags = flags;
     if (sc->buf_n == POOL_BATCH) pool_flush(ctx, sc);
 }
 static inline void pool_append(BeamCtx *ctx, Scratch *sc, const BeamEntry *t,
                                uint32_t parent_idx, float score, const RowChoice *mv) {
-    pool_append_sig(ctx, sc, frontier_sig(t), parent_idx, score, mv);
+    pool_append_sig(ctx, sc, frontier_sig(t), parent_idx, score, mv, t->flags);
 }
 
 /* Decode segment B record jb at cell cB; returns true and fills ciB/la_C for the
@@ -968,6 +1101,133 @@ static void try_BC(const BeamCtx *ctx, const BeamEntry *p, int row) {
     }
 }
 
+/* One (parent, orientation) expansion of a row that carries clues. Every segment
+   goes through the pinned walk -- the same walk that provably reproduces a
+   database cell when unpinned -- so pinned and free segments share one path and
+   a pinned segment A does not need the parent's A cell to exist at all (no
+   stored chain holds a clue piece). Clue rows are few and heavily constrained,
+   so giving up the cell's fan-out promise ordering here costs little.
+
+   Every loop level spends budget, not just the outermost: quota only falls on
+   ACCEPTED children, so a parent whose candidates all fail parity or the
+   lookahead would otherwise walk the full nA x nB x nC x terminals product --
+   up to 10^9 with a free segment at the 1024 cap. */
+static void expand_clued(BeamCtx *ctx, const BeamEntry *p, uint32_t pi, int row,
+                         bool at_stop, Scratch *sc, uint32_t quota, uint64_t budget,
+                         int orient, const int pin_idx[3], const int pin_kind[3],
+                         const uint16_t pin_val[3]) {
+    const uint8_t *rt = p->rtop;
+    int la_A = g_cur_left->right[row];
+    if (!color_is_inner(la_A)) return;
+    for (int c = 1; c <= EDGE_LEN; c++) if (!color_is_inner(rt[c])) return;
+    if (!color_is_edge_iface(rt[15])) return;
+
+    BeamEntry *t = &sc->tmp;
+    RowChoice mv;
+    const uint8_t oflags = (uint8_t)(orient | FLAG_ORIENT_SET);
+
+    int nA = enumerate_pinned_segment(la_A, rt + 1, CHAIN_LEN, pin_idx[0], pin_kind[0], pin_val[0],
+                                      p->used, sc->seg[0], CLUE_SEG_CAP);
+    if (g_clue_debug) {
+        #pragma omp atomic
+        g_dbg_nA[row] += nA;
+        #pragma omp atomic
+        g_dbg_calls[row] += 1;
+    }
+    for (int ia = 0; ia < nA && quota > 0 && budget > 0; ia++) {
+        const uint16_t *A = sc->seg[0][ia];
+        uint64_t mA[4], fA[4];
+        mask_of_chain(A, CHAIN_LEN, mA);
+        for (int k = 0; k < 4; k++) fA[k] = p->used[k] | mA[k];
+        int la_B = g_cat[A[CHAIN_LEN-1]].right;
+        if (!color_is_inner(la_B)) continue;
+        budget--;
+
+        int nB = enumerate_pinned_segment(la_B, rt + 6, CHAIN_LEN, pin_idx[1], pin_kind[1], pin_val[1],
+                                          fA, sc->seg[1], CLUE_SEG_CAP);
+        if (g_clue_debug) { 
+            #pragma omp atomic
+            g_dbg_nB[row] += nB; }
+        for (int ib = 0; ib < nB && quota > 0 && budget > 0; ib++) {
+            budget--;
+            const uint16_t *B = sc->seg[1][ib];
+            uint64_t mB[4], fB[4];
+            mask_of_chain(B, CHAIN_LEN, mB);
+            for (int k = 0; k < 4; k++) fB[k] = fA[k] | mB[k];
+            int la_C = g_cat[B[CHAIN_LEN-1]].right;
+            if (!color_is_inner(la_C)) continue;
+
+            int nC = enumerate_pinned_segment(la_C, rt + 11, CHAIN_LEN-1, pin_idx[2], pin_kind[2], pin_val[2],
+                                              fB, sc->seg[2], CLUE_SEG_CAP);
+            if (g_clue_debug) {
+                #pragma omp atomic
+                g_dbg_nC[row] += nC;
+            }
+            for (int ic = 0; ic < nC && quota > 0 && budget > 0; ic++) {
+                budget--;
+                const uint16_t *C = sc->seg[2][ic];
+                uint64_t mC[4], fC[4];
+                mask_of_chain(C, CHAIN_LEN-1, mC);
+                for (int k = 0; k < 4; k++) fC[k] = fB[k] | mC[k];
+                int cl = g_cat[C[CHAIN_LEN-2]].right;
+                if (cl < 0 || cl >= NUM_COLORS_TOTAL) continue;
+                /* The right edge is not searched: it falls out of whichever
+                   terminal matches C's exposed right and the frontier below. */
+                for (int kt = 0; kt < g_edge_term_by_left_n[cl] && quota > 0 && budget > 0; kt++) {
+                    budget--;
+                    int ti = g_edge_term_by_left[cl][kt];
+                    const Oriented *term = &g_edge_term[ti];
+                    if (term->bottom != rt[15]) continue;
+                    uint16_t tp = term->piece_id;
+                    if (fC[tp >> 6] & piece_bit(tp)) continue;
+
+                    memcpy(&mv.ci[0],           A, CHAIN_LEN * sizeof(uint16_t));
+                    memcpy(&mv.ci[CHAIN_LEN],   B, CHAIN_LEN * sizeof(uint16_t));
+                    memcpy(&mv.ci[2*CHAIN_LEN], C, (CHAIN_LEN-1) * sizeof(uint16_t));
+                    mv.rterm = (uint8_t)ti;
+
+                    *t = *p; commit_row(t, row, &mv);
+                    t->flags = oflags;          /* before pool_append: it hashes flags */
+                    if (!parity_ok(t)) continue;
+                    float score;
+                    if (at_stop) {
+                        score = (float)color_term(t, row);
+                    } else if (!score_child(t, row, &score)) {
+                        continue;
+                    }
+                    pool_append(ctx, sc, t, pi, score, &mv);
+                    quota--;
+                }
+            }
+        }
+    }
+}
+
+/* Clue handling for one parent on a row that carries clues; returns whether the
+   parent may ALSO expand normally.
+
+   A board is unassigned until it places its first clue, then owes that
+   orientation's remaining clues for life. An unassigned board may defer only
+   while some enabled orientation still has its first clue ahead of this row;
+   past that point it can never satisfy any orientation, so it stops producing
+   children and falls out of the beam. */
+static bool expand_clue_row(BeamCtx *ctx, const BeamEntry *p, uint32_t pi, int row,
+                            bool at_stop, Scratch *sc, uint32_t quota, uint64_t budget) {
+    int pin_idx[3], pin_kind[3]; uint16_t pin_val[3];
+    if (ENTRY_HAS_ORIENT(p)) {
+        int o = ENTRY_ORIENT(p);
+        if (!clue_pins_for(row, o, pin_idx, pin_kind, pin_val)) return true;   /* nothing due */
+        expand_clued(ctx, p, pi, row, at_stop, sc, quota, budget, o, pin_idx, pin_kind, pin_val);
+        return false;
+    }
+    for (int o = 0; o < 4; o++) {
+        if (!(g_clue_orients & (1u << o))) continue;
+        if (!clue_pins_for(row, o, pin_idx, pin_kind, pin_val)) continue;
+        expand_clued(ctx, p, pi, row, at_stop, sc, quota, budget, o, pin_idx, pin_kind, pin_val);
+    }
+    return row < g_clue_last_assign;
+}
+
 /* Expand one segment-A record into pool entries. Beam rows keep one child per A
    record: the first conflict-free C under the first workable of up to B_TRY
    conflict-free B chains. The stop row emits every conflict-free completion
@@ -1025,8 +1285,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
                    it is emitted -- whether a row fits above is deliberately the
                    next stage's problem, so --supply_check does not apply here
                    either. Rank by the heuristic terms only. */
-                float score = (float)(color_term(t, e->row)
-                              + ((t->flags & FLAG_BONUS_139) ? g_bonus_139 : 0.0));
+                float score = (float)color_term(t, e->row);
                 pool_append(ctx, sc, t, e->parent_idx, score, &mv);
                 e->quota--;
                 ab_full = true;
@@ -1050,6 +1309,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     const bool window = (g_bc_nB > 1 || g_bc_nC > 1);
     const bool supply = (g_supply_check && (uint32_t)e->row >= g_supply_check);
     RowChoice best_mv; float best_score = 0.0f; uint64_t best_sig = 0;
+    uint8_t best_flags = 0;
     bool have_best = false;
     uint32_t nb_done = 0;
     int b_left = B_TRY;
@@ -1084,13 +1344,14 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
             nc_done++;
             if (!have_best || score > best_score) {
                 best_score = score; best_mv = mv; best_sig = frontier_sig(t);
+                best_flags = t->flags;
                 have_best = true;
             }
         }
         if (nc_done) nb_done++;                 /* a B chain that produced a child */
     }
     if (have_best) {
-        pool_append_sig(ctx, sc, best_sig, e->parent_idx, best_score, &best_mv);
+        pool_append_sig(ctx, sc, best_sig, e->parent_idx, best_score, &best_mv, best_flags);
         e->quota--;
     }
 }
@@ -1125,6 +1386,13 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
     uint32_t quota_slice = quota_parent / n_slices; if (quota_slice == 0) quota_slice = 1;
     uint64_t budget_slice = budget_parent / n_slices; if (budget_slice < 64) budget_slice = 64;
     const bool at_stop = ((uint32_t)row == g_stop_row);
+    /* Does any enabled orientation place a clue on this row? */
+    bool clue_row = false;
+    if (g_clue_mask) {
+        int pi_[3], pk_[3]; uint16_t pv_[3];
+        for (int o = 0; o < 4 && !clue_row; o++)
+            if ((g_clue_orients & (1u << o)) && clue_pins_for(row, o, pi_, pk_, pv_)) clue_row = true;
+    }
 
     uint64_t items = (uint64_t)beam_n * n_slices;
     #pragma omp parallel for schedule(dynamic, 8) num_threads(nt)
@@ -1137,6 +1405,17 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
            segment-A cell is empty -- exactly the case a B+C partial records.
            Once per parent, not once per slice. */
         if (at_stop && g_incomplete_top && sl == 0) try_BC(ctx, &beam[pi], row);
+        if (clue_row) {
+            /* A clue row is expanded ONCE per parent, not once per slice: the
+               pinned walk already enumerates the parent's whole candidate set.
+               Letting the other slices fall through would run the ordinary
+               unclued expansion beside it and quietly fill the row with boards
+               that ignore the clue. */
+            if (sl != 0) continue;
+            if (!expand_clue_row(ctx, &beam[pi], pi, row, at_stop, sc,
+                                 quota_parent, budget_parent))
+                continue;                  /* this parent owes a clue it just placed */
+        }
         Expand e;
         if (!expand_prepare(&e, &beam[pi], pi, row, at_stop)) continue;
         /* Seeded per parent, NOT per slice: the slices of one parent have to
@@ -1174,6 +1453,12 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
         }
         pool_flush(ctx, sc);
     }
+    /* Every `continue` above skips the in-loop flush, so a thread whose LAST
+       work item took one leaves children sitting in its buffer. They would then
+       be flushed into the NEXT row's pool, where their parent indices point into
+       the wrong beam -- boards that fail parity on rebuild. Drain every buffer
+       here so no child can outlive the row that made it. */
+    for (int t = 0; t < nt; t++) pool_flush(ctx, scratch[t]);
 }
 
 /* -- Beam selection --------------------------------------------------------- */
@@ -1208,8 +1493,8 @@ static void sort_recs_desc(SortRec *a, SortRec *tmp, uint32_t n, int nt) {
 
 /* Deduplicate the pool by frontier signature, keeping the BEST score per
    signature (two boards with the same used-set and exposed tops have identical
-   futures, so only the top-scored representative -- e.g. the one holding the
-   center-139 bonus -- needs to survive). The hash table is region-sharded:
+   futures, so only the top-scored representative needs to survive). The hash
+   table is region-sharded:
    every signature belongs to exactly one thread's slot range, so threads insert
    without locks; probing wraps within the owner's range. Fills ctx->keep[]
    with the survivors' pool indices, best score first; returns the count. */
@@ -1313,12 +1598,39 @@ static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t beam_n,
                             RNG *rng) {
     const uint32_t K = target_K;
     if (kept <= K) { for (uint32_t i = 0; i < kept; i++) ctx->sel[i] = i; return kept; }
-    uint32_t k_rand = (uint32_t)(frac_rand_now * K);
-    if (k_rand > K) k_rand = K;
-    uint32_t k_top = K - k_rand;
     memset(ctx->taken, 0, kept);
     memset(ctx->offspring, 0, (size_t)beam_n*sizeof(uint32_t));
     uint32_t n_sel = 0, got = 0;
+
+    /* Per-orientation floor. Each orientation is a different hypothesis about
+       which puzzle side is our row 0, and the score cannot compare them -- left
+       to pure merit one orientation crowds the rest out and the search silently
+       stops being complete. So each gets a guaranteed min(n_o, K/8) taken in its
+       own score order, and whatever a thin orientation cannot fill simply stays
+       unclaimed: the passes below run unchanged over the same taken[] array and
+       spend the remainder on merit. Clues off leaves n_sel at 0 and every count
+       below identical to what it was before this existed. */
+    if (g_clue_mask) {
+        const uint32_t floor_o = (uint32_t)(CLUE_FLOOR_FRAC * (double)K / 4.0);
+        for (int o = 0; o < 4 && floor_o; o++) {
+            uint32_t got_o = 0;
+            for (uint32_t i = 0; i < kept && got_o < floor_o; i++) {
+                if (ctx->taken[i]) continue;
+                const PoolEntry *pe = &ctx->pool[ctx->keep[i]];
+                if (!(pe->flags & FLAG_ORIENT_SET)) continue;
+                if ((pe->flags & FLAG_ORIENT_MASK) != (uint8_t)o) continue;
+                if (cap && ctx->offspring[pe->parent] >= cap) continue;
+                ctx->offspring[pe->parent]++;
+                ctx->taken[i] = 1; ctx->sel[n_sel++] = i; got_o++;
+            }
+        }
+    }
+
+    /* Split what is left the way the whole beam was split before. */
+    const uint32_t rem = (n_sel < K) ? K - n_sel : 0;
+    uint32_t k_rand = (uint32_t)(frac_rand_now * rem);
+    if (k_rand > rem) k_rand = rem;
+    uint32_t k_top = rem - k_rand;
     for (uint32_t i = 0; i < kept && got < k_top; i++) {
         uint32_t par = ctx->pool[ctx->keep[i]].parent;
         if (cap && ctx->offspring[par] >= cap) continue;
@@ -1357,6 +1669,7 @@ static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
         ctx->log[row][i].mv = pe->mv;
         commit_row(d, row, &pe->mv);
         d->depth = (uint16_t)row; d->score = pe->score; d->log_idx = i;
+        d->flags = pe->flags;
         assert(parity_ok(d));
     }
 }
@@ -1395,6 +1708,8 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
             collect_rows(ctx, &beam[pe->parent], rows);
             g_emit_fps[k]  = board_fingerprint(rows, row);
             g_emit_lens[k] = format_board_tail(rows, row, ROWMASK_FULL,
+                                               (pe->flags & FLAG_ORIENT_SET)
+                                                   ? (int)(pe->flags & FLAG_ORIENT_MASK) : -1,
                                                g_emit_lines + (size_t)k * EMIT_LINE_MAX);
         }
         for (uint32_t k = 0; k < tile; k++) {
@@ -1423,9 +1738,6 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         if (g_stop)                      { res.reason = "interrupted"; break; }
         if (omp_get_wtime() >= deadline) { res.reason = "time";        break; }
         double t_row = omp_get_wtime();
-
-        if (g_soft_center_139 && row == SOFT_CENTER_RELEASE_ROW)
-            for (uint32_t i = 0; i < beam_n; i++) used_clear(cur[i].used, SOFT_CENTER_139_PIECE);
 
         expand_row(ctx, cur, beam_n, row, cfg_hash, scratch);
         double t_exp = omp_get_wtime();
@@ -1576,6 +1888,12 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         if (!any) printf("  none");
         printf("   reached stop_row: %" PRIu64 "\n", g_stats.reached_stop);
     }
+    if (g_clue_debug)
+        for (int r = 1; r <= EDGE_LEN; r++)
+            if (g_dbg_calls[r])
+                printf("[clue] row %2d: parents=%llu sumA=%llu sumB=%llu sumC=%llu\n", r,
+                       (unsigned long long)g_dbg_calls[r], (unsigned long long)g_dbg_nA[r],
+                       (unsigned long long)g_dbg_nB[r], (unsigned long long)g_dbg_nC[r]);
     printf("[sum] emitted unique boards: %" PRIu64 "\n", g_stats.emitted_total);
     if (g_incomplete_top)
         printf("[sum] incomplete-top partials: %zu  (A+B %zu, A+C %zu, B+C %zu)\n",
@@ -1584,6 +1902,65 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
 }
 
 /* -- main ------------------------------------------------------------------- */
+
+static int cmp_u64(const void *a, const void *b) {
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* E555_SEG_VERIFY=1: assert that the pinned-segment walk with NO pin reproduces
+   the database cell for the same key, chain for chain. The walk reads the raw
+   (left,bottom) buckets while the cell holds packed records built by a separate
+   DFS, so agreeing on both the count and the exact multiset of chains is strong
+   evidence the walk enumerates the same object the beam already trusts.
+   Only meaningful with clues off: with them on the walk deliberately sees pieces
+   the database excludes, so it would legitimately find more. */
+static void verify_segment_enumerator(void) {
+    if (!getenv("E555_SEG_VERIFY")) return;
+    if (g_clue_mask) { printf("[segv] skipped (clues on: the walk sees excluded pieces)\n"); return; }
+    enum { CAP = 2048 };
+    static uint16_t out[CAP][CHAIN_LEN];
+    static uint64_t ha[CAP], hb[CAP];
+    RNG r = rng_for(0x5E6C0DE5u, 0, 0, 0);
+    const uint64_t zero[4] = {0,0,0,0};
+    int checked = 0, tried = 0, bad = 0; uint64_t chains = 0;
+    while (checked < 300 && tried < 200000) {
+        tried++;
+        int la = COLOR_MIN + (int)rng_uniform(&r, DIM_INNER);
+        uint8_t b[CHAIN_LEN];
+        for (int i = 0; i < CHAIN_LEN; i++) b[i] = (uint8_t)(COLOR_MIN + rng_uniform(&r, DIM_INNER));
+        const Cell *c = g_db[INNER_IDX(la)][INNER_IDX(b[0])][INNER_IDX(b[1])]
+                            [INNER_IDX(b[2])][INNER_IDX(b[3])][b[4]];
+        if (!c || c->n == 0 || c->n > CAP) continue;
+        checked++; chains += c->n;
+        for (uint32_t j = 0; j < c->n; j++) {
+            uint32_t w = rec_load(c->rec, j, g_rec_bytes_inner);
+            uint8_t f[CHAIN_LEN]; unpack_inner(w, f, g_lb_bits);
+            uint16_t ci[CHAIN_LEN]; uint64_t m[4] = {0,0,0,0};
+            if (!decode_inner_chain(f, CHAIN_LEN, la, b, ci, m, zero)) { bad++; break; }
+            uint64_t h = 1469598103934665603ULL;
+            for (int i = 0; i < CHAIN_LEN; i++) { h ^= ci[i]; h *= 1099511628211ULL; }
+            ha[j] = h;
+        }
+        int n = enumerate_pinned_segment(la, b, CHAIN_LEN, -1, PIN_PIECE, 0, zero, out, CAP);
+        if (n != (int)c->n) {
+            printf("[segv] COUNT MISMATCH la=%d db=%u walk=%d\n", la, c->n, n); bad++; continue;
+        }
+        for (int j = 0; j < n; j++) {
+            uint64_t h = 1469598103934665603ULL;
+            for (int i = 0; i < CHAIN_LEN; i++) { h ^= out[j][i]; h *= 1099511628211ULL; }
+            hb[j] = h;
+        }
+        qsort(ha, (size_t)n, sizeof ha[0], cmp_u64);
+        qsort(hb, (size_t)n, sizeof hb[0], cmp_u64);
+        if (memcmp(ha, hb, (size_t)n * sizeof ha[0]) != 0) {
+            printf("[segv] SET MISMATCH la=%d n=%d\n", la, n); bad++;
+        }
+    }
+    printf("[segv] %d cells, %llu chains: %s\n", checked, (unsigned long long)chains,
+           bad ? "MISMATCHES FOUND" : "walk == database, exactly");
+    if (bad) fatal("segment enumerator disagrees with the database");
+}
 
 static void usage(const char *a0) {
     fprintf(stderr,
@@ -1642,9 +2019,11 @@ static void usage(const char *a0) {
 "  --avail_correct        discount the B/C fan-out counts by the fraction of each\n"
 "                         frontier color still unplaced, so the lookahead stops being\n"
 "                         blind to which pieces are gone (default off)\n"
-"  --bonus_139 F          score bonus while piece 139 sits on a center cell, added\n"
-"                         to a log-count score (default 1; was 10 before, which is a\n"
-"                         claimed factor of e^10 and swamped every other term)\n"
+"  --clue_center          force the published center clue piece onto its cell, at its\n"
+"                         orientation's spin (piece 138; one of the 4 center cells)\n"
+"  --clue_corners         force the two published corner clues the beam can reach,\n"
+"                         both on row 2; the other two sit on row 13 and are only\n"
+"                         reserved. Clue pieces leave the database entirely\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by\n"
 "                         score; halved at beam_expand_row-1, zero from\n"
 "                         beam_expand_row on (default 0.75)\n"
@@ -1722,8 +2101,6 @@ static void usage(const char *a0) {
 "  --threads N            OpenMP threads (default: all cores)\n"
 "  --seed S               RNG seed; omitted or 0 = randomized from clock+pid and\n"
 "                         printed, so repeated runs are uncorrelated\n"
-"  --soft_center_139      keep clue piece 139 out of rows 1..5 and add a score bonus\n"
-"                         whenever it lands on one of the 4 center cells\n"
 "  --verbose              per-row beam progress lines\n"
 "  --help                 this text\n", a0);
 }
@@ -1772,7 +2149,8 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--avail_correct"))             g_avail_correct = true;
         else if (!strcmp(argv[i], "--no_free_demand"))            g_free_demand = false;
         else if (!strcmp(argv[i], "--supply_check") && i+1 < argc) g_supply_check = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--bonus_139")   && i+1 < argc) g_bonus_139 = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--clue_center"))               g_clue_mask |= CLUE_CENTER;
+        else if (!strcmp(argv[i], "--clue_corners"))              g_clue_mask |= CLUE_CORNERS;
         else if (!strcmp(argv[i], "--gumbel_tau0") && i+1 < argc) g_gumbel_tau0 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--gumbel_tau1") && i+1 < argc) g_gumbel_tau1 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--bc_window")   && i+1 < argc) {
@@ -1796,7 +2174,6 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--max_wall_sec")    && i+1 < argc) g_max_wall_sec = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_partials")    && i+1 < argc) g_max_partials = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--resume"))          resume = true;
-        else if (!strcmp(argv[i], "--soft_center_139")) g_soft_center_139 = true;
         else if (!strcmp(argv[i], "--verbose"))         g_verbose = true;
         else { fprintf(stderr, "Unknown argument: %s\n\n", argv[i]); usage(argv[0]); return 1; }
     }
@@ -1816,7 +2193,11 @@ int main(int argc, char *argv[]) {
         fatal("--stop_row must be in 1..%d (rows 14-15 belong to Stage C)", MAX_DRILL_DEPTH);
     if (!(fabs(g_lambda_maha) <= 1e6)) fatal("--lambda_Mahalanobis in [-1e6,1e6]");
     if (!(fabs(g_lambda_J) <= 1e6))    fatal("--lambda_J in [-1e6,1e6]");
-    if (!(fabs(g_bonus_139) <= 1e6))   fatal("--bonus_139 in [-1e6,1e6]");
+    /* Row 13 carries two clues in every orientation and we deliberately do not
+       enforce them, so the top clue row must stay out of reach by construction. */
+    if (g_clue_mask && g_stop_row > 12)
+        fatal("--clue_center/--clue_corners need --stop_row <= 12 (row 13 holds the "
+              "two clues this build does not enforce)");
     if (!(g_gumbel_tau0 >= 0.0 && g_gumbel_tau0 <= 1e6)) fatal("--gumbel_tau0 in [0,1e6]");
     if (!(g_gumbel_tau1 >= 0.0 && g_gumbel_tau1 <= 1e6)) fatal("--gumbel_tau1 in [0,1e6]");
     if (!(g_tau_bottoms >= 0.0 && g_tau_bottoms <= 1e6)) fatal("--gumbel_tau_bottoms in [0,1e6]");
@@ -1859,9 +2240,11 @@ int main(int argc, char *argv[]) {
            g_fixed_corner_pid[2], g_fixed_corner_pid[3]);
     printf("[cfg] beam_width=%u stop_row=%u expand=%ux@row%u lambda_Maha=%.3f\n",
            g_beam_width, g_stop_row, g_beam_expand, g_beam_expand_row, g_lambda_maha);
-    printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u scan_factor=%u soft_center_139=%d bonus_139=%.3f\n",
-           g_frac_rand, g_parent_cap, g_pool_factor, g_scan_factor, g_soft_center_139?1:0,
-           g_bonus_139);
+    printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u scan_factor=%u\n",
+           g_frac_rand, g_parent_cap, g_pool_factor, g_scan_factor);
+    if (g_clue_mask)
+        printf("[cfg] clue_center=%d clue_corners=%d (all 4 orientations)\n",
+               (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0);
     printf("[cfg] score_model=%s lambda_J=%.3f avail_correct=%d free_demand=%d supply_check=%u"
            " gumbel_tau=%.2f->%.2f bc_window=%u,%u\n",
            g_score_model_J ? "J" : "legacy", g_lambda_J, g_avail_correct?1:0,
@@ -1881,6 +2264,30 @@ int main(int argc, char *argv[]) {
     build_inner_color_totals();
     build_maha_tables();
     build_logtab();
+    /* Needs the oriented catalog and nothing else, so it runs BEFORE the build:
+       a malformed clue table is then caught in milliseconds rather than after
+       eighty seconds of database. */
+    init_clue_tables();
+    clue_dump_schedule();
+
+    /* Clue pieces leave the DATABASE, so no chain can hold one and the search
+       never rejects a chain for colliding with a clue.
+
+       Set AFTER build_inner_color_totals: g_inner_color_total must stay the
+       WHOLE inner set. A clue piece is still placed on the board and consumed
+       there, so subtracting it from the totals leaves parity_ok's
+       S = total - consumed - required short by that piece's half-edges, which
+       flips S's parity and rejects perfectly sound boards.
+
+       Set BEFORE the cache is consulted: the exclude hash is what stops a clue
+       cache being reused for a normal run, and back. */
+    if (g_clue_mask) {
+        for (int k = 0; k < CLUE_N; k++) {
+            bool is_center = (k == 0);
+            if (is_center ? !(g_clue_mask & CLUE_CENTER) : !(g_clue_mask & CLUE_CORNERS)) continue;
+            for (int o = 0; o < 4; o++) used_set(g_db_exclude, g_clue[o][k].piece);
+        }
+    }
 
     /* On a cache hit db_cache_load also fills the fan-out table and ranking
        totals from its index table, so no arena page is touched at startup. */
@@ -1892,6 +2299,8 @@ int main(int argc, char *argv[]) {
         sort_db_by_fanout();
         if (g_db_file) db_cache_save(g_db_file);
     }
+    verify_segment_enumerator();
+
     if (g_free_edges) {                       /* edge cells are border-independent */
         build_edge_terminal_pool();
         build_db_edge_and_sort();

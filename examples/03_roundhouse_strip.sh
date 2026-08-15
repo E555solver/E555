@@ -92,11 +92,15 @@ BREAKS="${BREAKS:-0}"             # >0: also emit a complete board bought with b
 FIRST_LINE="${FIRST_LINE:-0}"
 N_LINES="${N_LINES:-1}"
 MAX_WALL="${MAX_WALL:-600}"       # seconds, 0 = unlimited
+CLUES="${CLUES:-0}"                # 1 = hold the published Eternity II clue
+                                  # pieces on their cells and spins
 # -----------------------------------------------------------------------------
 
 [ -x "$REPO/bin/E555_roundhouse" ] || make -C "$REPO" roundhouse
 
-"$REPO/bin/E555_roundhouse" "$SEED" "$PARTIALS" \
+CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
+
+"$REPO/bin/E555_roundhouse" "$SEED" "$PARTIALS" "${CLUE_ARG[@]}" \
     --border_row "$FIRST_LINE" \
     --border_row_N "$N_LINES" \
     --rounds "$ROUNDS" \

@@ -370,6 +370,94 @@ static void frame_to_orig(int R, int C, int k, int *r, int *c) {
     *r = R; *c = C;
 }
 
+/* -- Eternity II clue pieces ------------------------------------------------
+   The retained core is (16-2W)x(16-W) and always spans the middle of the board,
+   so all four candidate centre cells -- (7,7) (7,8) (8,7) (8,8) -- lie inside it
+   at every W in 2..5 and every --rounds. The centre clue is therefore never
+   freed here and --clue_center can only VERIFY it. The four corner clues, at
+   (2,2) (2,13) (13,2) (13,13), do get freed, and those are what --clue_corners
+   holds in place.
+
+   Enforcement is a filter inside the record loop of strip_dfs, not a pinned
+   enumerator: that search is exhaustive and has no beam to starve, so rejecting
+   a record at the level the clue sits on simply prunes the subtree. Nor is
+   there a push-down to do -- rh_decode already matches every record against the
+   colours the level below exposes, so "the clue's bottom must meet the piece
+   under it" holds by construction. */
+static int g_rh_orient = -1;              /* orientation of the board being searched */
+
+/* One clockwise quarter-turn applied to a cell and a spin, matching rotate_cw
+   exactly: (r,c) -> (15-c, r) and spin -> (spin+3)&3. */
+static void orig_to_frame(int r, int c, int spin, int k, int *R, int *C, int *S) {
+    for (int i = 0; i < (k & 3); i++) {
+        int nr = PUZZLE_SIDE-1-c, nc = r;
+        r = nr; c = nc; spin = (spin + 3) & 3;
+    }
+    *R = r; *C = c; *S = spin;
+}
+
+/* orig_to_frame must invert frame_to_orig for every cell and turn count. A wrong
+   spin direction here would pin the right piece the wrong way round and quietly
+   produce a board that satisfies every edge but not the clue, so it is checked
+   rather than commented. Runs once, only when a clue flag is set. */
+static void check_frame_maps(void) {
+    for (int k = 0; k < 4; k++)
+        for (int r = 0; r < PUZZLE_SIDE; r++)
+            for (int c = 0; c < PUZZLE_SIDE; c++) {
+                int R, C, S, br, bc;
+                orig_to_frame(r, c, 0, k, &R, &C, &S);
+                frame_to_orig(R, C, k, &br, &bc);
+                if (br != r || bc != c)
+                    fatal("orig_to_frame/frame_to_orig disagree at k=%d (%d,%d) -> (%d,%d) -> (%d,%d)",
+                          k, r, c, R, C, br, bc);
+            }
+}
+
+/* Is this clue entry active under the current flags? Entry 0 is the center. */
+static inline bool clue_on(int k) {
+    return (k == 0) ? (g_clue_mask & CLUE_CENTER) != 0 : (g_clue_mask & CLUE_CORNERS) != 0;
+}
+
+/* The orientation this board committed to: the one satisfying the most enabled
+   clues. -1 when it satisfies none, which is the only case this tool cannot
+   resolve on its own. */
+static int rh_clue_orient_of(const int pos[NUM_PIECES], const int rot[NUM_PIECES]) {
+    int best = -1, best_n = 0;
+    for (int o = 0; o < 4; o++) {
+        int n = 0;
+        for (int k = 0; k < CLUE_N; k++) {
+            if (!clue_on(k)) continue;
+            const ClueCell *cc = &g_clue[o][k];
+            if (pos[cc->piece] == cc->row * PUZZLE_SIDE + cc->col && rot[cc->piece] == cc->spin) n++;
+        }
+        if (n > best_n) { best = o; best_n = n; }
+    }
+    return best;
+}
+
+/* Is `pid` one of the enabled clue pieces? Five entries, scanned linearly --
+   this sits in the record loop, so it stays a straight-line test over a table
+   that is in cache. */
+static inline bool rh_is_clue_piece(uint16_t pid) {
+    if (!g_clue_mask || g_rh_orient < 0) return false;
+    for (int k = 0; k < CLUE_N; k++)
+        if (clue_on(k) && g_clue[g_rh_orient][k].piece == pid) return true;
+    return false;
+}
+
+/* The clue owed by frame cell (R,C) under the current rotation, or NULL. */
+static const ClueCell *rh_clue_at_frame(int R, int C, int *spin_out) {
+    if (!g_clue_mask || g_rh_orient < 0) return NULL;
+    for (int k = 0; k < CLUE_N; k++) {
+        if (!clue_on(k)) continue;
+        const ClueCell *cc = &g_clue[g_rh_orient][k];
+        int fr, fc, fs;
+        orig_to_frame(cc->row, cc->col, cc->spin, g_rot_applied, &fr, &fc, &fs);
+        if (fr == R && fc == C) { *spin_out = fs; return cc; }
+    }
+    return NULL;
+}
+
 /* The same map on a whole frame rectangle, for the log. A quarter-turn sends a
    rectangle to a rectangle, so mapping the two opposite corners and taking the
    min/max is exact -- no scan needed. Used to say where the core and the strip
@@ -1087,6 +1175,22 @@ static void strip_dfs(int round, int level, uint32_t sig) {
         spins[W-1] = g_edge_term[term].rotation;
         if (used_test(g_placed, pids[W-1])) continue;
 
+        /* Clue guards, two of them and both needed. A cell that owes a clue must
+           receive exactly that piece at exactly that spin; and a clue piece may
+           not be laid anywhere but its own cell -- the analogue of the beamer's
+           database exclusion, without which round 1 could spend a piece round 3
+           still needs and refute a strip that is actually fine. */
+        if (g_clue_mask && g_rh_orient >= 0) {
+            bool bad = false;
+            for (int i = 0; i < W && !bad; i++) {
+                int spin_need;
+                const ClueCell *cc = rh_clue_at_frame(level, PUZZLE_SIDE - W + i, &spin_need);
+                if (cc) bad = (pids[i] != cc->piece || spins[i] != (uint8_t)spin_need);
+                else    bad = rh_is_clue_piece(pids[i]);
+            }
+            if (bad) continue;
+        }
+
         level_place(level, pids, spins);
         if (parity_ok(round, level+1, succ)) {
             advanced = true;
@@ -1329,10 +1433,20 @@ static int greedy_fill(void) {
                 if (g_has[r][c]) continue;
                 int need = (r == 0) + (r == PUZZLE_SIDE-1) + (c == 0) + (c == PUZZLE_SIDE-1);
                 int cell_cost = 5, ways = 0, pid_at = -1, spin_at = 0;
+                /* The dive respects clues too, or a --max_breaks run would hand
+                   back a complete board with the clues scattered -- the exhaustive
+                   half having held them for nothing. A clue cell takes only its
+                   own piece at its own spin; every other cell refuses clue pieces
+                   outright, which also keeps one available for its cell. */
+                int clue_spin = 0;
+                const ClueCell *want_clue = rh_clue_at_frame(r, c, &clue_spin);
                 for (int pid = 0; pid < NUM_PIECES; pid++) {
                     if (used_test(g_placed, (uint16_t)pid)) continue;
                     if (rh_zero_count(pid) != need) continue;
+                    if (want_clue ? (pid != want_clue->piece) : rh_is_clue_piece((uint16_t)pid))
+                        continue;
                     for (int spin = 0; spin < 4; spin++) {
+                        if (want_clue && spin != clue_spin) continue;
                         if (!fits_frame(pid, spin, r, c)) continue;
                         Oriented o = rh_oriented((uint16_t)pid, (uint8_t)spin);
                         int cost = placement_cost(&o, r, c);
@@ -1541,6 +1655,16 @@ static bool load_and_cut(const char *path, uint32_t line, int forced_W) {
     int pos[NUM_PIECES], rot[NUM_PIECES]; char id[64];
     if (!read_line(path, line, id, pos, rot)) return false;
 
+    /* Read the board's committed orientation before anything is rotated or
+       freed: the clue table is in ORIGINAL coordinates, and this is the only
+       moment the board is still in them. */
+    g_rh_orient = g_clue_mask ? rh_clue_orient_of(pos, rot) : -1;
+    if (g_clue_mask && g_rh_orient < 0) {
+        printf("[skip] line %u: carries none of the enabled clue pieces, so there is\n"
+               "       nothing to read the board's orientation from\n", line);
+        return false;
+    }
+
     memset(g_has, 0, sizeof g_has);
     memset(g_placed, 0, sizeof g_placed);
     g_rot_applied = 0;
@@ -1589,6 +1713,26 @@ static bool load_and_cut(const char *path, uint32_t line, int forced_W) {
     for (int r = 0; r < PUZZLE_SIDE; r++)
         for (int c = 0; c < PUZZLE_SIDE; c++)
             if (!cell_kept(r, c, g_W)) g_has[r][c] = false;
+
+    /* Clue viability. A clue whose cell survives the cut is never re-placed by
+       any strip, so if it is wrong there it is wrong for good and searching this
+       board is wasted work. The centre clue is always in this case -- the core
+       spans the middle of the board at every W -- which is why --clue_center
+       verifies here rather than pinning anything. */
+    for (int k = 0; k < CLUE_N && g_clue_mask; k++) {
+        if (!clue_on(k)) continue;
+        const ClueCell *cc = &g_clue[g_rh_orient][k];
+        int R, C, S;
+        orig_to_frame(cc->row, cc->col, cc->spin, g_rot_applied, &R, &C, &S);
+        if (!g_has[R][C]) continue;                 /* freed: a strip will pin it */
+        if (g_grid[R][C].piece_id != cc->piece || g_grid[R][C].rotation != (uint8_t)S) {
+            printf("[skip] line %u: clue %d of orientation %d needs piece %u at board cell\n"
+                   "       (%d,%d), but that cell is inside the retained core holding piece %u,\n"
+                   "       and no strip can re-place it\n",
+                   line, k, g_rh_orient, cc->piece, cc->row, cc->col, g_grid[R][C].piece_id);
+            return false;
+        }
+    }
 
     g_n_placed = 0;
     memset(g_placed, 0, sizeof g_placed);
@@ -1667,6 +1811,14 @@ static const char *k_usage =
 "  --max_breaks B         after the exhaustive search, greedily fill the rest of\n"
 "                         the deepest board, spending at most B mismatches\n"
 "                         (default 0 = off, so the output stays break-free)\n"
+"  --clue_center          verify the published centre clue is on its cell. The core\n"
+"                         spans the middle of the board at every width, so this tool\n"
+"                         never frees that cell -- the flag checks, it cannot pin\n"
+"  --clue_corners         hold the four corner clues on their cells and spins. These\n"
+"                         DO fall in the freed bands, and without the flag a --rounds 3\n"
+"                         cut re-places all four somewhere else. Both flags read the\n"
+"                         orientation off each input board and skip a board whose core\n"
+"                         already contradicts a clue; --max_breaks respects them too\n"
 "  --max_nodes N          node budget per input board (0 = unlimited)\n"
 "  --config_time_sec S    wall-clock budget per input board (default 600)\n"
 "  --max_wall_sec S       wall-clock budget for the whole run (0 = unlimited)\n"
@@ -1750,6 +1902,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--rotate") && i+1 < argc) g_rotate = atoi(argv[++i]);
         else if (!strcmp(a, "--stop_row") && i+1 < argc) g_stop_level = atoi(argv[++i]);
         else if (!strcmp(a, "--max_breaks") && i+1 < argc) g_max_breaks = atoi(argv[++i]);
+        else if (!strcmp(a, "--clue_center"))  g_clue_mask |= CLUE_CENTER;
+        else if (!strcmp(a, "--clue_corners")) g_clue_mask |= CLUE_CORNERS;
         else if (!strcmp(a, "--max_nodes") && i+1 < argc) g_max_nodes = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--ties") && i+1 < argc) g_ties = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(a, "--only_complete")) g_only_complete = true;
@@ -1806,6 +1960,10 @@ int main(int argc, char **argv) {
     printf("[cfg] border_row=%u border_row_N=%u of %u data line(s)  "
            "corners BL/BR/TL/TR=%d/%d/%d/%d\n", g_line_first, g_line_count, csv_lines,
            g_pin_corner[0], g_pin_corner[1], g_pin_corner[2], g_pin_corner[3]);
+    if (g_clue_mask)
+        printf("[cfg] clue_center=%d clue_corners=%d (orientation read from each input board;\n"
+               "      the centre always survives the cut, so --clue_center only verifies it)\n",
+               (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0);
     printf("[plan] rounds refill the input's %s", round_side(1));
     for (int rd = 2; rd <= g_rounds; rd++) printf(" -> %s", round_side(rd));
     printf(" band; a break outside them makes a board unusable%s\n",
@@ -1819,6 +1977,7 @@ int main(int argc, char **argv) {
     load_seed_and_catalog(seed_path);
     build_catalog_indices();
     build_inner_color_totals();
+    if (g_clue_mask) check_frame_maps();
 
     for (int k = 0; k < 4; k++)
         if (g_pin_corner[k] >= 0) {

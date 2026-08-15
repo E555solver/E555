@@ -439,17 +439,127 @@ penalized exactly the pattern the Mahalanobis term rewards, hard infeasibility
 is already caught by the parity check, and supply health is already encoded in
 the fan-out lookahead.)
 
-**Center-139 bonus** (`--soft_center_139`, `--bonus_139`). Clue piece 139 is
-barred from rows 1-5; a board that later places it on one of the four true
-center cells carries a score flag on every subsequent row, promoting that
-lineage. The bonus is additive on a score measured in nats of log record count,
-so its value *is* a claimed factor in continuability: the historical +10
-asserted a center-139 board was worth `e^10 ~ 2.2e4` times one without, which
-no real fan-out difference can overcome, and it then persisted in every
-descendant from row 6 while the random band shut off at row 8. The default is
-now **1.0** -- roughly one standard deviation of the color term -- so it breaks
-near-ties in favour of a 139 lineage without overriding a board that is
-genuinely more continuable.
+### Eternity II clue pieces (`--clue_center`, `--clue_corners`)
+
+The five published hints, converted once into this repo's numbering (0-based
+ids, bottom-up rows, CCW spins) and validated against the classic piece table:
+all 256 pieces match under `our_id = classic - 1` with a complete, unique
+23-colour bijection.
+
+| our piece | cell | (row, col) at 0 deg | spin |
+|---|---|---|---|
+| 138 (centre) | 119 | (7, 7) | 0 |
+| 180 | 34 | (2, 2) | 0 |
+| 248 | 45 | (2, 13) | 3 |
+| 207 | 210 | (13, 2) | 3 |
+| 254 | 221 | (13, 13) | 1 |
+
+Each clue pins a cell **and** a spin. Rotating a solved board 90 degrees keeps
+the edge rules but moves the clues, so the clue-satisfying solution set is not
+rotation-closed; since our border is chosen by our own search, "which puzzle
+side is our row 0" is free and all four orientations must be searched. Every
+orientation places the centre plus two corner clues below row 12 and leaves the
+other two on row 13 -- which is why `--stop_row` is capped at 12 when a clue
+flag is on. The centre visits a different one of the four centre cells per
+orientation, so `{119,120,135,136}` are the four centre placements.
+
+A board is unassigned until it places its first clue, then owes that
+orientation for life; the orientation lives in `BeamEntry.flags` and joins the
+dedup signature, or boards owing different clue sets would merge. `select_beam`
+reserves a floor of `K/8` per orientation ahead of the score band, and hands
+whatever a thin orientation cannot fill back to merit.
+
+**The constraint bites one row early.** A clue's bottom face must meet the piece
+below it, so every clue demands a colour from the row *under* it, and that
+demand is met by generating the row with a `TOPCOLOR` pin rather than filtering
+the finished children. The distinction is not cosmetic: the beam keeps roughly
+one child per A record, so rejecting the children that miss starves the row
+instead of reshaping it.
+
+Both rules -- a clue pins its own cell, a clue pins a colour on the cell below
+-- are driven off `g_clue`, so the schedule falls out of the table rather than
+being written per row. For the row-2 corners it puts two `TOPCOLOR` pins on row
+1, in segment A (col 2) and segment C (col 13); measured, 22 surviving boards
+filtering against 3328 pinning. For the centre it puts one on row 6 or 7
+depending on orientation, which matters just as much: without it the centre row
+kept **1075 boards of 104833**, and with it 6069, with row 9 going 194 -> 884 on
+the same borders. And for the row-13 pair it puts two on row 12, which is what
+makes the attached pieces below meet the board rather than land on whatever
+colour the search happened to choose.
+
+`E555_CLUE_DEBUG=1` prints the whole schedule at startup, before any search
+runs -- rows 11 and 12 are reached too rarely to be a practical way of checking
+what they owe.
+
+**The two unreachable corners are attached to the emitted board.** With
+`--clue_corners` on, every emitted board also carries its orientation's two
+row-13 clue pieces at their cells. The search never reaches row 13 -- which is
+the point: the viewer makes it obvious the corners were pinned, and a hole-free
+Stage C solve has to build around them. There is no orientation to choose: the
+board committed to one when it placed its row-2 corners.
+
+Below `--stop_row 12` the cells they land on touch no placed neighbour, so no
+adjacency is asserted and the edge score is unchanged (verified: 294/480 with
+and without them). At `--stop_row 12` -- the default, and what the shipped
+pipelines finalize to -- row 12 *is* filled, and the pair sits directly on it.
+That is exactly why row 12 carries the push-down: the two cells beneath the
+clues are generated on the colours the clues need, so the junctions match
+instead of breaking on a colour nothing chose (~6% of inner half-edges carry
+any given colour, so left unpinned both junctions break almost surely).
+
+**Every later stage can hold them too.** `E555_finalizer`, `E555_roundhouse`,
+`E555_topper.py` and `E555_ender.py` all take the same two flags, all default
+off, and each holds what its own geometry lets it hold:
+
+| tool | what it can hold | what it cannot |
+|---|---|---|
+| finalizer | the centre clue and any clue on a searched row, by pinning it during generation | the row-13 pair: reserved and attached, so row 13 must not be searched |
+| roundhouse | the four corner clues, by filtering the strip records that would misplace them | nothing -- the centre never leaves the core, so `--clue_center` only verifies it |
+| topper / ender | every clue its open region reaches, including all four corners | a clue outside the window, reported and skipped |
+
+The finalizer is the one that mattered most: the shipped pipelines run it at
+`--finalize_from = BEAM_STOP - 5` (6 at the default stop row 11), which frees
+rows 7 and 8 and so the centre clue's cell. Measured on the delivered clued
+boards at that exact setting, a run without the flags kept **2/5 clues on 2146
+boards and 3/5 on 226** -- never 5 -- while the same run with them kept **5/5 on
+all 222** it emitted. The roundhouse is as stark: a `--rounds 3 --strip_width 5`
+cut with `--max_breaks` returns complete boards holding **1/5** clues without the
+flags (only the centre, which it never frees) and **5/5** with them.
+
+**How Stage C holds them.** `E555_topper.py` and `E555_ender.py` take the
+same two flags, and without them they treat a clue like any other piece: the
+topper's `--side T --work-rows 4` band covers rows 12..15, exactly where the two
+row-13 clues sit, and the ender's `--mode ring` opens the whole border with the
+centre clue inside any interior break box. Measured on 40 clued row-11 partials,
+a single default topper pass drops every board from 5/5 clues to 3/5; with
+`--clue_center --clue_corners` all 40 keep 5/5.
+
+Three differences from the beamer are worth knowing. **All four corner clues are
+enforceable here**, not just the two on row 2, because Stage C sees the whole
+board -- this is the only place entries 3..4 of the table are ever constrained.
+**Orientation is inherited, never chosen**: `--clue_orient auto` (the default)
+reads off the input board which of the four orientations it committed to, and
+only a board carrying no clue at all needs an explicit `--clue_orient 0..3`
+(measured unambiguous -- each of 329 clued boards matched exactly one
+orientation, never two). And **a clue the open region cannot reach is reported
+and skipped**, not an error: an early window of a sliding-window sweep
+legitimately cannot touch the far side of the board.
+
+The clue table itself lives once, in `tools/E555_viewer.py`, transcribed
+verbatim from `g_clue` in `E555_database.c` -- the row/column and spin
+conventions are identical, so no conversion is involved. `tools/E555_rank.py`
+reads it for its `clues` column.
+
+**The database.** Clue pieces are barred from the chain database
+(`g_db_exclude`), so no chain can hold one; the pinned walk places them
+directly and is exempt from the board's reserved mask. Only the enabled clues
+are excluded -- `--clue_center` alone leaves the corner pieces as ordinary inner
+pieces, because two of them genuinely sit at row 2 in the solution and
+excluding them without forcing them would make the answer unreachable.
+Measured record counts: 3.119e9 with no clues, 3.042e9 centre only
+(predicted (195/196)^5), 2.730e9 with all five (predicted (191/196)^5). A cache
+carries a hash of its exclusion set and refuses a mismatched run, so **use a
+separate `--db_file` per clue setting**.
 
 ### Color-parity pruning
 
@@ -551,7 +661,6 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--lambda_J F` | 1 | weight of the J terms (1 = as derived) |
 | `--lambda_Mahalanobis F` | 0 | weight of the color-usage atypicality bonus (legacy model) |
 | `--avail_correct` | off | discount B/C fan-out by each frontier color's remaining supply |
-| `--bonus_139 F` | 1 | center-139 score bonus (was a hard-coded 10) |
 | `--no_free_demand` | -- | **disable** the free-mode demand accounting (on by default) |
 | `--supply_check R` | 0 | piece-supply certificate from row R (0 = off) |
 | `--frac_rand F` | 0.75 | random selection band (halved at R-1, zero from R) |
@@ -566,13 +675,14 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--gumbel_tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
 | `--gumbel_tau_columns T` | 0 | ditto for left columns (measure before raising: see above) |
 | `--bail_columns N` | 0 | abandon a bottom after N consecutive columns that emitted nothing (0 = off) |
+| `--clue_center` | off | force the published centre clue (piece 138) onto its cell, at its orientation's spin |
+| `--clue_corners` | off | force the two reachable corner clues (row 2); needs `--stop_row <= 12` |
 | `--config_time_sec S` | 600 | wall-time slice per configuration |
 | `--max_wall_sec S` | 0 | total budget (0 = unlimited) |
 | `--max_partials N` | 0 | stop after N boards reported -- completions **plus** `--incomplete_top` partials (0 = unlimited) |
 | `--resume` | off | continue from the sweep checkpoint |
 | `--threads N` | all | OpenMP threads |
 | `--seed S` | random | master RNG seed |
-| `--soft_center_139` | off | center-clue handling (see `--bonus_139`) |
 | `--verbose` | off | per-row `[beam]` progress lines |
 
 `--bc_window` is the one place where extra compute buys objective rather than
@@ -625,7 +735,33 @@ outright: with half the board locked the chain DFS shrinks super-exponentially
 (a `finalize_from 10` database builds in ~2 s -- 5.5 M records vs 3.1 G) and
 contains no chain that could be rejected for reusing a locked piece. That is
 what makes rows 11-14 searchable at full width, in trivial memory, with no
-disk cache. Consecutive lines sharing a locked set skip the rebuild.
+disk cache. Consecutive lines sharing a locked set skip the rebuild -- with
+clues on, the reuse key is the locked set *plus the clue pieces*, since two
+partials can share a locked region and still owe different ones.
+
+**`--clue_center` / `--clue_corners`.** Both default off; with neither, this
+program behaves exactly as before. They matter here more than anywhere else in
+the pipeline, because the shipped `--finalize_from = BEAM_STOP - 5` frees the
+centre clue's row and the search then quietly refills that cell with something
+else (measured above: never 5/5 without the flags, always 5/5 with them).
+
+Unlike the beamer, which explores all four orientations at once and pays for it
+with orientation bits in the beam entry, a term in the frontier signature and a
+reserve pass in selection, the finalizer is always handed a board that already
+committed to one. It reads that orientation off the input line -- so none of
+that machinery exists here -- and folds it into the input-dedup hash, because
+everything freed above the lock collapses to one bucket there and two lines
+differing only in orientation would otherwise merge.
+
+A clue on a searched row is pinned during generation, via the same
+`enumerate_pinned_segment` walk the beamer uses; a clue on the row *above* a
+searched row pins a colour there instead, because a clue's bottom face has to
+meet whatever sits under it. Rows below the lock are checked, not searched: a
+partial whose locked region already contradicts a clue is skipped with the
+reason, since no row above it could repair the board. The row-13 pair is
+reserved and attached to the emitted board exactly as in the beamer, which is
+why row 13 must not be searched -- `--stop_row <= 12`, or `--finalize_from >= 13`
+so the row is locked with its clues already on it.
 
 **Side modes.** Without `--free_edges`, the partial's border placement is used
 as a fixed assignment (requires all 60 border pieces in the line; otherwise
@@ -841,8 +977,22 @@ rows deliberately.
 The geometry is forced, not chosen: requiring each rotation to land the next
 wall on column `15-W` gives core height `16-W` and core width `16-2W` uniquely
 (check: `(16-2W)(16-W) + 2W(16-W) + 15W + W = 256`). Note that all four center
-cells lie inside the `--rounds 3` core at every W, so clue piece 139's placement
-is inherited from the input and can never be created by a strip.
+cells lie inside the `--rounds 3` core at every W, so a center clue piece's
+placement is inherited from the input and can never be created by a strip.
+
+**`--clue_center` / `--clue_corners`** follow from exactly that. The centre is in
+the core at every width and round count, so `--clue_center` here can only verify
+it -- a board whose core contradicts a clue is skipped, since no strip could
+repair it. The four corner clues at (2,2) (2,13) (13,2) (13,13) *are* freed, and
+those the flags hold. Enforcement is a filter inside `strip_dfs`'s record loop,
+not a pinned enumerator: this search is exhaustive and has no beam to starve, so
+rejecting a record at the level its clue sits on simply prunes the subtree, and
+the "clue's bottom must meet the piece below" condition is already guaranteed by
+`rh_decode` matching every record against the level below. A second guard bars a
+clue piece from any cell but its own, so round 1 cannot spend a piece round 3
+still needs. `--max_breaks` respects both, or the dive would scatter the clues
+the proof engine just held. The oracle stays deliberately clue-blind: it solves
+the colour-only relaxation, and ignoring pins keeps it admissible.
 
 ### --rotate: which side each round attacks
 
@@ -1091,7 +1241,17 @@ duplicates, and the run summary says how often that happened: on a tight band
 the default `--beam_slack 1` often admits nothing at all (on
 `data/board_example_462.csv` with a 2-row band, the nearest distinct board
 costs 5 more breaks), so widen it when you want a genuinely wide beam. `--verbose` prints an ASCII map of the open band, and
-boards with nothing broken or empty inside the band skip the solver entirely.
+boards with nothing broken or empty inside the band skip the solver entirely
+(unless a clue inside the band is displaced, which is work whether or not the
+band holds a break).
+
+**`--clue_center` / `--clue_corners` / `--clue_orient`** hold the Eternity II
+hint pieces in place; see the clue section above for what they cover and why
+orientation is read off the board rather than chosen. Each pinned clue is two
+`Add` constraints on cells the model already has, so nothing about the
+objective, the break count or the corner pull changes. One consequence worth
+knowing: a pinned cell can never differ between beam ranks, so with clues on
+`--beam_diff` is effectively measured over the unpinned cells.
 
 Three drivers ship with it, in increasing depth and cost:
 
@@ -1191,6 +1351,18 @@ break can cascade all the way around the frame -- and the corners' three-way
 commodity symmetry falls out of the per-class `AddAllDifferent` for free.
 `--verbose` prints an ASCII map of the open pool per rung.
 
+It takes the same **`--clue_center` / `--clue_corners` / `--clue_orient`** as the
+topper, with two extras this tool needs. Its piece domains are exactly the
+pieces already in the pool -- it is a permutation repair, not a filler -- so a
+displaced clue also opens the cell its piece currently sits in, or the pin would
+be infeasible rather than merely unsatisfied; a clue already in place opens
+nothing. And its never-worse guard becomes lexicographic, clues before breaks,
+because a clue repair is often break-neutral and a break-only test would discard
+the repaired board. Both are recomputed per rung, so a clue fixed on one rung
+stops asking for cells on the next. Repairing a clue spends at least two of
+`--max-changes` (its cell and its donor), so the cheapest rungs of the ladder may
+come back infeasible on a clue-broken board and the ladder simply climbs.
+
 ---
 
 ## Tools
@@ -1198,7 +1370,10 @@ commodity symmetry falls out of the per-class `AddAllDifferent` for free.
 - **`tools/E555_viewer.py`** -- ASCII board (`#` marks broken junctions),
   placement/edge/solid statistics, frame-violation check, e2.bucas.name URL;
   `--diff A B` overlays two rows of a CSV. `--seed PATH` (defaults to
-  `./seed_Edge5.txt`, then the repo's `data/` copy).
+  `./seed_Edge5.txt`, then the repo's `data/` copy). It is also the toolkit's
+  shared Python module: `E555_rank.py` and the two Stage C CP-SAT tools import
+  it, and it holds the single copy of the Eternity II clue table
+  (`CLUE`, `clue_list`, `clue_orient`, `clue_pins`).
 - **`tools/E555_rank.py`** -- ranks and sorts board CSVs by what the score
   cannot see. Eighteen breaks spread over seven rows is a mess; the same
   eighteen packed into rows 14-15 is nearly finished. Per board it derives
@@ -1206,9 +1381,12 @@ commodity symmetry falls out of the per-class `AddAllDifferent` for free.
   `break_cols` (how many distinct lines hold a break -- the compactness
   measure), `span` (their bounding box), `clean_b/t/l/r` (contiguous
   break-free rows or columns from each border; `clean_b` is the old
-  "completed rows"), and `corner_d` (the distance the breaks still have to
+  "completed rows"), `corner_d` (the distance the breaks still have to
   travel to their nearest corner -- the quantity `E555_topper` minimizes
-  after the break count, and a good tie-breaker). `--sort` takes any of them,
+  after the break count, and a good tie-breaker), and `clues` (how many of the
+  five Eternity II clue pieces still sit at their published cell and spin,
+  0..5, for whichever orientation the board matches -- always measured, no flag,
+  and 0 for a board that never carried clues). `--sort` takes any of them,
   best board first, several files at once; `--emit` re-orders the input rows
   verbatim, so the canonical format never changes and old files rank fine.
   `--emit FILE --rescore` instead rewrites every row canonically

@@ -45,7 +45,34 @@ Between any two steps, look at what you have:
 
 ```bash
 python3 tools/E555_rank.py   FILE --seed data/seed_Edge5.txt --top 10
+python3 tools/E555_rank.py   FILE --seed data/seed_Edge5.txt --top 10 --no-id
 python3 tools/E555_viewer.py FILE --seed data/seed_Edge5.txt
+```
+
+`--no-id` drops the board-id column, which is the widest one and the usual
+reason the table wraps in a terminal; `row` still says which board is which.
+
+## Fixing the Eternity II clue pieces
+
+Scripts 01 to 04 take **`CLUES=1`**, which passes `--clue_center --clue_corners`
+to every tool in that script. It is off by default and changes nothing when
+unset.
+
+```bash
+CLUES=1 bash examples/01_beamer_quickstart.sh
+CLUES=1 PARTIALS=beam_out/beam_completions_random_10.csv bash examples/02_finalizer_regrow.sh
+CLUES=1 BOARDS=final_out/beam_completions_finalized_12.csv bash examples/04_stage_c_close.sh
+```
+
+Set it on **every** stage or on none. A clue held by one stage and dropped by
+the next is no better than never holding it, which is exactly what used to
+happen: script 02 locks rows 0..7 by default and re-grows everything above, so
+without the flag it frees the centre clue's cell and quietly refills it. The
+`clues` column of `E555_rank.py` counts how many of the five a board still has,
+so you can check any stage's output at a glance:
+
+```bash
+python3 tools/E555_rank.py FILE --sort clues,score --no-id
 ```
 
 And when a stage stalls on the same region twice, turn the board and hand it

@@ -20,7 +20,9 @@ THE MEASURES  (a "break" is an internal junction whose two cells disagree;
                a junction touching an unplaced cell counts as broken, exactly
                as everywhere else in Stage C)
 
-    breaks      480 - score. Lower is better.
+    breaks      480 - score. Lower is better. Measured and sortable, but NOT
+                printed: it is exactly 480 - score, so the table shows score
+                alone and you read closeness to a finished board off it.
     score       matched internal edges, 0..480. Higher is better.
     solid       pieces with all four sides satisfied (the viewer's "Solid
                 pieces"), 0..256. Higher is better.
@@ -46,6 +48,12 @@ THE MEASURES  (a "break" is an internal junction whose two cells disagree;
                 nearest corner: the quantity E555_topper.py minimizes after
                 the break count. Fine-grained, so it breaks ties that the
                 integer measures leave. Lower is better.
+
+    clues       how many of the five Eternity II clue pieces sit at their
+                published cell and spin, 0..5, for whichever of the four
+                board orientations the board matches. Higher is better. A
+                board that never carried clues reads 0; one from a clued
+                beam run reads 5 until some later stage moves a clue piece.
 
 CANONICAL OUTPUT  (--emit --rescore)
 
@@ -227,22 +235,37 @@ def measure(pos, rot, seed):
     else:
         span = "-"
 
+    # How many of the five Eternity II clue pieces sit at their published cell
+    # and spin, for whichever orientation the board matches. Always measured --
+    # it needs no flag, and a board that never had clues simply reads 0. Stage C
+    # can move clue pieces unless told not to, so this is what says whether a
+    # candidate still qualifies as a clue-satisfying solution.
+    _clue_o, n_clues = V.clue_orient(pos, rot)
+
     return dict(breaks=breaks, score=N_EDGES - breaks, solid=solid,
                 placed=len(colors), border=border,
                 break_rows=len(rows), break_cols=len(cols),
                 span=span, clean_b=clean_b, clean_t=clean_t,
-                clean_l=clean_l, clean_r=clean_r, corner_d=corner_d)
+                clean_l=clean_l, clean_r=clean_r, corner_d=corner_d,
+                clues=n_clues)
 
 
-# Printed left to right in this order; `span` is text, the rest are integers.
+# Every measure, in this order; `span` is text, the rest are integers. This is
+# what --sort, --field and --csv see.
 COLUMNS = ("breaks", "score", "solid", "placed", "border", "break_rows",
            "break_cols", "span", "clean_b", "clean_t", "clean_l", "clean_r",
-           "corner_d")
+           "corner_d", "clues")
+
+# What the human table prints. `breaks` is left out because score = 480 - breaks
+# EXACTLY, so the pair carried no information the other did not, and score is the
+# one that says how close the board is to a finished 480. It stays a measure, so
+# --sort breaks, --field breaks and --csv are unaffected.
+SHOWN = tuple(k for k in COLUMNS if k != "breaks")
 
 # Which way is "better" for each measure. Sorting is always best-first, so
 # --sort solid puts the most solid board on top without any extra syntax; a
 # '-' prefix (--sort=-solid) asks for worst-first instead.
-HIGH_IS_BETTER = {"score", "solid", "placed", "border",
+HIGH_IS_BETTER = {"score", "solid", "placed", "border", "clues",
                   "clean_b", "clean_t", "clean_l", "clean_r"}
 SORTABLE = tuple(k for k in COLUMNS if k != "span")
 
@@ -353,6 +376,10 @@ def main():
                          "verbatim. Makes `sort -t, -k2,2nr` meaningful.")
     ap.add_argument("--csv", action="store_true",
                     help="print the measures as CSV instead of a table")
+    ap.add_argument("--no-id", action="store_true",
+                    help="drop the board-id column from the table, which is the "
+                         "widest one and the usual reason a row wraps; `row` "
+                         "still identifies the board. Ignored by --csv.")
     ap.add_argument("--border-only", action="store_true",
                     help="keep only boards with a fully clean, complete external "
                          "border (border == 60)")
@@ -410,16 +437,21 @@ def main():
     print(f"\n=== E555 rank ===  {len(records)} boards from "
           f"{len(args.inputs)} file(s), sorted by {order}\n")
 
-    idw = min(44, max(len(r["id"]) for r in shown))
+    # --no-id drops the widest column of all: board ids run to 44 characters and
+    # are the main reason a row wraps. `row` still identifies the board, and it
+    # is what --row of the other tools wants anyway.
+    idw = 0 if args.no_id else min(44, max(len(r["id"]) for r in shown))
+    idh = "" if args.no_id else f"{'id':<{idw}}  "
     fw = max((len(r["file"]) for r in shown), default=4) if multi else 0
-    head = (f"{'file':<{fw}} " if multi else "") + f"{'row':>5}  {'id':<{idw}}  " + \
-           "  ".join(f"{k:>{max(6, len(k))}}" for k in COLUMNS)
+    head = (f"{'file':<{fw}} " if multi else "") + f"{'row':>5}  " + idh + \
+           "  ".join(f"{k:>{max(6, len(k))}}" for k in SHOWN)
     print(head)
     print("-" * len(head))
     for r in shown:
-        cid = r["id"] if len(r["id"]) <= idw else r["id"][:idw - 1] + "~"
-        line = (f"{r['file']:<{fw}} " if multi else "") + f"{r['row']:>5}  {cid:<{idw}}  " + \
-               "  ".join(f"{r[k]:>{max(6, len(k))}}" for k in COLUMNS)
+        cid = "" if args.no_id else \
+              (r["id"] if len(r["id"]) <= idw else r["id"][:idw - 1] + "~").ljust(idw) + "  "
+        line = (f"{r['file']:<{fw}} " if multi else "") + f"{r['row']:>5}  " + cid + \
+               "  ".join(f"{r[k]:>{max(6, len(k))}}" for k in SHOWN)
         print(line)
 
     b = shown[0]
@@ -427,7 +459,7 @@ def main():
           f"{b['break_cols']} col(s), span {b['span']}, solid {b['solid']}/256, "
           f"clean rows {b['clean_b']} from the bottom, {b['clean_t']} from the top")
     print("[note] lower is better: breaks break_rows break_cols corner_d   |   "
-          "higher is better: score solid placed border clean_*")
+          "higher is better: score solid placed border clues clean_*")
 
     if args.emit:
         write_emit(args.emit, shown, args.rescore)

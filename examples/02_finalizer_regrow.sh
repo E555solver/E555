@@ -46,6 +46,8 @@ BEAM_WIDTH="${BEAM_WIDTH:-150000}"
 FIRST_LINE="${FIRST_LINE:-0}"     # first input CSV line to use
 N_LINES="${N_LINES:-20}"          # how many input lines to process
 MAX_WALL="${MAX_WALL:-600}"       # seconds for the whole run, 0 = unlimited
+CLUES="${CLUES:-0}"                # 1 = hold the published Eternity II clue
+                                  # pieces on their cells and spins
 # -----------------------------------------------------------------------------
 
 [ -x "$REPO/bin/E555_finalizer" ] || make -C "$REPO" finalizer
@@ -56,8 +58,9 @@ MAX_WALL="${MAX_WALL:-600}"       # seconds for the whole run, 0 = unlimited
 # The rotations file is an optional third positional, so build just that part
 # conditionally rather than writing the whole call out twice.
 ROT_ARG=(); [ -n "$ROTATIONS" ] && ROT_ARG=("$ROTATIONS")
+CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 
-"$REPO/bin/E555_finalizer" "$SEED" "$PARTIALS" "${ROT_ARG[@]}" \
+"$REPO/bin/E555_finalizer" "$SEED" "$PARTIALS" "${ROT_ARG[@]}" "${CLUE_ARG[@]}" \
     --border_row "$FIRST_LINE" --border_row_N "$N_LINES" \
     --finalize_from "$FROM" --finalize_repeats "$REPEATS" \
     --beam_width "$BEAM_WIDTH" --stop_row "$STOP_ROW" \

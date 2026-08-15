@@ -37,6 +37,14 @@ SEED="${SEED:-$REPO/data/seed_Edge5.txt}"
 RUN_DIR="${RUN_DIR:-$PWD/pipeline_out}"
 THREADS="${THREADS:-$(nproc 2>/dev/null || echo 4)}"
 DB_FILE="${DB_FILE:-}"                  # empty = build the chain DB in memory
+CLUES="${CLUES:-0}"                     # 1 = hold the Eternity II clue pieces in
+                                        # place at every stage that can
+
+CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
+# A clue-built chain database has the same seed but different CONTENTS, and the
+# beamer refuses a cache whose exclusion set does not match. Keep the two apart so
+# toggling CLUES does not silently rebuild 6.4 GB each way.
+[ "$CLUES" = 1 ] && [ -n "$DB_FILE" ] && DB_FILE="$DB_FILE.clue"
 
 # -- stage 1: border annealer ------------------------------------------------
 # Per-side Euler-trail targets. The annealer drives the search toward
@@ -151,7 +159,7 @@ BEAM_CMD=("$REPO/bin/E555_beamer" "$SEED" 1_rotations.csv
     --beam_width "$BEAM_WIDTH" --stop_row "$BEAM_STOP_ROW"
     --border_row_N "$((ROUNDS/2))" --top_columns "$BEAM_COLUMNS" --lambda_Mahalanobis 10
     --incomplete_top --max_partials "$BEAM_MAX_PARTIALS"
-    --max_wall_sec "$BEAM_MAX_WALL" --verbose)
+    --max_wall_sec "$BEAM_MAX_WALL" --verbose "${CLUE_ARG[@]}")
 [ -n "$DB_FILE" ] && BEAM_CMD+=(--db_file "$DB_FILE")
 "${BEAM_CMD[@]}"
 
@@ -180,7 +188,7 @@ echo
     --beam_width "$FIN_WIDTH" --stop_row "$FIN_STOP_ROW" --finalize_from "$FIN_FROM" \
     --border_row_N "$BEAM_MAX_PARTIALS" --top_columns 0 --lambda_Mahalanobis 10 \
     --incomplete_top --max_partials "$FIN_MAX_PARTIALS" \
-    --max_wall_sec "$FIN_MAX_WALL" --verbose
+    --max_wall_sec "$FIN_MAX_WALL" --verbose "${CLUE_ARG[@]}"
 
 FIN_OUT="3_final_row$FIN_STOP_ROW.csv"
 cat final/beam_completions_finalized_"$FIN_STOP_ROW".csv          > "$FIN_OUT"
@@ -217,7 +225,7 @@ echo
 "$REPO/bin/E555_roundhouse" "$SEED" "$FIN_OUT" \
     --out_dir strip --threads "$THREADS" \
     --rounds 1 --strip_width "$RH_WIDTH" --rotate "$RH_ROTATE" \
-    --border_row_N "$RH_LINES" --max_wall_sec "$RH_WALL" --verbose
+    --border_row_N "$RH_LINES" --max_wall_sec "$RH_WALL" --verbose "${CLUE_ARG[@]}"
 
 # First existing match, or empty. NOT `$(ls GLOB 2>/dev/null | head -1)`: when
 # the glob matches nothing `ls` exits 2, pipefail promotes that to the
@@ -256,7 +264,7 @@ echo
 head -n "$TOP_N" "$FIN_OUT" > corners_in.csv
 INPUT="$PWD/corners_in.csv" NUM_ROWS="$TOP_N" WORKERS="$THREADS" \
 MAX_TIME="$CPSAT_TIME" STALL_TIME="$CPSAT_STALL" PIECE_SEED="$SEED" \
-OUT_DIR="$PWD/sweep" PRESET=window bash "$REPO/pipeline/topper_sweep.sh"
+OUT_DIR="$PWD/sweep" PRESET=window CLUES="$CLUES" bash "$REPO/pipeline/topper_sweep.sh"
 
 # topper_sweep.sh writes topped_<PRESET>_<first row>.csv into its OUT_DIR, and
 # the row suffix follows SLURM_ARRAY_TASK_ID -- so match it rather than assume
@@ -282,11 +290,11 @@ echo
 
 python3 "$REPO/src/C_tail/E555_ender.py" "$SEED" 5_corners.csv 6_rung.csv \
     --mode ring --reach 2 --max-changes 16 --workers "$THREADS" \
-    --max-time "$((CPSAT_TIME*2))" --stall-time "$CPSAT_STALL" --verbose
+    --max-time "$((CPSAT_TIME*2))" --stall-time "$CPSAT_STALL" --verbose "${CLUE_ARG[@]}"
 
 python3 "$REPO/src/C_tail/E555_ender.py" "$SEED" 6_rung.csv 6_patched.csv \
     --workers "$THREADS" \
-    --max-time "$((CPSAT_TIME*3))" --stall-time "$((CPSAT_STALL*2))" --verbose
+    --max-time "$((CPSAT_TIME*3))" --stall-time "$((CPSAT_STALL*2))" --verbose "${CLUE_ARG[@]}"
 
 rank 6_rung.csv
 rank 6_patched.csv

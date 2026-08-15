@@ -55,6 +55,7 @@ int g_cat_to_local[CATALOG_SIZE];
 
 int g_lb_bucket[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL][MAX_LB_BUCKET];
 int g_lb_count[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL];
+uint32_t g_lb_step[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL][MAX_LB_BUCKET];
 int g_cat_to_lb_local[CATALOG_SIZE];
 int g_lb_bits = 0, g_term_bits = 0;
 int g_rec_bytes_inner = 0, g_rec_bytes_edge = 0;
@@ -90,12 +91,22 @@ LeftOrder   *g_lefts   = NULL;  size_t g_left_n   = 0;
 
 int  g_nthreads        = 0;
 bool g_verbose         = false;
-bool g_soft_center_139 = false;
 bool g_free_edges      = false;
 
 /* Pieces barred from the database: excluded pieces never enter a chain record
    or the edge-terminal pool. All-zero (the default) means no exclusion. */
 uint64_t g_db_exclude[4] = {0, 0, 0, 0};
+
+/* Generated from the published clue data; see ClueCell in the header. Entry 0
+   of each row is the center clue, 1..2 the reachable corners, 3..4 row 13. */
+const ClueCell g_clue[4][CLUE_N] = {
+    { { 7, 7,138,0}, { 2, 2,180,0}, { 2,13,248,3}, {13, 2,207,3}, {13,13,254,1} },   /*   0 deg */
+    { { 8, 7,138,3}, { 2, 2,248,2}, { 2,13,254,0}, {13, 2,180,3}, {13,13,207,2} },   /*  90 deg */
+    { { 8, 8,138,2}, { 2, 2,254,3}, { 2,13,207,1}, {13, 2,248,1}, {13,13,180,2} },   /* 180 deg */
+    { { 7, 8,138,1}, { 2, 2,207,0}, { 2,13,180,1}, {13, 2,254,2}, {13,13,248,0} },   /* 270 deg */
+};
+uint32_t g_clue_mask    = 0;
+uint8_t  g_clue_orients = 0xF;
 
 int g_top_border_inner_count[NUM_COLORS_TOTAL];
 int g_inner_color_total[NUM_COLORS_TOTAL];
@@ -260,6 +271,30 @@ void build_catalog_indices(void) {
     if (CHAIN_LEN * g_lb_bits > 32)
         fatal("inner record needs %d bits (>32); widen rec_load/store to 64-bit", CHAIN_LEN * g_lb_bits);
     g_rec_bytes_inner = (CHAIN_LEN * g_lb_bits + 7) / 8;
+
+    /* Flatten the buckets for the chain walk. A record's per-piece field is
+       g_lb_bits wide, so decode_inner_chain indexes the table with values up to
+       (1 << g_lb_bits) - 1 and does no bounds test of its own: that is safe only
+       while the field cannot outrun the table, which is checked here once. It
+       holds for every seed (bits_for caps at 6 for a 64-slot bucket) and would
+       only break if MAX_LB_BUCKET were raised to a non-power of two. */
+    if ((1 << g_lb_bits) > MAX_LB_BUCKET)
+        fatal("g_lb_bits=%d indexes %d slots but MAX_LB_BUCKET is %d; raise it to a power of two",
+              g_lb_bits, 1 << g_lb_bits, MAX_LB_BUCKET);
+    for (int L = 0; L < NUM_COLORS_TOTAL; L++)
+        for (int B = 0; B < NUM_COLORS_TOTAL; B++)
+            for (int k = 0; k < MAX_LB_BUCKET; k++) {
+                if (k >= g_lb_count[L][B]) { g_lb_step[L][B][k] = LBSTEP_DEAD; continue; }
+                int ci = g_lb_bucket[L][B][k];
+                const Oriented *o = &g_cat[ci];
+                if (ci > 0x3FF || o->right > 0x1F || o->piece_id > 0x1FF)
+                    fatal("g_lb_step packing overflow: ci=%d right=%u piece=%u",
+                          ci, o->right, o->piece_id);
+                g_lb_step[L][B][k] = (uint32_t)ci
+                                   | ((uint32_t)o->right    << 10)
+                                   | ((uint32_t)o->piece_id << 15);
+            }
+
     if (g_verbose) {
         printf("[init] catalog=%d  max(left,bottom) bucket=%d -> g_lb_bits=%d  inner record=%d B\n",
                g_cat_count, maxlb, g_lb_bits, g_rec_bytes_inner);
@@ -698,16 +733,48 @@ uint64_t db_seg_fanout(int c0, int c1, int c2, int c3, int c4raw) {
 
 /* -- Fan-out sort ---------------------------------------------------------- */
 
-/* Records in a cell, paired with a promise key, for the in-cell order.
+/* Records in a cell, keyed by promise, for the in-cell order.
  * Promise = continuations of the chain's five exposed tops summed over every
  * possible left neighbour (the next row's left-neighbour color is
- * config-dependent and unknown here) -- one g_fanout lookup per record. */
-typedef struct { uint32_t key; uint32_t _pad; uint64_t w; } FanRec;
+ * config-dependent and unknown here) -- one g_fanout lookup per record.
+ *
+ * Key and record travel as ONE uint64: the promise complemented in the high
+ * half, the record word in the low half. Plain ascending order on that integer
+ * is exactly "promise descending, record word ascending", so the order needs no
+ * comparator at all -- which matters, because 3.1 billion records at ~142 per
+ * cell is some 22 billion comparisons, and reaching a comparator through a
+ * function pointer costs more than the comparison. */
+static inline uint64_t promise_key(uint32_t fanout, uint32_t w) {
+    return ((uint64_t)~fanout << 32) | (uint64_t)w;
+}
 
-static int cmp_fanrec_desc(const void *a, const void *b) {
-    const FanRec *x = a, *y = b;
-    if (x->key != y->key) return (x->key < y->key) ? 1 : -1;
-    return (x->w > y->w) - (x->w < y->w);
+/* Median-of-three quicksort, insertion sort below the cutoff, recursing on the
+ * smaller side and looping on the larger so the stack stays O(log n).
+ *
+ * Quicksort is normally the wrong answer for keys that repeat, and raw fan-out
+ * values repeat heavily -- but these keys cannot repeat: the low half is the
+ * record word, and db_dfs enumerates each chain exactly once, so every word is
+ * distinct inside its cell. The keys are therefore all distinct, the order is
+ * total, and the partition never meets a run of equals. */
+static void sort_promise(uint64_t *v, uint32_t n) {
+    while (n > 24) {
+        uint64_t a = v[0], b = v[n/2], c = v[n-1], p;
+        p = a < b ? (b < c ? b : (a < c ? c : a)) : (a < c ? a : (b < c ? c : b));
+        uint32_t i = 0, j = n - 1;
+        for (;;) {
+            while (v[i] < p) i++;
+            while (v[j] > p) j--;
+            if (i >= j) break;
+            uint64_t t = v[i]; v[i] = v[j]; v[j] = t; i++; if (j) j--;
+        }
+        if (j + 1 < n - j - 1) { sort_promise(v, j + 1); v += j + 1; n -= j + 1; }
+        else                   { sort_promise(v + j + 1, n - j - 1); n = j + 1; }
+    }
+    for (uint32_t k = 1; k < n; k++) {
+        uint64_t x = v[k]; uint32_t m = k;
+        while (m && v[m-1] > x) { v[m] = v[m-1]; m--; }
+        v[m] = x;
+    }
 }
 
 /* Sort one phase's cells by descending promise (ties by record word). */
@@ -718,7 +785,7 @@ static void sort_phase(bool inner_phase, const char *name) {
     const int rb = inner_phase ? g_rec_bytes_inner : g_rec_bytes_edge;
     #pragma omp parallel num_threads(nt)
     {
-        FanRec *buf = xmalloc((size_t)g_db_max_cell_n * sizeof(FanRec));
+        uint64_t *buf = xmalloc((size_t)g_db_max_cell_n * sizeof(uint64_t));
         /* collapse(3): 4913 chunks for the dynamic schedule instead of 289.
            Cell populations vary by orders of magnitude, so a coarse split
            leaves threads idle waiting on whoever drew the heavy chunk. Each
@@ -764,12 +831,11 @@ static void sort_phase(bool inner_phase, const char *name) {
                     }
                     uint64_t fo = g_fanout[fan_flat(tops_idx[0], tops_idx[1],
                                                     tops_idx[2], tops_idx[3], tops4raw)];
-                    buf[j].key = fo > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)fo;
-                    buf[j].w   = w;
+                    buf[j] = promise_key(fo > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)fo, w);
                 }
-                qsort(buf, cell->n, sizeof(FanRec), cmp_fanrec_desc);
+                sort_promise(buf, cell->n);
                 for (uint32_t j = 0; j < cell->n; j++)
-                    rec_store(cell->rec, j, rb, (uint32_t)buf[j].w);
+                    rec_store(cell->rec, j, rb, (uint32_t)buf[j]);
             }
         }
         free(buf);
@@ -789,6 +855,65 @@ void build_db_edge_and_sort(void) {
     sort_phase(false, "DB edge");
 }
 
+/* -- Pinned segment enumeration --------------------------------------------- */
+
+typedef struct {
+    const uint8_t *bottoms;
+    const uint64_t *forbid;
+    uint16_t (*out)[CHAIN_LEN];
+    int  len, pin_idx, pin_kind, max_out, n;
+    uint16_t pin_val;
+    uint16_t cur[CHAIN_LEN];
+    uint64_t seg[4];                 /* pieces used inside this segment */
+} SegWalk;
+
+static void seg_walk(SegWalk *w, int i, int cl) {
+    if (w->n >= w->max_out) return;
+    if (i == w->len) {
+        memcpy(w->out[w->n++], w->cur, (size_t)w->len * sizeof(uint16_t));
+        return;
+    }
+    int b = w->bottoms[i];
+    if (cl < 0 || cl >= NUM_COLORS_TOTAL || b < 0 || b >= NUM_COLORS_TOTAL) return;
+
+    if (i == w->pin_idx && w->pin_kind == PIN_PIECE) {
+        const Oriented *o = &g_cat[w->pin_val];
+        if (o->left != cl || o->bottom != b) return;      /* the cheap early kill */
+        uint16_t pid = o->piece_id; uint64_t bit = piece_bit(pid);
+        if (w->seg[pid >> 6] & bit) return;               /* not forbid: see header */
+        w->seg[pid >> 6] |= bit; w->cur[i] = w->pin_val;
+        seg_walk(w, i + 1, o->right);
+        w->seg[pid >> 6] &= ~bit;
+        return;
+    }
+    const bool top_pin = (i == w->pin_idx && w->pin_kind == PIN_TOPCOLOR);
+    const int nb = g_lb_count[cl][b];
+    for (int k = 0; k < nb && w->n < w->max_out; k++) {
+        int ci = g_lb_bucket[cl][b][k];
+        const Oriented *o = &g_cat[ci];
+        if (top_pin && o->top != w->pin_val) continue;
+        uint16_t pid = o->piece_id; uint64_t bit = piece_bit(pid);
+        if ((w->forbid[pid >> 6] | w->seg[pid >> 6]) & bit) continue;
+        w->seg[pid >> 6] |= bit; w->cur[i] = (uint16_t)ci;
+        seg_walk(w, i + 1, o->right);
+        w->seg[pid >> 6] &= ~bit;
+    }
+}
+
+int enumerate_pinned_segment(int la, const uint8_t bottoms[], int len,
+                             int pin_idx, int pin_kind, uint16_t pin_val,
+                             const uint64_t forbid[4],
+                             uint16_t (*out)[CHAIN_LEN], int max_out) {
+    if (len < 1 || len > CHAIN_LEN || max_out <= 0) return 0;
+    SegWalk w;
+    w.bottoms = bottoms; w.forbid = forbid; w.out = out;
+    w.len = len; w.pin_idx = pin_idx; w.pin_kind = pin_kind;
+    w.max_out = max_out; w.n = 0; w.pin_val = pin_val;
+    w.seg[0] = w.seg[1] = w.seg[2] = w.seg[3] = 0;
+    seg_walk(&w, 0, la);
+    return w.n;
+}
+
 /* -- Inner-DB disk cache ---------------------------------------------------- */
 /* The inner cells (and their promise sort) depend only on the seed file, so
  * they can be built once and reused across runs. File layout:
@@ -802,7 +927,10 @@ void build_db_edge_and_sort(void) {
    E555_database.h). A version-1 file packs them tightly, so every cell after the
    first odd-length one sits at a different offset -- the loader must reject it
    and rebuild rather than map the arena at the wrong stride. */
-#define DB_CACHE_VERSION 2u
+/* Version 3: the header carries a hash of g_db_exclude. A clue-built cache has
+   the same seed, lb_bits and rec_bytes as a normal one but different CONTENTS
+   (the excluded pieces appear in no chain), so nothing else would catch it. */
+#define DB_CACHE_VERSION 3u
 #define DB_CACHE_ALIGN   4096u
 
 typedef struct {
@@ -812,7 +940,15 @@ typedef struct {
     uint64_t ncells;
     uint64_t arena_bytes;
     uint64_t arena_off;
+    uint64_t exclude_hash;
 } DbCacheHdr;
+
+/* Identifies the g_db_exclude set a cache was built with. */
+static uint64_t db_exclude_hash(void) {
+    uint64_t h = 0x9E3779B97F4A7C15ULL;
+    for (int k = 0; k < 4; k++) { h ^= g_db_exclude[k]; h *= 0x100000001B3ULL; }
+    return h;
+}
 
 typedef struct { uint64_t fi; uint32_t n; uint32_t _pad; } DbCacheCell;
 
@@ -837,6 +973,7 @@ void db_cache_save(const char *path) {
     hdr.max_cell_n = g_db_max_cell_n;
     hdr.seed_hash = g_seed_file_hash;  hdr.ncells = ncells;
     hdr.arena_bytes = g_inner_arena_size;
+    hdr.exclude_hash = db_exclude_hash();
     uint64_t meta = sizeof hdr + ncells * sizeof(DbCacheCell);
     hdr.arena_off = (meta + DB_CACHE_ALIGN - 1) / DB_CACHE_ALIGN * DB_CACHE_ALIGN;
 
@@ -878,6 +1015,11 @@ bool db_cache_load(const char *path) {
     }
     if (hdr.seed_hash != g_seed_file_hash) {
         printf("[init] DB cache %s: different seed file; rebuilding\n", path); close(fd); return false;
+    }
+    if (hdr.exclude_hash != db_exclude_hash()) {
+        printf("[init] DB cache %s: built with a different clue/exclusion set; "
+               "rebuilding (use a separate --db_file per clue setting)\n", path);
+        close(fd); return false;
     }
     if (hdr.lb_bits != (uint32_t)g_lb_bits || hdr.rec_bytes != (uint32_t)g_rec_bytes_inner) {
         printf("[init] DB cache %s: record format mismatch; rebuilding\n", path); close(fd); return false;

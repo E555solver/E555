@@ -23,9 +23,6 @@
    a parent below this many full decode attempts. */
 #define MIN_DECODE_BUDGET   2048
 
-/* BeamEntry.flags bits. */
-#define FLAG_BONUS_139      0x1u   /* piece 139 sits on one of the 4 center cells */
-
 /* -- Beam state ------------------------------------------------------------ */
 
 /* One committed inner row: the 14 inner catalog indices for columns 1..14
@@ -47,6 +44,16 @@ typedef struct {
 #define ROWMASK_AB    0x07FFu   /* cols 0..10   -- C (11..15) missing */
 #define ROWMASK_AC    0xF83Fu   /* cols 0..5,11..15 -- B (6..10) missing */
 #define ROWMASK_BC    0xFFC1u   /* cols 0,6..15 -- A (1..5) missing    */
+
+/* BeamEntry.flags: the board's clue orientation. A board is UNASSIGNED until it
+   places its first clue, at which point it commits to one orientation for life
+   and owes every later clue of that orientation. Two boards with the same
+   frontier but different orientations have different futures, so the tag must
+   also enter the dedup signature -- see frontier_sig. */
+#define FLAG_ORIENT_MASK    0x3u
+#define FLAG_ORIENT_SET     0x4u
+#define ENTRY_ORIENT(e)     ((e)->flags & FLAG_ORIENT_MASK)
+#define ENTRY_HAS_ORIENT(e) (((e)->flags & FLAG_ORIENT_SET) != 0)
 
 /* One beam board: only the resumable frontier state (counters + exposed tops).
    The per-row move history lives OUTSIDE the entry, in the beam context's
@@ -73,6 +80,10 @@ typedef struct {
     uint32_t  parent;
     uint64_t  sig;
     RowChoice mv;
+    uint8_t   flags;              /* clue orientation; the child is rebuilt from
+                                     (parent, mv) at materialization, so a tag set
+                                     during expansion has to travel here or it is
+                                     silently lost. Fits in existing padding. */
 } PoolEntry;
 
 /* One ancestry-log entry: the move that created a materialized beam board, plus
@@ -88,10 +99,17 @@ typedef struct { float score; uint32_t idx; } SortRec;
 /* Per-thread scratch: a tentative child board for commit + score, and a local
    append buffer so pool insertion costs one atomic per batch, not per child. */
 #define POOL_BATCH 256
+/* Candidate chains held per segment while expanding a clue row. Cells top out
+   near 950 records, so this never truncates a free segment in practice. */
+#define CLUE_SEG_CAP 1024
 typedef struct {
     BeamEntry tmp;
     PoolEntry buf[POOL_BATCH];
     uint32_t  buf_n;
+    /* Clue-row candidate chains. Touched only on the two or three rows that
+       carry a clue, so it lives AFTER the hot fields: putting it between tmp and
+       buf pushed them 30 KB apart and cost ~2.8x on expand. */
+    uint16_t  seg[3][CLUE_SEG_CAP][CHAIN_LEN];
 } Scratch;
 
 /* Shared per-run beam workspace (sized once from --beam_width x --beam_expand). */

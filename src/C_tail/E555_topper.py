@@ -84,6 +84,28 @@ WHAT IS OPEN FOR MUTATION
     breaks, or the interior a band can never reach. --unused_rows is defined
     in terms of the bands, so it cannot be combined with a mask.
 
+CLUE PIECES
+
+    --clue_center and --clue_corners hold the published Eternity II hint
+    pieces at their cells and spins, so a board that arrives from a clued beam
+    run does not leave with its clues shuffled away. Without them this tool
+    treats a clue like any other piece and will happily move it.
+
+    The beamer can only ever reach the two corner clues on row 2; the other
+    two sit on row 13, above any legal stop row, and it merely reserves them.
+    This tool sees the whole board, so --clue_corners here enforces all four.
+
+    Orientation is not a choice. A solution rotated 90 degrees still satisfies
+    every edge rule but moves the clues, so all four orientations are legal
+    and a board commits to one when the beam places its first clue.
+    --clue_orient auto (the default) reads that commitment off the input board;
+    only a board carrying no clue at all needs an explicit --clue_orient 0..3.
+
+    A clue this run's open region cannot reach -- its cell locked outside the
+    band, or its piece stranded on the far side of the board -- is reported and
+    skipped, not treated as an error: an early window in a sliding-window
+    sweep legitimately cannot touch the rest of the board.
+
 OUTPUT
 
     One canonical board row per result:  config_id, score, pos[256], rot[256]
@@ -129,6 +151,7 @@ find out whether the two opposite sides can be re-cut against each other.
 from __future__ import annotations
 import argparse, csv, os, signal, sys, threading, time, random
 from dataclasses import dataclass
+from pathlib import Path
 try:
     from ortools.sat.python import cp_model
 except ImportError:
@@ -226,6 +249,24 @@ def read_holes_file(path):
                 values.extend(line.replace(",", " ").split())
     return {i for i, v in enumerate(values) if int(v) == 1}
 
+def load_clues():
+    """The clue table and its helpers, from tools/E555_viewer.py.
+
+    That module is the toolkit's shared Python primitives (tools/E555_rank.py
+    imports it the same way), and it holds the one copy of the Eternity II clue
+    table -- the one datum where a second, independently typed copy could put a
+    wrong piece on a board that still matches every edge. Imported lazily, so a
+    run without --clue_center / --clue_corners has no dependency on tools/ and
+    still works from a lone copy of this script.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+    try:
+        import E555_viewer
+    except ImportError:
+        sys.exit("[ERROR] --clue_* needs tools/E555_viewer.py, which holds the "
+                 "clue table; run this script from inside the E555 tree.")
+    return E555_viewer
+
 def rotate_edges(base, spin):
     """Returns the colors of a piece shifted by a given rotation [0-3]."""
     return (base[(NORTH + spin) & 3], base[(EAST + spin) & 3],
@@ -278,10 +319,15 @@ def board_metrics(pos, rot, tiles):
             sum(col_cost(a, b) for a, b in br),
             max((ROWW * row_cost(a, b) + col_cost(a, b)) for a, b in br))
 
-def solve_frontier(pos, rot, tiles, free_cells, args, verbose):
+def solve_frontier(pos, rot, tiles, free_cells, args, verbose, pins=()):
     """
     The core CP-SAT logic. Builds a constraint model to fill 'free_cells' using available pieces.
     Returns a list of best configurations found to support Beam Search.
+
+    `pins` are (cell, piece, spin) clue triples to hold fixed; main() has
+    already dropped any clue this window cannot reach. Pinned cells can never
+    differ between beam ranks, so with clues on --beam_diff is effectively
+    measured over the unpinned cells.
     """
     model = cp_model.CpModel()
     maxc = max(max(t) for t in tiles)
@@ -317,6 +363,15 @@ def solve_frontier(pos, rot, tiles, free_cells, args, verbose):
         cells = [c for c in free_cells if cell_class(c) == kls]
         if len(cells) > 1:
             model.AddAllDifferent([piece_of[c] for c in cells])
+
+    # Hard clue pins. Every clue cell is an interior cell and every clue piece
+    # is an inner piece, so this only ever touches the `inner` commodity, and
+    # the AddAllDifferent above already bars a pinned piece from every other
+    # free cell -- fixing a clue therefore costs no extra variable and leaves
+    # the objective untouched.
+    for cell, piece, spin in pins:
+        model.Add(piece_of[cell] == piece)
+        model.Add(rot_of[cell] == spin)
 
     fixed_col = {c: rotate_edges(tiles[piece_at[c]], rot[piece_at[c]])
                  for c in piece_at if c not in free_cells}
@@ -581,6 +636,18 @@ def main():
     ap.add_argument("--beam_diff",  type=int,   default=4, help="Beam Search: minimum cells by which ranks must differ.")
     ap.add_argument("--beam_slack", type=int,   default=1, help="Beam Search: extra breaks a lower rank may cost.")
     ap.add_argument("--allow_break_increase", action="store_true", help="Smart Scoring: Allows more total breaks if pushed further.")
+
+    # Clue Options: hold the published Eternity II hint pieces in place.
+    ap.add_argument("--clue_center", action="store_true",
+                    help="Hold piece 138 at the board's centre clue cell and spin.")
+    ap.add_argument("--clue_corners", action="store_true",
+                    help="Hold the four corner clues at their cells and spins. "
+                         "Unlike the beamer, which can only reach the two on row "
+                         "2, Stage C sees the whole board and enforces all four.")
+    ap.add_argument("--clue_orient", default="auto",
+                    choices=("auto", "0", "1", "2", "3"),
+                    help="Which of the four board orientations the clues follow. "
+                         "auto (default) reads it off each input board.")
     ap.add_argument("--tag_id", action="store_true", help="Also append _<score> to each output config_id (legacy naming).")
 
     # Solver Options
@@ -605,6 +672,12 @@ def main():
     if args.report_best < 1: sys.exit("[ERROR] --report_best must be >= 1.")
     if args.beam_diff < 1: sys.exit("[ERROR] --beam_diff must be >= 1.")
     if args.beam_slack < 0: sys.exit("[ERROR] --beam_slack must be >= 0.")
+
+    CL = clue_mask = None
+    if args.clue_center or args.clue_corners:
+        CL = load_clues()
+        clue_mask = ((CL.CLUE_CENTER if args.clue_center else 0)
+                     | (CL.CLUE_CORNERS if args.clue_corners else 0))
 
     master = args.rng_seed if args.rng_seed >= 0 else int.from_bytes(os.urandom(4), "little")
     random.seed(master)
@@ -664,6 +737,27 @@ def main():
                 if partial.pos[p] in unused:
                     partial.pos[p], partial.rot[p] = CSV_UNPLACED, 0
 
+            # Clue pins, resolved AFTER the lift: a clue piece sitting in the
+            # locked-empty region has just become unplaced, and the plan has to
+            # see it that way.
+            pins = []
+            if clue_mask:
+                if args.clue_orient == "auto":
+                    orient, _n = CL.clue_orient(partial.pos, partial.rot, clue_mask)
+                else:
+                    orient = int(args.clue_orient)
+                if orient is None:
+                    print(f"[{i:04d}] [WARN] board carries no clue: cannot tell "
+                          "which orientation to impose; pass --clue_orient 0..3. "
+                          "Solving this board unpinned.", flush=True)
+                else:
+                    pins, locked_ok, skipped = CL.clue_pins(
+                        partial.pos, partial.rot, free, orient, clue_mask)
+                    note = "; ".join(why for _c, _p, _s, why in skipped)
+                    print(f"[{i:04d}] clue orient={orient} | pin {len(pins)} | "
+                          f"locked-ok {locked_ok} | skip {len(skipped)}"
+                          + (f" ({note})" if note else ""), flush=True)
+
             B0, _, _, md0 = board_metrics(partial.pos, partial.rot, tiles)
             start_score = NUM_EDGES - B0
 
@@ -672,14 +766,20 @@ def main():
                 print()
                 print(band_map(free, unused, partial.pos), flush=True)
 
-            # Fast path: nothing inside the open region can be improved.
+            # Fast path: nothing inside the open region can be improved. A clue
+            # that is pinnable but not yet satisfied is such an improvement, so
+            # it has to veto the skip -- otherwise a board whose open region
+            # happens to be break-free would pass through with its clues still
+            # displaced, which is exactly what the pins exist to prevent.
             occupied = {partial.pos[p] for p in range(NUM_PIECES) if partial.pos[p] != CSV_UNPLACED}
             broken = {c for pair in broken_junctions(partial.pos, partial.rot, tiles) for c in pair}
-            if not (free & (broken | (set(range(NUM_PIECES)) - occupied))):
+            clue_pending = any(partial.pos[p] != cell or partial.rot[p] != spin
+                               for cell, p, spin in pins)
+            if not (free & (broken | (set(range(NUM_PIECES)) - occupied))) and not clue_pending:
                 results, reason, sec = [(partial.pos, partial.rot)], "clean", 0.0
                 skipped_count += 1
             else:
-                results, reason, sec = solve_frontier(partial.pos, partial.rot, tiles, free, args, args.verbose)
+                results, reason, sec = solve_frontier(partial.pos, partial.rot, tiles, free, args, args.verbose, pins)
                 if len(results) < args.report_best:
                     short_beams += 1
 

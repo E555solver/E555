@@ -71,9 +71,14 @@ WORKERS="${WORKERS:-8}"           # CP-SAT workers (a worker is a whole search,
                                   # which is why this is not called threads)
 MAX_TIME="${MAX_TIME:-120}"       # seconds per board per pass
 STALL_TIME="${STALL_TIME:-40}"    # give up after this long with no improvement
+CLUES="${CLUES:-0}"                # 1 = hold the published Eternity II clue
+                                  # pieces on their cells and spins
 # -----------------------------------------------------------------------------
 
 mkdir -p "$OUT_DIR"
+# One switch for all three passes: a clue held by the topper and then dropped by
+# the ender would be no better than never holding it.
+CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 TOPPED="$OUT_DIR/1_topped.csv"
 RINGED="$OUT_DIR/2_ringed.csv"
 PATCHED="$OUT_DIR/3_patched.csv"
@@ -89,7 +94,7 @@ if [ "$SKIP_TOPPER" != 1 ]; then
     # built conditionally -- the call itself is written once.
     if [ -n "$HOLES" ]; then REGION=(--holes "$HOLES")
     else                     REGION=(--side "$SIDE" --work-rows "$WORK_ROWS"); fi
-    python3 "$REPO/src/C_tail/E555_topper.py" "$SEED" "$CUR" "$TOPPED" \
+    python3 "$REPO/src/C_tail/E555_topper.py" "$SEED" "$CUR" "$TOPPED" "${CLUE_ARG[@]}" \
         --row "$FIRST_LINE" --count "$N_LINES" "${REGION[@]}" \
         --workers "$WORKERS" --max-time "$MAX_TIME" --stall-time "$STALL_TIME" \
         --verbose
@@ -98,14 +103,14 @@ fi
 
 echo
 echo "=== pass 2: ender, ring sweep ==="
-python3 "$REPO/src/C_tail/E555_ender.py" "$SEED" "$CUR" "$RINGED" \
+python3 "$REPO/src/C_tail/E555_ender.py" "$SEED" "$CUR" "$RINGED" "${CLUE_ARG[@]}" \
     --mode ring --reach "$REACH" --max-changes "$MAX_CHANGES" \
     --workers "$WORKERS" --max-time "$MAX_TIME" --stall-time "$STALL_TIME" \
     --verbose
 
 echo
 echo "=== pass 3: ender, patch ==="
-python3 "$REPO/src/C_tail/E555_ender.py" "$SEED" "$RINGED" "$PATCHED" \
+python3 "$REPO/src/C_tail/E555_ender.py" "$SEED" "$RINGED" "$PATCHED" "${CLUE_ARG[@]}" \
     --mode patch --reach "$REACH" --max-changes "$MAX_CHANGES" \
     --workers "$WORKERS" --max-time "$MAX_TIME" --stall-time "$STALL_TIME" \
     --verbose

@@ -46,6 +46,13 @@ SEED="${SEED:-$REPO/data/seed_Edge5.txt}"
 RUN_DIR="${RUN_DIR:-$PWD/pipeline_out}"
 THREADS="${THREADS:-$(nproc 2>/dev/null || echo 4)}"
 DB_FILE="${DB_FILE:-}"              # path to cache the 6.4 GB chain DB; empty = in memory
+CLUES="${CLUES:-0}"                 # 1 = hold the Eternity II clue pieces in place
+
+CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
+# A clue-built chain database has the same seed but different CONTENTS, and the
+# beamer refuses a cache whose exclusion set does not match. Keep the two apart so
+# toggling CLUES does not silently rebuild 6.4 GB each way.
+[ "$CLUES" = 1 ] && [ -n "$DB_FILE" ] && DB_FILE="$DB_FILE.clue"
 RNG_SEED="${RNG_SEED:-0}"           # 0 = clock+pid, so each run explores elsewhere
 
 # ---- stage 1: beamer --------------------------------------------------------
@@ -141,7 +148,7 @@ BEAM_CMD=("$REPO/bin/E555_beamer" "$SEED" --random_edges
     --gumbel_tau_bottoms "$BEAM_TAU_BOTTOMS" --gumbel_tau_columns "$BEAM_TAU_COLUMNS"
     --gumbel_tau0 "$BEAM_TAU0" --gumbel_tau1 "$BEAM_TAU1"
     --lambda_Mahalanobis 10 --incomplete_top
-    --max_partials "$BEAM_BOARDS" --max_wall_sec "$BEAM_WALL" --verbose)
+    --max_partials "$BEAM_BOARDS" --max_wall_sec "$BEAM_WALL" --verbose "${CLUE_ARG[@]}")
 [ -n "$DB_FILE" ] && BEAM_CMD+=(--db_file "$DB_FILE")
 [ "$RNG_SEED" != "0" ] && BEAM_CMD+=(--seed "$RNG_SEED")
 "${BEAM_CMD[@]}"
@@ -173,7 +180,7 @@ echo
     --beam_width "$FIN_WIDTH" --stop_row "$FIN_STOP" \
     --border_row_N "$BEAM_BOARDS" --top_columns 0 \
     --lambda_Mahalanobis 10 --frac_rand 0.0 --incomplete_top \
-    --max_partials "$FIN_BOARDS" --max_wall_sec "$FIN_WALL" --verbose
+    --max_partials "$FIN_BOARDS" --max_wall_sec "$FIN_WALL" --verbose "${CLUE_ARG[@]}"
 
 cat final/beam_completions_finalized_"$FIN_STOP".csv          > 2_final.csv 2>/dev/null || true
 cat final/beam_completions_finalized_"$FIN_STOP"_partial.csv >> 2_final.csv 2>/dev/null || true
@@ -203,7 +210,7 @@ echo
 "$REPO/bin/E555_roundhouse" "$SEED" "$BEST_SO_FAR" \
     --out_dir strip --threads "$THREADS" \
     --rounds "$RH_ROUNDS" --strip_width "$RH_WIDTH" --rotate "$RH_ROTATE" \
-    --border_row_N "$RH_LINES" --max_wall_sec "$RH_WALL" --verbose
+    --border_row_N "$RH_LINES" --max_wall_sec "$RH_WALL" --verbose "${CLUE_ARG[@]}"
 
 # First existing match, or empty. NOT `$(ls GLOB 2>/dev/null | head -1)`: when
 # the glob matches nothing `ls` exits 2, pipefail promotes that to the
@@ -241,12 +248,12 @@ head -n "$TOP_N" "$BEST_SO_FAR" > 4_topped.csv
 for depth in 5 4 3 3; do
     python3 "$REPO/src/C_tail/E555_topper.py" "$SEED" 4_topped.csv 4_step.csv \
         --side T --work-rows "$depth" --unused_rows 0 --count "$TOP_N" \
-        --workers "$THREADS" --max-time "$CPSAT_TIME" --stall-time "$CPSAT_STALL"
+        --workers "$THREADS" --max-time "$CPSAT_TIME" --stall-time "$CPSAT_STALL" "${CLUE_ARG[@]}"
     mv 4_step.csv 4_topped.csv
 done
 python3 "$REPO/src/C_tail/E555_topper.py" "$SEED" 4_topped.csv 4_step.csv \
     --side TR --work-rows 3 --unused_rows 0 --count "$TOP_N" \
-    --workers "$THREADS" --max-time "$CPSAT_TIME" --stall-time "$CPSAT_STALL"
+    --workers "$THREADS" --max-time "$CPSAT_TIME" --stall-time "$CPSAT_STALL" "${CLUE_ARG[@]}"
 mv 4_step.csv 4_topped.csv
 rank 4_topped.csv
 echo
@@ -262,11 +269,11 @@ echo
 
 python3 "$REPO/src/C_tail/E555_ender.py" "$SEED" 4_topped.csv 5_ring.csv \
     --mode ring --reach 2 --max-changes 16 --workers "$THREADS" \
-    --max-time "$((CPSAT_TIME*2))" --stall-time "$CPSAT_STALL" --verbose
+    --max-time "$((CPSAT_TIME*2))" --stall-time "$CPSAT_STALL" --verbose "${CLUE_ARG[@]}"
 
 python3 "$REPO/src/C_tail/E555_ender.py" "$SEED" 5_ring.csv 5_ended.csv \
     --mode patch --reach 2 --max-changes 16 --workers "$THREADS" \
-    --max-time "$((CPSAT_TIME*3))" --stall-time "$((CPSAT_STALL*2))" --verbose
+    --max-time "$((CPSAT_TIME*3))" --stall-time "$((CPSAT_STALL*2))" --verbose "${CLUE_ARG[@]}"
 
 rank 5_ended.csv
 rm -f 5_ring.csv
