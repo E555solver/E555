@@ -97,11 +97,6 @@ static double   g_frac_rand       = 0.75;
    orientation crowding the others out, and unused floor is handed straight
    back to the score ranking, so there is nothing to tune. */
 #define CLUE_FLOOR_FRAC 0.5
-/* Derived once from g_clue at startup. g_clue_need1[o][0/1] is the color the
-   row-2 corner clues of orientation o demand from row 1 at columns 2 and 13 --
-   a clue's own bottom face must meet the piece below it, so the constraint
-   really bites one row EARLIER than the clue itself. */
-static uint8_t  g_clue_need1[4][2];
 static uint16_t g_clue_ci[4][CLUE_N];      /* catalog index of each oriented clue */
 static bool     g_score_model_J   = false;  /* --score_model J (default legacy) */
 static double   g_lambda_J        = 1.0;
@@ -786,8 +781,7 @@ static inline double color_term(const BeamEntry *t, int row) {
 
 static bool g_clue_debug  = false;   /* E555_CLUE_DEBUG=1 */
 static uint64_t g_dbg_nA[EDGE_LEN+2], g_dbg_nB[EDGE_LEN+2], g_dbg_nC[EDGE_LEN+2], g_dbg_calls[EDGE_LEN+2];
-static bool g_clue_row1   = false;   /* row-1 compatibility filter armed        */
-static int  g_clue_first[4];         /* lowest clue row per orientation         */
+static int  g_clue_first[4];         /* lowest row that owes a pin, per orientation */
 static int  g_clue_last_assign = -1; /* last row at which a board may still commit */
 
 static uint16_t cat_index_of(uint16_t pid, uint8_t spin) {
@@ -805,7 +799,6 @@ static inline bool clue_on(int k) {
 static void init_clue_tables(void) {
     if (!g_clue_mask) return;
     g_clue_debug = getenv("E555_CLUE_DEBUG") != NULL;
-    g_clue_row1 = (g_clue_mask & CLUE_CORNERS) != 0;
     for (int o = 0; o < 4; o++) {
         for (int k = 0; k < CLUE_N; k++)
             g_clue_ci[o][k] = cat_index_of(g_clue[o][k].piece, g_clue[o][k].spin);
@@ -815,60 +808,93 @@ static void init_clue_tables(void) {
             fatal("clue table: entries 1,2 must be the row-2 corners");
         if (g_clue[o][3].row != 13 || g_clue[o][4].row != 13)
             fatal("clue table: entries 3,4 must sit on row 13");
-        g_clue_need1[o][0] = g_cat[g_clue_ci[o][1]].bottom;   /* demanded at col 2  */
-        g_clue_need1[o][1] = g_cat[g_clue_ci[o][2]].bottom;   /* demanded at col 13 */
+        /* The first row at which o demands anything is the PUSH-DOWN row, one
+           below its lowest clue -- that is where a board commits, not the clue's
+           own row. Corners put it at row 1, the center at 6 or 7. */
         g_clue_first[o] = 99;
-        for (int k = 0; k < CLUE_N_REACHABLE; k++)
-            if (clue_on(k) && g_clue[o][k].row < g_clue_first[o]) g_clue_first[o] = g_clue[o][k].row;
-        /* With corners on, row 1 already commits the board (see clue_pins_for). */
-        if (g_clue_mask & CLUE_CORNERS) g_clue_first[o] = 1;
+        for (int k = 0; k < CLUE_N; k++) {
+            if (!clue_on(k)) continue;
+            int r = g_clue[o][k].row - 1;
+            if (r < 1) r = 1;
+            if (r < g_clue_first[o]) g_clue_first[o] = r;
+        }
     }
     for (int o = 0; o < 4; o++)
         if ((g_clue_orients & (1u << o)) && g_clue_first[o] < 99 &&
             g_clue_first[o] > g_clue_last_assign) g_clue_last_assign = g_clue_first[o];
 }
 
-/* A row-1 board is viable only if some enabled orientation's row-2 corner clues
-   can meet it: a clue's bottom face must equal the color the piece below exposes.
-   Two colors out of 17 each, so this rejects ~98.6% of row-1 boards -- applied
-   here, before pool admission, so the pool never fills with boards that are
-   already dead one row up. */
-static inline bool clue_row1_ok(const uint8_t *rt) {
-    for (int o = 0; o < 4; o++)
-        if ((g_clue_orients & (1u << o)) &&
-            rt[2] == g_clue_need1[o][0] && rt[13] == g_clue_need1[o][1]) return true;
-    return false;
-}
+/* Pins owed by `row` under orientation o: pin_idx[s] is the position within
+   segment s (0=A,1=B,2=C) that is nailed down, or -1. Returns true if o owes
+   anything, in which case the row must go through expand_clued.
 
-/* Pins for orientation o on `row`: pin_idx[s] is the position within segment s
-   (0=A,1=B,2=C) that is nailed down, or -1. Returns true if o places anything. */
+   Two rules, and the second is the one that is easy to miss: a clue ON this row
+   fixes a piece, and a clue on the row ABOVE fixes a COLOR here, because a
+   clue's bottom face has to meet whatever sits under it. Demanding that color
+   while the segments are being generated is what keeps the row alive; filtering
+   finished children instead is not equivalent in effect, because the beam keeps
+   about one child per A record, so rejecting the ~94% that miss starves the row
+   rather than reshaping it. Measured on the row-2 corners: 22 surviving boards
+   filtering against 3328 pinning.
+
+   Driving both rules off the table rather than hard-coding the row-1 case makes
+   them cover every clue: the center's row 6-or-7 push-down, which is what the
+   beam pays for most (without it the center row kept 1075 boards of 104833), and
+   row 12 under the row-13 pair, whose pieces are attached to any board emitted
+   at --stop_row 12 and would otherwise meet row 12 on a color nothing chose.
+
+   Only one pin per segment is representable. Within a single orientation no row
+   ever wants two -- rows 2 and 13 put their pair in segments A and C, the center
+   is alone in B -- and init asserts the table shape that guarantees it. */
 static bool clue_pins_for(int row, int o, int pin_idx[3], int pin_kind[3],
                           uint16_t pin_val[3]) {
     pin_idx[0] = pin_idx[1] = pin_idx[2] = -1;
     pin_kind[0] = pin_kind[1] = pin_kind[2] = PIN_PIECE;
     pin_val[0] = pin_val[1] = pin_val[2] = 0;
 
-    /* Row 1 sits under the row-2 corner clues, and a clue's bottom face must
-       meet the piece below it. Demanding those colors HERE, while the segments
-       are being generated, is what keeps the row alive: the two demands fall on
-       segment A (col 2) and segment C (col 13) separately, so they are ordinary
-       per-segment pins. The four color pairs are distinct across orientations,
-       so meeting one pair already commits the board to that orientation. */
-    if (g_clue_row1 && row == 1) {
-        pin_idx[0] = 1; pin_kind[0] = PIN_TOPCOLOR; pin_val[0] = g_clue_need1[o][0];
-        pin_idx[2] = 2; pin_kind[2] = PIN_TOPCOLOR; pin_val[2] = g_clue_need1[o][1];
-        return true;
-    }
     bool any = false;
-    for (int k = 0; k < CLUE_N_REACHABLE; k++) {
-        if (!clue_on(k) || g_clue[o][k].row != row) continue;
-        int c = g_clue[o][k].col;                       /* cols 1..15 -> segment */
-        pin_idx [(c - 1) / CHAIN_LEN] = (c - 1) % CHAIN_LEN;
-        pin_kind[(c - 1) / CHAIN_LEN] = PIN_PIECE;
-        pin_val [(c - 1) / CHAIN_LEN] = g_clue_ci[o][k];
+    for (int k = 0; k < CLUE_N; k++) {
+        if (!clue_on(k)) continue;
+        const ClueCell *cc = &g_clue[o][k];
+        int c = -1, kind = PIN_PIECE; uint16_t val = 0;
+        if (cc->row == row && k < CLUE_N_REACHABLE) {    /* the clue itself */
+            c = cc->col; kind = PIN_PIECE; val = g_clue_ci[o][k];
+        } else if (cc->row == row + 1) {                 /* the color it will sit on */
+            c = cc->col; kind = PIN_TOPCOLOR; val = g_cat[g_clue_ci[o][k]].bottom;
+        }
+        if (c < 1 || c > EDGE_LEN) continue;             /* cols 1..14 are the segments */
+        int s = (c - 1) / CHAIN_LEN;
+        if (pin_idx[s] >= 0) fatal("clue table: row %d wants two pins in segment %d", row, s);
+        pin_idx[s] = (c - 1) % CHAIN_LEN; pin_kind[s] = kind; pin_val[s] = val;
         any = true;
     }
     return any;
+}
+
+/* E555_CLUE_DEBUG=1: the whole pin schedule, once, before any search runs.
+   Rows 11 and 12 are reached so rarely that a live run is a poor way to check
+   what they owe, and the schedule is entirely determined by the table -- so
+   print it instead of hunting for a board that gets there. */
+static void clue_dump_schedule(void) {
+    if (!g_clue_mask || !g_clue_debug) return;
+    for (int o = 0; o < 4; o++) {
+        if (!(g_clue_orients & (1u << o))) continue;
+        printf("[clue] orientation %d commits at row %d\n", o, g_clue_first[o]);
+        for (int r = 1; r <= EDGE_LEN; r++) {
+            int pi[3], pk[3]; uint16_t pv[3];
+            if (!clue_pins_for(r, o, pi, pk, pv)) continue;
+            printf("[clue]   row %2d:", r);
+            for (int s = 0; s < 3; s++) {
+                if (pi[s] < 0) continue;
+                if (pk[s] == PIN_PIECE)
+                    printf("  seg%c[%d] = piece %u", 'A' + s, pi[s], g_cat[pv[s]].piece_id);
+                else
+                    printf("  seg%c[%d] = color %u below a clue", 'A' + s, pi[s], pv[s]);
+            }
+            printf("\n");
+        }
+    }
+    fflush(stdout);
 }
 
 static bool score_child(const BeamEntry *t, int row, float *out) {
@@ -2238,6 +2264,11 @@ int main(int argc, char *argv[]) {
     build_inner_color_totals();
     build_maha_tables();
     build_logtab();
+    /* Needs the oriented catalog and nothing else, so it runs BEFORE the build:
+       a malformed clue table is then caught in milliseconds rather than after
+       eighty seconds of database. */
+    init_clue_tables();
+    clue_dump_schedule();
 
     /* Clue pieces leave the DATABASE, so no chain can hold one and the search
        never rejects a chain for colliding with a clue.
@@ -2268,7 +2299,6 @@ int main(int argc, char *argv[]) {
         sort_db_by_fanout();
         if (g_db_file) db_cache_save(g_db_file);
     }
-    init_clue_tables();
     verify_segment_enumerator();
 
     if (g_free_edges) {                       /* edge cells are border-independent */

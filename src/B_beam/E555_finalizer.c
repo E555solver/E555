@@ -1212,12 +1212,12 @@ static uint32_t gcd_u32(uint32_t a, uint32_t b) {
 
    Two rules, and the second is the one that is easy to miss: a clue ON this row
    fixes a piece, and a clue on the row ABOVE fixes a colour HERE, because a
-   clue's bottom face has to meet whatever sits under it. The beamer hard-codes
-   that second rule for row 1 under its row-2 corners; driving it off the table
-   instead makes it cover the centre clue's row 6-or-7 as well, which is exactly
-   the row the shipped pipelines free. Filtering afterwards is not an
-   alternative: the beamer measured 22 surviving boards against 3328 when it
-   tried that on the two-colour case.
+   clue's bottom face has to meet whatever sits under it. Driving both off the
+   table covers every clue at once: row 1 under the row-2 corners, the centre
+   clue's row 6-or-7 -- exactly the row the shipped pipelines free -- and row 12
+   under the row-13 pair, whose pieces are attached to any board emitted at
+   --stop_row 12. Filtering afterwards is not an alternative: 22 surviving
+   boards against 3328 when the beamer tried that on the two-colour case.
 
    Only one pin per segment is representable. Within a single orientation no row
    ever wants two -- rows 2 and 13 put their pair in segments A and C, the centre
@@ -1235,7 +1235,7 @@ static bool fin_clue_pins_for(int row, int pin_idx[3], int pin_kind[3], uint16_t
         int c = -1, kind = PIN_PIECE; uint16_t val = 0;
         if (cc->row == row) {                       /* the clue itself */
             c = cc->col; kind = PIN_PIECE; val = g_clue_ci[g_fin_orient][k];
-        } else if (cc->row == row + 1 && (uint32_t)cc->row <= g_stop_row) {
+        } else if (cc->row == row + 1) {
             c = cc->col; kind = PIN_TOPCOLOR;       /* the colour it will sit on */
             val = g_cat[g_clue_ci[g_fin_orient][k]].bottom;
         }

@@ -470,23 +470,42 @@ reserves a floor of `K/8` per orientation ahead of the score band, and hands
 whatever a thin orientation cannot fill back to merit.
 
 **The constraint bites one row early.** A clue's bottom face must meet the piece
-below it, so the row-2 corners demand two specific colours from row 1 -- 1/289
-per orientation, about 1.4% over the four. Those demands fall on segment A
-(col 2) and segment C (col 13) separately, so row 1 is generated with
-`TOPCOLOR` pins rather than filtered afterwards. That distinction is not
-cosmetic: the beam keeps roughly one child per A record, so rejecting 98.6% of
-finished children starves the row (measured: 22 boards at row 1 filtering, 3328
-pinning).
+below it, so every clue demands a colour from the row *under* it, and that
+demand is met by generating the row with a `TOPCOLOR` pin rather than filtering
+the finished children. The distinction is not cosmetic: the beam keeps roughly
+one child per A record, so rejecting the children that miss starves the row
+instead of reshaping it.
+
+Both rules -- a clue pins its own cell, a clue pins a colour on the cell below
+-- are driven off `g_clue`, so the schedule falls out of the table rather than
+being written per row. For the row-2 corners it puts two `TOPCOLOR` pins on row
+1, in segment A (col 2) and segment C (col 13); measured, 22 surviving boards
+filtering against 3328 pinning. For the centre it puts one on row 6 or 7
+depending on orientation, which matters just as much: without it the centre row
+kept **1075 boards of 104833**, and with it 6069, with row 9 going 194 -> 884 on
+the same borders. And for the row-13 pair it puts two on row 12, which is what
+makes the attached pieces below meet the board rather than land on whatever
+colour the search happened to choose.
+
+`E555_CLUE_DEBUG=1` prints the whole schedule at startup, before any search
+runs -- rows 11 and 12 are reached too rarely to be a practical way of checking
+what they owe.
 
 **The two unreachable corners are attached to the emitted board.** With
 `--clue_corners` on, every emitted board also carries its orientation's two
-row-13 clue pieces at their cells. The search never reaches row 13, so they land
-isolated in empty space -- which is the point: the viewer makes it obvious the
-corners were pinned, and a hole-free Stage C solve has to build around them.
-There is no orientation to choose: the board committed to one when it placed its
-row-2 corners. Isolated cells touch no placed neighbour, so no adjacency is
-asserted and the edge score is unchanged (verified: 294/480 with and without
-them).
+row-13 clue pieces at their cells. The search never reaches row 13 -- which is
+the point: the viewer makes it obvious the corners were pinned, and a hole-free
+Stage C solve has to build around them. There is no orientation to choose: the
+board committed to one when it placed its row-2 corners.
+
+Below `--stop_row 12` the cells they land on touch no placed neighbour, so no
+adjacency is asserted and the edge score is unchanged (verified: 294/480 with
+and without them). At `--stop_row 12` -- the default, and what the shipped
+pipelines finalize to -- row 12 *is* filled, and the pair sits directly on it.
+That is exactly why row 12 carries the push-down: the two cells beneath the
+clues are generated on the colours the clues need, so the junctions match
+instead of breaking on a colour nothing chose (~6% of inner half-edges carry
+any given colour, so left unpinned both junctions break almost surely).
 
 **Every later stage can hold them too.** `E555_finalizer`, `E555_roundhouse`,
 `E555_topper.py` and `E555_ender.py` all take the same two flags, all default
