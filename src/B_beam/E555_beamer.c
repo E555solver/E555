@@ -507,6 +507,14 @@ static inline char *u32a(char *p, uint32_t v) {
     return p;
 }
 
+/* Does the board being formatted carry a piece at (r, c)? Rows below the top one
+   are full; the top row carries only the columns in colmask. Anything above the
+   top row is empty, which is what makes an attached row-13 clue isolated. */
+static inline bool cell_is_placed(int r, int c, int row, uint16_t colmask) {
+    if (r < 0 || r > row) return false;
+    return (r < row) || ((colmask >> c) & 1u) != 0;
+}
+
 /* Flatten rows[0..row] into per-piece position/rotation vectors and write them
    as the 512 comma-separated fields that follow a line's prefix. colmask says
    which columns of the TOP row carry a piece (ROWMASK_FULL for a completed stop
@@ -526,17 +534,21 @@ static int format_board_tail(const RowChoice rows[EDGE_LEN], int row,
             pos[pid] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[pid] = rot;
         }
     }
-    /* --clue_corners: also show the two clue pieces the beam never reaches. They
-       sit on row 13, so with the search stopping at row 12 or below they land in
-       empty space, isolated -- which is the point: the viewer makes it obvious
-       the corners were pinned, and a hole-free Stage C solve has to build around
-       them. There is no choice of orientation here: the board committed to one
-       when it placed its row-2 corners, so its top pair follows from that.
-       Isolated cells touch no placed neighbour, so no adjacency is asserted and
-       the board's edge score is unchanged. */
+    /* --clue_corners: also show the two clue pieces the beam never reaches, but
+       ONLY where they land in empty space. Isolated they cost nothing and say
+       something -- the viewer makes it obvious the corners were pinned, and a
+       hole-free Stage C solve has to build around them. Touching a placed cell
+       they would assert an edge the search never chose and never scored, which
+       on a row-12 board is two near-certain breaks bolted onto the best partial
+       the run produced. So the attach yields to the board: a clue whose own cell
+       or whose cell below is filled is simply left off, and the board is emitted
+       as searched. There is no choice of orientation here -- the board committed
+       to one when it placed its row-2 corners. */
     if (orient >= 0 && (g_clue_mask & CLUE_CORNERS))
         for (int k = 3; k < CLUE_N; k++) {
             const ClueCell *cc = &g_clue[orient][k];
+            if (cell_is_placed(cc->row,     cc->col, row, colmask)) continue;
+            if (cell_is_placed(cc->row - 1, cc->col, row, colmask)) continue;
             pos[cc->piece]     = (uint32_t)(cc->row * PUZZLE_SIDE + cc->col);
             rot_arr[cc->piece] = cc->spin;
         }
@@ -812,7 +824,7 @@ static void init_clue_tables(void) {
            below its lowest clue -- that is where a board commits, not the clue's
            own row. Corners put it at row 1, the center at 6 or 7. */
         g_clue_first[o] = 99;
-        for (int k = 0; k < CLUE_N; k++) {
+        for (int k = 0; k < CLUE_N_REACHABLE; k++) {     /* row 13 pins nothing */
             if (!clue_on(k)) continue;
             int r = g_clue[o][k].row - 1;
             if (r < 1) r = 1;
@@ -838,14 +850,22 @@ static void init_clue_tables(void) {
    filtering against 3328 pinning.
 
    Driving both rules off the table rather than hard-coding the row-1 case makes
-   them cover every clue: the center's row 6-or-7 push-down, which is what the
-   beam pays for most (without it the center row kept 1075 boards of 104833), and
-   row 12 under the row-13 pair, whose pieces are attached to any board emitted
-   at --stop_row 12 and would otherwise meet row 12 on a color nothing chose.
+   them cover every clue the search actually places: the row-2 corners and the
+   center's row 6-or-7 push-down, which is what the beam pays for most (without
+   it the center row kept 1075 boards of 104833).
+
+   Entries 3..4 pin NOTHING. They sit on row 13, which no legal --stop_row
+   reaches, so they are only ever reserved -- and a clue that is never placed has
+   no business constraining the row below it. Pinning row 12 under them bought a
+   matching junction for two optional pieces and cost the whole row: a pinned row
+   goes through expand_clued, which skips the --incomplete_top emitters, so every
+   11-of-16 board at the hardest row in the search was silently thrown away. Rows
+   11 and 12 are where the search nearly dies; nothing there is worth spending on
+   a clue this program does not enforce.
 
    Only one pin per segment is representable. Within a single orientation no row
-   ever wants two -- rows 2 and 13 put their pair in segments A and C, the center
-   is alone in B -- and init asserts the table shape that guarantees it. */
+   ever wants two -- row 2 puts its pair in segments A and C, the center is alone
+   in B -- and init asserts the table shape that guarantees it. */
 static bool clue_pins_for(int row, int o, int pin_idx[3], int pin_kind[3],
                           uint16_t pin_val[3]) {
     pin_idx[0] = pin_idx[1] = pin_idx[2] = -1;
@@ -857,7 +877,8 @@ static bool clue_pins_for(int row, int o, int pin_idx[3], int pin_kind[3],
         if (!clue_on(k)) continue;
         const ClueCell *cc = &g_clue[o][k];
         int c = -1, kind = PIN_PIECE; uint16_t val = 0;
-        if (cc->row == row && k < CLUE_N_REACHABLE) {    /* the clue itself */
+        if (k >= CLUE_N_REACHABLE) continue;              /* row 13: never searched */
+        if (cc->row == row) {                            /* the clue itself */
             c = cc->col; kind = PIN_PIECE; val = g_clue_ci[o][k];
         } else if (cc->row == row + 1) {                 /* the color it will sit on */
             c = cc->col; kind = PIN_TOPCOLOR; val = g_cat[g_clue_ci[o][k]].bottom;
@@ -2022,8 +2043,8 @@ static void usage(const char *a0) {
 "  --clue_center          force the published center clue piece onto its cell, at its\n"
 "                         orientation's spin (piece 138; one of the 4 center cells)\n"
 "  --clue_corners         force the two published corner clues the beam can reach,\n"
-"                         both on row 2; the other two sit on row 13 and are only\n"
-"                         reserved. Clue pieces leave the database entirely\n"
+"                         both on row 2; the row-13 pair is only reserved, never pinned,\n"
+"                         and constrains no searched row. Clue pieces leave the database\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by\n"
 "                         score; halved at beam_expand_row-1, zero from\n"
 "                         beam_expand_row on (default 0.75)\n"
@@ -2193,11 +2214,10 @@ int main(int argc, char *argv[]) {
         fatal("--stop_row must be in 1..%d (rows 14-15 belong to Stage C)", MAX_DRILL_DEPTH);
     if (!(fabs(g_lambda_maha) <= 1e6)) fatal("--lambda_Mahalanobis in [-1e6,1e6]");
     if (!(fabs(g_lambda_J) <= 1e6))    fatal("--lambda_J in [-1e6,1e6]");
-    /* Row 13 carries two clues in every orientation and we deliberately do not
-       enforce them, so the top clue row must stay out of reach by construction. */
-    if (g_clue_mask && g_stop_row > 12)
-        fatal("--clue_center/--clue_corners need --stop_row <= 12 (row 13 holds the "
-              "two clues this build does not enforce)");
+    /* No clue cap on --stop_row. Row 13's two clues are reserved, never pinned,
+       and the attach in format_board_tail now yields to whatever the search
+       placed -- so searching row 13 simply builds it from other pieces and the
+       clues are left off, rather than being written on top of them. */
     if (!(g_gumbel_tau0 >= 0.0 && g_gumbel_tau0 <= 1e6)) fatal("--gumbel_tau0 in [0,1e6]");
     if (!(g_gumbel_tau1 >= 0.0 && g_gumbel_tau1 <= 1e6)) fatal("--gumbel_tau1 in [0,1e6]");
     if (!(g_tau_bottoms >= 0.0 && g_tau_bottoms <= 1e6)) fatal("--gumbel_tau_bottoms in [0,1e6]");
