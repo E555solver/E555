@@ -708,16 +708,48 @@ uint64_t db_seg_fanout(int c0, int c1, int c2, int c3, int c4raw) {
 
 /* -- Fan-out sort ---------------------------------------------------------- */
 
-/* Records in a cell, paired with a promise key, for the in-cell order.
+/* Records in a cell, keyed by promise, for the in-cell order.
  * Promise = continuations of the chain's five exposed tops summed over every
  * possible left neighbour (the next row's left-neighbour color is
- * config-dependent and unknown here) -- one g_fanout lookup per record. */
-typedef struct { uint32_t key; uint32_t _pad; uint64_t w; } FanRec;
+ * config-dependent and unknown here) -- one g_fanout lookup per record.
+ *
+ * Key and record travel as ONE uint64: the promise complemented in the high
+ * half, the record word in the low half. Plain ascending order on that integer
+ * is exactly "promise descending, record word ascending", so the order needs no
+ * comparator at all -- which matters, because 3.1 billion records at ~142 per
+ * cell is some 22 billion comparisons, and reaching a comparator through a
+ * function pointer costs more than the comparison. */
+static inline uint64_t promise_key(uint32_t fanout, uint32_t w) {
+    return ((uint64_t)~fanout << 32) | (uint64_t)w;
+}
 
-static int cmp_fanrec_desc(const void *a, const void *b) {
-    const FanRec *x = a, *y = b;
-    if (x->key != y->key) return (x->key < y->key) ? 1 : -1;
-    return (x->w > y->w) - (x->w < y->w);
+/* Median-of-three quicksort, insertion sort below the cutoff, recursing on the
+ * smaller side and looping on the larger so the stack stays O(log n).
+ *
+ * Quicksort is normally the wrong answer for keys that repeat, and raw fan-out
+ * values repeat heavily -- but these keys cannot repeat: the low half is the
+ * record word, and db_dfs enumerates each chain exactly once, so every word is
+ * distinct inside its cell. The keys are therefore all distinct, the order is
+ * total, and the partition never meets a run of equals. */
+static void sort_promise(uint64_t *v, uint32_t n) {
+    while (n > 24) {
+        uint64_t a = v[0], b = v[n/2], c = v[n-1], p;
+        p = a < b ? (b < c ? b : (a < c ? c : a)) : (a < c ? a : (b < c ? c : b));
+        uint32_t i = 0, j = n - 1;
+        for (;;) {
+            while (v[i] < p) i++;
+            while (v[j] > p) j--;
+            if (i >= j) break;
+            uint64_t t = v[i]; v[i] = v[j]; v[j] = t; i++; if (j) j--;
+        }
+        if (j + 1 < n - j - 1) { sort_promise(v, j + 1); v += j + 1; n -= j + 1; }
+        else                   { sort_promise(v + j + 1, n - j - 1); n = j + 1; }
+    }
+    for (uint32_t k = 1; k < n; k++) {
+        uint64_t x = v[k]; uint32_t m = k;
+        while (m && v[m-1] > x) { v[m] = v[m-1]; m--; }
+        v[m] = x;
+    }
 }
 
 /* Sort one phase's cells by descending promise (ties by record word). */
@@ -728,7 +760,7 @@ static void sort_phase(bool inner_phase, const char *name) {
     const int rb = inner_phase ? g_rec_bytes_inner : g_rec_bytes_edge;
     #pragma omp parallel num_threads(nt)
     {
-        FanRec *buf = xmalloc((size_t)g_db_max_cell_n * sizeof(FanRec));
+        uint64_t *buf = xmalloc((size_t)g_db_max_cell_n * sizeof(uint64_t));
         /* collapse(3): 4913 chunks for the dynamic schedule instead of 289.
            Cell populations vary by orders of magnitude, so a coarse split
            leaves threads idle waiting on whoever drew the heavy chunk. Each
@@ -774,12 +806,11 @@ static void sort_phase(bool inner_phase, const char *name) {
                     }
                     uint64_t fo = g_fanout[fan_flat(tops_idx[0], tops_idx[1],
                                                     tops_idx[2], tops_idx[3], tops4raw)];
-                    buf[j].key = fo > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)fo;
-                    buf[j].w   = w;
+                    buf[j] = promise_key(fo > 0xFFFFFFFFu ? 0xFFFFFFFFu : (uint32_t)fo, w);
                 }
-                qsort(buf, cell->n, sizeof(FanRec), cmp_fanrec_desc);
+                sort_promise(buf, cell->n);
                 for (uint32_t j = 0; j < cell->n; j++)
-                    rec_store(cell->rec, j, rb, (uint32_t)buf[j].w);
+                    rec_store(cell->rec, j, rb, (uint32_t)buf[j]);
             }
         }
         free(buf);
