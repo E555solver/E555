@@ -897,7 +897,11 @@ static bool score_child(const BeamEntry *t, int row, float *out) {
     uint64_t fC = db_seg_fanout(rt[11], rt[12], rt[13], rt[14], rt[15]);
     if (fC == 0) return false;
 
-    double s = log((double)cA->n) + log1p((double)fB) + log1p((double)fC)
+    /* log(a) + log1p(b) + log1p(c) = log(a*(1+b)*(1+c)) in R: one log instead of
+       three, same objective. All three factors are positive integers here (a
+       cell exists only if it holds records; both fan-outs are non-zero by the
+       gates above), so the product is >= 4 and log is safely in range. */
+    double s = log((double)cA->n * (1.0 + (double)fB) * (1.0 + (double)fC))
                + color_term(t, row);
     if (g_avail_correct) s += avail_term(t);
     *out = (float)s;

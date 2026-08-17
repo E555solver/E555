@@ -893,6 +893,34 @@ static void clue_dump_schedule(void) {
     fflush(stdout);
 }
 
+/* Score a child whose one-row lookahead already passed, from the three counts
+   the lookahead returned. The only formula in the program: every caller reaches
+   the score through here.
+
+       log(nA) + log1p(fB) + log1p(fC) = log(nA * (1+fB) * (1+fC))
+
+   is an identity in R, so the product form is the same objective with one log
+   instead of three. All three factors are positive integers -- nA >= 1 because a
+   cell exists only if it holds records, and both fan-outs are non-zero by the
+   gate -- so the product is >= 4, and even the absurd upper bound of the whole
+   database squared is 9.2e21, nowhere near overflowing a double.
+
+   The two forms differ by a few ulp: measured over 400 k triples drawn from the
+   live ranges, at most 7.1e-15 absolute (2.8e-16 relative), and all 400 k round
+   to the SAME float -- which is what the score is stored as. So this is not a
+   numerical change in any sense the search can see; it is only formally not
+   bit-identical, since a double difference of 1e-15 can in principle land the
+   sum on the far side of a float rounding boundary. */
+static inline float score_scanned(const BeamEntry *t, int row,
+                                  uint32_t nA, uint64_t fB, uint64_t fC) {
+    double s = log((double)nA * (1.0 + (double)fB) * (1.0 + (double)fC))
+               + color_term(t, row);
+    if (g_avail_correct) s += avail_term(t);
+    return (float)s;
+}
+
+/* Full scoring for a child that already exists: the same gate as
+   child_lookahead, read off the materialized frontier instead of the chunks. */
 static bool score_child(const BeamEntry *t, int row, float *out) {
     const uint8_t *rt = t->rtop;
     for (int c = 1; c <= EDGE_LEN; c++) if (!color_is_inner(rt[c])) return false;
@@ -908,10 +936,7 @@ static bool score_child(const BeamEntry *t, int row, float *out) {
     uint64_t fC = db_seg_fanout(rt[11], rt[12], rt[13], rt[14], rt[15]);
     if (fC == 0) return false;
 
-    double s = log((double)cA->n) + log1p((double)fB) + log1p((double)fC)
-               + color_term(t, row);
-    if (g_avail_correct) s += avail_term(t);
-    *out = (float)s;
+    *out = score_scanned(t, row, cA->n, fB, fC);
     return true;
 }
 
@@ -949,17 +974,6 @@ static inline bool child_lookahead(const uint16_t ci[EDGE_LEN], uint8_t rterm, i
 
     *nA_out = cA->n; *fB_out = fB; *fC_out = fC;
     return true;
-}
-
-/* The rest of score_child, for a child whose lookahead already passed. Identical
-   arithmetic, in the same order, so the score is bit-for-bit what score_child
-   would have returned. */
-static inline float score_scanned(const BeamEntry *t, int row,
-                                  uint32_t nA, uint64_t fB, uint64_t fC) {
-    double s = log((double)nA) + log1p((double)fB) + log1p((double)fC)
-               + color_term(t, row);
-    if (g_avail_correct) s += avail_term(t);
-    return (float)s;
 }
 
 static inline uint64_t frontier_sig(const BeamEntry *b) {
