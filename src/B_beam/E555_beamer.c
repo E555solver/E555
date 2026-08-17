@@ -81,6 +81,12 @@
    viable A chain can be lost to one unlucky B pick. */
 #define B_TRY 4
 
+/* Largest --bc_window side. Nothing is sized by it -- the window keeps one
+   running best, not an array -- but b_left is B_TRY + nB - 1 in an int, so an
+   unbounded nB would overflow it negative and the B loop would never run, which
+   would empty the beam silently instead of merely slowing it. */
+#define BC_WINDOW_MAX 64
+
 /* Stop-row emission safety cap (lines per config; the CSV rows are ~2 KB). */
 #define EMIT_MAX 1000000u
 
@@ -102,11 +108,10 @@ static bool     g_score_model_J   = false;  /* --score_model J (default legacy) 
 static double   g_lambda_J        = 1.0;
 static bool     g_avail_correct   = false;
 static bool     g_free_demand     = true;   /* --no_free_demand turns it off */
-static uint32_t g_supply_check    = 0;      /* first row tested; 0 = off */
 static double   g_gumbel_tau0     = 0.0;    /* 0 = off (exact legacy selection) */
 static double   g_gumbel_tau1     = 0.0;
-static uint32_t g_bc_nB           = 1;      /* --bc_window nB,nC (1,1 = legacy) */
-static uint32_t g_bc_nC           = 1;
+static uint32_t g_bc_nB           = 3;      /* --bc_window nB,nC; 1,1 = legacy */
+static uint32_t g_bc_nC           = 2;
 static uint32_t g_parent_cap      = 5;
 static uint32_t g_pool_factor     = 8;
 static uint32_t g_scan_factor     = 1024;
@@ -294,9 +299,9 @@ static void beam_init_border(BeamEntry *p, const BottomOrder *bot, const LeftOrd
         }
     }
     /* Reserve every enabled clue piece. Two of the corner clues sit on row 13
-       and are never placed, so holding them makes --supply_check and the
-       free-demand accounting exact rather than optimistic. The pinned walk is
-       exempt from this mask, so a clue can still be placed on its own cell. */
+       and are never placed, so holding them makes the free-demand accounting
+       exact rather than optimistic. The pinned walk is exempt from this mask,
+       so a clue can still be placed on its own cell. */
     for (int k = 0; k < CLUE_N; k++) {
         if ((k == 0) ? !(g_clue_mask & CLUE_CENTER) : !(g_clue_mask & CLUE_CORNERS)) continue;
         for (int o = 0; o < 4; o++)
@@ -352,30 +357,6 @@ static bool parity_ok(const BeamEntry *p) {
         int S = g_inner_color_total[c] - p->color_consumed[c] - p->req_exposed[c];
         if (S < 0) return false;
         if (demand_exact && (S & 1)) return false;
-    }
-    return true;
-}
-
-/* Piece-supply certificate (Hall's condition, singleton case; --supply_check).
-   Each of the 14 frontier columns needs a DISTINCT remaining inner piece
-   carrying its exposed top color. Columns demanding the same color have
-   identical candidate sets, so Hall's condition binds first on whole color
-   classes: if a color is wanted by more columns than there are unused pieces
-   carrying it anywhere, no perfect matching exists and the board is dead.
-   This counts PIECES where parity_ok counts HALF-EDGES, so neither implies the
-   other -- a piece with two sides of color c adds 2 to that color's surplus but
-   can still serve only one column. */
-static bool supply_ok(const BeamEntry *p) {
-    int need[NUM_COLORS_TOTAL] = {0};
-    for (int c = 1; c <= EDGE_LEN; c++) need[p->rtop[c]]++;   /* always inner */
-    for (int col = COLOR_MIN; col <= COLOR_MAX; col++) {
-        if (!need[col]) continue;
-        const uint64_t *m = g_color_pieces[col];
-        int have = __builtin_popcountll(m[0] & ~p->used[0])
-                 + __builtin_popcountll(m[1] & ~p->used[1])
-                 + __builtin_popcountll(m[2] & ~p->used[2])
-                 + __builtin_popcountll(m[3] & ~p->used[3]);
-        if (have < need[col]) return false;
     }
     return true;
 }
@@ -918,6 +899,34 @@ static void clue_dump_schedule(void) {
     fflush(stdout);
 }
 
+/* Score a child whose one-row lookahead already passed, from the three counts
+   the lookahead returned. The only formula in the program: every caller reaches
+   the score through here.
+
+       log(nA) + log1p(fB) + log1p(fC) = log(nA * (1+fB) * (1+fC))
+
+   is an identity in R, so the product form is the same objective with one log
+   instead of three. All three factors are positive integers -- nA >= 1 because a
+   cell exists only if it holds records, and both fan-outs are non-zero by the
+   gate -- so the product is >= 4, and even the absurd upper bound of the whole
+   database squared is 9.2e21, nowhere near overflowing a double.
+
+   The two forms differ by a few ulp: measured over 400 k triples drawn from the
+   live ranges, at most 7.1e-15 absolute (2.8e-16 relative), and all 400 k round
+   to the SAME float -- which is what the score is stored as. So this is not a
+   numerical change in any sense the search can see; it is only formally not
+   bit-identical, since a double difference of 1e-15 can in principle land the
+   sum on the far side of a float rounding boundary. */
+static inline float score_scanned(const BeamEntry *t, int row,
+                                  uint32_t nA, uint64_t fB, uint64_t fC) {
+    double s = log((double)nA * (1.0 + (double)fB) * (1.0 + (double)fC))
+               + color_term(t, row);
+    if (g_avail_correct) s += avail_term(t);
+    return (float)s;
+}
+
+/* Full scoring for a child that already exists: the same gate as
+   child_lookahead, read off the materialized frontier instead of the chunks. */
 static bool score_child(const BeamEntry *t, int row, float *out) {
     const uint8_t *rt = t->rtop;
     for (int c = 1; c <= EDGE_LEN; c++) if (!color_is_inner(rt[c])) return false;
@@ -933,10 +942,43 @@ static bool score_child(const BeamEntry *t, int row, float *out) {
     uint64_t fC = db_seg_fanout(rt[11], rt[12], rt[13], rt[14], rt[15]);
     if (fC == 0) return false;
 
-    double s = log((double)cA->n) + log1p((double)fB) + log1p((double)fC)
-               + color_term(t, row);
-    if (g_avail_correct) s += avail_term(t);
-    *out = (float)s;
+    *out = score_scanned(t, row, cA->n, fB, fC);
+    return true;
+}
+
+/* score_child's lookahead, run BEFORE the child exists.
+ *
+ * The tops a row exposes upward follow from the chosen chunks alone -- commit_row
+ * sets new_top[1+i] = g_cat[ci[i]].top and new_top[15] = term->top, and reads
+ * nothing else from the parent -- so every one of score_child's early returns can
+ * be decided without materializing anything. That is worth hoisting: the gate is
+ * an exact one-row death test, and a candidate dying on it used to pay a whole
+ * BeamEntry copy, commit_row's counter updates and a parity scan first.
+ *
+ * The three counts the score needs come back with it, so the caller does not
+ * repeat the lookups -- one g_db probe into a 261 MB pointer array plus two
+ * g_fanout probes, which are the expensive part of scoring a child. */
+static inline bool child_lookahead(const uint16_t ci[EDGE_LEN], uint8_t rterm, int row,
+                                   uint32_t *nA_out, uint64_t *fB_out, uint64_t *fC_out) {
+    uint8_t tp[PUZZLE_SIDE];
+    tp[0] = 0;                                   /* col 0 is the border; unread here */
+    for (int i = 0; i < EDGE_LEN; i++) tp[1+i] = g_cat[ci[i]].top;
+    tp[15] = g_edge_term[rterm].top;
+
+    for (int c = 1; c <= EDGE_LEN; c++) if (!color_is_inner(tp[c])) return false;
+    if (!color_is_edge_iface(tp[15])) return false;
+
+    int la = g_cur_left->right[row + 1];
+    if (!color_is_inner(la)) return false;
+    const Cell *cA = g_db[INNER_IDX(la)][INNER_IDX(tp[1])][INNER_IDX(tp[2])]
+                         [INNER_IDX(tp[3])][INNER_IDX(tp[4])][tp[5]];
+    if (!cA) return false;
+    uint64_t fB = db_seg_fanout(tp[6], tp[7], tp[8], tp[9], tp[10]);
+    if (fB == 0) return false;
+    uint64_t fC = db_seg_fanout(tp[11], tp[12], tp[13], tp[14], tp[15]);
+    if (fC == 0) return false;
+
+    *nA_out = cA->n; *fB_out = fB; *fC_out = fC;
     return true;
 }
 
@@ -1304,8 +1346,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
                 if (!parity_ok(t)) continue;
                 /* No lookahead gate at the stop row: every board that completes
                    it is emitted -- whether a row fits above is deliberately the
-                   next stage's problem, so --supply_check does not apply here
-                   either. Rank by the heuristic terms only. */
+                   next stage's problem. Rank by the heuristic terms only. */
                 float score = (float)color_term(t, e->row);
                 pool_append(ctx, sc, t, e->parent_idx, score, &mv);
                 e->quota--;
@@ -1320,7 +1361,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     if (!cB) return;                    /* stop-row-only fall-through ends above */
 
     /* Beam row: up to B_TRY conflict-free B chains, first conflict-free C.
-       With --bc_window nB,nC (default 1,1) the row's B and C segments -- 10 of
+       With --bc_window nB,nC (default 3,2) the row's B and C segments -- 10 of
        its 14 pieces -- stop being whatever the database's global, board-blind
        fan-out sort offered first: up to nB workable B chains x nC C completions
        are scored and only the best is kept, so the objective steers generation
@@ -1328,12 +1369,18 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
        search immediately, exactly as before; the B_TRY retry on a B chain whose
        C fails is orthogonal and unchanged. */
     const bool window = (g_bc_nB > 1 || g_bc_nC > 1);
-    const bool supply = (g_supply_check && (uint32_t)e->row >= g_supply_check);
     RowChoice best_mv; float best_score = 0.0f; uint64_t best_sig = 0;
     uint8_t best_flags = 0;
     bool have_best = false;
     uint32_t nb_done = 0;
-    int b_left = B_TRY;
+    /* The retry budget has to grow with the window, or the window cannot fill.
+       b_left is spent on every conflict-free B chain, while nb_done counts only a
+       B chain that PRODUCED a child -- so at nB = 3 the loop must find three
+       productive B chains inside B_TRY conflict-free tries. Deep rows are
+       conflict-dominated, so a fixed B_TRY starves any nB > 1 and the window
+       would look ineffective for a reason unrelated to its merit. Exactly B_TRY
+       at nB = 1, so the legacy path is untouched. */
+    int b_left = B_TRY + (int)g_bc_nB - 1;
     for (uint32_t jb = 0; jb < cB->n && b_left > 0 && nb_done < g_bc_nB; jb++) {
         uint16_t ciB[CHAIN_LEN]; int la_C;
         if (!pick_segB(cB, jb, rt + 6, forbidA, ciB, la_B, &la_C)) continue;
@@ -1345,18 +1392,20 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
         uint64_t maskB[4]; mask_of_chain(ciB, CHAIN_LEN, maskB);
         uint64_t forbidB[4] = { forbidA[0]|maskB[0], forbidA[1]|maskB[1],
                                 forbidA[2]|maskB[2], forbidA[3]|maskB[3] };
+        memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));  /* B is fixed here */
         uint32_t nc_done = 0;
         for (uint32_t jc = 0; jc < cC->n && nc_done < g_bc_nC; jc++) {
             uint16_t ciC[CHAIN_LEN-1]; uint8_t rterm;
             if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
-            memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));
             memcpy(&mv.ci[2*CHAIN_LEN], ciC, (CHAIN_LEN-1) * sizeof(uint16_t));
             mv.rterm = rterm;
+            /* Lookahead first: an exact one-row death costs nothing to find here,
+               where it used to cost a board copy, commit_row and a parity scan. */
+            uint32_t nA; uint64_t fB, fC;
+            if (!child_lookahead(mv.ci, rterm, e->row, &nA, &fB, &fC)) continue;
             *t = *p; commit_row(t, e->row, &mv);
             if (!parity_ok(t)) continue;
-            if (supply && !supply_ok(t)) continue;
-            float score;
-            if (!score_child(t, e->row, &score)) continue;
+            float score = score_scanned(t, e->row, nA, fB, fC);
             if (!window) {                      /* legacy: first hit wins */
                 pool_append(ctx, sc, t, e->parent_idx, score, &mv);
                 e->quota--;
@@ -2067,10 +2116,6 @@ static void usage(const char *a0) {
 "                         demands -- and hence the color parity test -- are exact\n"
 "                         without knowing the split. Without this accounting free mode\n"
 "                         carries no color certificate at all\n"
-"  --supply_check R       from row R on, reject a board unless every frontier color is\n"
-"                         wanted by no more columns than there are unused pieces\n"
-"                         carrying it (Hall's condition on color classes; counts\n"
-"                         pieces where parity counts half-edges). 0 = off (default 0)\n"
 "\n"
 "Expansion effort:\n"
 "  --pool_factor N        candidate-pool target as a multiple of beam_width; more\n"
@@ -2079,10 +2124,14 @@ static void usage(const char *a0) {
 "                         spent on parents with nearly-impossible rows (default 1024)\n"
 "  --bc_window nB,nC      per segment-A record, score up to nB workable B chains x nC\n"
 "                         C completions and keep only the best child, instead of\n"
-"                         taking the first that fits. This is where extra compute buys\n"
-"                         objective rather than more candidates -- but note the\n"
-"                         --scan_factor budget counts segment-A decodes only, so an\n"
-"                         open window multiplies the work it does not see\n"
+"                         taking the first that fits (default 3,2; 1,1 = first fit).\n"
+"                         Same one child per A record either way -- the window picks it\n"
+"                         on the objective instead of on the database\'s board-blind\n"
+"                         sort order. Costs ~35%% fewer borders per hour and returns\n"
+"                         ~36%% more distinct foundations, with far fewer beams dying\n"
+"                         at the stop row. Note --scan_factor\'s budget counts\n"
+"                         segment-A decodes only, so an open window multiplies work it\n"
+"                         does not see\n"
 "                         (default 1,1 = the first fit, as before)\n"
 "\n"
 "Sweep control:\n"
@@ -2169,15 +2218,18 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--lambda_J")    && i+1 < argc) g_lambda_J = atof(argv[++i]);
         else if (!strcmp(argv[i], "--avail_correct"))             g_avail_correct = true;
         else if (!strcmp(argv[i], "--no_free_demand"))            g_free_demand = false;
-        else if (!strcmp(argv[i], "--supply_check") && i+1 < argc) g_supply_check = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--clue_center"))               g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(argv[i], "--clue_corners"))              g_clue_mask |= CLUE_CORNERS;
         else if (!strcmp(argv[i], "--gumbel_tau0") && i+1 < argc) g_gumbel_tau0 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--gumbel_tau1") && i+1 < argc) g_gumbel_tau1 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--bc_window")   && i+1 < argc) {
             unsigned nb = 0, nc = 0;
-            if (sscanf(argv[++i], "%u,%u", &nb, &nc) != 2 || nb < 1 || nc < 1)
-                fatal("--bc_window needs nB,nC with both >= 1 (e.g. 8,4)");
+            /* Bounded above as well: b_left is B_TRY + nB - 1 as an int, so an
+               absurd nB would overflow it negative and the B loop would never
+               run -- an empty beam instead of a slow one. */
+            if (sscanf(argv[++i], "%u,%u", &nb, &nc) != 2
+                || nb < 1 || nc < 1 || nb > BC_WINDOW_MAX || nc > BC_WINDOW_MAX)
+                fatal("--bc_window needs nB,nC in 1..%d (e.g. 3,2)", BC_WINDOW_MAX);
             g_bc_nB = nb; g_bc_nC = nc;
         }
         else if (!strcmp(argv[i], "--frac_rand")   && i+1 < argc) g_frac_rand = atof(argv[++i]);
@@ -2222,8 +2274,6 @@ int main(int argc, char *argv[]) {
     if (!(g_gumbel_tau1 >= 0.0 && g_gumbel_tau1 <= 1e6)) fatal("--gumbel_tau1 in [0,1e6]");
     if (!(g_tau_bottoms >= 0.0 && g_tau_bottoms <= 1e6)) fatal("--gumbel_tau_bottoms in [0,1e6]");
     if (!(g_tau_columns >= 0.0 && g_tau_columns <= 1e6)) fatal("--gumbel_tau_columns in [0,1e6]");
-    if (g_supply_check > (uint32_t)MAX_DRILL_DEPTH)
-        fatal("--supply_check must be in 0..%d (0 = off)", MAX_DRILL_DEPTH);
     if (g_frac_rand < 0.0 || g_frac_rand > 1.0) fatal("--frac_rand must be in [0,1]");
     if (g_pool_factor == 0) g_pool_factor = 1;
     if (g_scan_factor == 0) g_scan_factor = 1;
@@ -2265,10 +2315,10 @@ int main(int argc, char *argv[]) {
     if (g_clue_mask)
         printf("[cfg] clue_center=%d clue_corners=%d (all 4 orientations)\n",
                (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0);
-    printf("[cfg] score_model=%s lambda_J=%.3f avail_correct=%d free_demand=%d supply_check=%u"
+    printf("[cfg] score_model=%s lambda_J=%.3f avail_correct=%d free_demand=%d"
            " gumbel_tau=%.2f->%.2f bc_window=%u,%u\n",
            g_score_model_J ? "J" : "legacy", g_lambda_J, g_avail_correct?1:0,
-           g_free_demand?1:0, g_supply_check, g_gumbel_tau0, g_gumbel_tau1,
+           g_free_demand?1:0, g_gumbel_tau0, g_gumbel_tau1,
            g_bc_nB, g_bc_nC);
     printf("[cfg] top_bottoms=%ld top_columns=%ld config_time=%.0fs max_wall=%.0fs max_partials=%" PRIu64 " db_file=%s\n",
            g_top_bottoms, g_top_columns, g_config_time_sec, g_max_wall_sec, g_max_partials,

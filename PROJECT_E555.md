@@ -606,24 +606,26 @@ test is kept because it costs nothing and would fire immediately on a
 malformed seed -- but it is not a source of pruning, and the exact free-mode
 demands matter only through the `S >= 0` half.
 
-### Piece-supply pruning (`--supply_check R`)
+### A certificate that was tried and removed (`--supply_check`)
 
-A certificate that counts **pieces** where the parity test counts half-edges,
-so neither implies the other -- a piece with two sides of color c adds 2 to
-`S_c` but can still serve only one column. Each of the 14 frontier columns
-needs a distinct remaining inner piece carrying its exposed top color. Columns
-demanding the same color have identical candidate sets, so Hall's condition
-binds first on whole color classes, and the singleton case is
+Worth recording because the negative result is the useful part. A Hall-type
+condition counted **pieces** where the parity test counts half-edges, so
+neither implied the other: each of the 14 frontier columns needs a distinct
+remaining inner piece carrying its exposed top color, and columns demanding the
+same color have identical candidate sets, so the singleton case was
 
 ```
 for each inner color c:  #{columns demanding c} <= #{unused inner pieces carrying c}
 ```
 
-which is 4 `andn` + 4 `popcount` per demanded color against `g_color_pieces`.
-Off by default, and worth measuring before trusting: in the finalizer regime
-above it rejected 0 of 25 M candidates, because a color is carried by ~40 of
-the 196 inner pieces and 14 columns cannot exhaust that until the board is very
-nearly full.
+It never binds. A color is carried by ~40 of the 196 inner pieces and 14
+columns cannot exhaust that until the board is very nearly full -- measured, it
+rejected 0 of 25 M candidates in the finalizer, and two independent 24-minute
+beamer runs with and without it agreed on config count, extinctions and
+row-11 yield to within noise. The option and its `g_color_pieces` table were
+deleted rather than left off by default: an inner-loop test that provably
+cannot fire is cost without pruning, and a knob nobody should set is a knob
+that misleads.
 
 ### Random border mode (`--random_edges`)
 
@@ -669,14 +671,13 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--lambda_Mahalanobis F` | 0 | weight of the color-usage atypicality bonus (legacy model) |
 | `--avail_correct` | off | discount B/C fan-out by each frontier color's remaining supply |
 | `--no_free_demand` | -- | **disable** the free-mode demand accounting (on by default) |
-| `--supply_check R` | 0 | piece-supply certificate from row R (0 = off) |
 | `--frac_rand F` | 0.75 | random selection band (halved at R-1, zero from R) |
 | `--gumbel_tau0 T` | 0 | selection temperature at row 1 (0 = off, exact legacy) |
 | `--gumbel_tau1 T` | 0 | selection temperature at `--stop_row` |
 | `--parent_cap N` | 5 | children per parent in the score band |
 | `--pool_factor N` | 8 | candidate-pool target, x beam width |
 | `--scan_factor N` | 1024 | decode budget per requested child |
-| `--bc_window nB,nC` | `1,1` | score up to nB x nC (B,C) completions per A record, keep the best |
+| `--bc_window nB,nC` | `3,2` | score up to nB x nC (B,C) completions per A record, keep the best |
 | `--top_bottoms N` | 300 | ranked bottom orderings tried per border row |
 | `--top_columns N` | 10 | ranked left columns per bottom |
 | `--gumbel_tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
@@ -693,15 +694,45 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--verbose` | off | per-row `[beam]` progress lines |
 
 `--bc_window` is the one place where extra compute buys objective rather than
-more candidates. `try_A` normally commits to the **first** conflict-free (B, C)
-and returns, so segments B and C -- 10 of the row's 14 pieces -- are chosen by
-the database's global, board-blind fan-out sort: the score filters an unbiased
-sample but never steers it. With a window open, up to nB workable B chains x nC
-C completions are scored with the same `score_child` used for selection and only
-the best is kept. Note `--scan_factor`'s budget counts segment-A decodes only,
+more candidates. Without it `try_A` commits to the **first** conflict-free
+(B, C) and returns, so segments B and C -- 10 of the row's 14 pieces -- are
+chosen by the database's global, board-blind fan-out sort: the score filters an
+unbiased sample but never steers it. With a window open, up to nB workable B
+chains x nC C completions are scored with the same formula used for selection and
+only the best is kept. **Either way exactly one child per A record survives** --
+the window is not a narrowing, it is the same width with a better choice inside
+it. Note `--scan_factor`'s budget counts segment-A decodes only,
 so an open window multiplies work the budget does not see. There is no
 counterpart in the finalizer, whose beam rows already enumerate *every*
 conflict-free (B, C) -- the defect the window fixes does not exist there.
+
+The retry budget has to grow with the window or it cannot fill: `b_left` is
+spent on every conflict-free B chain, while `nb_done` counts only a B chain that
+*produced* a child, so at nB = 3 the loop must find three productive B chains
+inside `B_TRY` conflict-free tries. Deep rows are conflict-dominated, and with a
+fixed `B_TRY` the window is starved -- an early sweep measured only +5% for
+`2,2` and `3,3` for exactly this reason, which is a measurement of the
+starvation, not of the window. The budget is `B_TRY + nB - 1`, which is `B_TRY`
+at nB = 1.
+
+Where the default comes from -- two seeds, `--random_edges`, `--beam_width
+200000`, `--stop_row 11`, ~16 min of sweep per arm, metric **distinct
+rows-0..10 foundations per minute** (Stage C consumes foundations, and the 4.9
+`--incomplete_top` siblings per foundation make partials/min a misleading
+count):
+
+| window | found/min (2 seeds) | vs `1,1` | borders/hour | reached stop row | died at stop row |
+|---|---|---|---|---|---|
+| `1,1` | 657 / 600 | -- | 234 / 260 | 61% / 52% | 14 / 16 |
+| `2,2` | 824 / 759 | +26% | 174 / 181 | 70% / 60% | 8 / 11 |
+| **`3,2`** | **913 / 804** | **+37%** | 154 / 151 | **83% / 83%** | **1 / 2** |
+| `3,3` | 867 / 795 | +32% | 147 / 147 | 77% / 69% | 3 / 7 |
+
+`3,2` wins on both seeds and on both criteria at once, which is the important
+part: it examines ~35% *fewer* borders per hour, yet more of them survive to the
+stop row and each yields more foundations. The window buys depth and throughput
+together rather than trading one for the other. Beyond `3,2` the extra column
+costs more than it returns.
 
 ### Performance (reference set, 4 laptop threads)
 

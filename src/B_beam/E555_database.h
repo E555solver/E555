@@ -318,14 +318,6 @@ extern uint8_t  g_clue_orients;
 extern int g_top_border_inner_count[NUM_COLORS_TOTAL];
 extern int g_inner_color_total[NUM_COLORS_TOTAL];
 
-/* Piece-level companion to g_inner_color_total: g_color_pieces[c] is the used[]-
-   style bitmask of every INNER piece carrying color c on at least one side. The
-   two count different things -- a piece with two sides of color c adds 2 to
-   g_inner_color_total[c] but is still one piece -- which is what makes the
-   supply certificate (frontier columns demanding c vs pieces that could serve
-   them) independent of the half-edge parity test. */
-extern uint64_t g_color_pieces[NUM_COLORS_TOTAL][4];
-
 /* Memory tracking for the two database arenas. */
 extern uint8_t *g_inner_arena;  extern size_t g_inner_arena_size;
 extern uint8_t *g_edge_arena;   extern size_t g_edge_arena_size;
