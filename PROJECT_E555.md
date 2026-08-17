@@ -677,7 +677,7 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--parent_cap N` | 5 | children per parent in the score band |
 | `--pool_factor N` | 8 | candidate-pool target, x beam width |
 | `--scan_factor N` | 1024 | decode budget per requested child |
-| `--bc_window nB,nC` | `1,1` | score up to nB x nC (B,C) completions per A record, keep the best |
+| `--bc_window nB,nC` | `3,2` | score up to nB x nC (B,C) completions per A record, keep the best |
 | `--top_bottoms N` | 300 | ranked bottom orderings tried per border row |
 | `--top_columns N` | 10 | ranked left columns per bottom |
 | `--gumbel_tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
@@ -694,15 +694,45 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--verbose` | off | per-row `[beam]` progress lines |
 
 `--bc_window` is the one place where extra compute buys objective rather than
-more candidates. `try_A` normally commits to the **first** conflict-free (B, C)
-and returns, so segments B and C -- 10 of the row's 14 pieces -- are chosen by
-the database's global, board-blind fan-out sort: the score filters an unbiased
-sample but never steers it. With a window open, up to nB workable B chains x nC
-C completions are scored with the same `score_child` used for selection and only
-the best is kept. Note `--scan_factor`'s budget counts segment-A decodes only,
+more candidates. Without it `try_A` commits to the **first** conflict-free
+(B, C) and returns, so segments B and C -- 10 of the row's 14 pieces -- are
+chosen by the database's global, board-blind fan-out sort: the score filters an
+unbiased sample but never steers it. With a window open, up to nB workable B
+chains x nC C completions are scored with the same formula used for selection and
+only the best is kept. **Either way exactly one child per A record survives** --
+the window is not a narrowing, it is the same width with a better choice inside
+it. Note `--scan_factor`'s budget counts segment-A decodes only,
 so an open window multiplies work the budget does not see. There is no
 counterpart in the finalizer, whose beam rows already enumerate *every*
 conflict-free (B, C) -- the defect the window fixes does not exist there.
+
+The retry budget has to grow with the window or it cannot fill: `b_left` is
+spent on every conflict-free B chain, while `nb_done` counts only a B chain that
+*produced* a child, so at nB = 3 the loop must find three productive B chains
+inside `B_TRY` conflict-free tries. Deep rows are conflict-dominated, and with a
+fixed `B_TRY` the window is starved -- an early sweep measured only +5% for
+`2,2` and `3,3` for exactly this reason, which is a measurement of the
+starvation, not of the window. The budget is `B_TRY + nB - 1`, which is `B_TRY`
+at nB = 1.
+
+Where the default comes from -- two seeds, `--random_edges`, `--beam_width
+200000`, `--stop_row 11`, ~16 min of sweep per arm, metric **distinct
+rows-0..10 foundations per minute** (Stage C consumes foundations, and the 4.9
+`--incomplete_top` siblings per foundation make partials/min a misleading
+count):
+
+| window | found/min (2 seeds) | vs `1,1` | borders/hour | reached stop row | died at stop row |
+|---|---|---|---|---|---|
+| `1,1` | 657 / 600 | -- | 234 / 260 | 61% / 52% | 14 / 16 |
+| `2,2` | 824 / 759 | +26% | 174 / 181 | 70% / 60% | 8 / 11 |
+| **`3,2`** | **913 / 804** | **+37%** | 154 / 151 | **83% / 83%** | **1 / 2** |
+| `3,3` | 867 / 795 | +32% | 147 / 147 | 77% / 69% | 3 / 7 |
+
+`3,2` wins on both seeds and on both criteria at once, which is the important
+part: it examines ~35% *fewer* borders per hour, yet more of them survive to the
+stop row and each yields more foundations. The window buys depth and throughput
+together rather than trading one for the other. Beyond `3,2` the extra column
+costs more than it returns.
 
 ### Performance (reference set, 4 laptop threads)
 

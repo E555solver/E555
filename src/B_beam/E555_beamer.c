@@ -81,6 +81,12 @@
    viable A chain can be lost to one unlucky B pick. */
 #define B_TRY 4
 
+/* Largest --bc_window side. Nothing is sized by it -- the window keeps one
+   running best, not an array -- but b_left is B_TRY + nB - 1 in an int, so an
+   unbounded nB would overflow it negative and the B loop would never run, which
+   would empty the beam silently instead of merely slowing it. */
+#define BC_WINDOW_MAX 64
+
 /* Stop-row emission safety cap (lines per config; the CSV rows are ~2 KB). */
 #define EMIT_MAX 1000000u
 
@@ -104,8 +110,8 @@ static bool     g_avail_correct   = false;
 static bool     g_free_demand     = true;   /* --no_free_demand turns it off */
 static double   g_gumbel_tau0     = 0.0;    /* 0 = off (exact legacy selection) */
 static double   g_gumbel_tau1     = 0.0;
-static uint32_t g_bc_nB           = 1;      /* --bc_window nB,nC (1,1 = legacy) */
-static uint32_t g_bc_nC           = 1;
+static uint32_t g_bc_nB           = 3;      /* --bc_window nB,nC; 1,1 = legacy */
+static uint32_t g_bc_nC           = 2;
 static uint32_t g_parent_cap      = 5;
 static uint32_t g_pool_factor     = 8;
 static uint32_t g_scan_factor     = 1024;
@@ -1355,7 +1361,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     if (!cB) return;                    /* stop-row-only fall-through ends above */
 
     /* Beam row: up to B_TRY conflict-free B chains, first conflict-free C.
-       With --bc_window nB,nC (default 1,1) the row's B and C segments -- 10 of
+       With --bc_window nB,nC (default 3,2) the row's B and C segments -- 10 of
        its 14 pieces -- stop being whatever the database's global, board-blind
        fan-out sort offered first: up to nB workable B chains x nC C completions
        are scored and only the best is kept, so the objective steers generation
@@ -2118,10 +2124,14 @@ static void usage(const char *a0) {
 "                         spent on parents with nearly-impossible rows (default 1024)\n"
 "  --bc_window nB,nC      per segment-A record, score up to nB workable B chains x nC\n"
 "                         C completions and keep only the best child, instead of\n"
-"                         taking the first that fits. This is where extra compute buys\n"
-"                         objective rather than more candidates -- but note the\n"
-"                         --scan_factor budget counts segment-A decodes only, so an\n"
-"                         open window multiplies the work it does not see\n"
+"                         taking the first that fits (default 3,2; 1,1 = first fit).\n"
+"                         Same one child per A record either way -- the window picks it\n"
+"                         on the objective instead of on the database\'s board-blind\n"
+"                         sort order. Costs ~35%% fewer borders per hour and returns\n"
+"                         ~36%% more distinct foundations, with far fewer beams dying\n"
+"                         at the stop row. Note --scan_factor\'s budget counts\n"
+"                         segment-A decodes only, so an open window multiplies work it\n"
+"                         does not see\n"
 "                         (default 1,1 = the first fit, as before)\n"
 "\n"
 "Sweep control:\n"
@@ -2214,8 +2224,12 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--gumbel_tau1") && i+1 < argc) g_gumbel_tau1 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--bc_window")   && i+1 < argc) {
             unsigned nb = 0, nc = 0;
-            if (sscanf(argv[++i], "%u,%u", &nb, &nc) != 2 || nb < 1 || nc < 1)
-                fatal("--bc_window needs nB,nC with both >= 1 (e.g. 8,4)");
+            /* Bounded above as well: b_left is B_TRY + nB - 1 as an int, so an
+               absurd nB would overflow it negative and the B loop would never
+               run -- an empty beam instead of a slow one. */
+            if (sscanf(argv[++i], "%u,%u", &nb, &nc) != 2
+                || nb < 1 || nc < 1 || nb > BC_WINDOW_MAX || nc > BC_WINDOW_MAX)
+                fatal("--bc_window needs nB,nC in 1..%d (e.g. 3,2)", BC_WINDOW_MAX);
             g_bc_nB = nb; g_bc_nC = nc;
         }
         else if (!strcmp(argv[i], "--frac_rand")   && i+1 < argc) g_frac_rand = atof(argv[++i]);
