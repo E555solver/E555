@@ -606,24 +606,26 @@ test is kept because it costs nothing and would fire immediately on a
 malformed seed -- but it is not a source of pruning, and the exact free-mode
 demands matter only through the `S >= 0` half.
 
-### Piece-supply pruning (`--supply_check R`)
+### A certificate that was tried and removed (`--supply_check`)
 
-A certificate that counts **pieces** where the parity test counts half-edges,
-so neither implies the other -- a piece with two sides of color c adds 2 to
-`S_c` but can still serve only one column. Each of the 14 frontier columns
-needs a distinct remaining inner piece carrying its exposed top color. Columns
-demanding the same color have identical candidate sets, so Hall's condition
-binds first on whole color classes, and the singleton case is
+Worth recording because the negative result is the useful part. A Hall-type
+condition counted **pieces** where the parity test counts half-edges, so
+neither implied the other: each of the 14 frontier columns needs a distinct
+remaining inner piece carrying its exposed top color, and columns demanding the
+same color have identical candidate sets, so the singleton case was
 
 ```
 for each inner color c:  #{columns demanding c} <= #{unused inner pieces carrying c}
 ```
 
-which is 4 `andn` + 4 `popcount` per demanded color against `g_color_pieces`.
-Off by default, and worth measuring before trusting: in the finalizer regime
-above it rejected 0 of 25 M candidates, because a color is carried by ~40 of
-the 196 inner pieces and 14 columns cannot exhaust that until the board is very
-nearly full.
+It never binds. A color is carried by ~40 of the 196 inner pieces and 14
+columns cannot exhaust that until the board is very nearly full -- measured, it
+rejected 0 of 25 M candidates in the finalizer, and two independent 24-minute
+beamer runs with and without it agreed on config count, extinctions and
+row-11 yield to within noise. The option and its `g_color_pieces` table were
+deleted rather than left off by default: an inner-loop test that provably
+cannot fire is cost without pruning, and a knob nobody should set is a knob
+that misleads.
 
 ### Random border mode (`--random_edges`)
 
@@ -669,7 +671,6 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--lambda_Mahalanobis F` | 0 | weight of the color-usage atypicality bonus (legacy model) |
 | `--avail_correct` | off | discount B/C fan-out by each frontier color's remaining supply |
 | `--no_free_demand` | -- | **disable** the free-mode demand accounting (on by default) |
-| `--supply_check R` | 0 | piece-supply certificate from row R (0 = off) |
 | `--frac_rand F` | 0.75 | random selection band (halved at R-1, zero from R) |
 | `--gumbel_tau0 T` | 0 | selection temperature at row 1 (0 = off, exact legacy) |
 | `--gumbel_tau1 T` | 0 | selection temperature at `--stop_row` |

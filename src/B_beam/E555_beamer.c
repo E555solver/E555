@@ -102,7 +102,6 @@ static bool     g_score_model_J   = false;  /* --score_model J (default legacy) 
 static double   g_lambda_J        = 1.0;
 static bool     g_avail_correct   = false;
 static bool     g_free_demand     = true;   /* --no_free_demand turns it off */
-static uint32_t g_supply_check    = 0;      /* first row tested; 0 = off */
 static double   g_gumbel_tau0     = 0.0;    /* 0 = off (exact legacy selection) */
 static double   g_gumbel_tau1     = 0.0;
 static uint32_t g_bc_nB           = 1;      /* --bc_window nB,nC (1,1 = legacy) */
@@ -294,9 +293,9 @@ static void beam_init_border(BeamEntry *p, const BottomOrder *bot, const LeftOrd
         }
     }
     /* Reserve every enabled clue piece. Two of the corner clues sit on row 13
-       and are never placed, so holding them makes --supply_check and the
-       free-demand accounting exact rather than optimistic. The pinned walk is
-       exempt from this mask, so a clue can still be placed on its own cell. */
+       and are never placed, so holding them makes the free-demand accounting
+       exact rather than optimistic. The pinned walk is exempt from this mask,
+       so a clue can still be placed on its own cell. */
     for (int k = 0; k < CLUE_N; k++) {
         if ((k == 0) ? !(g_clue_mask & CLUE_CENTER) : !(g_clue_mask & CLUE_CORNERS)) continue;
         for (int o = 0; o < 4; o++)
@@ -352,30 +351,6 @@ static bool parity_ok(const BeamEntry *p) {
         int S = g_inner_color_total[c] - p->color_consumed[c] - p->req_exposed[c];
         if (S < 0) return false;
         if (demand_exact && (S & 1)) return false;
-    }
-    return true;
-}
-
-/* Piece-supply certificate (Hall's condition, singleton case; --supply_check).
-   Each of the 14 frontier columns needs a DISTINCT remaining inner piece
-   carrying its exposed top color. Columns demanding the same color have
-   identical candidate sets, so Hall's condition binds first on whole color
-   classes: if a color is wanted by more columns than there are unused pieces
-   carrying it anywhere, no perfect matching exists and the board is dead.
-   This counts PIECES where parity_ok counts HALF-EDGES, so neither implies the
-   other -- a piece with two sides of color c adds 2 to that color's surplus but
-   can still serve only one column. */
-static bool supply_ok(const BeamEntry *p) {
-    int need[NUM_COLORS_TOTAL] = {0};
-    for (int c = 1; c <= EDGE_LEN; c++) need[p->rtop[c]]++;   /* always inner */
-    for (int col = COLOR_MIN; col <= COLOR_MAX; col++) {
-        if (!need[col]) continue;
-        const uint64_t *m = g_color_pieces[col];
-        int have = __builtin_popcountll(m[0] & ~p->used[0])
-                 + __builtin_popcountll(m[1] & ~p->used[1])
-                 + __builtin_popcountll(m[2] & ~p->used[2])
-                 + __builtin_popcountll(m[3] & ~p->used[3]);
-        if (have < need[col]) return false;
     }
     return true;
 }
@@ -1351,8 +1326,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
                 if (!parity_ok(t)) continue;
                 /* No lookahead gate at the stop row: every board that completes
                    it is emitted -- whether a row fits above is deliberately the
-                   next stage's problem, so --supply_check does not apply here
-                   either. Rank by the heuristic terms only. */
+                   next stage's problem. Rank by the heuristic terms only. */
                 float score = (float)color_term(t, e->row);
                 pool_append(ctx, sc, t, e->parent_idx, score, &mv);
                 e->quota--;
@@ -1375,7 +1349,6 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
        search immediately, exactly as before; the B_TRY retry on a B chain whose
        C fails is orthogonal and unchanged. */
     const bool window = (g_bc_nB > 1 || g_bc_nC > 1);
-    const bool supply = (g_supply_check && (uint32_t)e->row >= g_supply_check);
     RowChoice best_mv; float best_score = 0.0f; uint64_t best_sig = 0;
     uint8_t best_flags = 0;
     bool have_best = false;
@@ -1412,7 +1385,6 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
             if (!child_lookahead(mv.ci, rterm, e->row, &nA, &fB, &fC)) continue;
             *t = *p; commit_row(t, e->row, &mv);
             if (!parity_ok(t)) continue;
-            if (supply && !supply_ok(t)) continue;
             float score = score_scanned(t, e->row, nA, fB, fC);
             if (!window) {                      /* legacy: first hit wins */
                 pool_append(ctx, sc, t, e->parent_idx, score, &mv);
@@ -2124,10 +2096,6 @@ static void usage(const char *a0) {
 "                         demands -- and hence the color parity test -- are exact\n"
 "                         without knowing the split. Without this accounting free mode\n"
 "                         carries no color certificate at all\n"
-"  --supply_check R       from row R on, reject a board unless every frontier color is\n"
-"                         wanted by no more columns than there are unused pieces\n"
-"                         carrying it (Hall's condition on color classes; counts\n"
-"                         pieces where parity counts half-edges). 0 = off (default 0)\n"
 "\n"
 "Expansion effort:\n"
 "  --pool_factor N        candidate-pool target as a multiple of beam_width; more\n"
@@ -2226,7 +2194,6 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--lambda_J")    && i+1 < argc) g_lambda_J = atof(argv[++i]);
         else if (!strcmp(argv[i], "--avail_correct"))             g_avail_correct = true;
         else if (!strcmp(argv[i], "--no_free_demand"))            g_free_demand = false;
-        else if (!strcmp(argv[i], "--supply_check") && i+1 < argc) g_supply_check = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--clue_center"))               g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(argv[i], "--clue_corners"))              g_clue_mask |= CLUE_CORNERS;
         else if (!strcmp(argv[i], "--gumbel_tau0") && i+1 < argc) g_gumbel_tau0 = atof(argv[++i]);
@@ -2279,8 +2246,6 @@ int main(int argc, char *argv[]) {
     if (!(g_gumbel_tau1 >= 0.0 && g_gumbel_tau1 <= 1e6)) fatal("--gumbel_tau1 in [0,1e6]");
     if (!(g_tau_bottoms >= 0.0 && g_tau_bottoms <= 1e6)) fatal("--gumbel_tau_bottoms in [0,1e6]");
     if (!(g_tau_columns >= 0.0 && g_tau_columns <= 1e6)) fatal("--gumbel_tau_columns in [0,1e6]");
-    if (g_supply_check > (uint32_t)MAX_DRILL_DEPTH)
-        fatal("--supply_check must be in 0..%d (0 = off)", MAX_DRILL_DEPTH);
     if (g_frac_rand < 0.0 || g_frac_rand > 1.0) fatal("--frac_rand must be in [0,1]");
     if (g_pool_factor == 0) g_pool_factor = 1;
     if (g_scan_factor == 0) g_scan_factor = 1;
@@ -2322,10 +2287,10 @@ int main(int argc, char *argv[]) {
     if (g_clue_mask)
         printf("[cfg] clue_center=%d clue_corners=%d (all 4 orientations)\n",
                (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0);
-    printf("[cfg] score_model=%s lambda_J=%.3f avail_correct=%d free_demand=%d supply_check=%u"
+    printf("[cfg] score_model=%s lambda_J=%.3f avail_correct=%d free_demand=%d"
            " gumbel_tau=%.2f->%.2f bc_window=%u,%u\n",
            g_score_model_J ? "J" : "legacy", g_lambda_J, g_avail_correct?1:0,
-           g_free_demand?1:0, g_supply_check, g_gumbel_tau0, g_gumbel_tau1,
+           g_free_demand?1:0, g_gumbel_tau0, g_gumbel_tau1,
            g_bc_nB, g_bc_nC);
     printf("[cfg] top_bottoms=%ld top_columns=%ld config_time=%.0fs max_wall=%.0fs max_partials=%" PRIu64 " db_file=%s\n",
            g_top_bottoms, g_top_columns, g_config_time_sec, g_max_wall_sec, g_max_partials,
