@@ -940,6 +940,53 @@ static bool score_child(const BeamEntry *t, int row, float *out) {
     return true;
 }
 
+/* score_child's lookahead, run BEFORE the child exists.
+ *
+ * The tops a row exposes upward follow from the chosen chunks alone -- commit_row
+ * sets new_top[1+i] = g_cat[ci[i]].top and new_top[15] = term->top, and reads
+ * nothing else from the parent -- so every one of score_child's early returns can
+ * be decided without materializing anything. That is worth hoisting: the gate is
+ * an exact one-row death test, and a candidate dying on it used to pay a whole
+ * BeamEntry copy, commit_row's counter updates and a parity scan first.
+ *
+ * The three counts the score needs come back with it, so the caller does not
+ * repeat the lookups -- one g_db probe into a 261 MB pointer array plus two
+ * g_fanout probes, which are the expensive part of scoring a child. */
+static inline bool child_lookahead(const uint16_t ci[EDGE_LEN], uint8_t rterm, int row,
+                                   uint32_t *nA_out, uint64_t *fB_out, uint64_t *fC_out) {
+    uint8_t tp[PUZZLE_SIDE];
+    tp[0] = 0;                                   /* col 0 is the border; unread here */
+    for (int i = 0; i < EDGE_LEN; i++) tp[1+i] = g_cat[ci[i]].top;
+    tp[15] = g_edge_term[rterm].top;
+
+    for (int c = 1; c <= EDGE_LEN; c++) if (!color_is_inner(tp[c])) return false;
+    if (!color_is_edge_iface(tp[15])) return false;
+
+    int la = g_cur_left->right[row + 1];
+    if (!color_is_inner(la)) return false;
+    const Cell *cA = g_db[INNER_IDX(la)][INNER_IDX(tp[1])][INNER_IDX(tp[2])]
+                         [INNER_IDX(tp[3])][INNER_IDX(tp[4])][tp[5]];
+    if (!cA) return false;
+    uint64_t fB = db_seg_fanout(tp[6], tp[7], tp[8], tp[9], tp[10]);
+    if (fB == 0) return false;
+    uint64_t fC = db_seg_fanout(tp[11], tp[12], tp[13], tp[14], tp[15]);
+    if (fC == 0) return false;
+
+    *nA_out = cA->n; *fB_out = fB; *fC_out = fC;
+    return true;
+}
+
+/* The rest of score_child, for a child whose lookahead already passed. Identical
+   arithmetic, in the same order, so the score is bit-for-bit what score_child
+   would have returned. */
+static inline float score_scanned(const BeamEntry *t, int row,
+                                  uint32_t nA, uint64_t fB, uint64_t fC) {
+    double s = log((double)nA) + log1p((double)fB) + log1p((double)fC)
+               + color_term(t, row);
+    if (g_avail_correct) s += avail_term(t);
+    return (float)s;
+}
+
 static inline uint64_t frontier_sig(const BeamEntry *b) {
     uint64_t h = 0x6BEA6BEA6BEA6BEAULL, w;
     /* Orientation joins the hash, or two boards that differ only in which clue
@@ -1333,7 +1380,14 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     uint8_t best_flags = 0;
     bool have_best = false;
     uint32_t nb_done = 0;
-    int b_left = B_TRY;
+    /* The retry budget has to grow with the window, or the window cannot fill.
+       b_left is spent on every conflict-free B chain, while nb_done counts only a
+       B chain that PRODUCED a child -- so at nB = 3 the loop must find three
+       productive B chains inside B_TRY conflict-free tries. Deep rows are
+       conflict-dominated, so a fixed B_TRY starves any nB > 1 and the window
+       would look ineffective for a reason unrelated to its merit. Exactly B_TRY
+       at nB = 1, so the legacy path is untouched. */
+    int b_left = B_TRY + (int)g_bc_nB - 1;
     for (uint32_t jb = 0; jb < cB->n && b_left > 0 && nb_done < g_bc_nB; jb++) {
         uint16_t ciB[CHAIN_LEN]; int la_C;
         if (!pick_segB(cB, jb, rt + 6, forbidA, ciB, la_B, &la_C)) continue;
@@ -1345,18 +1399,21 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
         uint64_t maskB[4]; mask_of_chain(ciB, CHAIN_LEN, maskB);
         uint64_t forbidB[4] = { forbidA[0]|maskB[0], forbidA[1]|maskB[1],
                                 forbidA[2]|maskB[2], forbidA[3]|maskB[3] };
+        memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));  /* B is fixed here */
         uint32_t nc_done = 0;
         for (uint32_t jc = 0; jc < cC->n && nc_done < g_bc_nC; jc++) {
             uint16_t ciC[CHAIN_LEN-1]; uint8_t rterm;
             if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
-            memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));
             memcpy(&mv.ci[2*CHAIN_LEN], ciC, (CHAIN_LEN-1) * sizeof(uint16_t));
             mv.rterm = rterm;
+            /* Lookahead first: an exact one-row death costs nothing to find here,
+               where it used to cost a board copy, commit_row and a parity scan. */
+            uint32_t nA; uint64_t fB, fC;
+            if (!child_lookahead(mv.ci, rterm, e->row, &nA, &fB, &fC)) continue;
             *t = *p; commit_row(t, e->row, &mv);
             if (!parity_ok(t)) continue;
             if (supply && !supply_ok(t)) continue;
-            float score;
-            if (!score_child(t, e->row, &score)) continue;
+            float score = score_scanned(t, e->row, nA, fB, fC);
             if (!window) {                      /* legacy: first hit wins */
                 pool_append(ctx, sc, t, e->parent_idx, score, &mv);
                 e->quota--;
