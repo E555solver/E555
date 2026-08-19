@@ -750,16 +750,21 @@ step_pipeline_topper_sweep() {
 # Builds the real chain database twice -- once per invocation. ANNEAL=1 is the
 # only check anywhere that drives the beamer from a Stage A rotations file
 # rather than --random_edges.
+# STOP_ROW 10, which is the example's own default -- the check used to override
+# it down to 4 and got a 29 MB CSV on the real seed for it. Nothing has gone
+# extinct that shallow, so the stop-row beam is emitted in full; by row 10 it has
+# thinned. Neither assertion below needs a surviving board (the example reports
+# "no board survived" and exits 0), so depth costs the check nothing.
 step_example_beamer() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
-    SEED=data/seed_Edge5.txt OUT_DIR="$OUT/ex01" BEAM_WIDTH=2000 STOP_ROW=4 \
+    SEED=data/seed_Edge5.txt OUT_DIR="$OUT/ex01" BEAM_WIDTH=2000 STOP_ROW=10 \
     N_BOTTOMS=1 N_COLUMNS=1 \
         bash examples/01_beamer_quickstart.sh > "$OUT/ex01.log" \
         || { tail -5 "$OUT/ex01.log"; fail "examples/01 exited non-zero"; }
     grep -q "run summary" "$OUT/ex01.log" || fail "examples/01 printed no run summary"
     ANNEAL=1 SEED=data/seed_Edge5.txt ROTATIONS="$OUT/ex01_rotations.csv" \
     RESTARTS=2 STEPS=2000 TARGET=250 THREADS=4 OUT_DIR="$OUT/ex01a" \
-    BEAM_WIDTH=2000 STOP_ROW=4 N_BOTTOMS=2 N_COLUMNS=1 \
+    BEAM_WIDTH=2000 STOP_ROW=10 N_BOTTOMS=2 N_COLUMNS=1 \
         bash examples/01_beamer_quickstart.sh > "$OUT/ex01a.log" \
         || { tail -5 "$OUT/ex01a.log"; fail "examples/01 ANNEAL=1 exited non-zero"; }
     [ -s "$OUT/ex01_rotations.csv" ] || fail "examples/01 ANNEAL=1 wrote no rotations file"

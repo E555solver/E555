@@ -122,10 +122,25 @@ BEAM_TAU1="${BEAM_TAU1:-0.25}"
 # enumerate every conflict-free (B, C), so it has no --bc_window.
 BC_WINDOW="${BC_WINDOW:-3,3}"
 
+# Never below row 10, on either the beamer or a lap. See WHIRL_ROWS above.
+[ "$BEAM_STOP" -ge 10 ] || { echo "!! BEAM_STOP $BEAM_STOP is below 10: a shallow"
+    echo "   stop row emits the whole beam and floods the output. Use 10 or more."; exit 1; }
+for _t in $WHIRL_ROWS; do
+    [ "$_t" -ge 10 ] || { echo "!! WHIRL_ROWS entry $_t is below 10: same reason."; exit 1; }
+    [ "$_t" -le 12 ] || { echo "!! WHIRL_ROWS entry $_t is above 12: the beam is spent"
+        echo "   past 12 and the Stage C tools are better. Use 10, 11 or 12."; exit 1; }
+done
+
 # ---- the whirlpool ----------------------------------------------------------
-# One target row per lap. 11 first, then 12 -- and 12 is the ceiling, reached
-# with --incomplete_top because a board that fills row 12 bar one 5-piece
+# One target row per lap: 10 or 11 to start, WITHOUT incomplete emissions, then
+# 12 WITH them -- 12 is the ceiling, and a board filling row 12 bar one 5-piece
 # segment is still the best thing Stage C will be handed all day.
+#
+# Never below 10, and the guard below enforces it. Depth is what bounds output:
+# nothing has gone extinct at a shallow row, so the stop-row beam is emitted in
+# full and --incomplete_top's siblings multiply it. Measured on the real seed,
+# one config: row 6 wrote 807 042 boards and 1.5 GB, row 10 wrote 1 136 and
+# 2.2 MB in the same 5 s.
 WHIRL_ROWS="${WHIRL_ROWS:-11 12 12 12}"
 BAND_ROW="${BAND_ROW:-5}"           # backtracker --stop_row: rows 0..BAND_ROW are rebuilt exactly
 # Bands per lap is 2 * POP * BT_LIMIT, and it is the setting that decides how
