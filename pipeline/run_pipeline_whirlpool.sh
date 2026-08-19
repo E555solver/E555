@@ -115,6 +115,12 @@ BEAM_TAU_BOTTOMS="${BEAM_TAU_BOTTOMS:-2}"
 BEAM_TAU_COLUMNS="${BEAM_TAU_COLUMNS:-4}"
 BEAM_TAU0="${BEAM_TAU0:-0.25}"
 BEAM_TAU1="${BEAM_TAU1:-0.25}"
+# Score up to nB x nC (B, C) completions per segment-A record and keep the best,
+# instead of taking the first that fits. The repo default is 3,2, which won a
+# two-seed sweep on foundations/minute; 3,3 scores one more column per B chain
+# and is the setting asked for here. Beamer only -- the finalizer's rows already
+# enumerate every conflict-free (B, C), so it has no --bc_window.
+BC_WINDOW="${BC_WINDOW:-3,3}"
 
 # ---- the whirlpool ----------------------------------------------------------
 # One target row per lap. 11 first, then 12 -- and 12 is the ceiling, reached
@@ -215,7 +221,7 @@ BEAM_CMD=("$REPO/bin/E555_beamer" "$SEED" --random_edges
     --border_row_N "$BEAM_BOARDS" --top_columns "$BEAM_COLUMNS"
     --gumbel_tau_bottoms "$BEAM_TAU_BOTTOMS" --gumbel_tau_columns "$BEAM_TAU_COLUMNS"
     --gumbel_tau0 "$BEAM_TAU0" --gumbel_tau1 "$BEAM_TAU1"
-    --lambda_Mahalanobis 10
+    --lambda_Mahalanobis 10 --bc_window "$BC_WINDOW"
     --max_partials "$BEAM_BOARDS" --max_wall_sec "$BEAM_WALL" --verbose "${CLUE_ARG[@]}")
 [ -n "$DB_FILE" ] && BEAM_CMD+=(--db_file "$DB_FILE")
 [ "$RNG_SEED" != "0" ] && BEAM_CMD+=(--seed "$RNG_SEED")

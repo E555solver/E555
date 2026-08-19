@@ -771,6 +771,15 @@ step_example_beamer() {
 # reachable no other way: the runner has no stage selector, so the CP-SAT and
 # backtracker stages sit behind two chain-database builds. Until that selector
 # exists, SKIP_BEAMER=1 leaves the second half of this script unexercised.
+# Stop row 10, not 6. --incomplete_top emits a sibling partial for every pair of
+# the three segments, and at a shallow row nothing has gone extinct yet, so the
+# stop-row beam is reported in full and the siblings multiply it: measured on
+# this fixture, row 6 wrote 807 042 boards and 1.5 GB, enough to push
+# E555_rank.py to 13.9 GB RSS and get it OOM-killed mid-gate. The same run at
+# row 10 writes 1 136 boards and 2.2 MB in the same 5 s, because by then the
+# beam has thinned. Depth is what bounds this output, not width or --top_bottoms
+# (capping that to 2 changed nothing), and row 10 is also where the pipeline
+# really operates.
 step_pipeline_annealed() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
     if ! python3 -c "import ortools" 2>/dev/null; then
@@ -778,8 +787,8 @@ step_pipeline_annealed() {
         return 0
     fi
     SEED=data/seed_Edge5.txt RUN_DIR="$PWD/$OUT/pipeline" THREADS=4 DB_FILE= \
-    ROUNDS=2 BEAM_WIDTH=2000 BEAM_STOP_ROW=6 BEAM_MAX_PARTIALS=2 \
-    BEAM_MAX_WALL=300 BEAM_COLUMNS=2 FIN_WIDTH=2000 FIN_STOP_ROW=8 FIN_FROM=2 \
+    ROUNDS=2 BEAM_WIDTH=2000 BEAM_STOP_ROW=10 BEAM_MAX_PARTIALS=2 \
+    BEAM_MAX_WALL=300 BEAM_COLUMNS=2 FIN_WIDTH=2000 FIN_STOP_ROW=11 FIN_FROM=5 \
     FIN_MAX_PARTIALS=2 FIN_MAX_WALL=300 RH_WIDTH=5 RH_LINES=2 RH_WALL=60 \
     TOP_N=2 CPSAT_TIME=10 CPSAT_STALL=5 BT_MISMATCH=60 BT_RESTARTS=2000 \
     BT_TIME=15 \
