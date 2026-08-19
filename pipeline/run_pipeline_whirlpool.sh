@@ -65,7 +65,10 @@
 # =============================================================================
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Derived from this script's own location, so the runner works from anywhere.
+# Overridable because a copy of this file kept outside the tree -- a snapshot
+# pinned for a long run, say -- would otherwise resolve the repo to nonsense.
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 # ---- what to run on ---------------------------------------------------------
 SEED="${SEED:-$REPO/data/seed_Edge5.txt}"
