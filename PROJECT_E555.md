@@ -1340,6 +1340,20 @@ clue-aware but never has to be, since it only fills the empty notch). The cost
 is a shallower cut -- at `BAND_ROW = 8` a lap preserves 99 cells and frees 77,
 against 66 and 110 at `BAND_ROW = 5`.
 
+**This is a finalizer limitation worth fixing in code, not a fact of the
+problem.** Locking *below* the centre is the common case, not an exotic one --
+the shipped `--finalize_from = BEAM_STOP - 5` does it on every ordinary run, and
+any pipeline that re-cuts a low band does it by construction. The finalizer
+needs an orientation because a partial has committed to one, but deriving it
+*only* from the clue pieces on the line means a partial that legitimately holds
+none is refused rather than searched. Three ways out, in increasing order of
+appetite: take the orientation from the command line when no clue is on the
+board; infer it from the border pieces, which are present and already
+orientation-bearing; or carry it in the CSV's metadata fields, which readers
+already skip. Until one of those exists, a clued whirlpool cannot cut below
+`BAND_ROW 8`, and that is a tooling constraint rather than anything about
+Eternity II.
+
 The finalizer
 needs the flag on **every lap** -- the centre sits on the rows it re-grows, and
 without it the search quietly refills that cell. The backtracker is not
