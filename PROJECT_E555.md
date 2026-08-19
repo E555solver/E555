@@ -1322,10 +1322,25 @@ another satisfied one rather than breaking it. That holds for the corner clues
 too: the reachable pair is the row-2 cells at every orientation, with a
 different piece on them.
 
-The runner passes only `--clue_center`, which is a choice about difficulty, not
-a rotation constraint -- it is the target matching the higher centre-only
-record, and it keeps a brand-new pipeline's first validation free of an extra
-constraint. `CLUES=1` is the switch. The finalizer
+**`CLUES=1` requires `BAND_ROW >= 8`.** This is the one hard constraint the
+loop imposes, and it is not obvious: the finalizer reads a partial's
+*orientation* off the clue pieces it carries, and skips any line that carries
+none --
+
+```
+[skip] line 21: carries none of the enabled clue pieces, so there is
+       nothing to read the board's orientation from
+```
+
+The centre clue sits on row 7 or 8 depending on orientation, so a band of rows
+`0..5` strips it and **every** band is refused. Measured: 26 exact bands in,
+0 out, four laps running. A band reaching row 8 carries the clue through (the
+cut preserves cells already placed inside the band, and the backtracker is not
+clue-aware but never has to be, since it only fills the empty notch). The cost
+is a shallower cut -- at `BAND_ROW = 8` a lap preserves 99 cells and frees 77,
+against 66 and 110 at `BAND_ROW = 5`.
+
+The finalizer
 needs the flag on **every lap** -- the centre sits on the rows it re-grows, and
 without it the search quietly refills that cell. The backtracker is not
 clue-aware at all, which is harmless at the band cut (rows `0..5` exclude the

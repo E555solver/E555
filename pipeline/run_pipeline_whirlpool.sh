@@ -78,9 +78,21 @@ CLUES="${CLUES:-0}"                 # 1 = hold the Eternity II centre clue
 # E555_database.c tabulates the published clues at ALL FOUR orientations (the
 # centre piece 138 at (7,7) (8,7) (8,8) (7,8), spins 0 3 2 1) and g_clue_orients
 # is 0xF, so a quarter-turn maps a satisfied configuration to another satisfied
-# one. Only --clue_center is passed, and that is a choice about difficulty --
-# the centre-only record is the higher one -- not a rotation constraint.
+# one. Only --clue_center is passed: the centre-only record is the higher one.
+#
+# CLUES=1 REQUIRES BAND_ROW >= 8. The finalizer reads a partial's orientation
+# off the clue pieces it carries and skips any line carrying none, and the
+# centre clue sits on row 7 or 8 -- so a rows-0..5 band strips it and every
+# band is refused (measured: 26 bands in, 0 out, every lap). The guard below
+# enforces it rather than letting a run burn hours emitting nothing.
 CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center)
+if [ "$CLUES" = 1 ] && [ "${BAND_ROW:-5}" -lt 8 ]; then
+    echo "!! CLUES=1 needs BAND_ROW >= 8: the centre clue sits on row 7/8, so a"
+    echo "   shallower band strips it and the finalizer refuses every partial"
+    echo "   ('carries none of the enabled clue pieces'). Set BAND_ROW=8, or"
+    echo "   run with CLUES=0."
+    exit 1
+fi
 # A clued chain database has different CONTENTS for the same seed, and the
 # beamer refuses a cache whose exclusion set does not match.
 [ "$CLUES" = 1 ] && [ -n "$DB_FILE" ] && DB_FILE="$DB_FILE.clue"
