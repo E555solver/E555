@@ -63,6 +63,7 @@ ALL_STEPS=(
     "backtracker_dives|greedy dives on the example board, plus an own-output round-trip"
     "backtracker_exhaustive|exhaustive enumeration identical at 1 and 4 threads"
     "backtracker_stop_band|--stop_row/--stop_column emit exact, finalizer-shaped bands"
+    "whirlpool_lap|one whirlpool lap: turn, re-cut rows 0..5, re-grow to row 11"
     "cpsat_chain|topper -> ender(ring) -> ender(patch), each fed by the last"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
     "scripts_parse|every shipped example and pipeline script parses"
@@ -164,8 +165,12 @@ step_compile() {
 step_viewer() {
     python3 tools/E555_viewer.py data/synth_solution_480.csv --seed data/synth_seed.txt \
         --no-board --no-url > /dev/null   # parse check
+    # Not piped into `grep -q`: the match is on line 5 of 43, so grep exits at
+    # once, the viewer takes SIGPIPE on the rest of the board, and `pipefail`
+    # turns that into a failed check -- a gate that goes red on a passing tool.
     python3 tools/E555_viewer.py data/synth_solution_480.csv --seed data/synth_seed.txt \
-        --no-url | grep -q "Correct edges : 480 / 480" || fail "expected 480/480"
+        --no-url > "$OUT/viewer.txt"
+    grep -q "Correct edges : 480 / 480" "$OUT/viewer.txt" || fail "expected 480/480"
     echo "ok: 480/480"
 }
 
@@ -530,6 +535,64 @@ step_backtracker_stop_band() {
     grep -q "requires --max-mismatch 0" "$OUT/sbx.log" || fail "wrong error for --max-mismatch"
 
     echo "ok: $n exact row-0 bands, thread-independent, --reverse and guards correct"
+}
+
+# One whirlpool lap: turn the board, re-cut rows 0..5 exactly, re-grow to row 11.
+# The assertions are the lap's geometry, which is what a rotation-sense error
+# would silently break: a turned rows-0..10 board must have 11 complete COLUMNS
+# and no complete row (that is why the band cut is needed at all), the band must
+# be rows 0..5 at the theoretical 170, and the re-grow must reach rows 0..11 at
+# the theoretical 356 = 15*12 + 16*11.
+step_whirlpool_lap() {
+    python3 - "$OUT/wp_row10.csv" <<'EOF'
+import sys
+line = [l for l in open("data/synth_solution_480.csv")
+        if l.strip() and not l.startswith(("#", "%"))][0].rstrip("\n")
+f = line.split(",")
+meta, pos, rot = f[:-512], [p.strip() for p in f[-512:-256]], [r.strip() for r in f[-256:]]
+pos = ["999" if p != "999" and int(p) // 16 > 10 else p for p in pos]
+open(sys.argv[1], "w").write(",".join(meta + pos + rot) + "\n")
+EOF
+    n=$(awk -F, '!/^#/{p=0; for(i=3;i<=258;i++) if($i!=999)p++; print p}' "$OUT/wp_row10.csv")
+    [ "$n" = 176 ] || fail "the rows-0..10 fixture has $n placed cells, expected 176"
+
+    # A quarter-turn CW puts the filled region on columns 0..10 and leaves NO
+    # complete row, so no finalizer could start from it.
+    python3 tools/E555_rotate.py "$OUT/wp_row10.csv" 1 \
+        --out "$OUT/wp_rot.csv" --seed data/synth_seed.txt > /dev/null
+    read -r nc nr <<<"$(awk -F, '!/^#/{delete col; delete row;
+        for(i=3;i<=258;i++) if($i!=999){col[$i%16]++; row[int($i/16)]++}
+        nc=0; for(c=0;c<16;c++) if(col[c]==16)nc++
+        nr=0; for(r=0;r<16;r++) if(row[r]==16)nr++
+        print nc, nr}' "$OUT/wp_rot.csv")"
+    [ "$nc" = 11 ] || fail "a turned rows-0..10 board has $nc complete columns, expected 11"
+    [ "$nr" = 0 ]  || fail "a turned rows-0..10 board has $nr complete rows, expected 0"
+
+    bin/E555_backtracker data/synth_seed.txt "$OUT/wp_rot.csv" "$OUT/wp_bt.csv" \
+        --stop_row 5 --order rowmajor --break-mode any --max-mismatch 0 \
+        --solution-limit 2 --time-limit 60 --threads 4 > "$OUT/wp_bt.log"
+    band="$OUT/wp_bt.csv.stop_row5.csv"
+    [ -s "$band" ] || { tail -5 "$OUT/wp_bt.log"; fail "the band cut emitted nothing"; }
+    bad=$(awk -F, '!/^#/{p=0; hi=0; for(i=3;i<=258;i++) if($i!=999){p++; if(int($i/16)>5)hi++}
+                          if (p!=96 || hi!=0 || $2!=170) n++} END{print n+0}' "$band")
+    [ "$bad" = 0 ] || fail "$bad emitted bands are not an exact rows-0..5 band at 170"
+
+    bin/E555_finalizer data/synth_seed.txt "$band" \
+        --out_dir "$OUT/wp_fin" --threads 4 \
+        --finalize_from 5 --stop_row 11 --beam_width 20000 --frac_rand 0 \
+        --border_row_N "$(grep -vc '^#' "$band")" --top_columns 0 \
+        --seed 1 --max_partials 8 --max_wall_sec 300 > "$OUT/wp_fin.log"
+    comp="$OUT/wp_fin/beam_completions_finalized_11.csv"
+    [ -s "$comp" ] || { tail -5 "$OUT/wp_fin.log"; fail "no board re-grew from row 5 to row 11"; }
+    # Stage B writes its solution INDEX in field 2, so the score has to be
+    # recomputed from the seed before it can be asserted on.
+    python3 tools/E555_rank.py "$comp" --seed data/synth_seed.txt \
+        --emit "$OUT/wp_final.csv" --rescore > /dev/null
+    comp="$OUT/wp_final.csv"
+    bad=$(awk -F, '!/^#/{p=0; hi=0; for(i=3;i<=258;i++) if($i!=999){p++; if(int($i/16)>11)hi++}
+                          if (p!=192 || hi!=0 || $2!=356) n++} END{print n+0}' "$comp")
+    [ "$bad" = 0 ] || fail "$bad re-grown boards are not an exact rows-0..11 board at 356"
+    echo "ok: turn -> band(170) -> re-grow(356), $(grep -vc '^#' "$comp") boards"
 }
 
 step_cpsat_chain() {

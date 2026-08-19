@@ -1205,6 +1205,134 @@ near-siblings hard.
 
 ---
 
+## The whirlpool -- turning the board between every re-grow
+
+`pipeline/run_pipeline_whirlpool.sh` (no new tool; it chains the existing four)
+
+Every Stage B tool grows **rows upward from the bottom**. The beam advances a
+row at a time and the finalizer locks rows `0..N` and frees everything above, so
+the rows a board stands on were chosen early, by a beam that was guessing, and
+are never revisited however often the top is re-grown.
+
+Turn the board 90 degrees and those buried rows become **columns** on one side,
+where a re-grow can reach them. What blocked that until now is that a turned
+board has complete *columns* and the finalizer can only start from complete
+*rows* -- and nothing converted one into the other. `E555_backtracker
+--stop_row` does: it searches rows `0..N` only and emits every exact filling.
+That is its role here, and it is the whole reason the loop exists.
+
+### The lap
+
+```
+rows 0..T full
+  ├─ rotate +-90 deg    tools/E555_rotate.py in.csv 1   (and 3)
+  │      T+1 complete COLUMNS, and zero complete rows
+  ├─ backtracker        --stop_row 5 --order rowmajor --break-mode any
+  │      completes rows 0..5, clears everything above
+  └─ finalizer          --finalize_from 5 --stop_row T
+         rows 6..T re-grown at full width over a reduced database
+```
+
+The lap ends where it began -- rows `0..T` full -- but rebuilt from a different
+direction. **Four laps is one full turn of the board.**
+
+`--order rowmajor` at the cut is deliberate: after a turn the empty cells are
+whole *columns* of rows `0..5`, and rowmajor walks them row by row, closing the
+border row 0 first, which is the shape the finalizer's lock needs. `--break-mode
+any` is required because the default `stuck` takes a minimal break where no
+exact fit exists and a broken band is dropped at emission.
+
+A quarter-turn CW (`1`) sends the old **right** column down to the new bottom
+row and leaves the filled region on columns `0..T`; CCW (`3`) takes the old
+**left** column down and fills columns `15-T..15`. The two keep different halves
+of the board, so running both genuinely doubles the field rather than mirroring
+it.
+
+### What it buys
+
+The lap keeps rows `0..5` of the turned board -- a six-deep slab against **one
+side** -- and that side moves 90 degrees every lap:
+
+| at `T = 11` (12 filled columns) | |
+|---|---|
+| **cells** preserved -- rows 0..5 of the filled columns | 72 |
+| **cells** rebuilt by the band cut | 24 |
+| **cells** re-grown by the finalizer, rows 6..11 | 96 |
+| **pieces** free for the search -- 120 freed plus 64 never placed | **184** |
+
+Cells and pieces are counted separately on purpose: `72 + 24 + 96 = 192` is the
+board's filled area, while `184` is how much material the search may draw on.
+Measured on a real lap-1 board (`T = 10`, so 11 filled columns): 66 cells kept
+in place and 110 freed, exactly `6*11` and `10*11`.
+
+The four slabs hug four different sides and their common intersection is empty,
+so **no piece survives a full circle untouched**: the centre is re-searched in
+all four laps, a corner in two. A board that comes out the far end admits an
+exact rows-`0..T` partial cut from every direction, which is far stronger
+evidence than surviving once from the bottom.
+
+### It holds depth; it does not climb
+
+`WHIRL_ROWS` caps at 12 on purpose. Above row 12 the beam is spent and the Stage
+C tools are simply better, so the loop holds its depth and spends its time on
+coverage instead. Stage C runs **once, at the end**, on the survivors --
+roundhouse (`--rotate -1 --rounds 3 --strip_width 4`, the width raised on
+purpose to free already-solved rows) and then the backtracker's mismatch dives.
+
+Nothing inside the loop ranks, because there is nothing to rank: every stage
+emits **exactly matched** boards, so at equal depth they all score the same. A
+rows-`0..T` board scores exactly `15(T+1) + 16T` -- 356 at `T = 11` -- and the
+ranker's `breaks` column is then just `480 - score`, counting adjacencies
+against empty cells rather than real defects. What thins the field is
+**attrition**: a board whose turned band admits no exact filling, or that will
+not re-grow to `T`, drops out. The per-lap counts the script prints are
+therefore the real diagnostic, and a lap that returns what it was given means
+the neighbourhood is exhausted.
+
+### Cost, and why `--solution-limit` is load-bearing
+
+The cut is effectively free and the finalizer is the whole cost, which is the
+opposite of what the shape of the pipeline suggests. Measured on **one** turned
+synthetic board, `--all-solutions`: **4 787 556 exact bands in 120 s** (6.9 GB
+of CSV), 100% accepted, and still running when the clock stopped. Meanwhile
+every distinct band is a distinct locked set, so the finalizer rebuilds its
+reduced database for each one -- at `--finalize_from 5`, 337 M records, 0.82 GB,
+about 9 s.
+
+So the loop consumes a vanishing fraction of what the cut offers, and
+`--solution-limit` is not a safety net but the setting that defines the run.
+Bands per lap is `2 * POP * BT_LIMIT`. Two consequences worth knowing:
+
+- `BT_LIMIT` takes the DFS's **first** K bands, which share a long prefix.
+  `BT_ORDER` is the lever on that -- a different static order starts from a
+  different corner and returns a different first K. Ranking the bands would be
+  the principled fix, but there is nothing to rank them *by*: they are all
+  exact and all score the same (see above).
+- Raising `BAND_ROW` shrinks the finalizer's database fast, at the cost of
+  freeing less of the board per lap. That is the main speed/coverage dial.
+
+### Clues
+
+Clues are rotation-covariant, which is what makes the loop legal at all:
+`g_clue` (`E555_database.c`) tabulates the published clues at **all four**
+orientations -- the centre piece 138 sits at `(7,7) (8,7) (8,8) (7,8)` with
+spins `0 3 2 1` -- and `g_clue_orients` is `0xF`, so every one of them is
+enabled. A quarter-turn therefore maps a satisfied clue configuration to
+another satisfied one rather than breaking it. That holds for the corner clues
+too: the reachable pair is the row-2 cells at every orientation, with a
+different piece on them.
+
+The runner passes only `--clue_center`, which is a choice about difficulty, not
+a rotation constraint -- it is the target matching the higher centre-only
+record, and it keeps a brand-new pipeline's first validation free of an extra
+constraint. `CLUES=1` is the switch. The finalizer
+needs the flag on **every lap** -- the centre sits on the rows it re-grows, and
+without it the search quietly refills that cell. The backtracker is not
+clue-aware at all, which is harmless at the band cut (rows `0..5` exclude the
+centre) but means the closing dive must use a `--holes` mask that leaves the
+centre cell shut; the shipped `holes_open_border_TR.csv` does.
+
+---
 ## Stage C -- the tail toolbox
 
 Three tools, one canonical CSV, different philosophies. None of them has

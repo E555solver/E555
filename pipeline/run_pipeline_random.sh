@@ -128,6 +128,12 @@ rank() {
 
 [ -x "$REPO/bin/E555_beamer" ] || make -C "$REPO"
 mkdir -p "$RUN_DIR"
+# Everything below runs from inside this directory, so a path handed in relative
+# to the invocation directory has to be resolved before the cd.
+abspath() { case "$1" in /*) printf '%s' "$1";; *) printf '%s' "$PWD/$1";; esac; }
+[ -n "${SEED:-}" ] && SEED="$(abspath "$SEED")"
+[ -n "${HOLES:-}" ] && HOLES="$(abspath "$HOLES")"
+[ -n "${DB_FILE:-}" ] && DB_FILE="$(abspath "$DB_FILE")"
 cd "$RUN_DIR"
 echo "[cfg] repo=$REPO"
 echo "[cfg] seed=$SEED"

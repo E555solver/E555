@@ -65,6 +65,11 @@ CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 # -----------------------------------------------------------------------------
 
 mkdir -p "$FARM_DIR/records"
+# Everything below runs from inside this directory, so a path handed in relative
+# to the invocation directory has to be resolved before the cd.
+abspath() { case "$1" in /*) printf '%s' "$1";; *) printf '%s' "$PWD/$1";; esac; }
+[ -n "${SEED:-}" ] && SEED="$(abspath "$SEED")"
+[ -n "${DB_FILE:-}" ] && DB_FILE="$(abspath "$DB_FILE")"
 cd "$FARM_DIR"
 CHAMPS="$FARM_DIR/champions.csv"
 LOG="$FARM_DIR/farm.log"
