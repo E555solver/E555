@@ -62,6 +62,7 @@ ALL_STEPS=(
     "roundhouse_legal|every emitted board is break-free and frame-legal"
     "backtracker_dives|greedy dives on the example board, plus an own-output round-trip"
     "backtracker_exhaustive|exhaustive enumeration identical at 1 and 4 threads"
+    "backtracker_stop_band|--stop_row/--stop_column emit exact, finalizer-shaped bands"
     "cpsat_chain|topper -> ender(ring) -> ender(patch), each fed by the last"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
     "scripts_parse|every shipped example and pipeline script parses"
@@ -483,6 +484,52 @@ step_backtracker_exhaustive() {
     s4=$(grep -oE 'full_solutions *= *[0-9]+' "$OUT/ex4.log" | grep -oE '[0-9]+$')
     [ -n "$s1" ] && [ "$s1" = "$s4" ] || fail "solution count differs by thread count: 1thr=$s1 4thr=$s4"
     echo "ok: $s1 solutions at both thread counts"
+}
+
+# --stop_row/--stop_column restrict the search to a band and emit every way to
+# fill it, for the finalizer to resume from.  tests/fixtures/holes_row0_x4.csv
+# reopens four cells of the bottom border row, which enumerates exhaustively in
+# well under a second.  The three things that must hold are the three the
+# finalizer depends on: exactly the band is placed, nothing outside it is, and
+# the band is perfectly matched (score 15 = the 15 horizontal edges of one row).
+step_backtracker_stop_band() {
+    bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sb.csv" \
+        --holes tests/fixtures/holes_row0_x4.csv --stop_row 0 --order rowmajor \
+        --max-mismatch 0 --all-solutions --threads 4 > "$OUT/sb.log"
+    band="$OUT/sb.csv.stop_row0.csv"
+    [ -s "$band" ] || fail "no stop-band file at $band"
+    n=$(grep -vc '^#' "$band")
+    [ "$n" -gt 0 ] || fail "stop-band file has no data lines"
+    bad=$(awk -F, '!/^#/{p=0; out=0; for(i=3;i<=258;i++) if ($i!=999) { p++; if ($i>15) out++ }
+                          if (p!=16 || out!=0 || $2!=15) n++ } END{print n+0}' "$band")
+    [ "$bad" = "0" ] || fail "$bad of $n bands are not an exact, row-0-only band"
+
+    # Emission order is racy across threads, but the SET enumerated must not be.
+    for t in 1 4; do
+        bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sb$t.csv" \
+            --holes tests/fixtures/holes_row0_x4.csv --stop_row 0 --order rowmajor \
+            --max-mismatch 0 --all-solutions --threads $t > "$OUT/sb$t.log"
+        grep -v '^#' "$OUT/sb$t.csv.stop_row0.csv" | cut -d, -f2- | sort > "$OUT/sbset$t.txt"
+    done
+    cmp -s "$OUT/sbset1.txt" "$OUT/sbset4.txt" \
+        || fail "stop-band enumeration differs between 1 and 4 threads"
+
+    # --reverse anchors the band at the far side: rows 15..15 for --stop_row 0.
+    bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sbr.csv" \
+        --stop_row 0 --reverse --max-mismatch 0 --solution-limit 1 --threads 1 > "$OUT/sbr.log"
+    [ -s "$OUT/sbr.csv.stop_row0_rev.csv" ] || fail "no reversed stop-band file"
+    top=$(awk -F, '!/^#/{for(i=3;i<=258;i++) if ($i!=999 && $i<240) bad++} END{print bad+0}' \
+          "$OUT/sbr.csv.stop_row0_rev.csv")
+    [ "$top" = "0" ] || fail "--reverse band placed $top cells outside the top row"
+
+    # A band must be refused where it could only mislead: a broken edge would be
+    # rejected by the finalizer later, and --jump can never complete the band.
+    bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sbx.csv" \
+        --stop_row 3 --max-mismatch 5 > "$OUT/sbx.log" 2>&1 && \
+        fail "--stop_row accepted --max-mismatch 5"
+    grep -q "requires --max-mismatch 0" "$OUT/sbx.log" || fail "wrong error for --max-mismatch"
+
+    echo "ok: $n exact row-0 bands, thread-independent, --reverse and guards correct"
 }
 
 step_cpsat_chain() {

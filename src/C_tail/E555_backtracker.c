@@ -347,6 +347,46 @@ typedef enum {
 static OrderMode g_order_mode = ORD_MRV;
 static bool g_reverse = false;   /* --reverse: reversed traversal; mrv tie-break -> column-major */
 
+/* -- Stop band (--stop_row / --stop_column) ----------------------------------- *
+ * The beamer stops at --stop_row R and emits every board that fills rows 0..R,
+ * which the finalizer then resumes from with --finalize_from R.  These options
+ * give the backtracker the same shape: restrict the search to a band of rows or
+ * columns and emit every distinct way to fill it.
+ *
+ * The band is the CLOSED range 0..g_stop_n, matching the beamer (--stop_row 12
+ * there means rows 0..12, thirteen rows).  --reverse anchors it at the far side
+ * instead -- rows 15-N..15, columns 15-N..15 -- so with a stop option on,
+ * --reverse both flips static traversal (its older meaning) and picks the side.
+ *
+ * Membership is decided in the ORIGINAL frame, the one the CSV is written in,
+ * so "row 12" means row 12 as the user reads it.  Under --rotate the DFS works
+ * in a rotated frame, so callers there must map back first (rotated_to_orig). */
+static int  g_stop_n      = -1;      /* band size - 1; -1 = no stop option */
+static bool g_stop_isrow  = true;    /* true: --stop_row, false: --stop_column */
+static bool g_stop_active = false;
+
+static inline bool cell_in_band(int r, int c) {
+    if (!g_stop_active) return true;
+    int v = g_stop_isrow ? r : c;
+    return g_reverse ? (v >= PUZZLE_SIDE - 1 - g_stop_n) : (v <= g_stop_n);
+}
+
+/* Band membership for a cell of the SEARCH board, which under --rotate K sits
+ * in the rotated frame.  apply_rotation_k turns (r,c) into (c, SIDE-1-r) once
+ * per quarter turn, so undoing K turns means applying that same step (4-K)&3
+ * times -- the coordinate half of inverse_rotation_k, which cannot be reused
+ * here because it moves whole boards, not single cells. */
+static inline bool cell_in_band_search(int r, int c) {
+    if (!g_stop_active) return true;
+    if (g_rotation > 0) {
+        for (int q = (4 - g_rotation) & 3; q > 0; q--) {
+            int tr = c, tc = PUZZLE_SIDE - 1 - r;
+            r = tr; c = tc;
+        }
+    }
+    return cell_in_band(r, c);
+}
+
 static const char *order_name(OrderMode m) {
     switch (m) {
         case ORD_ROWMAJOR:  return "rowmajor";
@@ -471,6 +511,12 @@ static FILE *g_status_csv = NULL;   /* optional --status per-record diagnostics 
 static FILE *g_ckpt_csv   = NULL;   /* E555: append-only crash-recovery checkpoint;
                                      * last line per record = its best so far.
                                      * Removed on clean completion. */
+static FILE *g_band_csv   = NULL;   /* --stop_row/--stop_column: one line per band
+                                     * filling.  Unlike output.csv, which holds a
+                                     * single best board per record, this streams
+                                     * every emission as the search finds it. */
+static uint64_t g_band_emitted  = 0; /* bands written */
+static uint64_t g_band_rejected = 0; /* bands dropped for carrying a broken edge */
 
 
 /* -- Utilities ---------------------------------------------------------------- */
@@ -735,6 +781,28 @@ static int board_count_placed(const Board *b) {
     for (int w = 0; w < USED_WORDS; w++)
         n += __builtin_popcountll(b->used[w]);
     return n;
+}
+
+/* Empty cells the search is actually allowed to fill.  Without a stop band that
+ * is every empty cell, so this reduces to NUM_PIECES - board_count_placed(). */
+static int board_count_searchable(const Board *b) {
+    if (!g_stop_active) return NUM_PIECES - board_count_placed(b);
+    int n = 0;
+    for (int r = 0; r < PUZZLE_SIDE; r++)
+        for (int c = 0; c < PUZZLE_SIDE; c++)
+            if (b->cell[r][c].piece_id == EMPTY_PIECE && cell_in_band_search(r, c))
+                n++;
+    return n;
+}
+
+/* Every band cell placed?  The DFS leaf tests this instead of "all 256 placed",
+ * which a band search never reaches. */
+static bool band_is_complete(const Board *b) {
+    for (int r = 0; r < PUZZLE_SIDE; r++)
+        for (int c = 0; c < PUZZLE_SIDE; c++)
+            if (cell_in_band_search(r, c) && b->cell[r][c].piece_id == EMPTY_PIECE)
+                return false;
+    return true;
 }
 
 static int cell_frame_degree(int row, int col) {
@@ -1091,6 +1159,23 @@ static bool build_initial_board(const int pos[NUM_PIECES], const int rot[NUM_PIE
                 board_unplace(b, r, c);
                 (*n_placed)--;
                 (*holes_applied)++;
+            }
+        }
+    }
+    /* With a stop band, everything outside it is cleared and its pieces go back
+     * to the pool.  Without this a beamer partial that already carries rows
+     * above the band would starve the band of pieces it should be free to use,
+     * and the enumeration would silently be of a smaller set than asked for.
+     * Runs after holes and before the state hash, so deduplication still sees
+     * exactly the board that gets searched. */
+    if (g_stop_active) {
+        for (int r = 0; r < PUZZLE_SIDE; r++) {
+            for (int c = 0; c < PUZZLE_SIDE; c++) {
+                if (cell_in_band_search(r, c)) continue;
+                if (b->cell[r][c].piece_id != EMPTY_PIECE) {
+                    board_unplace(b, r, c);
+                    (*n_placed)--;
+                }
             }
         }
     }
@@ -1958,6 +2043,7 @@ static void side_sequence_add(const Board *b,
                               Cell *seq, int *n, int r, int c) {
     if (r < 0 || r >= PUZZLE_SIDE || c < 0 || c >= PUZZLE_SIDE) return;
     if (seen[r][c] || b->cell[r][c].piece_id != EMPTY_PIECE) return;
+    if (!cell_in_band_search(r, c)) return;
     if (*n >= MAX_SEQ_LEN)
         fatal("search sequence overflow (MAX_SEQ_LEN=%d)", MAX_SEQ_LEN);
     seen[r][c] = true;
@@ -2004,7 +2090,7 @@ static void build_side_sequence(const Board *b, Cell *seq, int *n_seq,
         }
     }
 
-    int expected = NUM_PIECES - board_count_placed(b);
+    int expected = board_count_searchable(b);
     if (n != expected)
         fatal("%s sequence covers %d empty cells, expected %d",
               order_name(mode), n, expected);
@@ -2023,7 +2109,7 @@ static void build_search_sequence_ordered(const Board *b, Cell *seq, int *n_seq,
     int n = 0;
     for (int r = 0; r < PUZZLE_SIDE; r++)
         for (int c = 0; c < PUZZLE_SIDE; c++)
-            if (b->cell[r][c].piece_id == EMPTY_PIECE) {
+            if (b->cell[r][c].piece_id == EMPTY_PIECE && cell_in_band_search(r, c)) {
                 if (n >= MAX_SEQ_LEN)
                     fatal("search sequence overflow (MAX_SEQ_LEN=%d)", MAX_SEQ_LEN);
                 items[n].key  = order_key(mode, r, c);
@@ -2325,13 +2411,28 @@ static void board_to_pos_rot(const Board *b, int pos[NUM_PIECES], int rot[NUM_PI
     }
 }
 
+static void write_band_partial(const Board *b,
+                               const char *config_id_str, long long sol_id);
+
 /*
  * Write a full solution. Board b is in rotated frame.
  * ASCII display uses rotated frame; CSV/txt output uses original frame.
+ *
+ * With a stop band the board is deliberately incomplete, so the full-board
+ * validator below -- which treats any empty cell as a defect -- cannot run and
+ * the band writer takes over.  Routing both through here means the four DFS
+ * leaves need no knowledge of which mode they are in.
  */
 static uint64_t write_solution(const Board *b,
                                 const char *config_id_str, long long input_sol_id) {
     char why[256];
+    if (g_stop_active) {
+        write_band_partial(b, config_id_str, input_sol_id);
+        uint64_t n;
+        #pragma omp atomic capture
+        n = ++g_total_solutions;
+        return n;
+    }
     /* For validation: use original frame */
     Board orig;
     const Board *out_b;
@@ -2401,6 +2502,67 @@ static void write_stream_best(const Board *b,
     #pragma omp critical(stream_csv)
     { checked_fwrite(buf, 1, off, g_stream_csv, "output.csv");
       checked_fflush(g_stream_csv, "output.csv"); }
+}
+
+/*
+ * E555: write one completed stop band.
+ *
+ * Same canonical 514-field layout as output.csv, so the finalizer and every
+ * other reader take it unchanged; pieces outside the band are simply unplaced,
+ * which board_to_pos_rot already renders as CSV_UNPLACED.  Field 2 is the
+ * matched-edge count of the band alone -- board_edge_counts skips empty cells,
+ * so adjacencies leaving the band are not counted either way.
+ *
+ * Two failure modes, treated differently on purpose.  A structural defect (an
+ * unfilled band cell, a frame-zero violation) is an internal error and aborts,
+ * exactly as write_solution does for a full board.  A BROKEN EDGE only drops
+ * the board: --break-mode stuck takes a minimal break wherever no exact fit
+ * exists, so it produces such bands legitimately, and they are useless
+ * downstream because the finalizer validates every color match inside its
+ * locked region.  Rejections are counted so a run that emits nothing is
+ * diagnosable from the summary rather than mysterious.
+ */
+static void write_band_partial(const Board *b,
+                               const char *config_id_str, long long sol_id) {
+    if (!g_band_csv) return;
+    Board orig;
+    const Board *out_b = b;
+    if (g_rotation > 0) { inverse_rotation_k(&orig, b, g_rotation); out_b = &orig; }
+
+    for (int r = 0; r < PUZZLE_SIDE; r++) {
+        for (int c = 0; c < PUZZLE_SIDE; c++) {
+            if (!cell_in_band(r, c)) continue;
+            const Oriented *o = &out_b->cell[r][c];
+            if (o->piece_id == EMPTY_PIECE)
+                fatal("internal error: band cell (r=%d,c=%d) empty at emission "
+                      "from sol_id=%lld", r, c, sol_id);
+            if (!frame_zero_rule_ok(r, c, o))
+                fatal("internal error: frame-zero violation at (r=%d,c=%d) in band "
+                      "from sol_id=%lld", r, c, sol_id);
+        }
+    }
+
+    int conn = 0, brk = 0;
+    board_edge_counts(out_b, &conn, &brk);
+    if (brk > 0) {
+        #pragma omp atomic update
+        g_band_rejected++;
+        return;
+    }
+
+    int pos[NUM_PIECES], rot_arr[NUM_PIECES];
+    board_to_pos_rot(out_b, pos, rot_arr);
+    char buf[CSV_BUF_BYTES]; size_t off = 0;
+    appendf(buf, sizeof(buf), &off, "%s_%lld,%d", config_id_str, sol_id, conn);
+    for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", pos[i]);
+    for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", rot_arr[i]);
+    appendf(buf, sizeof(buf), &off, "\n");
+    /* One fwrite per line keeps the append atomic, so several processes may
+     * share one output file the way the beamer's emitters do. */
+    #pragma omp critical(band_csv)
+    { checked_fwrite(buf, 1, off, g_band_csv, "stop-band csv");
+      checked_fflush(g_band_csv, "stop-band csv");
+      g_band_emitted++; }
 }
 
 /* -- E555: crash-recovery checkpoint + progress heartbeat ------------------------ */
@@ -3268,7 +3430,8 @@ static void side_dfs(Board *b, FcState *fc, Cell *seq, int n_seq, int pos,
     if (depth > st->max_depth_entered) st->max_depth_entered = depth;
 
     if (pos == n_seq) {
-        if (board_count_placed(b) == NUM_PIECES) {
+        if (g_stop_active ? band_is_complete(b)
+                          : board_count_placed(b) == NUM_PIECES) {
             if (!claim_complete_solution(cx->live)) return;
             st->completed_leaves++;
             (*local_solutions)++;
@@ -3362,7 +3525,8 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
     if (depth > st->max_depth_entered) st->max_depth_entered = depth;
 
     if (pos == n_rem) {
-        if (board_count_placed(b) == NUM_PIECES) {
+        if (g_stop_active ? band_is_complete(b)
+                          : board_count_placed(b) == NUM_PIECES) {
             if (!claim_complete_solution(cx->live)) return;
             st->completed_leaves++;
             (*local_solutions)++;
@@ -3583,7 +3747,8 @@ static void side_build_frontier(Board *b, FcState *fc, Cell *seq, int n_seq,
     if (depth > st->max_depth_entered) st->max_depth_entered = depth;
 
     if (pos == n_seq) {
-        if (board_count_placed(b) == NUM_PIECES) {
+        if (g_stop_active ? band_is_complete(b)
+                          : board_count_placed(b) == NUM_PIECES) {
             if (!claim_complete_solution(cx->live)) return;
             st->completed_leaves++;
             (*local_solutions)++;
@@ -3683,7 +3848,8 @@ static void afo_build_frontier(Board *b, FcState *fc, Cell *rem, int n_rem, int 
     if (depth > st->max_depth_entered) st->max_depth_entered = depth;
 
     if (pos == n_rem) {
-        if (board_count_placed(b) == NUM_PIECES) {
+        if (g_stop_active ? band_is_complete(b)
+                          : board_count_placed(b) == NUM_PIECES) {
             if (!claim_complete_solution(cx->live)) return;
             st->completed_leaves++;
             (*local_solutions)++;
@@ -4717,9 +4883,24 @@ static void usage(const char *prog) {
         "  --solution-limit N     Stop after N completions per record (default 1; 0=all).\n"
         "                         Ignored in stuck mode (--stuck_restarts governs).\n"
         "  --all-solutions        Alias for --solution-limit 0.\n\n"
+        "Stop band (emit partials for the finalizer):\n"
+        "  --stop_row N           Search ONLY rows 0..N and emit every way to fill\n"
+        "                         them, as the beamer's --stop_row does.  Cells above\n"
+        "                         the band are cleared first (their pieces return to\n"
+        "                         the pool) and written unplaced, so each line feeds\n"
+        "                         E555_finalizer --finalize_from N directly.\n"
+        "  --stop_column N        The same over columns 0..N.\n"
+        "                         --reverse anchors either band at the far side\n"
+        "                         instead (rows 15-N..15, columns 15-N..15) as well as\n"
+        "                         flipping static traversal.  A band completion IS the\n"
+        "                         solution here, so --solution-limit caps how many are\n"
+        "                         emitted -- it defaults to 1, use --all-solutions to\n"
+        "                         enumerate.  Requires --max-mismatch 0 and --jump off.\n\n"
         "Auxiliary output:\n"
         "  output.csv.status.csv          Per-record diagnostics, with --status.\n"
         "  output.csv.checkpoint.csv      Crash recovery; removed on clean completion.\n"
+        "  output.csv.stop_row<N>.csv     Every completed band, with --stop_row\n"
+        "                                 (stop_col<N> for columns, _rev when reversed).\n"
         "  output.csv.best_pure.csv       With --best-output.\n"
         "  output.csv.best_mismatch.csv   With --best-output.\n\n",
         stderr);
@@ -4849,6 +5030,24 @@ int main(int argc, char **argv) {
             if (errno || end == argv[i] || *end || v < 0 || v > 3)
                 fatal("--rotate expects 0, 1, 2, or 3; got '%s'", argv[i]);
             g_rotation = (int)v;
+        } else if (strcmp(argv[i], "--stop_row") == 0 && i+1 < argc) {
+            char *end = NULL; errno = 0;
+            long v = strtol(argv[++i], &end, 10);
+            if (errno || end == argv[i] || *end || v < 0 || v > PUZZLE_SIDE - 1)
+                fatal("--stop_row expects an integer in [0,%d], got '%s'",
+                      PUZZLE_SIDE - 1, argv[i]);
+            if (g_stop_active)
+                fatal("--stop_row and --stop_column are mutually exclusive");
+            g_stop_n = (int)v; g_stop_isrow = true; g_stop_active = true;
+        } else if (strcmp(argv[i], "--stop_column") == 0 && i+1 < argc) {
+            char *end = NULL; errno = 0;
+            long v = strtol(argv[++i], &end, 10);
+            if (errno || end == argv[i] || *end || v < 0 || v > PUZZLE_SIDE - 1)
+                fatal("--stop_column expects an integer in [0,%d], got '%s'",
+                      PUZZLE_SIDE - 1, argv[i]);
+            if (g_stop_active)
+                fatal("--stop_row and --stop_column are mutually exclusive");
+            g_stop_n = (int)v; g_stop_isrow = false; g_stop_active = true;
         } else if (strcmp(argv[i], "--max-mismatch") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
@@ -4922,6 +5121,22 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Unknown option: %s\n\n", argv[i]);
             usage(argv[0]); return EXIT_FAILURE;
         }
+    }
+
+    /* A stop band exists to feed the finalizer, which structurally validates
+     * every color match inside its locked region -- so a band carrying a broken
+     * edge would be rejected there rather than here, silently, one stage later.
+     * Requiring exactness up front turns that into an argument error.  --jump is
+     * refused for a different reason: it skips a dead cell and keeps going, so
+     * the band would never be complete and the run could only ever emit nothing. */
+    if (g_stop_active) {
+        if (g_max_mismatch != 0)
+            fatal("--stop_%s requires --max-mismatch 0: an emitted band must be "
+                  "exactly matched or the finalizer will reject it",
+                  g_stop_isrow ? "row" : "column");
+        if (g_jump)
+            fatal("--stop_%s requires --jump off: jumping leaves dead cells empty, "
+                  "so the band can never complete", g_stop_isrow ? "row" : "column");
     }
 
     /* Literal side-growth orders use exact placements only.  They have their
@@ -5064,6 +5279,9 @@ int main(int argc, char **argv) {
         for (int i = 0; i < NUM_PIECES; i++) if (g_holes[i]) nholes++;
         printf("[holes] %d positions marked forced-empty (in rotated frame)\n", nholes);
         g_holes_active = true;
+        /* No stop-band interaction to guard here: a hole UNPLACES a cell so the
+         * search can refill it, rather than forcing it to stay empty, so holes
+         * inside the band are the ordinary way to open one for enumeration. */
     } else {
         printf("[2/5] No holes file.\n"); fflush(stdout);
     }
@@ -5079,6 +5297,14 @@ int main(int argc, char **argv) {
     snprintf(pure_csv_path, sizeof(pure_csv_path), "%s.best_pure.csv",      out_path);
     snprintf(mm_csv_path,   sizeof(mm_csv_path),   "%s.best_mismatch.csv",  out_path);
     snprintf(ckpt_csv_path, sizeof(ckpt_csv_path), "%s.checkpoint.csv",     out_path);
+    /* Sidecar naming as elsewhere here, carrying the band size the way the
+     * beamer's beam_completions_<border>_<stop_row>.csv does, so a directory of
+     * results says which row or column each file stopped at. */
+    char band_csv_path[PATH_MAX];
+    if (g_stop_active)
+        snprintf(band_csv_path, sizeof(band_csv_path), "%s.stop_%s%d%s.csv",
+                 out_path, g_stop_isrow ? "row" : "col", g_stop_n,
+                 g_reverse ? "_rev" : "");
 
     const char *stream_hdr =
         "# E555 backtracker -- best board per record (original frame)\n"
@@ -5111,6 +5337,22 @@ int main(int argc, char **argv) {
     checked_fflush(g_ckpt_csv, ckpt_csv_path);
     printf("  checkpoint      -> %s (crash recovery; removed on clean exit)\n",
            ckpt_csv_path);
+    if (g_stop_active) {
+        g_band_csv = fopen(band_csv_path, "w");
+        if (!g_band_csv) fatal("cannot create %s: %s", band_csv_path, strerror(errno));
+        if (fprintf(g_band_csv,
+                    "# E555 backtracker -- every completed --stop_%s %d band%s "
+                    "(original frame)\n"
+                    "# cells outside the band are unplaced (%d); feed to "
+                    "E555_finalizer --finalize_from %d\n"
+                    "# fields: config_id,score,pos_0,...,pos_255,rot_0,...,rot_255\n",
+                    g_stop_isrow ? "row" : "column", g_stop_n,
+                    g_reverse ? " (anchored at the far side)" : "",
+                    CSV_UNPLACED, g_stop_n) < 0)
+            fatal("cannot write header to %s", band_csv_path);
+        checked_fflush(g_band_csv, band_csv_path);
+        printf("  stop band       -> %s\n", band_csv_path);
+    }
     if (g_write_status) {
         g_status_csv = fopen(status_csv_path, "w");
         if (!g_status_csv) fatal("cannot create %s: %s", status_csv_path, strerror(errno));
@@ -5277,6 +5519,19 @@ int main(int argc, char **argv) {
     printf("    no_solution          = %" PRIu64 "\n", g_cnt_no_solution);
     printf("    cutoff               = %" PRIu64 "\n", g_cnt_cutoff);
     printf("    full_solutions       = %" PRIu64 "\n", g_total_solutions);
+    if (g_stop_active) {
+        /* The accept rate is the diagnostic that matters under --break-mode
+         * stuck, whose dives take a minimal break when no exact fit exists and
+         * so can reject every band they produce.  Without it a run that emitted
+         * nothing looks like a bug rather than the mode working as designed. */
+        uint64_t seen = g_band_emitted + g_band_rejected;
+        printf("    bands_emitted        = %" PRIu64 "\n", g_band_emitted);
+        printf("    bands_rejected_broken= %" PRIu64 "%s\n", g_band_rejected,
+               seen ? "" : "  (no band was ever completed)");
+        if (seen)
+            printf("    band_accept_rate     = %.1f%%\n",
+                   100.0 * (double)g_band_emitted / (double)seen);
+    }
 
     if (g_cnt_infeasible > 0) {
         printf("\n  Initial infeasibility breakdown:\n");

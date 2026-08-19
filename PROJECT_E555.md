@@ -1360,6 +1360,33 @@ so under `--solution-limit 1` it returns a different first closure: two triage
 passes (forward and `--reverse`) yield border-distinct partials that the
 finalizer's fixed-mode dedup keeps separate. No effect on `2sides` or `4sides`.
 
+**`--stop_row N` / `--stop_column N` -- enumerating partials for the finalizer.**
+The same shape as the beamer's `--stop_row`: restrict the search to rows `0..N`
+(or columns `0..N`) and emit *every* way to fill that band, one canonical line
+each, to `<out>.stop_row<N>.csv`. Cells outside the band are cleared first --
+their pieces return to the pool, so a partial that already carries rows above
+the band does not starve it -- and are written unplaced (`999`), so each line
+feeds `E555_finalizer --finalize_from N` directly.
+
+The band is the whole search: `rem[]` holds only in-band empty cells, so the DFS
+enumerates exactly the distinct fillings, each leaf is one emission, and no two
+lines can repeat a band. `--reverse` anchors the band at the far side instead
+(rows `15-N..15`, columns `15-N..15`) *as well as* flipping static traversal --
+one flag, two effects, whenever a stop option is on. A band completion is the
+solution here, so `--solution-limit` caps emissions and defaults to **1**;
+`--all-solutions` enumerates, and should be used with care, since rows 0..3
+alone ran to 7.6 M bands and 11 GB in five minutes.
+
+Two options are refused rather than silently useless: `--max-mismatch` must be
+`0`, because the finalizer validates every colour match inside its locked region
+and would reject a broken band one stage later; and `--jump` must be off, since
+skipping a dead cell leaves the band forever incomplete. `--break-mode stuck`
+is accepted but takes a minimal break where no exact fit exists, so the bands it
+produces are dropped at emission -- the summary reports `band_accept_rate` so a
+run that emits nothing is diagnosable. Under `--rotate` the band is defined in
+the original frame, the one the CSV is written in, unlike `--holes`, which is
+read in the rotated frame.
+
 Parallelism is automatic: one record per thread, or every thread on one record's
 search when there are no more records than threads (`--all-for-one` forces the
 latter). Note that this search is memory-system bound, not scheduling bound -- on
@@ -1455,6 +1482,7 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
 | finalizer | `beam_completions_finalized_<row>.csv` | same 514-field layout, ids `p<line>r<repeat>l<column>` |
 | Stage C (all) | output CSV | **canonical**: `config_id, score, pos[256], rot[256]` (514) |
 | backtracker | `<out>.checkpoint.csv`, `<out>.status.csv`, `<out>.best_*.csv` | canonical rows / diagnostic sidecars |
+| backtracker | `<out>.stop_row<N>.csv` / `<out>.stop_col<N>.csv` (`_rev` when reversed) | every completed stop band, canonical 514-field layout |
 
 ---
 
