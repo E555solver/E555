@@ -1295,9 +1295,16 @@ evidence than surviving once from the bottom.
 
 ### It holds depth; it does not climb
 
-`WHIRL_ROWS` caps at 12 on purpose. Above row 12 the beam is spent and the Stage
-C tools are simply better, so the loop holds its depth and spends its time on
-coverage instead. Stage C runs **once, at the end**, on the survivors --
+`WHIRL_ROWS` defaults inside 10..12 on purpose. Below 10 the output floods --
+nothing has gone extinct that shallow, so the whole stop-row beam is emitted and
+`--incomplete_top`'s siblings multiply it (row 6 wrote 807 042 boards and 1.5 GB
+where row 10 wrote 1 136 and 2.2 MB, same 5 s, same config) -- and above 12 the
+beam is spent and the Stage C tools are simply better. So the loop holds its
+depth and spends its time on coverage instead. Both bounds are **advice the
+runner prints and then ignores**: a shallow stop row is a legitimate thing to
+ask for, and only a row the beamer cannot accept at all (outside 1..13) is
+refused. What must not run shallow is a test or an example, where nobody is
+watching the disk fill, so those pass their depth explicitly. Stage C runs **once, at the end**, on the survivors --
 roundhouse (`--rotate -1 --rounds 3 --strip_width 4`, the width raised on
 purpose to free already-solved rows) and then the backtracker's mismatch dives.
 

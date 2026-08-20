@@ -120,26 +120,40 @@ BEAM_TAU1="${BEAM_TAU1:-0.25}"
 # enumerate every conflict-free (B, C), so it has no --bc_window.
 BC_WINDOW="${BC_WINDOW:-3,3}"
 
-# Never below row 10, on either the beamer or a lap. See WHIRL_ROWS above.
-[ "$BEAM_STOP" -ge 10 ] || { echo "!! BEAM_STOP $BEAM_STOP is below 10: a shallow"
-    echo "   stop row emits the whole beam and floods the output. Use 10 or more."; exit 1; }
-for _t in $WHIRL_ROWS; do
-    [ "$_t" -ge 10 ] || { echo "!! WHIRL_ROWS entry $_t is below 10: same reason."; exit 1; }
-    [ "$_t" -le 12 ] || { echo "!! WHIRL_ROWS entry $_t is above 12: the beam is spent"
-        echo "   past 12 and the Stage C tools are better. Use 10, 11 or 12."; exit 1; }
-done
-
 # ---- the whirlpool ----------------------------------------------------------
 # One target row per lap: 10 or 11 to start, WITHOUT incomplete emissions, then
 # 12 WITH them -- 12 is the ceiling, and a board filling row 12 bar one 5-piece
 # segment is still the best thing Stage C will be handed all day.
 #
-# Never below 10, and the guard below enforces it. Depth is what bounds output:
-# nothing has gone extinct at a shallow row, so the stop-row beam is emitted in
-# full and --incomplete_top's siblings multiply it. Measured on the real seed,
-# one config: row 6 wrote 807 042 boards and 1.5 GB, row 10 wrote 1 136 and
-# 2.2 MB in the same 5 s.
+# Below 10 is warned about, not refused. Depth is what bounds output: nothing
+# has gone extinct at a shallow row, so the stop-row beam is emitted in full and
+# --incomplete_top's siblings multiply it. Measured on the real seed, one
+# config: row 6 wrote 807 042 boards and 1.5 GB, row 10 wrote 1 136 and 2.2 MB
+# in the same 5 s. Worth knowing before you ask for it; not worth forbidding.
 WHIRL_ROWS="${WHIRL_ROWS:-11 12 12 12}"
+
+# Depth advice, not law -- and it has to sit HERE, after WHIRL_ROWS and
+# BEAM_STOP are defaulted: reading either one earlier is an unbound variable
+# under `set -u`, which kills the runner before it prints anything.
+#
+# Below row 10 the output floods and above 12 the beam is spent, but a shallow
+# stop row is a legitimate thing to ask a runner for -- seeing what the beam
+# holds early, say -- so this warns and carries on. What must never run shallow
+# is a TEST or an EXAMPLE, where nobody is watching the disk fill; those pass
+# their depth explicitly. Only a row the tools cannot accept is an error.
+for _t in $BEAM_STOP $WHIRL_ROWS; do
+    [ "$_t" -ge 1 ] && [ "$_t" -le 13 ] || {
+        echo "!! stop row $_t is outside 1..13, which is all the beamer accepts."; exit 1; }
+done
+[ "$BEAM_STOP" -ge 10 ] || echo "[warn] BEAM_STOP $BEAM_STOP is below 10: nothing has gone
+       extinct that shallow, so the whole stop-row beam is emitted and the output
+       floods. Measured on the real seed: row 6 wrote 807 042 boards and 1.5 GB,
+       row 10 wrote 1 136 boards and 2.2 MB in the same 5 s. Continuing anyway."
+for _t in $WHIRL_ROWS; do
+    [ "$_t" -ge 10 ] || echo "[warn] WHIRL_ROWS entry $_t is below 10: same flood, per lap."
+    [ "$_t" -le 12 ] || echo "[warn] WHIRL_ROWS entry $_t is above 12: the beam is spent past
+       12 and the Stage C tools do better there. Continuing anyway."
+done
 BAND_ROW="${BAND_ROW:-5}"           # backtracker --stop_row: rows 0..BAND_ROW are rebuilt exactly
 # Bands per lap is 2 * POP * BT_LIMIT, and it is the setting that decides how
 # long a lap takes: every distinct band is a distinct locked set, so the

@@ -46,9 +46,12 @@ moves 90 degrees every lap, so **184 of the 256 pieces are freed and
 re-searched each lap**, the four slabs hug four different sides, and no piece
 survives a full circle untouched. Four laps is one full turn.
 
-It does **not** climb: `WHIRL_ROWS` caps at 12 because above that the beam is
-spent and the Stage C tools are better. The loop holds its depth and spends its
-time on coverage; Stage C runs once, at the end.
+It does **not** climb: `WHIRL_ROWS` stays inside 10..12 because below 10 the
+output floods (the whole stop-row beam is emitted before anything has gone
+extinct) and above 12 the beam is spent and the Stage C tools are better. The
+loop holds its depth and spends its time on coverage; Stage C runs once, at the
+end. Both bounds are warnings, not refusals -- go shallow deliberately if you
+want to; only a stop row outside 1..13 is rejected.
 
 Nothing in the loop ranks, because there is nothing to rank -- every stage emits
 exactly matched boards, so at equal depth they all score the same (a rows-`0..T`
