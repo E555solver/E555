@@ -62,6 +62,9 @@ ALL_STEPS=(
     "roundhouse_legal|every emitted board is break-free and frame-legal"
     "backtracker_dives|greedy dives on the example board, plus an own-output round-trip"
     "backtracker_exhaustive|exhaustive enumeration identical at 1 and 4 threads"
+    "backtracker_stop_band|--stop_row/--stop_column emit exact, finalizer-shaped bands"
+    "whirlpool_lap|one whirlpool lap: turn, re-cut rows 0..5, re-grow to row 11"
+    "clue_orient|a band carrying no clue is searched at all four orientations"
     "cpsat_chain|topper -> ender(ring) -> ender(patch), each fed by the last"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
     "scripts_parse|every shipped example and pipeline script parses"
@@ -163,8 +166,12 @@ step_compile() {
 step_viewer() {
     python3 tools/E555_viewer.py data/synth_solution_480.csv --seed data/synth_seed.txt \
         --no-board --no-url > /dev/null   # parse check
+    # Not piped into `grep -q`: the match is on line 5 of 43, so grep exits at
+    # once, the viewer takes SIGPIPE on the rest of the board, and `pipefail`
+    # turns that into a failed check -- a gate that goes red on a passing tool.
     python3 tools/E555_viewer.py data/synth_solution_480.csv --seed data/synth_seed.txt \
-        --no-url | grep -q "Correct edges : 480 / 480" || fail "expected 480/480"
+        --no-url > "$OUT/viewer.txt"
+    grep -q "Correct edges : 480 / 480" "$OUT/viewer.txt" || fail "expected 480/480"
     echo "ok: 480/480"
 }
 
@@ -485,6 +492,167 @@ step_backtracker_exhaustive() {
     echo "ok: $s1 solutions at both thread counts"
 }
 
+# --stop_row/--stop_column restrict the search to a band and emit every way to
+# fill it, for the finalizer to resume from.  tests/fixtures/holes_row0_x4.csv
+# reopens four cells of the bottom border row, which enumerates exhaustively in
+# well under a second.  The three things that must hold are the three the
+# finalizer depends on: exactly the band is placed, nothing outside it is, and
+# the band is perfectly matched (score 15 = the 15 horizontal edges of one row).
+step_backtracker_stop_band() {
+    bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sb.csv" \
+        --holes tests/fixtures/holes_row0_x4.csv --stop_row 0 --order rowmajor \
+        --max-mismatch 0 --all-solutions --threads 4 > "$OUT/sb.log"
+    band="$OUT/sb.csv.stop_row0.csv"
+    [ -s "$band" ] || fail "no stop-band file at $band"
+    n=$(grep -vc '^#' "$band")
+    [ "$n" -gt 0 ] || fail "stop-band file has no data lines"
+    bad=$(awk -F, '!/^#/{p=0; out=0; for(i=3;i<=258;i++) if ($i!=999) { p++; if ($i>15) out++ }
+                          if (p!=16 || out!=0 || $2!=15) n++ } END{print n+0}' "$band")
+    [ "$bad" = "0" ] || fail "$bad of $n bands are not an exact, row-0-only band"
+
+    # Emission order is racy across threads, but the SET enumerated must not be.
+    for t in 1 4; do
+        bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sb$t.csv" \
+            --holes tests/fixtures/holes_row0_x4.csv --stop_row 0 --order rowmajor \
+            --max-mismatch 0 --all-solutions --threads $t > "$OUT/sb$t.log"
+        grep -v '^#' "$OUT/sb$t.csv.stop_row0.csv" | cut -d, -f2- | sort > "$OUT/sbset$t.txt"
+    done
+    cmp -s "$OUT/sbset1.txt" "$OUT/sbset4.txt" \
+        || fail "stop-band enumeration differs between 1 and 4 threads"
+
+    # --reverse anchors the band at the far side: rows 15..15 for --stop_row 0.
+    bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sbr.csv" \
+        --stop_row 0 --reverse --max-mismatch 0 --solution-limit 1 --threads 1 > "$OUT/sbr.log"
+    [ -s "$OUT/sbr.csv.stop_row0_rev.csv" ] || fail "no reversed stop-band file"
+    top=$(awk -F, '!/^#/{for(i=3;i<=258;i++) if ($i!=999 && $i<240) bad++} END{print bad+0}' \
+          "$OUT/sbr.csv.stop_row0_rev.csv")
+    [ "$top" = "0" ] || fail "--reverse band placed $top cells outside the top row"
+
+    # A band must be refused where it could only mislead: a broken edge would be
+    # rejected by the finalizer later, and --jump can never complete the band.
+    bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sbx.csv" \
+        --stop_row 3 --max-mismatch 5 > "$OUT/sbx.log" 2>&1 && \
+        fail "--stop_row accepted --max-mismatch 5"
+    grep -q "requires --max-mismatch 0" "$OUT/sbx.log" || fail "wrong error for --max-mismatch"
+
+    echo "ok: $n exact row-0 bands, thread-independent, --reverse and guards correct"
+}
+
+# One whirlpool lap: turn the board, re-cut rows 0..5 exactly, re-grow to row 11.
+# The assertions are the lap's geometry, which is what a rotation-sense error
+# would silently break: a turned rows-0..10 board must have 11 complete COLUMNS
+# and no complete row (that is why the band cut is needed at all), the band must
+# be rows 0..5 at the theoretical 170, and the re-grow must reach rows 0..11 at
+# the theoretical 356 = 15*12 + 16*11.
+step_whirlpool_lap() {
+    python3 - "$OUT/wp_row10.csv" <<'EOF'
+import sys
+line = [l for l in open("data/synth_solution_480.csv")
+        if l.strip() and not l.startswith(("#", "%"))][0].rstrip("\n")
+f = line.split(",")
+meta, pos, rot = f[:-512], [p.strip() for p in f[-512:-256]], [r.strip() for r in f[-256:]]
+pos = ["999" if p != "999" and int(p) // 16 > 10 else p for p in pos]
+open(sys.argv[1], "w").write(",".join(meta + pos + rot) + "\n")
+EOF
+    n=$(awk -F, '!/^#/{p=0; for(i=3;i<=258;i++) if($i!=999)p++; print p}' "$OUT/wp_row10.csv")
+    [ "$n" = 176 ] || fail "the rows-0..10 fixture has $n placed cells, expected 176"
+
+    # A quarter-turn CW puts the filled region on columns 0..10 and leaves NO
+    # complete row, so no finalizer could start from it.
+    python3 tools/E555_rotate.py "$OUT/wp_row10.csv" 1 \
+        --out "$OUT/wp_rot.csv" --seed data/synth_seed.txt > /dev/null
+    read -r nc nr <<<"$(awk -F, '!/^#/{delete col; delete row;
+        for(i=3;i<=258;i++) if($i!=999){col[$i%16]++; row[int($i/16)]++}
+        nc=0; for(c=0;c<16;c++) if(col[c]==16)nc++
+        nr=0; for(r=0;r<16;r++) if(row[r]==16)nr++
+        print nc, nr}' "$OUT/wp_rot.csv")"
+    [ "$nc" = 11 ] || fail "a turned rows-0..10 board has $nc complete columns, expected 11"
+    [ "$nr" = 0 ]  || fail "a turned rows-0..10 board has $nr complete rows, expected 0"
+
+    bin/E555_backtracker data/synth_seed.txt "$OUT/wp_rot.csv" "$OUT/wp_bt.csv" \
+        --stop_row 5 --order rowmajor --break-mode any --max-mismatch 0 \
+        --solution-limit 2 --time-limit 60 --threads 4 > "$OUT/wp_bt.log"
+    band="$OUT/wp_bt.csv.stop_row5.csv"
+    [ -s "$band" ] || { tail -5 "$OUT/wp_bt.log"; fail "the band cut emitted nothing"; }
+    bad=$(awk -F, '!/^#/{p=0; hi=0; for(i=3;i<=258;i++) if($i!=999){p++; if(int($i/16)>5)hi++}
+                          if (p!=96 || hi!=0 || $2!=170) n++} END{print n+0}' "$band")
+    [ "$bad" = 0 ] || fail "$bad emitted bands are not an exact rows-0..5 band at 170"
+
+    bin/E555_finalizer data/synth_seed.txt "$band" \
+        --out_dir "$OUT/wp_fin" --threads 4 \
+        --finalize_from 5 --stop_row 11 --beam_width 20000 --frac_rand 0 \
+        --border_row_N "$(grep -vc '^#' "$band")" --top_columns 0 \
+        --seed 1 --max_partials 8 --max_wall_sec 300 > "$OUT/wp_fin.log"
+    comp="$OUT/wp_fin/beam_completions_finalized_11.csv"
+    [ -s "$comp" ] || { tail -5 "$OUT/wp_fin.log"; fail "no board re-grew from row 5 to row 11"; }
+    # Stage B writes its solution INDEX in field 2, so the score has to be
+    # recomputed from the seed before it can be asserted on.
+    python3 tools/E555_rank.py "$comp" --seed data/synth_seed.txt \
+        --emit "$OUT/wp_final.csv" --rescore > /dev/null
+    comp="$OUT/wp_final.csv"
+    bad=$(awk -F, '!/^#/{p=0; hi=0; for(i=3;i<=258;i++) if($i!=999){p++; if(int($i/16)>11)hi++}
+                          if (p!=192 || hi!=0 || $2!=356) n++} END{print n+0}' "$comp")
+    [ "$bad" = 0 ] || fail "$bad re-grown boards are not an exact rows-0..11 board at 356"
+    echo "ok: turn -> band(170) -> re-grow(356), $(grep -vc '^#' "$comp") boards"
+}
+
+step_clue_orient() {
+    # The real seed, not the synthetic one: the clue table names real piece ids.
+    # A band cut at row 5 carries no clue -- the centre sits on row 7 or 8 -- so
+    # the finalizer has to CHOOSE an orientation rather than read one, which is
+    # exactly the case that used to be refused outright.
+    python3 - "$OUT/co_band.csv" <<'EOF'
+import sys
+line = [l for l in open("data/board_partial_row12.csv")
+        if l.strip() and not l.startswith(("#", "%"))][0].rstrip("\n")
+f = line.split(",")
+meta, pos, rot = f[:-512], [p.strip() for p in f[-512:-256]], [r.strip() for r in f[-256:]]
+pos = ["999" if p != "999" and int(p) // 16 > 5 else p for p in pos]
+open(sys.argv[1], "w").write(",".join(meta + pos + rot) + "\n")
+EOF
+    n=$(python3 tools/E555_rank.py "$OUT/co_band.csv" --seed data/seed_Edge5.txt --field clues)
+    [ "$n" = 0 ] || fail "the rows-0..5 band carries $n clue(s), expected none"
+
+    # stop_row 10, never lower: every orientation's centre cell (row 7 or 8) is
+    # inside the searched region well before that, and depth is what keeps the
+    # output small -- measured here, row 10 writes 51 boards and 100 KB where
+    # row 8 wrote 109 and 208 KB, in the same 10 s.
+    bin/E555_finalizer data/seed_Edge5.txt "$OUT/co_band.csv" \
+        --out_dir "$OUT/co_fin" --threads 4 --clue_center \
+        --finalize_from 5 --stop_row 10 --beam_width 2000 --top_columns 1 \
+        --seed 3 --max_wall_sec 300 > "$OUT/co_fin.log"
+    comp="$OUT/co_fin/beam_completions_finalized_10.csv"
+    [ -s "$comp" ] || { tail -5 "$OUT/co_fin.log"; fail "the unclued band emitted nothing"; }
+
+    n=$(grep -cE "^\[sweep\] line 0: orientation [0-3] \(" "$OUT/co_fin.log")
+    [ "$n" = 4 ] || fail "expected 4 orientation passes, saw $n"
+    # One database for all four: the clue pieces are the same set in every
+    # orientation, so only the pins move between passes.
+    n=$(grep -c "DB inner stored" "$OUT/co_fin.log")
+    [ "$n" = 1 ] || fail "expected 1 database build for the line, saw $n"
+
+    # Every emitted board carries the centre clue, whichever orientation placed it.
+    bad=$(python3 tools/E555_rank.py "$comp" --seed data/seed_Edge5.txt --csv |
+          awk -F, 'NR>1 && $NF < 1 {n++} END{print n+0}')
+    [ "$bad" = 0 ] || fail "$bad emitted boards lost the centre clue"
+
+    # Pinning one orientation runs one pass and puts piece 138 on that cell only.
+    # Orientation 1 because it is the one that survives to row 10 from this band
+    # -- the other three go extinct, which is itself the point of searching all
+    # four rather than picking one.
+    bin/E555_finalizer data/seed_Edge5.txt "$OUT/co_band.csv" \
+        --out_dir "$OUT/co_fin2" --threads 4 --clue_center --clue_orient 1 \
+        --finalize_from 5 --stop_row 10 --beam_width 2000 --top_columns 1 \
+        --seed 3 --max_wall_sec 300 > "$OUT/co_fin2.log"
+    comp2="$OUT/co_fin2/beam_completions_finalized_10.csv"
+    [ -s "$comp2" ] || { tail -5 "$OUT/co_fin2.log"; fail "--clue_orient 1 emitted nothing"; }
+    # Piece 138 is field 3+138 of the pos block; orientation 1 puts it on cell 135.
+    bad=$(awk -F, '!/^#/{ if ($(3+138)+0 != 135) n++ } END{print n+0}' "$comp2")
+    [ "$bad" = 0 ] || fail "$bad boards from --clue_orient 1 do not hold the clue at cell 135"
+
+    echo "ok: 4 orientations over 1 database, $(grep -vc '^#' "$comp") boards, all clued"
+}
+
 step_cpsat_chain() {
     if ! python3 -c "import ortools" 2>/dev/null; then
         echo "SKIPPED: OR-Tools not installed (pip install ortools)"
@@ -640,16 +808,21 @@ step_pipeline_topper_sweep() {
 # Builds the real chain database twice -- once per invocation. ANNEAL=1 is the
 # only check anywhere that drives the beamer from a Stage A rotations file
 # rather than --random_edges.
+# STOP_ROW 10, which is the example's own default -- the check used to override
+# it down to 4 and got a 29 MB CSV on the real seed for it. Nothing has gone
+# extinct that shallow, so the stop-row beam is emitted in full; by row 10 it has
+# thinned. Neither assertion below needs a surviving board (the example reports
+# "no board survived" and exits 0), so depth costs the check nothing.
 step_example_beamer() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
-    SEED=data/seed_Edge5.txt OUT_DIR="$OUT/ex01" BEAM_WIDTH=2000 STOP_ROW=4 \
+    SEED=data/seed_Edge5.txt OUT_DIR="$OUT/ex01" BEAM_WIDTH=2000 STOP_ROW=10 \
     N_BOTTOMS=1 N_COLUMNS=1 \
         bash examples/01_beamer_quickstart.sh > "$OUT/ex01.log" \
         || { tail -5 "$OUT/ex01.log"; fail "examples/01 exited non-zero"; }
     grep -q "run summary" "$OUT/ex01.log" || fail "examples/01 printed no run summary"
     ANNEAL=1 SEED=data/seed_Edge5.txt ROTATIONS="$OUT/ex01_rotations.csv" \
     RESTARTS=2 STEPS=2000 TARGET=250 THREADS=4 OUT_DIR="$OUT/ex01a" \
-    BEAM_WIDTH=2000 STOP_ROW=4 N_BOTTOMS=2 N_COLUMNS=1 \
+    BEAM_WIDTH=2000 STOP_ROW=10 N_BOTTOMS=2 N_COLUMNS=1 \
         bash examples/01_beamer_quickstart.sh > "$OUT/ex01a.log" \
         || { tail -5 "$OUT/ex01a.log"; fail "examples/01 ANNEAL=1 exited non-zero"; }
     [ -s "$OUT/ex01_rotations.csv" ] || fail "examples/01 ANNEAL=1 wrote no rotations file"
@@ -661,6 +834,15 @@ step_example_beamer() {
 # reachable no other way: the runner has no stage selector, so the CP-SAT and
 # backtracker stages sit behind two chain-database builds. Until that selector
 # exists, SKIP_BEAMER=1 leaves the second half of this script unexercised.
+# Stop row 10, not 6. --incomplete_top emits a sibling partial for every pair of
+# the three segments, and at a shallow row nothing has gone extinct yet, so the
+# stop-row beam is reported in full and the siblings multiply it: measured on
+# this fixture, row 6 wrote 807 042 boards and 1.5 GB, enough to push
+# E555_rank.py to 13.9 GB RSS and get it OOM-killed mid-gate. The same run at
+# row 10 writes 1 136 boards and 2.2 MB in the same 5 s, because by then the
+# beam has thinned. Depth is what bounds this output, not width or --top_bottoms
+# (capping that to 2 changed nothing), and row 10 is also where the pipeline
+# really operates.
 step_pipeline_annealed() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
     if ! python3 -c "import ortools" 2>/dev/null; then
@@ -668,8 +850,8 @@ step_pipeline_annealed() {
         return 0
     fi
     SEED=data/seed_Edge5.txt RUN_DIR="$PWD/$OUT/pipeline" THREADS=4 DB_FILE= \
-    ROUNDS=2 BEAM_WIDTH=2000 BEAM_STOP_ROW=6 BEAM_MAX_PARTIALS=2 \
-    BEAM_MAX_WALL=300 BEAM_COLUMNS=2 FIN_WIDTH=2000 FIN_STOP_ROW=8 FIN_FROM=2 \
+    ROUNDS=2 BEAM_WIDTH=2000 BEAM_STOP_ROW=10 BEAM_MAX_PARTIALS=2 \
+    BEAM_MAX_WALL=300 BEAM_COLUMNS=2 FIN_WIDTH=2000 FIN_STOP_ROW=11 FIN_FROM=5 \
     FIN_MAX_PARTIALS=2 FIN_MAX_WALL=300 RH_WIDTH=5 RH_LINES=2 RH_WALL=60 \
     TOP_N=2 CPSAT_TIME=10 CPSAT_STALL=5 BT_MISMATCH=60 BT_RESTARTS=2000 \
     BT_TIME=15 \

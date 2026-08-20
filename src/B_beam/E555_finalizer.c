@@ -270,11 +270,23 @@ static Oriented fin_oriented(uint16_t pid, uint8_t spin) {
 
    g_clue_ci[o][k] is the catalog index of clue k under orientation o, which is
    both what PIN_PIECE wants and where the clue's own bottom colour comes from.
-   g_fin_orient is the orientation of the line being searched, -1 when clues are
-   off or the line carries none. */
+   g_fin_orient is the orientation of the pass being searched, -1 when clues are
+   off.
+
+   READING an orientation and CHOOSING one are different things, and the
+   difference is the whole of --clue_orient. A board carrying a clue has already
+   committed: fin_clue_orient_of reads it off and it is never reconsidered. A
+   board carrying none has committed to nothing -- which is every partial locked
+   below row 7 under --clue_center, the centre clue being the only reachable one
+   and sitting on row 7 or 8. Such a line is searched once per candidate
+   orientation: four different pins against the same fixed lock, so four
+   genuinely different searches, of which the old code ran none. */
 static uint16_t g_clue_ci[4][CLUE_N];
 static bool     g_clue_debug = false;   /* E555_CLUE_DEBUG=1 */
 static int      g_fin_orient = -1;
+static uint8_t  g_clue_orient_req = 0xF;  /* --clue_orient: allowed orientations */
+static int      g_fin_orient_cand[4];     /* candidates for the current line */
+static int      g_fin_orient_n = 0;       /* 0 = clues off -> one pass at -1 */
 
 static uint16_t fin_cat_index_of(uint16_t pid, uint8_t spin) {
     for (int i = 0; i < g_cat_count; i++)
@@ -317,6 +329,33 @@ static int fin_clue_orient_of(const int pos[NUM_PIECES], const int rot[NUM_PIECE
     return best;
 }
 
+/* --clue_orient: "auto" (all four) or a comma list from 0..3, into a 4-bit
+   mask. Rejects anything else rather than silently searching everything -- a
+   typo here would quietly quadruple a run's cost. */
+static uint8_t parse_clue_orient(const char *spec) {
+    if (!strcmp(spec, "auto") || !strcmp(spec, "all")) return 0xF;
+    uint8_t m = 0;
+    for (const char *p = spec; *p; ) {
+        if (*p < '0' || *p > '3' || (p[1] && p[1] != ','))
+            fatal("--clue_orient wants 'auto' or a comma list from 0,1,2,3, not '%s'", spec);
+        m |= (uint8_t)(1u << (*p - '0'));
+        p += p[1] == ',' ? 2 : 1;
+    }
+    if (!m) fatal("--clue_orient names no orientation");
+    return m;
+}
+
+/* Every enabled clue piece, over all four orientations. The four rows of
+   g_clue permute the same five pieces -- {138, 180, 207, 248, 254} with
+   --clue_corners, {138} without -- so this set does not depend on the
+   orientation, which is exactly why the reduced database and the reserve can be
+   shared by all four passes of one line. */
+static void fin_clue_reserve(uint64_t used[4]) {
+    for (int o = 0; o < 4; o++)
+        for (int k = 0; k < CLUE_N; k++)
+            if (clue_on(k)) used_set(used, g_clue[o][k].piece);
+}
+
 /* Frame sides of a seed piece: 0 = inner, 1 = edge, 2 = corner. */
 static int fin_zero_count(int pid) {
     return (g_seed_top[pid]==0) + (g_seed_right[pid]==0)
@@ -345,10 +384,12 @@ static void fin_init_entry(BeamEntry *p, const LeftOrder *lft) {
        mask, so a clue can still be placed on its own cell; everything else is
        barred from spending it. Reserving also keeps the supply and free-demand
        accounting exact for the row-13 pair, which is genuinely unavailable to
-       any row this run searches. Idempotent for clues already inside the lock. */
-    if (g_clue_mask && g_fin_orient >= 0)
-        for (int k = 0; k < CLUE_N; k++)
-            if (clue_on(k)) used_set(p->used, g_clue[g_fin_orient][k].piece);
+       any row this run searches. Idempotent for clues already inside the lock.
+       Taken over all four orientations, which is not a widening: the four rows
+       of g_clue name the same five pieces and only move them, so the mask is
+       the one this pass would build anyway -- and it no longer depends on which
+       orientation the pass happens to be searching. */
+    if (g_clue_mask) fin_clue_reserve(p->used);
 
     for (int r = 1; r <= (int)g_finalize_from; r++)
         for (int c = 1; c <= EDGE_LEN; c++) {
@@ -1968,6 +2009,53 @@ static void fin_prescan_hashes(const char *path, uint32_t upto) {
     fflush(stdout);
 }
 
+/* Can this line be searched at orientation `orient` at all? Reads g_grid and
+   g_lock_mask, so it runs after the load's structural checks. `explain` prints
+   the reason: an auto sweep tests four orientations and only wants to hear
+   about them when every one has failed, otherwise three rejections would be
+   printed for every ordinary line. */
+static bool fin_clue_viable(int orient, const int pos[NUM_PIECES],
+                            uint32_t want, bool explain) {
+    for (int k = 0; k < CLUE_N; k++) {
+        if (!clue_on(k)) continue;
+        const ClueCell *cc = &g_clue[orient][k];
+        if ((uint32_t)cc->row <= g_finalize_from) {          /* locked: must be right already */
+            const Oriented *o = &g_grid[cc->row][cc->col];
+            if (o->piece_id != cc->piece || o->rotation != cc->spin) {
+                if (explain)
+                    printf("[skip] line %u: locked cell (%d,%d) holds piece %u spin %u, but clue %d\n"
+                           "       of orientation %d needs piece %u spin %u there\n",
+                           want, cc->row, cc->col, o->piece_id, o->rotation,
+                           k, orient, cc->piece, cc->spin);
+                return false;
+            }
+            continue;
+        }
+        if (used_test(g_lock_mask, cc->piece)) {             /* locked somewhere else */
+            if (explain)
+                printf("[skip] line %u: clue piece %u is locked at cell %d, but clue %d of\n"
+                       "       orientation %d needs it at (%d,%d)\n",
+                       want, cc->piece, pos[cc->piece], k, orient, cc->row, cc->col);
+            return false;
+        }
+        /* A clue's bottom face must meet the piece below it. When that row is
+           locked the colour is already decided, so check it now; when it is
+           searched, fin_clue_pins_for demands the colour during generation. */
+        if ((uint32_t)cc->row <= g_stop_row && (uint32_t)(cc->row - 1) <= g_finalize_from) {
+            uint8_t need = g_cat[g_clue_ci[orient][k]].bottom;
+            if (g_grid[cc->row - 1][cc->col].top != need) {
+                if (explain)
+                    printf("[skip] line %u: locked cell (%d,%d) exposes colour %u upward, but clue %d\n"
+                           "       of orientation %d sits on it and needs %u\n",
+                           want, cc->row - 1, cc->col, g_grid[cc->row-1][cc->col].top,
+                           k, orient, need);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 /* Load and validate CSV line `want` into g_grid / g_lock_mask /
    g_partial_depth. Returns 1 when loaded, 0 with a printed reason when the
    line cannot seed a search (the sweep skips it), -1 when the file has no
@@ -1977,16 +2065,14 @@ static int fin_load_partial(const char *path, uint32_t want, char id_out[64]) {
     int pos[NUM_PIECES], rot[NUM_PIECES];
     if (!fin_read_partial_line(path, want, id_out, pos, rot)) return -1;
 
-    /* Which of the four orientations this line committed to. Resolved before the
+    /* Which of the four orientations this line committed to, -1 for a line that
+       carries no clue and has therefore committed to none. Resolved before the
        dedup because the hash folds it in: everything freed above the lock
        collapses to one bucket there, so two lines differing only in orientation
-       would otherwise merge and the survivor be pinned to the wrong one. */
+       would otherwise merge and the survivor be pinned to the wrong one. Two
+       UNCLUED lines with the same state do still merge, which is right -- they
+       would expand to the same candidate set and search it twice. */
     int orient = g_clue_mask ? fin_clue_orient_of(pos, rot) : -1;
-    if (g_clue_mask && orient < 0) {
-        printf("[skip] line %u: carries none of the enabled clue pieces, so there is\n"
-               "       nothing to read the board's orientation from\n", want);
-        return 0;
-    }
 
     /* Input dedup: a line seeding a search state already seen (earlier in the
        file or in this window) is skipped -- see fin_partial_hash. */
@@ -2059,45 +2145,47 @@ static int fin_load_partial(const char *path, uint32_t want, char id_out[64]) {
         for (int c = 0; c < PUZZLE_SIDE; c++)
             used_set(g_lock_mask, g_grid[r][c].piece_id);
 
-    /* Clue viability, decided here rather than discovered mid-search. A locked
-       region that already contradicts a clue can never be fixed by growing rows
-       above it, so the whole board is doomed and searching it is wasted work. */
-    for (int k = 0; k < CLUE_N && g_clue_mask; k++) {
-        if (!clue_on(k)) continue;
-        const ClueCell *cc = &g_clue[orient][k];
-        if ((uint32_t)cc->row <= g_finalize_from) {          /* locked: must be right already */
-            const Oriented *o = &g_grid[cc->row][cc->col];
-            if (o->piece_id != cc->piece || o->rotation != cc->spin) {
-                printf("[skip] line %u: locked cell (%d,%d) holds piece %u spin %u, but clue %d\n"
-                       "       of orientation %d needs piece %u spin %u there\n",
-                       want, cc->row, cc->col, o->piece_id, o->rotation,
-                       k, orient, cc->piece, cc->spin);
+    /* Which orientations this line can be searched at. A line that CARRIES a
+       clue has committed to one; a line that carries none is searched at every
+       viable candidate --clue_orient allows. Either way the answer has to
+       survive fin_clue_viable, which is decided here rather than discovered
+       mid-search: a locked region contradicting a clue can never be repaired by
+       growing rows above it. */
+    g_fin_orient_n = 0;
+    if (g_clue_mask) {
+        if (orient >= 0) {
+            if (!(g_clue_orient_req & (1u << orient))) {
+                printf("[skip] line %u: carries clue orientation %d, which "
+                       "--clue_orient excludes\n", want, orient);
                 return 0;
             }
-            continue;
-        }
-        if (used_test(g_lock_mask, cc->piece)) {             /* locked somewhere else */
-            printf("[skip] line %u: clue piece %u is locked at cell %d, but clue %d of\n"
-                   "       orientation %d needs it at (%d,%d)\n",
-                   want, cc->piece, pos[cc->piece], k, orient, cc->row, cc->col);
-            return 0;
-        }
-        /* A clue's bottom face must meet the piece below it. When that row is
-           locked the colour is already decided, so check it now; when it is
-           searched, fin_clue_pins_for demands the colour during generation. */
-        if ((uint32_t)cc->row <= g_stop_row && (uint32_t)(cc->row - 1) <= g_finalize_from) {
-            uint8_t need = g_cat[g_clue_ci[orient][k]].bottom;
-            if (g_grid[cc->row - 1][cc->col].top != need) {
-                printf("[skip] line %u: locked cell (%d,%d) exposes colour %u upward, but clue %d\n"
-                       "       of orientation %d sits on it and needs %u\n",
-                       want, cc->row - 1, cc->col, g_grid[cc->row-1][cc->col].top,
-                       k, orient, need);
+            if (!fin_clue_viable(orient, pos, want, true)) return 0;
+            g_fin_orient_cand[g_fin_orient_n++] = orient;
+        } else {
+            for (int o = 0; o < 4; o++)
+                if ((g_clue_orient_req & (1u << o)) &&
+                    fin_clue_viable(o, pos, want, false))
+                    g_fin_orient_cand[g_fin_orient_n++] = o;
+            if (g_fin_orient_n == 0) {
+                printf("[skip] line %u: carries no clue piece, and no orientation "
+                       "--clue_orient allows survives the locked region:\n", want);
+                for (int o = 0; o < 4; o++)
+                    if (g_clue_orient_req & (1u << o))
+                        (void)fin_clue_viable(o, pos, want, true);
                 return 0;
             }
+            printf("[note] line %u: carries no clue piece, so the orientation is "
+                   "not read but chosen:\n"
+                   "       searching %d of the 4 (", want, g_fin_orient_n);
+            for (int i = 0; i < g_fin_orient_n; i++)
+                printf("%s%d", i ? "," : "", g_fin_orient_cand[i]);
+            printf("), one pass each over one database\n");
         }
     }
-    g_fin_orient = orient;
-    fin_clue_dump_schedule();
+    /* The sweep's orientation loop is the only thing that selects a candidate.
+       Cleared here so nothing between the load and that loop -- the database
+       build above all -- can read the previous line's orientation. */
+    g_fin_orient = -1;
 
     g_partial_depth = -1;
     for (int r = 0; r < PUZZLE_SIDE; r++) {
@@ -2227,12 +2315,14 @@ static void fin_build_db(void) {
        `used` reservation in fin_init_entry is what makes it correct. Note the
        exclusion set, not g_lock_mask, is the cache key: two partials can share a
        locked region and still owe different clue pieces, and reusing the first
-       one's arena for the second would leave a clue in the chains. */
+       one's arena for the second would leave a clue in the chains.
+
+       The exclusion is taken over all four orientations (fin_clue_reserve), so
+       one line's database serves every orientation it is searched at: the pins
+       move between passes, the excluded pieces do not. */
     uint64_t excl[4];
     memcpy(excl, g_lock_mask, sizeof excl);
-    if (g_clue_mask && g_fin_orient >= 0)
-        for (int k = 0; k < CLUE_N; k++)
-            if (clue_on(k)) used_set(excl, g_clue[g_fin_orient][k].piece);
+    if (g_clue_mask) fin_clue_reserve(excl);
 
     if (!have_db || memcmp(built_mask, excl, sizeof built_mask) != 0) {
         if (g_inner_arena) {
@@ -2683,6 +2773,21 @@ static void usage(const char *a0) {
 "                         Both flags read the orientation off each input board; a\n"
 "                         board whose locked region already contradicts a clue is\n"
 "                         skipped with the reason, since no row above can repair it\n"
+"  --clue_orient LIST     which orientations a board that carries NO clue may be\n"
+"                         searched at: 'auto' (default, all four) or a comma list\n"
+"                         from 0,1,2,3. Every partial locked below row 7 is such a\n"
+"                         board under --clue_center, the centre clue being the only\n"
+"                         reachable one and sitting on row 7 or 8 -- it has committed\n"
+"                         to no orientation, so one is CHOSEN rather than read, and\n"
+"                         the line is searched once per candidate the lock does not\n"
+"                         already contradict. Four different pins against the same\n"
+"                         lock, so up to 4x the work of one pass, over one shared\n"
+"                         database; name a single orientation to pin it back down.\n"
+"                         The passes share the run's column-sampling stream, so each\n"
+"                         one sees DIFFERENT left columns -- more coverage, but a\n"
+"                         pinned re-run does not reproduce the columns the auto run\n"
+"                         gave that orientation. A board that DOES carry a clue is\n"
+"                         never re-oriented\n"
 "  --incomplete_top       also emit boards that reach --stop_row with only TWO of its\n"
 "                         three 5-piece segments -- 11 of the row's 16 pieces -- to a\n"
 "                         separate <...>_<stop_row>_partial.csv. All three shapes are\n"
@@ -2793,6 +2898,7 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--free_edges"))                g_opt_free_edges = true;
         else if (!strcmp(argv[i], "--clue_center"))               g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(argv[i], "--clue_corners"))              g_clue_mask |= CLUE_CORNERS;
+        else if (!strcmp(argv[i], "--clue_orient")  && i+1 < argc) g_clue_orient_req = parse_clue_orient(argv[++i]);
         else if (!strcmp(argv[i], "--incomplete_top"))            g_incomplete_top = true;
         else if (!strcmp(argv[i], "--beam_width")  && i+1 < argc) g_beam_width = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--stop_row")    && i+1 < argc) g_stop_row = (uint32_t)atoi(argv[++i]);
@@ -2876,9 +2982,17 @@ int main(int argc, char *argv[]) {
     printf("[cfg] top_columns=%ld config_time=%.0fs max_wall=%.0fs max_partials=%" PRIu64 " free_edges=%s\n",
            g_top_columns, g_config_time_sec, g_max_wall_sec, g_max_partials,
            g_opt_free_edges ? "forced" : "auto (per line)");
-    if (g_clue_mask)
-        printf("[cfg] clue_center=%d clue_corners=%d (orientation read from each input board)\n",
-               (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0);
+    if (g_clue_mask) {
+        char oz[16]; size_t on = 0;
+        for (int o = 0; o < 4; o++)
+            if (g_clue_orient_req & (1u << o)) on += (size_t)snprintf(oz + on, sizeof oz - on, "%s%d", on ? "," : "", o);
+        printf("[cfg] clue_center=%d clue_corners=%d clue_orient=%s (read off a clued "
+               "board, chosen from these when it carries none)\n",
+               (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0, oz);
+    }
+    if (g_clue_orient_req != 0xF && !g_clue_mask)
+        fatal("--clue_orient needs --clue_center or --clue_corners: with clues off "
+              "there is no orientation to choose");
     if (rot_path && g_opt_free_edges)
         printf("[note] --free_edges given: the rotations file '%s' is ignored\n", rot_path);
     fflush(stdout);
@@ -2976,62 +3090,74 @@ int main(int argc, char *argv[]) {
         g_cBR = g_grid[0][PUZZLE_SIDE-1];    g_has_cBR = true;
         validate_color_constants();
 
-        /* The left column is searched unless the partial fixes it outright: a
-           matched rotations row constrains WHICH pieces may sit in it, not their
-           order, so those lines still enumerate or sample columns. */
-        const bool cols_free = g_free_edges || g_sides_from_rot;
+        /* One pass per candidate orientation. The loop starts AFTER
+           fin_build_db so all four passes share one reduced database: the pins
+           move between orientations, the excluded pieces do not (fin_clue_reserve).
+           g_stop, --max_wall_sec and the partials budget are tested inside, so a
+           budget still stops the line part-way through its orientations. */
+        for (int oi = 0; oi < (g_fin_orient_n ? g_fin_orient_n : 1) && !g_stop; oi++) {
+            g_fin_orient = g_fin_orient_n ? g_fin_orient_cand[oi] : -1;
+            fin_clue_dump_schedule();
+            if (g_fin_orient_n > 1)
+                printf("[sweep] line %u: orientation %d (%d of %d)\n",
+                       line, g_fin_orient, oi + 1, g_fin_orient_n);
+            /* The left column is searched unless the partial fixes it outright: a
+               matched rotations row constrains WHICH pieces may sit in it, not their
+               order, so those lines still enumerate or sample columns. */
+            const bool cols_free = g_free_edges || g_sides_from_rot;
 
-        bool exhaustive = cols_free && g_top_columns <= 0;
-        if (exhaustive) {
-            /* Test EVERY legal left column up to the stop row (no sampling).
-               Deterministic, so a single pass -- repeats would only duplicate. */
-            size_t n = fin_enumerate_lefts(&ctx, scratch, t_start, line);
-            printf("[sweep] line %u: enumerated %zu left columns\n", line, n);
-            if (n == 0 && !g_stop)
-                printf("[warn] line %u: no legal left column above row %u%s\n",
-                       line, g_finalize_from,
-                       g_sides_from_rot ? " from the matched rotations row's left edges" : "");
-        } else {
-            size_t run_l = (!cols_free) ? 1
-                         : (g_top_columns >= 1 ? (size_t)g_top_columns : 1);
-            uint64_t *tried = xmalloc(run_l * sizeof(uint64_t));
+            bool exhaustive = cols_free && g_top_columns <= 0;
+            if (exhaustive) {
+                /* Test EVERY legal left column up to the stop row (no sampling).
+                   Deterministic, so a single pass -- repeats would only duplicate. */
+                size_t n = fin_enumerate_lefts(&ctx, scratch, t_start, line);
+                printf("[sweep] line %u: enumerated %zu left columns\n", line, n);
+                if (n == 0 && !g_stop)
+                    printf("[warn] line %u: no legal left column above row %u%s\n",
+                           line, g_finalize_from,
+                           g_sides_from_rot ? " from the matched rotations row's left edges" : "");
+            } else {
+                size_t run_l = (!cols_free) ? 1
+                             : (g_top_columns >= 1 ? (size_t)g_top_columns : 1);
+                uint64_t *tried = xmalloc(run_l * sizeof(uint64_t));
 
-            for (uint32_t rep = 0; rep < g_finalize_repeats && !g_stop; rep++) {
-                size_t tried_n = 0;
-                LeftOrder lft;
-                for (size_t li = 0; li < run_l && !g_stop; li++) {
-                    if (g_max_wall_sec > 0.0 && omp_get_wtime() - t_start >= g_max_wall_sec) {
-                        printf("[sweep] max_wall reached.\n"); g_stop = 1; break;
-                    }
-                    if (partials_budget_spent()) { partials_budget_announce(); break; }
-                    if (cols_free) {
-                        bool fresh = false, any = false;
-                        uint64_t h = 0;
-                        for (int attempt = 0; attempt < 16 && !fresh; attempt++) {
-                            if (!fin_sample_left(&srng, g_tau_columns, &lft)) break;
-                            any = true;
-                            h = fin_left_hash(&lft);
-                            fresh = true;
-                            for (size_t q = 0; q < tried_n; q++)
-                                if (tried[q] == h) { fresh = false; break; }
+                for (uint32_t rep = 0; rep < g_finalize_repeats && !g_stop; rep++) {
+                    size_t tried_n = 0;
+                    LeftOrder lft;
+                    for (size_t li = 0; li < run_l && !g_stop; li++) {
+                        if (g_max_wall_sec > 0.0 && omp_get_wtime() - t_start >= g_max_wall_sec) {
+                            printf("[sweep] max_wall reached.\n"); g_stop = 1; break;
                         }
-                        if (!fresh) {
-                            if (!any)
-                                printf("[warn] line %u: no legal left column above row %u\n",
-                                       line, g_finalize_from);
-                            else if (g_verbose)
-                                printf("[note] line %u rep %u: left columns exhausted after %zu\n",
-                                       line, rep, tried_n);
-                            break;
+                        if (partials_budget_spent()) { partials_budget_announce(); break; }
+                        if (cols_free) {
+                            bool fresh = false, any = false;
+                            uint64_t h = 0;
+                            for (int attempt = 0; attempt < 16 && !fresh; attempt++) {
+                                if (!fin_sample_left(&srng, g_tau_columns, &lft)) break;
+                                any = true;
+                                h = fin_left_hash(&lft);
+                                fresh = true;
+                                for (size_t q = 0; q < tried_n; q++)
+                                    if (tried[q] == h) { fresh = false; break; }
+                            }
+                            if (!fresh) {
+                                if (!any)
+                                    printf("[warn] line %u: no legal left column above row %u\n",
+                                           line, g_finalize_from);
+                                else if (g_verbose)
+                                    printf("[note] line %u rep %u: left columns exhausted after %zu\n",
+                                           line, rep, tried_n);
+                                break;
+                            }
+                            tried[tried_n++] = h;
+                        } else {
+                            fin_left_fixed(&lft);
                         }
-                        tried[tried_n++] = h;
-                    } else {
-                        fin_left_fixed(&lft);
+                        run_left_config(&ctx, scratch, t_start, line, rep, li, &lft);
                     }
-                    run_left_config(&ctx, scratch, t_start, line, rep, li, &lft);
                 }
+                free(tried);
             }
-            free(tried);
         }
     }
 
