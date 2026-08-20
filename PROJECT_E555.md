@@ -1368,10 +1368,14 @@ cost was a shallower cut: at `BAND_ROW = 8` a lap preserves 99 cells and frees
 it is a cost, up to 4x the finalizer work per band, over **one** shared
 database (the five clue pieces are the same set in all four orientations, so
 only the pins move between passes). `--clue_orient N` pins it back to one pass.
-Measured on a rows-0..5 band with `--clue_center`: 0 boards before, 33,536
-after, from four passes over one database, every one of them carrying the
-centre clue -- 27,241 at orientation 0, 4,734 at 1, 1,561 at 2, and 0 at 3,
-whose pass ran and went extinct at row 6.
+Measured on a rows-0..5 band with `--clue_center`, growing to row 8: 0 boards
+before, 33,536 after, from four passes over one database, every one of them
+carrying the centre clue -- 27,241 at orientation 0, 4,734 at 1, 1,561 at 2,
+and 0 at 3, whose pass ran and went extinct at row 6. Depth discriminates
+between the four: the same band grown to row 10 keeps only orientation 1, the
+other three dying on the way up. That is the argument for searching all four
+rather than picking one -- which orientation survives is a property of the
+band, not something you can know in advance.
 
 Locking below the centre was never exotic, which is why this mattered: the
 shipped `--finalize_from = BEAM_STOP - 5` does it on every ordinary run.

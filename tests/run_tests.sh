@@ -613,14 +613,15 @@ EOF
     n=$(python3 tools/E555_rank.py "$OUT/co_band.csv" --seed data/seed_Edge5.txt --field clues)
     [ "$n" = 0 ] || fail "the rows-0..5 band carries $n clue(s), expected none"
 
-    # stop_row 8 so every orientation's centre cell (row 7 or 8) is inside the
-    # searched region; at 7 the two orientations clued on row 8 legitimately
-    # emit boards without it.
+    # stop_row 10, never lower: every orientation's centre cell (row 7 or 8) is
+    # inside the searched region well before that, and depth is what keeps the
+    # output small -- measured here, row 10 writes 51 boards and 100 KB where
+    # row 8 wrote 109 and 208 KB, in the same 10 s.
     bin/E555_finalizer data/seed_Edge5.txt "$OUT/co_band.csv" \
         --out_dir "$OUT/co_fin" --threads 4 --clue_center \
-        --finalize_from 5 --stop_row 8 --beam_width 150 --top_columns 1 \
+        --finalize_from 5 --stop_row 10 --beam_width 2000 --top_columns 1 \
         --seed 3 --max_wall_sec 300 > "$OUT/co_fin.log"
-    comp="$OUT/co_fin/beam_completions_finalized_8.csv"
+    comp="$OUT/co_fin/beam_completions_finalized_10.csv"
     [ -s "$comp" ] || { tail -5 "$OUT/co_fin.log"; fail "the unclued band emitted nothing"; }
 
     n=$(grep -cE "^\[sweep\] line 0: orientation [0-3] \(" "$OUT/co_fin.log")
@@ -636,15 +637,18 @@ EOF
     [ "$bad" = 0 ] || fail "$bad emitted boards lost the centre clue"
 
     # Pinning one orientation runs one pass and puts piece 138 on that cell only.
+    # Orientation 1 because it is the one that survives to row 10 from this band
+    # -- the other three go extinct, which is itself the point of searching all
+    # four rather than picking one.
     bin/E555_finalizer data/seed_Edge5.txt "$OUT/co_band.csv" \
-        --out_dir "$OUT/co_fin2" --threads 4 --clue_center --clue_orient 2 \
-        --finalize_from 5 --stop_row 8 --beam_width 150 --top_columns 1 \
+        --out_dir "$OUT/co_fin2" --threads 4 --clue_center --clue_orient 1 \
+        --finalize_from 5 --stop_row 10 --beam_width 2000 --top_columns 1 \
         --seed 3 --max_wall_sec 300 > "$OUT/co_fin2.log"
-    comp2="$OUT/co_fin2/beam_completions_finalized_8.csv"
-    [ -s "$comp2" ] || { tail -5 "$OUT/co_fin2.log"; fail "--clue_orient 2 emitted nothing"; }
-    # Piece 138 is field 3+138 of the pos block; orientation 2 puts it on cell 136.
-    bad=$(awk -F, '!/^#/{ if ($(3+138)+0 != 136) n++ } END{print n+0}' "$comp2")
-    [ "$bad" = 0 ] || fail "$bad boards from --clue_orient 2 do not hold the clue at cell 136"
+    comp2="$OUT/co_fin2/beam_completions_finalized_10.csv"
+    [ -s "$comp2" ] || { tail -5 "$OUT/co_fin2.log"; fail "--clue_orient 1 emitted nothing"; }
+    # Piece 138 is field 3+138 of the pos block; orientation 1 puts it on cell 135.
+    bad=$(awk -F, '!/^#/{ if ($(3+138)+0 != 135) n++ } END{print n+0}' "$comp2")
+    [ "$bad" = 0 ] || fail "$bad boards from --clue_orient 1 do not hold the clue at cell 135"
 
     echo "ok: 4 orientations over 1 database, $(grep -vc '^#' "$comp") boards, all clued"
 }
