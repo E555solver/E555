@@ -1632,6 +1632,24 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   (`config_id, score, pos[256], rot[256]`) with the score recomputed from the
   seed -- the one way to make a mixed corpus sortable by field 2, since Stage B
   writes its solution index there and older dialects write other things again.
+  `--diverse K` answers a different question: a run that emits a thousand
+  boards rarely emits a thousand ideas, so the top of a ranking is usually one
+  lineage and post-processing its top five spends five budgets on one
+  hypothesis. It picks K boards farthest-first on **cell agreement** (two
+  boards agree on a cell when both put the same piece there at the same spin),
+  starting from the best-ranked board and adding whichever board's closest
+  chosen root is furthest away -- K x M comparisons, not M^2 -- and prints each
+  root's agreement with the roots before it. On the 15 exact row-12 partials of
+  a whirlpool run it returns one board from each of the four lineages the pool
+  holds (199-202 of 203 cells shared inside a lineage, 0-14 across).
+  `--max-agree P` is the blunt version: drop anything agreeing with a kept
+  board on more than fraction P of its placed cells.
+  Memory is bounded rather than hoped for: a record is the input line plus its
+  measures, about 1.8x the row on disk (51,000 boards of a 96 MB CSV peak at
+  165 MB, against 2.2 GB before), `--top N` streams into a bounded heap so peak
+  memory stops depending on file size at all (14 MB for the same input), and
+  without `--top` an input projected past `--max-mem` (default 8 GB) is refused
+  up front instead of being OOM-killed half way.
 - **`tools/E555_rotate.py`** -- turns every board in a CSV by `N` quarter-turns
   clockwise, same convention as `E555_roundhouse --rotate`. Lossless: the frame
   rule is identical on all four sides, so a rotated board is the same board
@@ -1721,7 +1739,7 @@ ender at anything above ~460.
 | `src/C_tail/E555_backtracker.c` | Exact/bounded-mismatch DFS tail closer. |
 | `src/C_tail/E555_ender.py` | CP-SAT closer: budgeted local re-solve, `--mode patch` (compacting LNS) or `ring` (border sweep). |
 | `tools/E555_viewer.py` | Board viewer/differ + bucas URL. |
-| `tools/E555_rank.py` | Ranks/sorts board CSVs by compactness, solidity, clean rows; `--rescore` rewrites them canonically. |
+| `tools/E555_rank.py` | Ranks/sorts board CSVs by compactness, solidity, clean rows; `--rescore` rewrites them canonically; `--diverse K` picks independent roots. |
 | `tools/E555_rotate.py` | Turns every board in a CSV by a quarter-turn multiple, losslessly. |
 | `data/` | Seeds, known synthetic solution, example boards, masks (see `data/README.md`). |
 | `examples/` | One small script per tool: read these first. |
