@@ -182,6 +182,11 @@ Two consequences worth knowing:
   refuses a cache whose exclusion set does not match. The runners therefore use
   `$DB_FILE.clue` when `CLUES=1`, so the two coexist and neither is rebuilt on
   every toggle.
+* **A clued whirlpool band costs up to 4x.** A band cut at `BAND_ROW=5` carries
+  no clue -- the centre one sits on row 7 or 8 -- so the finalizer has no
+  orientation to read and *chooses* instead, searching the band once per
+  orientation the band does not already contradict. Four passes over one shared
+  database; pass `--clue_orient N` to the finalizer to pin it to one.
 * **The backtracker stage is not clue-aware.** It only moves pieces in cells
   named by `$HOLES`, but the shipped masks do free clue cells
   (`holes_open_border_TR.csv`, the default, frees the one at row 13 col 13), so

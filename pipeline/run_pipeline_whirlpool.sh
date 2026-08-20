@@ -69,6 +69,11 @@ set -euo pipefail
 # Overridable because a copy of this file kept outside the tree -- a snapshot
 # pinned for a long run, say -- would otherwise resolve the repo to nonsense.
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# Checked, because REPO is a common enough variable name that an unrelated one
+# already exported would otherwise fail ten stages later with a puzzling error.
+[ -d "$REPO/bin" ] && [ -d "$REPO/tools" ] || {
+    echo "!! REPO=$REPO does not look like the E555 tree (no bin/ and tools/)."
+    echo "   Unset REPO, or point it at the repository root."; exit 1; }
 
 # ---- what to run on ---------------------------------------------------------
 SEED="${SEED:-$REPO/data/seed_Edge5.txt}"
@@ -83,19 +88,12 @@ CLUES="${CLUES:-0}"                 # 1 = hold the Eternity II centre clue
 # is 0xF, so a quarter-turn maps a satisfied configuration to another satisfied
 # one. Only --clue_center is passed: the centre-only record is the higher one.
 #
-# CLUES=1 REQUIRES BAND_ROW >= 8. The finalizer reads a partial's orientation
-# off the clue pieces it carries and skips any line carrying none, and the
-# centre clue sits on row 7 or 8 -- so a rows-0..5 band strips it and every
-# band is refused (measured: 26 bands in, 0 out, every lap). The guard below
-# enforces it rather than letting a run burn hours emitting nothing.
+# A band cut below row 7 carries no clue at all -- the centre clue sits on row 7
+# or 8 -- so the finalizer CHOOSES the orientation instead of reading it, and
+# searches the band once per candidate (--clue_orient, default auto). That is
+# four passes over one database per band, which is the cost of clueing a
+# shallow band; --clue_orient N pins it to one.
 CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center)
-if [ "$CLUES" = 1 ] && [ "${BAND_ROW:-5}" -lt 8 ]; then
-    echo "!! CLUES=1 needs BAND_ROW >= 8: the centre clue sits on row 7/8, so a"
-    echo "   shallower band strips it and the finalizer refuses every partial"
-    echo "   ('carries none of the enabled clue pieces'). Set BAND_ROW=8, or"
-    echo "   run with CLUES=0."
-    exit 1
-fi
 # A clued chain database has different CONTENTS for the same seed, and the
 # beamer refuses a cache whose exclusion set does not match.
 [ "$CLUES" = 1 ] && [ -n "$DB_FILE" ] && DB_FILE="$DB_FILE.clue"

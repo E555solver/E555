@@ -64,6 +64,7 @@ ALL_STEPS=(
     "backtracker_exhaustive|exhaustive enumeration identical at 1 and 4 threads"
     "backtracker_stop_band|--stop_row/--stop_column emit exact, finalizer-shaped bands"
     "whirlpool_lap|one whirlpool lap: turn, re-cut rows 0..5, re-grow to row 11"
+    "clue_orient|a band carrying no clue is searched at all four orientations"
     "cpsat_chain|topper -> ender(ring) -> ender(patch), each fed by the last"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
     "scripts_parse|every shipped example and pipeline script parses"
@@ -593,6 +594,59 @@ EOF
                           if (p!=192 || hi!=0 || $2!=356) n++} END{print n+0}' "$comp")
     [ "$bad" = 0 ] || fail "$bad re-grown boards are not an exact rows-0..11 board at 356"
     echo "ok: turn -> band(170) -> re-grow(356), $(grep -vc '^#' "$comp") boards"
+}
+
+step_clue_orient() {
+    # The real seed, not the synthetic one: the clue table names real piece ids.
+    # A band cut at row 5 carries no clue -- the centre sits on row 7 or 8 -- so
+    # the finalizer has to CHOOSE an orientation rather than read one, which is
+    # exactly the case that used to be refused outright.
+    python3 - "$OUT/co_band.csv" <<'EOF'
+import sys
+line = [l for l in open("data/board_partial_row12.csv")
+        if l.strip() and not l.startswith(("#", "%"))][0].rstrip("\n")
+f = line.split(",")
+meta, pos, rot = f[:-512], [p.strip() for p in f[-512:-256]], [r.strip() for r in f[-256:]]
+pos = ["999" if p != "999" and int(p) // 16 > 5 else p for p in pos]
+open(sys.argv[1], "w").write(",".join(meta + pos + rot) + "\n")
+EOF
+    n=$(python3 tools/E555_rank.py "$OUT/co_band.csv" --seed data/seed_Edge5.txt --field clues)
+    [ "$n" = 0 ] || fail "the rows-0..5 band carries $n clue(s), expected none"
+
+    # stop_row 8 so every orientation's centre cell (row 7 or 8) is inside the
+    # searched region; at 7 the two orientations clued on row 8 legitimately
+    # emit boards without it.
+    bin/E555_finalizer data/seed_Edge5.txt "$OUT/co_band.csv" \
+        --out_dir "$OUT/co_fin" --threads 4 --clue_center \
+        --finalize_from 5 --stop_row 8 --beam_width 150 --top_columns 1 \
+        --seed 3 --max_wall_sec 300 > "$OUT/co_fin.log"
+    comp="$OUT/co_fin/beam_completions_finalized_8.csv"
+    [ -s "$comp" ] || { tail -5 "$OUT/co_fin.log"; fail "the unclued band emitted nothing"; }
+
+    n=$(grep -cE "^\[sweep\] line 0: orientation [0-3] \(" "$OUT/co_fin.log")
+    [ "$n" = 4 ] || fail "expected 4 orientation passes, saw $n"
+    # One database for all four: the clue pieces are the same set in every
+    # orientation, so only the pins move between passes.
+    n=$(grep -c "DB inner stored" "$OUT/co_fin.log")
+    [ "$n" = 1 ] || fail "expected 1 database build for the line, saw $n"
+
+    # Every emitted board carries the centre clue, whichever orientation placed it.
+    bad=$(python3 tools/E555_rank.py "$comp" --seed data/seed_Edge5.txt --csv |
+          awk -F, 'NR>1 && $NF < 1 {n++} END{print n+0}')
+    [ "$bad" = 0 ] || fail "$bad emitted boards lost the centre clue"
+
+    # Pinning one orientation runs one pass and puts piece 138 on that cell only.
+    bin/E555_finalizer data/seed_Edge5.txt "$OUT/co_band.csv" \
+        --out_dir "$OUT/co_fin2" --threads 4 --clue_center --clue_orient 2 \
+        --finalize_from 5 --stop_row 8 --beam_width 150 --top_columns 1 \
+        --seed 3 --max_wall_sec 300 > "$OUT/co_fin2.log"
+    comp2="$OUT/co_fin2/beam_completions_finalized_8.csv"
+    [ -s "$comp2" ] || { tail -5 "$OUT/co_fin2.log"; fail "--clue_orient 2 emitted nothing"; }
+    # Piece 138 is field 3+138 of the pos block; orientation 2 puts it on cell 136.
+    bad=$(awk -F, '!/^#/{ if ($(3+138)+0 != 136) n++ } END{print n+0}' "$comp2")
+    [ "$bad" = 0 ] || fail "$bad boards from --clue_orient 2 do not hold the clue at cell 136"
+
+    echo "ok: 4 orientations over 1 database, $(grep -vc '^#' "$comp") boards, all clued"
 }
 
 step_cpsat_chain() {

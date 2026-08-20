@@ -548,7 +548,10 @@ board -- this is the only place entries 3..4 of the table are ever constrained.
 reads off the input board which of the four orientations it committed to, and
 only a board carrying no clue at all needs an explicit `--clue_orient 0..3`
 (measured unambiguous -- each of 329 clued boards matched exactly one
-orientation, never two). And **a clue the open region cannot reach is reported
+orientation, never two). The finalizer takes the same flag but reads `auto`
+more freely: it *searches* every viable orientation of an unclued board rather
+than asking for one, because it is growing rows and can afford four passes,
+where these tools are performing one repair. And **a clue the open region cannot reach is reported
 and skipped**, not an error: an early window of a sliding-window sweep
 legitimately cannot touch the far side of the board.
 
@@ -785,11 +788,30 @@ else (measured above: never 5/5 without the flags, always 5/5 with them).
 
 Unlike the beamer, which explores all four orientations at once and pays for it
 with orientation bits in the beam entry, a term in the frontier signature and a
-reserve pass in selection, the finalizer is always handed a board that already
-committed to one. It reads that orientation off the input line -- so none of
-that machinery exists here -- and folds it into the input-dedup hash, because
-everything freed above the lock collapses to one bucket there and two lines
-differing only in orientation would otherwise merge.
+reserve pass in selection, the finalizer searches **one orientation per pass**.
+None of that machinery exists here; the orientation is folded into the
+input-dedup hash instead, because everything freed above the lock collapses to
+one bucket there and two lines differing only in orientation would otherwise
+merge.
+
+**`--clue_orient LIST`** (`auto` by default, or a comma list from `0,1,2,3`)
+decides where that orientation comes from, and the distinction it draws is
+between *reading* one and *choosing* one:
+
+- a line **carrying** a clue has committed, so its orientation is read off the
+  board and never reconsidered -- naming a different one in `--clue_orient`
+  skips the line rather than re-orienting it;
+- a line carrying **none** has committed to nothing. Every partial locked below
+  row 7 is such a line under `--clue_center`, the centre clue being the only
+  reachable one and sitting on row 7 or 8. It is searched once per orientation
+  the lock does not already contradict.
+
+Up to four passes, then, over **one** database: the five clue pieces are the
+same set in all four rows of `g_clue` -- only their cells and spins rotate --
+so the reduced database and the reserved mask are shared and only the pins
+move. The passes share the run's column-sampling stream, so each sees different
+left columns; that is more coverage, at the price that a pinned re-run does not
+reproduce the columns the auto run gave that orientation.
 
 A clue on a searched row is pinned during generation, via the same
 `enumerate_pinned_segment` walk the beamer uses; a clue on the row *above* a
@@ -1322,44 +1344,39 @@ another satisfied one rather than breaking it. That holds for the corner clues
 too: the reachable pair is the row-2 cells at every orientation, with a
 different piece on them.
 
-**`CLUES=1` requires `BAND_ROW >= 8`.** This is the one hard constraint the
-loop imposes, and it is not obvious: the finalizer reads a partial's
-*orientation* off the clue pieces it carries, and skips any line that carries
-none --
+**A band cut below row 7 carries no clue, and that is fine.** The centre clue
+sits on row 7 or 8 depending on orientation, so a band of rows `0..5` strips it
+and the line arrives at the finalizer carrying nothing to read an orientation
+off. Reading and *choosing* are different things, and the finalizer now
+distinguishes them: a board that carries a clue has committed to an orientation
+and is never re-oriented, while a board that carries none has committed to
+nothing and is searched once per orientation the locked region does not already
+contradict (`--clue_orient`, default `auto`). Four different pins against the
+same fixed band, so four genuinely different searches -- of which the old code,
+which refused the line outright, ran none.
 
-```
-[skip] line 21: carries none of the enabled clue pieces, so there is
-       nothing to read the board's orientation from
-```
+That refusal used to force `BAND_ROW >= 8` on every clued whirlpool, and the
+cost was a shallower cut: at `BAND_ROW = 8` a lap preserves 99 cells and frees
+77, against 66 and 110 at `BAND_ROW = 5`. The constraint is gone; what replaces
+it is a cost, up to 4x the finalizer work per band, over **one** shared
+database (the five clue pieces are the same set in all four orientations, so
+only the pins move between passes). `--clue_orient N` pins it back to one pass.
+Measured on a rows-0..5 band with `--clue_center`: 0 boards before, 33,536
+after, from four passes over one database, every one of them carrying the
+centre clue -- 27,241 at orientation 0, 4,734 at 1, 1,561 at 2, and 0 at 3,
+whose pass ran and went extinct at row 6.
 
-The centre clue sits on row 7 or 8 depending on orientation, so a band of rows
-`0..5` strips it and **every** band is refused. Measured: 26 exact bands in,
-0 out, four laps running. A band reaching row 8 carries the clue through (the
-cut preserves cells already placed inside the band, and the backtracker is not
-clue-aware but never has to be, since it only fills the empty notch). The cost
-is a shallower cut -- at `BAND_ROW = 8` a lap preserves 99 cells and frees 77,
-against 66 and 110 at `BAND_ROW = 5`.
-
-**This is a finalizer limitation worth fixing in code, not a fact of the
-problem.** Locking *below* the centre is the common case, not an exotic one --
-the shipped `--finalize_from = BEAM_STOP - 5` does it on every ordinary run, and
-any pipeline that re-cuts a low band does it by construction. The finalizer
-needs an orientation because a partial has committed to one, but deriving it
-*only* from the clue pieces on the line means a partial that legitimately holds
-none is refused rather than searched. Three ways out, in increasing order of
-appetite: take the orientation from the command line when no clue is on the
-board; infer it from the border pieces, which are present and already
-orientation-bearing; or carry it in the CSV's metadata fields, which readers
-already skip. Until one of those exists, a clued whirlpool cannot cut below
-`BAND_ROW 8`, and that is a tooling constraint rather than anything about
-Eternity II.
+Locking below the centre was never exotic, which is why this mattered: the
+shipped `--finalize_from = BEAM_STOP - 5` does it on every ordinary run.
 
 The finalizer
 needs the flag on **every lap** -- the centre sits on the rows it re-grows, and
 without it the search quietly refills that cell. The backtracker is not
 clue-aware at all, which is harmless at the band cut (rows `0..5` exclude the
 centre) but means the closing dive must use a `--holes` mask that leaves the
-centre cell shut; the shipped `holes_open_border_TR.csv` does.
+centre cell shut; the shipped `holes_open_border_TR.csv` does. The roundhouse
+keeps the old refusal, and should: it only *verifies* clues rather than placing
+any, so a board carrying none gives it nothing to check and no choice to make.
 
 ---
 ## Stage C -- the tail toolbox
