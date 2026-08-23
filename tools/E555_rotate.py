@@ -70,6 +70,16 @@ MASKS
     mask or the next stage opens the wrong region. Pass `--holes IN.csv` and
     the mask is turned by the same map and written alongside the board.
 
+ANNEALED BORDERS
+
+    A Stage A rotations CSV is a spin per piece, and for a border piece the
+    spin IS its side: the grey face points at the edge of the frame it belongs
+    to. Turn the board and those spins no longer describe it, so the finalizer
+    stops matching the row and drops to --free_edges. `--rotations` turns the
+    file instead of a board -- same spin map, applied only to the pieces that
+    have a grey side -- so the annealed side assignment follows the board round
+    and keeps constraining which pieces may sit on each edge.
+
 CAVEATS
 
     Anything that pins a specific cell -- a clue piece, a corner fixed with
@@ -164,6 +174,112 @@ def rotate_file(path, n, out_path, seed):
     return boards, others, bad
 
 
+# Seed order is (N, E, S, W) and grey is colour 0. A border piece carries one
+# grey side and a corner two, so once a spin is applied the grey side says which
+# edge of the frame the piece belongs to -- which is the entire content of a
+# rotations row. This is classify_deal_from_rotations() in E555_database.c,
+# rewritten in Python; V.rotate_edges is the same formula the beamer applies.
+SIDE_NAMES = ("top", "right", "bottom", "left")
+EDGE_LEN = SIDE - 2                       # 14 non-corner pieces per side
+# One clockwise turn carries the bottom row round to the left column.
+CW_SIDE = {"bottom": "left", "left": "top", "top": "right", "right": "bottom"}
+
+
+def classify_border(seed, spins):
+    """{side: set of piece ids} for the four edges, plus 'corner', from spins alone."""
+    out = {name: set() for name in SIDE_NAMES}
+    out["corner"] = set()
+    for pid, edges in enumerate(seed):
+        shown = V.rotate_edges(edges, spins[pid])
+        grey = [d for d in range(4) if shown[d] == 0]
+        if len(grey) == 2:
+            out["corner"].add(pid)
+        elif len(grey) == 1:
+            out[SIDE_NAMES[grey[0]]].add(pid)
+    return out
+
+
+def turned_sides(cls, n):
+    """Where each side's pieces should end up after n quarter-turns clockwise."""
+    out = {"corner": cls["corner"]}
+    for name in SIDE_NAMES:
+        dst = name
+        for _ in range(n):
+            dst = CW_SIDE[dst]
+        out[dst] = cls[name]
+    return out
+
+
+def parse_rotations_row(fields):
+    """Split a rotations row into (meta, spins), or None if it is not one.
+
+    Mirrors read_one_border_row in E555_database.c: 256, 257 or 258 fields, the
+    spins being the last 256, so the leading id and any second meta column ride
+    through untouched."""
+    if len(fields) not in (N_PIECES, N_PIECES + 1, N_PIECES + 2):
+        return None
+    spins = fields[-N_PIECES:]
+    try:
+        vals = [int(s) for s in spins]
+    except ValueError:
+        return None
+    if any(v < 0 or v > 3 for v in vals):
+        return None
+    return fields[:-N_PIECES], vals
+
+
+def rotate_rotations(path, n, out_path, seed):
+    """Turn a Stage A rotations CSV; return (rows written, other rows, bad rows).
+
+    Only pieces with a grey side are touched. Nothing downstream reads an inner
+    piece's spin out of a rotations row -- classify_deal_from_rotations,
+    build_top_border_demands and fin_rot_match all skip them -- so leaving them
+    alone keeps the file's meaning identical and its diff to the frame."""
+    greyed = [pid for pid, e in enumerate(seed) if 0 in e]
+    rows = others = bad = 0
+    label = "no rotation" if n == 0 else f"{n * 90} degrees clockwise"
+    with open(path, newline="") as fh, open(out_path, "w", newline="") as out:
+        writer = csv.writer(out, lineterminator="\n")
+        out.write(f"# {label} from {Path(path).name} by E555_rotate.py --rotations\n")
+        for raw in csv.reader(fh):
+            fields = [f.strip() for f in raw]
+            rec = parse_rotations_row([f for f in fields if f != ""])
+            if rec is None:                       # comment, header, short row
+                writer.writerow(raw)
+                others += 1
+                continue
+            meta, spins = rec
+            before = classify_border(seed, spins)
+            new = list(spins)
+            for pid in greyed:
+                new[pid] = (new[pid] + 3 * n) % 4
+            after = classify_border(seed, new)
+            # A legal row partitions the frame 14/14/14/14 with one corner per
+            # board corner -- the same test fin_rot_row_valid applies, and a row
+            # failing it is dropped there too, so dropping it here keeps the row
+            # numbering the two see identical.
+            sizes = [len(before[s]) for s in SIDE_NAMES]
+            if len(before["corner"]) != 4 or any(s != EDGE_LEN for s in sizes):
+                print(f"[ERROR] row {rows + bad} is not a legal 14/14/14/14 border "
+                      f"partition ({sizes}, {len(before['corner'])} corners) "
+                      "-- row dropped", file=sys.stderr)
+                bad += 1
+                continue
+            # The invariant a turn must preserve, and the reason this mode exists:
+            # the side SETS have to follow the board round, or the finalizer would
+            # be handed the wrong pool for each side.
+            want = turned_sides(before, n)
+            if any(after[s] != want[s] for s in SIDE_NAMES) or \
+                    after["corner"] != want["corner"]:
+                print(f"[ERROR] row {rows + bad}: the side sets did not follow the "
+                      "turn -- row dropped", file=sys.stderr)
+                bad += 1
+                continue
+            writer.writerow(meta + [str(v) for v in new])
+            rows += 1
+    return rows, others, bad
+
+
 def rotate_holes(path, n, out_path):
     """Turn a 16x16 --holes mask by the same map; return its open-cell count."""
     grid, comments = [], []
@@ -221,6 +337,10 @@ def main():
                          "no N, --out or --holes-out")
     ap.add_argument("--out", metavar="FILE",
                     help="output path (default: the input with _rotN appended)")
+    ap.add_argument("--rotations", action="store_true",
+                    help="the input is a Stage A rotations CSV (a spin per piece, "
+                         "not a board): turn the border's side assignment instead, "
+                         "so an annealed border still matches after the board turns")
     ap.add_argument("--holes", metavar="FILE",
                     help="a 16x16 --holes mask to turn with the board, so the "
                          "next stage opens the same cells it did before")
@@ -239,6 +359,9 @@ def main():
         raise SystemExit("[ERROR] give N (0..4), or --all for every turn")
     if args.holes_out and not args.holes:
         raise SystemExit("[ERROR] --holes-out only means something with --holes")
+    if args.rotations and args.holes:
+        raise SystemExit("[ERROR] --rotations turns a border's side assignment, "
+                         "which has no cells for a --holes mask to name")
 
     src = Path(args.input)
     if not src.exists():
@@ -259,19 +382,26 @@ def main():
         dst = Path(args.out) if args.out else turned_name(src, turn)
         if dst.resolve() == src.resolve():
             raise SystemExit(f"[ERROR] refusing to overwrite the input '{src}'")
-        boards, others, bad = rotate_file(src, turn, dst, seed)
+        if args.rotations:
+            boards, others, bad = rotate_rotations(src, turn, dst, seed)
+        else:
+            boards, others, bad = rotate_file(src, turn, dst, seed)
         if not boards:
-            raise SystemExit(f"[ERROR] no board rows survived from {src}")
+            raise SystemExit(f"[ERROR] no {'border' if args.rotations else 'board'} "
+                             f"rows survived from {src}")
 
         label = "no rotation" if turn == 0 else f"{turn * 90} degrees clockwise"
+        kind = "border" if args.rotations else "board"
         print(f"[rot] {src.name}: {label} (N={turn})")
-        print(f"[rot] {boards} board row(s) turned"
+        print(f"[rot] {boards} {kind} row(s) turned"
               + (f", {others} other row(s) passed through" if others else ""))
+        check = "the side sets followed the turn on every row" if args.rotations \
+            else "score preserved on every row"
         if bad:
-            print(f"[rot] {bad} row(s) FAILED the score check and were dropped")
+            print(f"[rot] {bad} row(s) FAILED the check and were dropped")
             rc = 1
         else:
-            print("[rot] score preserved on every row")
+            print(f"[rot] {check}")
         print(f"[out] {dst}")
 
         if holes:

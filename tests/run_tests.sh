@@ -229,7 +229,62 @@ step_rotate() {
     span_of() { awk -F, -v f="$1" 'NR>1 && $1==f {print $11}' "$OUT/rot_rank.csv"; }
     [ "$(span_of rot0.csv)" = "5x15" ] || fail "unrotated span is not 5x15"
     [ "$(span_of rot1.csv)" = "15x5" ] || fail "90-degree span did not transpose to 15x5"
-    echo "ok: rotation is lossless, span transposes, 4 turns = identity"
+
+    # --rotations turns a Stage A border's side assignment instead of a board.
+    # Same identity law, and the spins it writes must be the ones the turned
+    # board carries -- that equality is exactly what fin_rot_match compares.
+    python3 tools/E555_rotate.py data/borders_annealed_fix12.csv 0 --rotations \
+        --seed data/seed_Edge5.txt --out "$OUT/br0.csv" > /dev/null
+    prev="$OUT/br0.csv"
+    for t in 1 2 3 4; do
+        python3 tools/E555_rotate.py "$prev" 1 --rotations --seed data/seed_Edge5.txt \
+            --out "$OUT/br$t.csv" > /dev/null || fail "--rotations failed at turn $t"
+        prev="$OUT/br$t.csv"
+    done
+    grep -v '^ *#' "$OUT/br0.csv" > "$OUT/br0.spins"
+    grep -v '^ *#' "$OUT/br4.csv" > "$OUT/br4.spins"
+    cmp -s "$OUT/br0.spins" "$OUT/br4.spins" \
+        || fail "four --rotations turns did not return the original spins"
+    n=$(grep -vc '^ *#' "$OUT/br0.csv")
+    [ "$n" = 12 ] || fail "--rotations kept $n border rows of data/borders_annealed_fix12.csv, expected 12"
+
+    python3 - "$OUT" <<'EOF' || exit 1
+import csv, subprocess, sys
+out = sys.argv[1]
+def frame_spins(path):                     # {piece: rotation} over the 60 frame cells
+    row = next(r for r in csv.reader(open(path))
+               if r and not r[0].lstrip().startswith("#"))
+    f = [x.strip() for x in row][-512:]
+    pos, rot = [int(x) for x in f[:256]], [int(x) for x in f[256:]]
+    return {p: rot[p] for p, v in enumerate(pos)
+            if v != 999 and (v // 16 in (0, 15) or v % 16 in (0, 15))}
+subprocess.run(["python3", "tools/E555_rank.py", "data/best_463.csv",
+                "--seed", "data/seed_Edge5.txt", "--border-only",
+                "--emit", f"{out}/rr_full.csv"], check=True,
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+open(f"{out}/rr_board.csv", "w").write(open(f"{out}/rr_full.csv").readline())
+sp = [0] * 256
+for p, s in frame_spins(f"{out}/rr_board.csv").items():
+    sp[p] = s
+open(f"{out}/rr_row.csv", "w").write("000," + ",".join(str(x) for x in sp) + "\n")
+for tool, src, dst, extra in (
+        ("board", f"{out}/rr_board.csv", f"{out}/rr_board1.csv", []),
+        ("row",   f"{out}/rr_row.csv",   f"{out}/rr_row1.csv",   ["--rotations"])):
+    subprocess.run(["python3", "tools/E555_rotate.py", src, "1",
+                    "--seed", "data/seed_Edge5.txt", "--out", dst] + extra,
+                   check=True, stdout=subprocess.DEVNULL)
+turned = frame_spins(f"{out}/rr_board1.csv")
+row = next(r for r in csv.reader(open(f"{out}/rr_row1.csv"))
+           if r and not r[0].lstrip().startswith("#"))
+row = [int(v.strip()) for v in row][-256:]
+bad = [p for p, s in turned.items() if row[p] != s]
+if len(turned) != 60 or bad:
+    print(f"!!! --rotations disagreed with the turned board on {len(bad)} of "
+          f"{len(turned)} frame pieces", file=sys.stderr)
+    raise SystemExit(1)
+EOF
+    echo "ok: rotation is lossless, span transposes, 4 turns = identity;"
+    echo "    --rotations agrees with the turned board on all 60 frame spins"
 }
 
 # --verbose: the BEST lines grepped below are verbose-only, the default being
