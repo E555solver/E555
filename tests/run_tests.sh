@@ -65,6 +65,7 @@ ALL_STEPS=(
     "backtracker_stop_band|--stop_row/--stop_column emit exact, finalizer-shaped bands"
     "whirlpool_lap|one whirlpool lap: turn, re-cut rows 0..5, re-grow to row 11"
     "clue_orient|a band carrying no clue is searched at all four orientations"
+    "band_with_frame|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
     "cpsat_chain|topper -> ender(ring) -> ender(patch), each fed by the last"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
     "scripts_parse|every shipped example and pipeline script parses"
@@ -594,6 +595,79 @@ EOF
                           if (p!=192 || hi!=0 || $2!=356) n++} END{print n+0}' "$comp")
     [ "$bad" = 0 ] || fail "$bad re-grown boards are not an exact rows-0..11 board at 356"
     echo "ok: turn -> band(170) -> re-grow(356), $(grep -vc '^#' "$comp") boards"
+}
+
+# A plain --stop_row clears everything outside the band, the outer frame with it,
+# so the band reaches the finalizer holding 26 of 60 border cells and fixed-sides
+# mode is not available to it. --with_frame widens the band to take the frame in:
+# border cells the turned board already holds are retained, the ones it does not
+# are searched, and the band arrives complete. This check pins both halves of
+# that -- the count, and the mode the finalizer actually chooses because of it.
+step_band_with_frame() {
+    python3 - "$OUT/wf_row10.csv" <<'EOF'
+import sys
+line = [l for l in open("data/synth_solution_480.csv")
+        if l.strip() and not l.startswith(("#", "%"))][0].rstrip("\n")
+f = line.split(",")
+meta, pos, rot = f[:-512], [p.strip() for p in f[-512:-256]], [r.strip() for r in f[-256:]]
+pos = ["999" if p != "999" and int(p) // 16 > 10 else p for p in pos]
+open(sys.argv[1], "w").write(",".join(meta + pos + rot) + "\n")
+EOF
+    python3 tools/E555_rotate.py "$OUT/wf_row10.csv" 1 \
+        --out "$OUT/wf_rot.csv" --seed data/synth_seed.txt > /dev/null
+
+    # count_frame FILE -- placed cells and frame cells of the first board.
+    count_frame='!/^#/{p=0; f=0
+        for(i=3;i<=258;i++) if($i!=999){p++; v=$i+0
+            if(int(v/16)==0||int(v/16)==15||v%16==0||v%16==15) f++}
+        print p, f; exit}'
+
+    bin/E555_backtracker data/synth_seed.txt "$OUT/wf_rot.csv" "$OUT/wf_plain.csv" \
+        --stop_row 5 --order rowmajor --break-mode any --max-mismatch 0 \
+        --solution-limit 1 --time-limit 90 --threads 4 > "$OUT/wf_plain.log"
+    plain="$OUT/wf_plain.csv.stop_row5.csv"
+    [ -s "$plain" ] || { tail -5 "$OUT/wf_plain.log"; fail "the plain band cut emitted nothing"; }
+    read -r p f <<<"$(awk -F, "$count_frame" "$plain")"
+    [ "$p" = 96 ] || fail "a plain rows-0..5 band has $p placed cells, expected 96"
+    [ "$f" = 26 ] || fail "a plain rows-0..5 band carries $f frame cells, expected 26"
+
+    bin/E555_backtracker data/synth_seed.txt "$OUT/wf_rot.csv" "$OUT/wf_frame.csv" \
+        --stop_row 5 --with_frame --order rowmajor --break-mode any --max-mismatch 0 \
+        --solution-limit 1 --time-limit 120 --threads 4 > "$OUT/wf_frame.log"
+    band="$OUT/wf_frame.csv.stop_row5.csv"
+    [ -s "$band" ] || { tail -5 "$OUT/wf_frame.log"; fail "--with_frame emitted no band"; }
+    read -r p f <<<"$(awk -F, "$count_frame" "$band")"
+    # 96 band cells, plus the 34 frame cells that sit outside rows 0..5:
+    # columns 0 and 15 over rows 6..14, and the whole of row 15.
+    [ "$p" = 130 ] || fail "a --with_frame band has $p placed cells, expected 130"
+    [ "$f" = 60 ]  || fail "a --with_frame band carries $f frame cells, expected 60"
+
+    # The point of the count: 60 is what fixed-sides mode requires. 26 is not.
+    bin/E555_finalizer data/synth_seed.txt "$band" \
+        --out_dir "$OUT/wf_fin" --threads 4 \
+        --finalize_from 5 --stop_row 10 --beam_width 20000 --frac_rand 0 \
+        --border_row_N 1 --top_columns 0 \
+        --seed 1 --max_partials 8 --max_wall_sec 300 > "$OUT/wf_fin.log"
+    grep -q "mode=fixed" "$OUT/wf_fin.log" \
+        || { grep -m2 "mode=" "$OUT/wf_fin.log"; fail "a complete frame did not select fixed sides"; }
+    comp="$OUT/wf_fin/beam_completions_finalized_10.csv"
+    [ -s "$comp" ] || { tail -5 "$OUT/wf_fin.log"; fail "no board re-grew from the framed band"; }
+
+    bin/E555_finalizer data/synth_seed.txt "$plain" \
+        --out_dir "$OUT/wf_fin2" --threads 4 \
+        --finalize_from 5 --stop_row 10 --beam_width 2000 --frac_rand 0 \
+        --border_row_N 1 --top_columns 1 \
+        --seed 1 --max_partials 1 --max_wall_sec 120 > "$OUT/wf_fin2.log"
+    grep -q "mode=free" "$OUT/wf_fin2.log" \
+        || { grep -m2 "mode=" "$OUT/wf_fin2.log"; fail "an incomplete frame did not fall back to free sides"; }
+
+    # --with_frame widens a band; without one there is nothing to widen.
+    if bin/E555_backtracker data/synth_seed.txt "$OUT/wf_rot.csv" "$OUT/wf_bad.csv" \
+           --with_frame --max-mismatch 0 --threads 1 > "$OUT/wf_bad.log" 2>&1; then
+        fail "--with_frame without a stop band was accepted"
+    fi
+
+    echo "ok: band 96/26 frame cells plain, 130/60 with --with_frame -> mode=fixed"
 }
 
 step_clue_orient() {

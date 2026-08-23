@@ -1249,14 +1249,48 @@ That is its role here, and it is the whole reason the loop exists.
 rows 0..T full
   ├─ rotate +-90 deg    tools/E555_rotate.py in.csv 1   (and 3)
   │      T+1 complete COLUMNS, and zero complete rows
-  ├─ backtracker        --stop_row 5 --order rowmajor --break-mode any
-  │      completes rows 0..5, clears everything above
+  ├─ backtracker        --stop_row 5 --with_frame --order rowmajor --break-mode any
+  │      completes rows 0..5 AND the outer frame, clears everything else
   └─ finalizer          --finalize_from 5 --stop_row T
-         rows 6..T re-grown at full width over a reduced database
+         rows 6..T re-grown at full width over a reduced database,
+         with the border held fixed
 ```
 
 The lap ends where it began -- rows `0..T` full -- but rebuilt from a different
 direction. **Four laps is one full turn of the board.**
+
+### Carrying the border round the lap -- `--with_frame`
+
+A plain `--stop_row` clears **everything** outside the band, and the outer frame
+is outside it. So the band used to reach the finalizer holding 26 of the 60
+border cells, and `fin_border_complete()` -- which needs all 60 -- had no option
+but to fall back to `--free_edges`. The border could never be a fixed thing the
+loop carried; it was re-guessed from scratch on every lap.
+
+`--with_frame` widens the band to **rows `0..N` plus all 60 frame cells**. That
+one predicate does three jobs: border cells the turned board already holds are no
+longer cleared, border cells it does not hold are *searched* as part of the band,
+and band completeness now demands the frame close, so a board whose leftover
+border pool cannot chain is dropped instead of being handed on. The band arrives
+at the finalizer with all 60 and fixed-sides mode selects itself.
+
+Two things it is not.
+
+It is a **harder cut**: many turned boards admit an exact band but no exact frame
+to go with it, and those drop out. That is a real filter and a real loss of
+population -- the loop's attrition goes up, deliberately.
+
+And it does **not** make the frame byte-identical from lap to lap. Fixed mode
+pins the *set* of pieces on each side, not their order: the finalizer draws each
+row's right terminal from that pool (`rows[r].rterm` indexes `g_edge_term`), so
+the frame is re-completed every lap rather than carried unchanged. Pinning it per
+cell would mean constraining the terminals inside the beam, which this is not.
+What you get is that every lap runs against a committed border rather than a free
+one, which is a much tighter search, not a frozen frame.
+
+`FIXED_BORDER=0` restores the old free-border lap. Keep it available: a free
+border out-yields a fixed one by roughly an order of magnitude at the same depth,
+so it is the control arm any claim about fixed borders has to beat.
 
 `--order rowmajor` at the cut is deliberate: after a turn the empty cells are
 whole *columns* of rows `0..5`, and rowmajor walks them row by row, closing the
@@ -1561,6 +1595,21 @@ one flag, two effects, whenever a stop option is on. A band completion is the
 solution here, so `--solution-limit` caps emissions and defaults to **1**;
 `--all-solutions` enumerates, and should be used with care, since rows 0..3
 alone ran to 7.6 M bands and 11 GB in five minutes.
+
+**`--with_frame` -- keep the border instead of clearing it.** The outer frame is
+outside the band, so a plain cut clears it: a rows-`0..5` band reaches the
+finalizer holding 26 of 60 border cells, and fixed-sides mode, which needs all
+60, is not available to it. `--with_frame` makes the band *rows `0..N` plus the
+60 frame cells*. Border cells the input holds are retained; border cells it does
+not hold are searched as part of the band; and completeness now demands the frame
+close, so a band whose leftover border pool cannot chain is never emitted. The
+frame's pieces stay out of the pool -- they are committed -- so the rows have
+that many fewer to draw on. Requires a stop band; rejected without one.
+
+This is what lets a whirlpool lap hand a committed border to the next lap. It
+does not freeze the frame: fixed mode pins the piece *set* per side, not the
+order, so the finalizer re-chooses each row's terminal and the frame is
+re-completed each lap rather than carried unchanged.
 
 Two options are refused rather than silently useless: `--max-mismatch` must be
 `0`, because the finalizer validates every colour match inside its locked region
