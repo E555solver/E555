@@ -1719,7 +1719,10 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   from -- run a board at 0/1/2/3 and hand all four to the finalizer, the
   roundhouse or the topper. `--all` writes all four turns in one pass, and
   `--holes FILE` turns a mask alongside the board so the next stage still opens
-  the same physical pieces.
+  the same physical pieces. `--rotations` turns a Stage A rotations CSV instead
+  of a board -- a border piece's spin *is* its side, so a turned board needs a
+  turned rotations file or `fin_rot_match` stops recognising it and the
+  finalizer drops to `--free_edges`.
 
 ---
 
