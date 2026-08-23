@@ -364,9 +364,21 @@ static bool g_reverse = false;   /* --reverse: reversed traversal; mrv tie-break
 static int  g_stop_n      = -1;      /* band size - 1; -1 = no stop option */
 static bool g_stop_isrow  = true;    /* true: --stop_row, false: --stop_column */
 static bool g_stop_active = false;
+static bool g_with_frame  = false;   /* --with_frame: the 60 frame cells join the band */
 
+/* --with_frame widens the band to rows 0..N PLUS the whole outer frame, which is
+ * what lets a fixed border survive a whirlpool lap.  Everything the band means
+ * is expressed through this one predicate, so widening it here does three jobs
+ * at once: cells outside the band are cleared, so the frame is no longer wiped;
+ * empty cells inside it are searched, so the frame is COMPLETED rather than
+ * merely retained; and band completeness now demands all 60 frame cells, so a
+ * board only counts when its frame closes.  The frame pieces stay out of the
+ * pool, which is right -- they are committed, and the band has that many fewer
+ * pieces to place. */
 static inline bool cell_in_band(int r, int c) {
     if (!g_stop_active) return true;
+    if (g_with_frame && (r == 0 || r == PUZZLE_SIDE - 1 ||
+                         c == 0 || c == PUZZLE_SIDE - 1)) return true;
     int v = g_stop_isrow ? r : c;
     return g_reverse ? (v >= PUZZLE_SIDE - 1 - g_stop_n) : (v <= g_stop_n);
 }
@@ -4895,7 +4907,19 @@ static void usage(const char *prog) {
         "                         flipping static traversal.  A band completion IS the\n"
         "                         solution here, so --solution-limit caps how many are\n"
         "                         emitted -- it defaults to 1, use --all-solutions to\n"
-        "                         enumerate.  Requires --max-mismatch 0 and --jump off.\n\n"
+        "                         enumerate.  Requires --max-mismatch 0 and --jump off.\n"
+        "  --with_frame           Widen the band to rows 0..N PLUS all 60 outer frame\n"
+        "                         cells, so a fixed border survives the cut instead of\n"
+        "                         being cleared with everything else outside the band.\n"
+        "                         Frame cells the input leaves unplaced are SEARCHED,\n"
+        "                         so the border is completed as part of the band, and a\n"
+        "                         band only counts once its frame closes.  The frame\n"
+        "                         pieces are committed and stay out of the pool, so the\n"
+        "                         rows have that many fewer pieces to draw on.  Every\n"
+        "                         emitted band then carries all 60 border cells, which\n"
+        "                         is what E555_finalizer needs to run its fixed-sides\n"
+        "                         mode rather than falling back to --free_edges.\n"
+        "                         Requires --stop_row or --stop_column.\n\n"
         "Auxiliary output:\n"
         "  output.csv.status.csv          Per-record diagnostics, with --status.\n"
         "  output.csv.checkpoint.csv      Crash recovery; removed on clean completion.\n"
@@ -5048,6 +5072,8 @@ int main(int argc, char **argv) {
             if (g_stop_active)
                 fatal("--stop_row and --stop_column are mutually exclusive");
             g_stop_n = (int)v; g_stop_isrow = false; g_stop_active = true;
+        } else if (strcmp(argv[i], "--with_frame") == 0) {
+            g_with_frame = true;
         } else if (strcmp(argv[i], "--max-mismatch") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
@@ -5137,6 +5163,9 @@ int main(int argc, char **argv) {
         if (g_jump)
             fatal("--stop_%s requires --jump off: jumping leaves dead cells empty, "
                   "so the band can never complete", g_stop_isrow ? "row" : "column");
+    } else if (g_with_frame) {
+        fatal("--with_frame widens a stop band, so it needs one: add --stop_row N "
+              "or --stop_column N");
     }
 
     /* Literal side-growth orders use exact placements only.  They have their
@@ -5212,6 +5241,10 @@ int main(int argc, char **argv) {
     if (g_parallel_mode != PAR_RECORDS)
         printf("  target_frontier=%d (auto)", nt * SPLIT_TASKS_PER_THREAD);
     printf("\n");
+    if (g_stop_active)
+        printf("  stop_%s=%d%s  with_frame=%s\n",
+               g_stop_isrow ? "row" : "column", g_stop_n,
+               g_reverse ? " (far side)" : "", g_with_frame ? "on" : "off");
     const bool side_growth = order_is_side_growth(g_order_mode);
     printf("  order=%s%s  jump=%s  completion_feasibility=%s\n",
            order_name(g_order_mode), g_reverse ? " (reverse)" : "", g_jump ? "on" : "off",
@@ -5341,13 +5374,14 @@ int main(int argc, char **argv) {
         g_band_csv = fopen(band_csv_path, "w");
         if (!g_band_csv) fatal("cannot create %s: %s", band_csv_path, strerror(errno));
         if (fprintf(g_band_csv,
-                    "# E555 backtracker -- every completed --stop_%s %d band%s "
+                    "# E555 backtracker -- every completed --stop_%s %d band%s%s "
                     "(original frame)\n"
                     "# cells outside the band are unplaced (%d); feed to "
                     "E555_finalizer --finalize_from %d\n"
                     "# fields: config_id,score,pos_0,...,pos_255,rot_0,...,rot_255\n",
                     g_stop_isrow ? "row" : "column", g_stop_n,
                     g_reverse ? " (anchored at the far side)" : "",
+                    g_with_frame ? " + the complete outer frame" : "",
                     CSV_UNPLACED, g_stop_n) < 0)
             fatal("cannot write header to %s", band_csv_path);
         checked_fflush(g_band_csv, band_csv_path);

@@ -27,11 +27,20 @@
 #     rows 0..T full
 #       -> rotate +-90    T+1 complete COLUMNS (new row 0 is an old column,
 #                         so it is incomplete and no finalizer could start here)
-#       -> backtracker    --stop_row 5 --order rowmajor: complete rows 0..5,
-#                         clear everything above
+#       -> backtracker    --stop_row 5 --order rowmajor --with_frame: complete
+#                         rows 0..5 AND the outer frame, clear everything else
 #       -> finalizer      --finalize_from 5 --stop_row T: re-grow rows 6..T
 #                         at full width over a database rebuilt without the
-#                         locked pieces
+#                         locked pieces, with the border held fixed
+#
+#   --with_frame is what makes the border survive the cut. A plain --stop_row
+#   clears everything outside the band, frame included, so the band reaches the
+#   finalizer carrying 26 of 60 border cells and the finalizer has no choice but
+#   --free_edges. Widening the band to take in the frame retains the border cells
+#   the turned board already holds and SEARCHES the ones it does not, so the band
+#   arrives with all 60 -- and a band whose leftover border pool cannot chain is
+#   dropped, which is a filter the loop did not have before. Set FIXED_BORDER=0
+#   for the old free-border lap.
 #
 #   and the lap ends where it started -- rows 0..T full -- but rebuilt from a
 #   different direction. Four laps is one full turn of the board.
@@ -47,10 +56,11 @@
 #   evidence than surviving once from the bottom.
 #
 # WHAT THE LOOP DOES *NOT* DO
-#   It does not climb. WHIRL_ROWS caps at 12 on purpose: above row 12 the beam
-#   is spent and the Stage C tools are simply better, so the loop holds its
-#   depth and spends its time on coverage instead. Stage C runs once, at the
-#   end, on the survivors.
+#   It does not climb. The loop holds its depth and spends its time on coverage;
+#   Stage C runs once, at the end, on the survivors. That is not only a policy:
+#   from a five-row lock the beam reaches row 10 and row 11 and does not reach
+#   row 12 at all -- measured against a perfect board on its own frame, which is
+#   the friendliest input that exists. Climbing past 11 is Stage C's job.
 #
 #   Nothing here ranks: every stage in the loop emits EXACTLY MATCHED boards, so
 #   at equal depth they all score the same and there is nothing to sort on.
@@ -121,16 +131,25 @@ BEAM_TAU1="${BEAM_TAU1:-0.25}"
 BC_WINDOW="${BC_WINDOW:-3,3}"
 
 # ---- the whirlpool ----------------------------------------------------------
-# One target row per lap: 10 or 11 to start, WITHOUT incomplete emissions, then
-# 12 WITH them -- 12 is the ceiling, and a board filling row 12 bar one 5-piece
-# segment is still the best thing Stage C will be handed all day.
+# One target row per lap. Row 12 used to sit at the end of this list, on the
+# theory that a board filling row 12 bar one 5-piece segment is the best thing
+# Stage C will be handed all day. It is -- but the lap cannot produce one from a
+# five-row lock, so asking costs a lap and returns nothing. See below.
 #
 # Below 10 is warned about, not refused. Depth is what bounds output: nothing
 # has gone extinct at a shallow row, so the stop-row beam is emitted in full and
 # --incomplete_top's siblings multiply it. Measured on the real seed, one
 # config: row 6 wrote 807 042 boards and 1.5 GB, row 10 wrote 1 136 and 2.2 MB
 # in the same 5 s. Worth knowing before you ask for it; not worth forbidding.
-WHIRL_ROWS="${WHIRL_ROWS:-11 12 12 12}"
+#
+# Ten, not twelve, because twelve is not reachable from a five-row lock. Measured
+# against the one board that cannot be argued with -- a perfect 480 solution on
+# its own true frame, locked at rows 0..4 -- the beam found 7 491 completions at
+# row 10, ten at row 11 and NONE at row 12, fixed border or free. A default that
+# asks every lap for 12 is asking for something ground truth does not deliver.
+# Raise it if the run is free-bordered (FIXED_BORDER=0), where row 11 still had
+# 349 completions; row 12 needs Stage C, not another lap.
+WHIRL_ROWS="${WHIRL_ROWS:-10 10 10 10}"
 
 # Depth advice, not law -- and it has to sit HERE, after WHIRL_ROWS and
 # BEAM_STOP are defaulted: reading either one earlier is an unbound variable
@@ -155,21 +174,46 @@ for _t in $WHIRL_ROWS; do
        12 and the Stage C tools do better there. Continuing anyway."
 done
 BAND_ROW="${BAND_ROW:-5}"           # backtracker --stop_row: rows 0..BAND_ROW are rebuilt exactly
+# FIXED_BORDER=1 adds --with_frame to the cut, so the band carries all 60 outer
+# frame cells instead of the 26 a plain --stop_row leaves: the frame is retained
+# where the input placed it and SEARCHED where it did not, and a band only counts
+# once its frame closes. That is what lets E555_finalizer run its fixed-sides
+# mode -- it needs all 60 border cells present or it falls back to --free_edges.
+#
+# Two things to know before turning it on. It is a much harder cut: many turned
+# boards admit an exact band but no exact frame to go with it, and those now drop
+# out, which is a real filter and a real loss of population. And fixed sides cost
+# yield -- every row must terminate on a piece the frame's own pool can supply,
+# where a free border may choose one that fits. Measured against ground truth (a
+# perfect board on its own frame, lock rows 0..4): 7 491 boards to row 10 fixed
+# against 95 540 free, and 10 against 349 at row 11.
+#
+# What it does NOT give you is a frame that is byte-identical from lap to lap.
+# Fixed mode pins the SET of pieces on each side, not their order: the finalizer
+# re-chooses which edge terminates which row from that pool, so the frame is
+# re-completed every lap rather than carried. Pinning it per cell would mean
+# constraining the terminals inside the beam, which this is not.
+FIXED_BORDER="${FIXED_BORDER:-1}"   # 1 = --with_frame; 0 = the old free-border lap
 # Bands per lap is 2 * POP * BT_LIMIT, and it is the setting that decides how
 # long a lap takes: every distinct band is a distinct locked set, so the
 # finalizer rebuilds its reduced database for each one. Measured at
 # --finalize_from 5 on the synthetic seed: 337 M records, 0.82 GB, ~9 s a band.
 # Locking only six rows is what makes that database big -- raise BAND_ROW and it
 # shrinks fast, at the cost of freeing less of the board per lap.
-BT_LIMIT="${BT_LIMIT:-3}"           # bands emitted per turned board (--solution-limit)
-# --solution-limit is load-bearing, not a safety net. Measured on one turned
-# synthetic board: 4 787 556 exact bands in 120 s (6.9 GB of CSV) and still
-# running when the clock stopped. The cut is effectively free and the finalizer
-# is the whole cost, so the loop consumes a vanishing fraction of what is on
-# offer -- and BT_LIMIT takes the DFS's FIRST K, which share a long prefix.
-# BT_ORDER is the lever on that: a static order starts from a different corner
-# and so returns a different first K. rowmajor walks the empty columns row by
-# row and closes the border row 0 first, which is the shape the lock needs.
+BT_LIMIT="${BT_LIMIT:-200}"         # bands ENUMERATED per turned board (--solution-limit)
+BT_PICK="${BT_PICK:-6}"             # bands actually GROWN, chosen farthest-first
+# --solution-limit is load-bearing, not a safety net: the cut is effectively free
+# and the finalizer is the whole cost, so the loop consumes a vanishing fraction
+# of what is on offer. The trap is that the DFS returns its FIRST K, which share
+# a long prefix -- three near-identical bands re-searching one neighbourhood.
+# So enumerate a wide sample and let E555_rank.py --diverse pick BT_PICK of them
+# farthest-first on cell agreement. Exact bands all score the same, so agreement
+# is the only signal there is to choose on.
+#
+# How wide the sample can usefully be depends on how deep the board is, and the
+# spread is enormous: a turned rows-0..12 board admits 28 exact five-row bands
+# and is exhausted in under a second, while a turned rows-0..10 board runs past
+# a million in fifteen. Deeper input, smaller and more tractable band space.
 BT_ORDER="${BT_ORDER:-rowmajor}"
 BT_TIME="${BT_TIME:-60}"            # seconds per turned board
 POP="${POP:-40}"                    # boards carried into the next lap
@@ -210,6 +254,19 @@ rank() {
 }
 
 [ -x "$REPO/bin/E555_beamer" ] || make -C "$REPO"
+# A binary that EXISTS is not a binary that RUNS here. CFLAGS carries
+# -march=native, so a bin/ built on another machine can hold instructions this
+# CPU lacks, and `make` will not rebuild it because the sources are not newer.
+# The failure mode is the nasty one: a mid-search SIGILL that still leaves a
+# checkpoint and a truncated CSV behind, so the lap looks like a short
+# successful run. Smoke-test the search itself, cheaply, and rebuild if it dies.
+if ! "$REPO/bin/E555_backtracker" "$SEED" "$REPO/data/board_partial_row12.csv" \
+        "$(mktemp -u)" --row 0 --count 1 --max-mismatch 480 --break-mode stuck \
+        --stuck_restarts 1 --time-limit 1 --threads 1 > /dev/null 2>&1; then
+    echo "[warn] bin/ does not run on this machine (a stale -march=native build?)."
+    echo "       Rebuilding from source before starting."
+    make -B -C "$REPO"
+fi
 # Everything below runs from inside $RUN_DIR, so any path handed in relative to
 # the invocation directory has to be resolved before the cd.
 abspath() { case "$1" in /*) printf '%s' "$1";; *) printf '%s' "$PWD/$1";; esac; }
@@ -223,7 +280,8 @@ cd "$RUN_DIR"
 echo "[cfg] repo=$REPO"
 echo "[cfg] seed=$SEED"
 echo "[cfg] run_dir=$RUN_DIR threads=$THREADS db_file=${DB_FILE:-<in memory>} clues=$CLUES"
-echo "[cfg] whirlpool: laps=[$WHIRL_ROWS] band_row=$BAND_ROW bt_limit=$BT_LIMIT pop=$POP"
+echo "[cfg] whirlpool: laps=[$WHIRL_ROWS] band_row=$BAND_ROW bt_limit=$BT_LIMIT bt_pick=$BT_PICK pop=$POP"
+echo "[cfg] fixed_border=$FIXED_BORDER ($([ "$FIXED_BORDER" = 1 ] && echo "--with_frame: the cut carries all 60 frame cells, finalizer runs fixed sides" || echo "free border: the old lap"))"
 START=$SECONDS
 
 # -----------------------------------------------------------------------------
@@ -271,7 +329,8 @@ show_board 0_beam.csv
 # nothing -- an empty lap is usually a real answer about the boards, not a crash.
 # -----------------------------------------------------------------------------
 lap() {
-    local k="$1" target="$2" inc=() nrot nband nout nin
+    local k="$1" target="$2" inc=() frame_arg=() nrot nband nout nin
+    [ "$FIXED_BORDER" = 1 ] && frame_arg=(--with_frame)
     # A lap that emits nothing leaves no file, and `rows` on a missing file is
     # 0 -- but only if a previous run into this same RUN_DIR did not leave one.
     rm -f "${k}_band.csv" "${k}_final.csv" "${k}_rot.csv"
@@ -300,10 +359,21 @@ lap() {
     # exists, and a broken band is dropped at emission.
     "$REPO/bin/E555_backtracker" "$SEED" "${k}_rot.csv" "${k}_bt.csv" \
         --stop_row "$BAND_ROW" --order "$BT_ORDER" --break-mode any \
+        "${frame_arg[@]}" \
         --max-mismatch 0 --solution-limit "$BT_LIMIT" \
         --time-limit "$BT_TIME" --threads "$THREADS" > "${k}_bt.log" 2>&1 || true
     if [ -s "${k}_bt.csv.stop_row${BAND_ROW}.csv" ]; then
         mv "${k}_bt.csv.stop_row${BAND_ROW}.csv" "${k}_band.csv"
+    fi
+    # Thin the enumeration down to BT_PICK bands the finalizer will actually
+    # grow. Farthest-first on cell agreement, because the DFS returns its first
+    # K sharing a long prefix and exact bands are all the same score -- there is
+    # nothing else to choose on. Skipped when the cut returned few enough anyway.
+    if [ -s "${k}_band.csv" ] && [ "$(rows "${k}_band.csv")" -gt "$BT_PICK" ]; then
+        python3 "$REPO/tools/E555_rank.py" "${k}_band.csv" --seed "$SEED" \
+            --diverse "$BT_PICK" --emit "${k}_band.tmp" > /dev/null 2>&1 \
+            && mv "${k}_band.tmp" "${k}_band.csv"
+        rm -f "${k}_band.tmp"
     fi
     rm -f "${k}_bt.csv" "${k}_bt.csv".*
     nband=$(rows "${k}_band.csv")

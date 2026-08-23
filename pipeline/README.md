@@ -36,9 +36,17 @@ searches rows `0..N` only and emits every exact filling -- and that is the whole
 reason this runner exists. One lap:
 
 ```
-rows 0..T full -> rotate +-90 -> backtracker --stop_row 5 --order rowmajor
+rows 0..T full -> rotate +-90 -> backtracker --stop_row 5 --with_frame --order rowmajor
                -> finalizer --finalize_from 5 --stop_row T -> rows 0..T full
 ```
+
+`--with_frame` widens the cut to take in the outer frame, so the band carries all
+60 border cells instead of the 26 a plain `--stop_row` leaves -- border cells the
+turned board holds are kept, the ones it does not are searched, and a band whose
+leftover border pool will not chain is dropped. That is what lets the finalizer
+run its fixed-sides mode instead of falling back to `--free_edges`. It costs
+population (a harder cut) and yield (fixed sides beat fewer completions out of
+the same depth), so `FIXED_BORDER=0` keeps the old free-border lap for comparison.
 
 The lap ends where it began, rebuilt from a different direction. It keeps rows
 `0..5` of the turned board -- a six-deep slab against one side -- and that side
@@ -48,7 +56,11 @@ survives a full circle untouched. Four laps is one full turn.
 
 It does **not** climb: `WHIRL_ROWS` stays inside 10..12 because below 10 the
 output floods (the whole stop-row beam is emitted before anything has gone
-extinct) and above 12 the beam is spent and the Stage C tools are better. The
+extinct) and above 12 the beam is spent and the Stage C tools are better. Twelve
+is not merely expensive, it is out of reach from a five-row lock: measured
+against a perfect board on its own frame, the beam found completions at row 10
+and row 11 and **none at all** at row 12, fixed border or free. The default is
+four laps at row 10; row 12 is Stage C's job, not a lap's. The
 loop holds its depth and spends its time on coverage; Stage C runs once, at the
 end. Both bounds are warnings, not refusals -- go shallow deliberately if you
 want to; only a stop row outside 1..13 is rejected.
@@ -62,7 +74,8 @@ what it was given means the neighbourhood is exhausted.
 ```bash
 bash pipeline/run_pipeline_whirlpool.sh                    # beamer, then four laps
 INPUT=champions.csv bash pipeline/run_pipeline_whirlpool.sh  # whirl boards you have
-WHIRL_ROWS="11 12 12 12" BAND_ROW=5 POP=40 bash pipeline/run_pipeline_whirlpool.sh
+WHIRL_ROWS="10 10 10 10" BAND_ROW=5 POP=40 bash pipeline/run_pipeline_whirlpool.sh
+FIXED_BORDER=0 bash pipeline/run_pipeline_whirlpool.sh        # the old free-border lap
 ```
 
 `INPUT` skips the beamer and whirls boards you already have -- they need whole
