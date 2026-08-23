@@ -60,6 +60,7 @@ ALL_STEPS=(
     "roundhouse_two_rounds|closes the board in two rounds, rotating between them"
     "roundhouse_selfcheck|the relaxed oracle against brute-force enumeration"
     "roundhouse_legal|every emitted board is break-free and frame-legal"
+    "roundhouse_reverse|--reverse mirrors the seed, so the spiral runs the other way round"
     "backtracker_dives|greedy dives on the example board, plus an own-output round-trip"
     "backtracker_exhaustive|exhaustive enumeration identical at 1 and 4 threads"
     "backtracker_stop_band|--stop_row/--stop_column emit exact, finalizer-shaped bands"
@@ -479,6 +480,77 @@ step_roundhouse_selfcheck() {
     grep -q "PASS" "$OUT/roundhouse_selfcheck.log" || \
         { cat "$OUT/roundhouse_selfcheck.log"; fail "oracle disagrees with brute force"; }
     grep -E "selfcheck" "$OUT/roundhouse_selfcheck.log"
+}
+
+# --reverse mirrors the seed left-right, runs the unchanged right/top/left spiral
+# in that mirror, and mirrors every emitted board back. Four maps have to compose
+# to the identity for that to work -- the seed, the clue table, the board in and
+# the board out -- and rebuilding the KNOWN SOLUTION is what proves they do.
+# Break-freeness alone could not: a mirror preserves every match, so a board
+# emitted still mirrored would score a clean 480 and look perfectly fine. Only
+# equality with data/synth_solution_480.csv catches a missing un-mirror.
+step_roundhouse_reverse() {
+    rh_fixtures
+    for spec in "rh_rows12.csv:0" "rh_rows10.csv:5"; do
+        src="${spec%%:*}"; w="${spec##*:}"
+        bin/E555_roundhouse data/synth_seed.txt "$OUT/$src" --reverse --rounds 1 \
+            --strip_width "$w" --ties 50 --out_dir "$OUT/rh_rev_$w" > "$OUT/roundhouse_rev_$w.log"
+        comp=$(first_match "$OUT/rh_rev_$w"/roundhouse_*rev_*_miss0.csv)
+        [ -s "$comp" ] || { tail -5 "$OUT/roundhouse_rev_$w.log"; fail "reverse ($src) emitted nothing"; }
+        python3 - "$comp" data/synth_solution_480.csv "$src" <<'EOF' || exit 1
+import sys
+def rows(p): return [l.split(",") for l in open(p) if l.strip() and not l.startswith("#")]
+truth = rows(sys.argv[2])[0]
+tpos, trot = [x.strip() for x in truth[-512:-256]], [x.strip() for x in truth[-256:]]
+hit = False
+for r in rows(sys.argv[1]):
+    pos, rot = [x.strip() for x in r[-512:-256]], [x.strip() for x in r[-256:]]
+    assert "999" not in pos, "a --rounds 1 completion must be a full 256-piece board"
+    hit = hit or (pos == tpos and rot == trot)
+assert hit, "the mirrored search did not rebuild the known solution (%s)" % sys.argv[3]
+print("ok: mirrored spiral rebuilt the known solution from %s" % sys.argv[3])
+EOF
+    done
+
+    # The spiral really turned round. --rotate names the side round 1 attacks and
+    # keeps it for odd K, so it is rounds 2 and 3 that have to diverge. Nothing is
+    # searched here: --border_row is past the end of the one-line CSV.
+    plan() {
+        bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_rows12.csv" --rounds 3 \
+            --strip_width 3 --rotate 1 --border_row 9 --out_dir "$OUT/rh_rev_plan" "$@" 2>&1 |
+            sed -n 's/^\[plan\] rounds refill the input.s //p' | sed 's/ band;.*//'
+    }
+    [ "$(plan)" = "TOP -> LEFT -> BOTTOM" ] || fail "the forward spiral changed: $(plan)"
+    [ "$(plan --reverse)" = "TOP -> RIGHT -> BOTTOM" ] || \
+        fail "--reverse did not turn the spiral round: $(plan --reverse)"
+    echo "ok: --rotate 1 refills TOP -> LEFT -> BOTTOM, and TOP -> RIGHT -> BOTTOM reversed"
+
+    # Corner roles are read in the INPUT's coordinates, so --BL still means the
+    # board the user handed in. --rotate 3 frees the bottom band either way, and
+    # the synthetic solution has piece 95 at (0,0) and piece 31 at (0,15): pinning
+    # the right one must find the solution, pinning the other must refute.
+    for spec in "95:1" "31:0"; do
+        pid="${spec%%:*}"; want="${spec##*:}"
+        rm -rf "$OUT/rh_rev_pin"
+        bin/E555_roundhouse data/synth_seed.txt data/synth_solution_480.csv --reverse \
+            --rounds 1 --strip_width 3 --rotate 3 --ties 50 --BL "$pid" \
+            --out_dir "$OUT/rh_rev_pin" > "$OUT/roundhouse_rev_pin$pid.log"
+        got=$(first_match "$OUT/rh_rev_pin"/roundhouse_*rev_*_miss0.csv)
+        n=0; [ -n "$got" ] && [ -s "$got" ] && n=1
+        [ "$n" = "$want" ] || fail "--reverse --BL $pid: expected emitted=$want, got $n"
+    done
+    echo "ok: --BL still names the input board's bottom-left corner under --reverse"
+
+    # A break inside the kept core must be reported on the user's board, not in
+    # mirror space. The fixture swaps the pieces at (4,6) and (4,11), so both
+    # directions have to name a row-4 cell -- and un-mirroring the column is the
+    # only way the reversed run can.
+    bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_corebreak.csv" --reverse --rounds 1 \
+        --strip_width 3 --rotate 1 --out_dir "$OUT/rh_rev_cb" \
+        > "$OUT/roundhouse_rev_cb.log" 2>&1 || true
+    grep -qE "break inside the kept region at \(4,[0-9]+\)-\(4,[0-9]+\)" "$OUT/roundhouse_rev_cb.log" || \
+        { cat "$OUT/roundhouse_rev_cb.log"; fail "the core break was not reported in the input's coordinates"; }
+    echo "ok: a core break is reported on the input board, not on its mirror"
 }
 
 # The roundhouse only ever places pieces matching on every committed side, so a

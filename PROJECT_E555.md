@@ -970,7 +970,8 @@ inside the strip, so each inner color's surplus must be non-negative *and even*.
 
 ### Geometry
 
-Work in a **frame**: the board rotated `--rotate` quarter-turns clockwise, so
+Work in a **frame**: the board mirrored by `--reverse`, then rotated `--rotate`
+quarter-turns clockwise, so
 the strip is always the rightmost W columns. A rotation maps `(r,c) → (15-c, r)`
 and spin `s → (s+3)&3`. Boards are emitted in the input's orientation.
 
@@ -1079,6 +1080,41 @@ provably has a solution, which makes a round-1 failure diagnostic rather than
 normal. Expect it to die earlier overall, since it reaches the hard region with
 a depleted pool.
 
+### --reverse: the spiral the other way round
+
+Every strip level ends on a frame-**right** edge terminal, so the spiral has one
+handedness and the four rows above are all `--rotate` can offer. `--reverse`
+mirrors the board left-right instead and gives the other four:
+
+| `--reverse --rotate` | round 1 | round 2 | round 3 | core hugs |
+|---|---|---|---|---|
+| 0 | left | top | right | bottom |
+| 1 | top | right | bottom | left |
+| 2 | right | bottom | left | top |
+| 3 or -1 | bottom | left | top | right |
+
+Reflecting the board swaps each piece's left and right colours and negates its
+spin: a placement `(p, (r,c), s)` mirrors to `(p, (r,15-c), (4-s)&3)`, the piece
+id untouched, and mirroring twice is the identity. The mirrored pieces do not
+exist in the box, but they are a legal seed - swapping left and right preserves
+each piece's grey count, and a corner's two greys stay adjacent - so every
+derived table builds unchanged and the whole search simply runs in the mirror.
+Boards are mirrored on the way in and back on the way out, so nothing outside the
+process ever sees a mirrored piece. `--rotate` keeps its meaning for round 1 at
+odd `K`: `--rotate 1` still attacks the input's top either way.
+
+It does **not** free a region `--rotate` cannot already free. The kept core is
+either mirror-symmetric or lands on another `--rotate`'s core - at `--rounds 3
+--strip_width 5` the 11x6 core sits on columns 5..10, dead centre, so `--reverse
+--rotate 0` keeps exactly the same 66 cells. What changes is the **search**: each
+band is traversed the other way with the wall on the other side, so the strip DFS
+and the oracle's layered graph are different problems over the same cells, and
+because the rounds nest, the order in which bands are rebuilt decides which
+partial the run reaches. Run to exhaustion the two directions prove the same
+theorem. The value is in the cut that does *not* exhaust - `--rounds 3
+--strip_width 5`, the one the sizing note above admits ends on a budget - where
+the two reach different deepest boards. Eight distinct searches instead of four.
+
 ### What gets reported
 
 The search is **exhaustive and deterministic** - no beam, no sampling, no random
@@ -1096,11 +1132,11 @@ round. `--ties N` widens that to N boards at the same depth, dropping any that
 repeats an earlier one with a single frontier piece swapped, since those collapse
 into the same board the moment a later stage frees the frontier.
 
-Boards go to `<out_dir>/roundhouse_round<N>_rot<K>_W<w>_miss<B>.csv`, appended
-one atomic line at a time, duplicates suppressed. The name carries `--rounds`,
-`--rotate` and `--strip_width`, so runs with different geometry never share a
-file -- while runs with the *same* geometry do, which is what lets a corpus sweep
-accumulate.
+Boards go to `<out_dir>/roundhouse_round<N>_rot<K>[rev]_W<w>_miss<B>.csv`,
+appended one atomic line at a time, duplicates suppressed. The name carries
+`--rounds`, `--rotate`, `--reverse` and `--strip_width`, so runs with different
+geometry never share a file -- while runs with the *same* geometry do, which is
+what lets a corpus sweep accumulate.
 
 **Two files, split by breaks.** A board with no mismatch goes to `miss0`; one
 with mismatches goes to `miss<--max_breaks>`. So `miss0` is always a corpus you
@@ -1119,8 +1155,8 @@ Ids are `p<line><tag><n>`, `n` counting boards written by this run, so every lin
 is uniquely named and stdout names the id it just wrote.
 
 **Boards are always written in the input's orientation** - the frame is rotated
-back first, so cell `(r,c)` means what it meant in the input whatever `--rotate`
-was. Every placed junction matches, so `score` is 480 minus the junctions a hole
+back (and un-mirrored) first, so cell `(r,c)` means what it meant in the input
+whatever `--rotate` and `--reverse` were. Every placed junction matches, so `score` is 480 minus the junctions a hole
 still leaves unrealized - it falls with every *empty* cell and never with a
 mismatch. A 191-piece board scoring 350 is perfectly matched, not damaged;
 compare a partial with a partial, or re-score both with `tools/E555_rank.py`.
@@ -1188,8 +1224,9 @@ feeds any stage unchanged.
 | `--strip_width W` | 5 | 2..5; chain length, and hence the core. 0 = narrowest usable |
 | `--rounds N` | 3 | 1..3; bands freed and refilled (right, top, left) |
 | `--rotate K` | 1 | quarter-turns before the cut, -3..3; negative turns anticlockwise |
+| `--reverse` | off | spiral the other way round, by mirroring the seed; a second exhaustive attack on the same cells, not a new region |
 | `--stop_row R` | last level | stop each strip at this level instead of its last |
-| `--BL/--BR/--TL/--TR P` | -- | pin a corner piece by **original**-board role |
+| `--BL/--BR/--TL/--TR P` | -- | pin a corner piece by its role on the **input** board |
 | `--max_breaks B` | 0 = off | after the exhaustive search, greedily fill the rest of the deepest board, spending at most B mismatches |
 | `--max_nodes N` | 0 | node budget per input board |
 | `--config_time_sec S` | 600 | wall-time budget per input board |
@@ -1733,7 +1770,7 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
 | Stage A | `rotations.csv` | `# comment` lines + `id, spin[0..255]` (60 border spins, 196 zeros) |
 | beamer | `beam_completions_<border>_<row>.csv` / `..._random_<row>.csv` | `config_id, sol_idx, pos[256], rot[256]` (514) |
 | beamer | `sweep_checkpoint.txt` | resume state, one line |
-| roundhouse | `roundhouse_round<N>_rot<K>_W<w>_miss0.csv` (break-free) and `..._miss<B>.csv` (with breaks) | canonical 514-field layout, ids `p<line><tag><n>` |
+| roundhouse | `roundhouse_round<N>_rot<K>[rev]_W<w>_miss0.csv` (break-free) and `..._miss<B>.csv` (with breaks) | canonical 514-field layout, ids `p<line><tag><n>` |
 | finalizer | `beam_completions_finalized_<row>.csv` | same 514-field layout, ids `p<line>r<repeat>l<column>` |
 | Stage C (all) | output CSV | **canonical**: `config_id, score, pos[256], rot[256]` (514) |
 | backtracker | `<out>.checkpoint.csv`, `<out>.status.csv`, `<out>.best_*.csv` | canonical rows / diagnostic sidecars |
