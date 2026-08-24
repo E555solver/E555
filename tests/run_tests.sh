@@ -60,6 +60,8 @@ ALL_STEPS=(
     "roundhouse_two_rounds|closes the board in two rounds, rotating between them"
     "roundhouse_selfcheck|the relaxed oracle against brute-force enumeration"
     "roundhouse_legal|every emitted board is break-free and frame-legal"
+    "roundhouse_reverse|--reverse mirrors the seed, so the spiral runs the other way round"
+    "roundhouse_hold_band|--hold_band keeps the last band's standing levels and fills up to meet them"
     "backtracker_dives|greedy dives on the example board, plus an own-output round-trip"
     "backtracker_exhaustive|exhaustive enumeration identical at 1 and 4 threads"
     "backtracker_stop_band|--stop_row/--stop_column emit exact, finalizer-shaped bands"
@@ -71,6 +73,7 @@ ALL_STEPS=(
     "scripts_parse|every shipped example and pipeline script parses"
     "example_finalizer|examples/02 re-grows the synthetic board"
     "example_roundhouse|examples/03 refills one strip"
+    "example_bothways|examples/06 runs both chains over one board, ids intact"
     "example_cpsat|examples/04, the whole Stage C chain"
     "example_backtracker|examples/05 dives on the example board"
     "pipeline_topper_sweep|pipeline/topper_sweep.sh through a two-pass plan"
@@ -481,6 +484,140 @@ step_roundhouse_selfcheck() {
     grep -E "selfcheck" "$OUT/roundhouse_selfcheck.log"
 }
 
+# --reverse mirrors the seed left-right, runs the unchanged right/top/left spiral
+# in that mirror, and mirrors every emitted board back. Four maps have to compose
+# to the identity for that to work -- the seed, the clue table, the board in and
+# the board out -- and rebuilding the KNOWN SOLUTION is what proves they do.
+# Break-freeness alone could not: a mirror preserves every match, so a board
+# emitted still mirrored would score a clean 480 and look perfectly fine. Only
+# equality with data/synth_solution_480.csv catches a missing un-mirror.
+step_roundhouse_reverse() {
+    rh_fixtures
+    for spec in "rh_rows12.csv:0" "rh_rows10.csv:5"; do
+        src="${spec%%:*}"; w="${spec##*:}"
+        bin/E555_roundhouse data/synth_seed.txt "$OUT/$src" --reverse --rounds 1 \
+            --strip_width "$w" --ties 50 --out_dir "$OUT/rh_rev_$w" > "$OUT/roundhouse_rev_$w.log"
+        comp=$(first_match "$OUT/rh_rev_$w"/roundhouse_*rev_*_miss0.csv)
+        [ -s "$comp" ] || { tail -5 "$OUT/roundhouse_rev_$w.log"; fail "reverse ($src) emitted nothing"; }
+        python3 - "$comp" data/synth_solution_480.csv "$src" <<'EOF' || exit 1
+import sys
+def rows(p): return [l.split(",") for l in open(p) if l.strip() and not l.startswith("#")]
+truth = rows(sys.argv[2])[0]
+tpos, trot = [x.strip() for x in truth[-512:-256]], [x.strip() for x in truth[-256:]]
+hit = False
+for r in rows(sys.argv[1]):
+    pos, rot = [x.strip() for x in r[-512:-256]], [x.strip() for x in r[-256:]]
+    assert "999" not in pos, "a --rounds 1 completion must be a full 256-piece board"
+    hit = hit or (pos == tpos and rot == trot)
+assert hit, "the mirrored search did not rebuild the known solution (%s)" % sys.argv[3]
+print("ok: mirrored spiral rebuilt the known solution from %s" % sys.argv[3])
+EOF
+    done
+
+    # The spiral really turned round. --rotate names the side round 1 attacks and
+    # keeps it for odd K, so it is rounds 2 and 3 that have to diverge. Nothing is
+    # searched here: --border_row is past the end of the one-line CSV.
+    plan() {
+        bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_rows12.csv" --rounds 3 \
+            --strip_width 3 --rotate 1 --border_row 9 --out_dir "$OUT/rh_rev_plan" "$@" 2>&1 |
+            sed -n 's/^\[plan\] rounds refill the input.s //p' | sed 's/ band;.*//'
+    }
+    [ "$(plan)" = "TOP -> LEFT -> BOTTOM" ] || fail "the forward spiral changed: $(plan)"
+    [ "$(plan --reverse)" = "TOP -> RIGHT -> BOTTOM" ] || \
+        fail "--reverse did not turn the spiral round: $(plan --reverse)"
+    echo "ok: --rotate 1 refills TOP -> LEFT -> BOTTOM, and TOP -> RIGHT -> BOTTOM reversed"
+
+    # Corner roles are read in the INPUT's coordinates, so --BL still means the
+    # board the user handed in. --rotate 3 frees the bottom band either way, and
+    # the synthetic solution has piece 95 at (0,0) and piece 31 at (0,15): pinning
+    # the right one must find the solution, pinning the other must refute.
+    for spec in "95:1" "31:0"; do
+        pid="${spec%%:*}"; want="${spec##*:}"
+        rm -rf "$OUT/rh_rev_pin"
+        bin/E555_roundhouse data/synth_seed.txt data/synth_solution_480.csv --reverse \
+            --rounds 1 --strip_width 3 --rotate 3 --ties 50 --BL "$pid" \
+            --out_dir "$OUT/rh_rev_pin" > "$OUT/roundhouse_rev_pin$pid.log"
+        got=$(first_match "$OUT/rh_rev_pin"/roundhouse_*rev_*_miss0.csv)
+        n=0; [ -n "$got" ] && [ -s "$got" ] && n=1
+        [ "$n" = "$want" ] || fail "--reverse --BL $pid: expected emitted=$want, got $n"
+    done
+    echo "ok: --BL still names the input board's bottom-left corner under --reverse"
+
+    # A break inside the kept core must be reported on the user's board, not in
+    # mirror space. The fixture swaps the pieces at (4,6) and (4,11), so both
+    # directions have to name a row-4 cell -- and un-mirroring the column is the
+    # only way the reversed run can.
+    bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_corebreak.csv" --reverse --rounds 1 \
+        --strip_width 3 --rotate 1 --out_dir "$OUT/rh_rev_cb" \
+        > "$OUT/roundhouse_rev_cb.log" 2>&1 || true
+    grep -qE "break inside the kept region at \(4,[0-9]+\)-\(4,[0-9]+\)" "$OUT/roundhouse_rev_cb.log" || \
+        { cat "$OUT/roundhouse_rev_cb.log"; fail "the core break was not reported in the input's coordinates"; }
+    echo "ok: a core break is reported on the input board, not on its mirror"
+}
+
+# --hold_band stops the last round freeing what is already standing in its band,
+# so two passes can compound instead of the second erasing the first. The fixture
+# is the known solution with the near half of the right band emptied: eight
+# complete chain levels stay at the far end, and the search has to fill up to
+# MEET them. Getting all 256 pieces back is the assertion -- the held pieces are
+# never re-placed, so the run can only reach 480 by filling to fit them.
+step_roundhouse_hold_band() {
+    rh_fixtures
+    python3 - data/synth_solution_480.csv "$OUT/rh_hold.csv" <<'EOF' || exit 1
+import sys
+src, dst = sys.argv[1:3]
+line = [l for l in open(src) if l.strip() and not l.lstrip().startswith(("#", "%"))][0]
+f = [t.strip() for t in line.split(",")]
+pos, rot = [int(x) for x in f[-512:-256]], f[-256:]
+# Columns 13..15 are the band a W=3 --rounds 1 --rotate 0 run frees; emptying
+# rows 0..7 of it leaves rows 8..15 standing as eight whole levels.
+free = {r * 16 + c for r in range(8) for c in range(13, 16)}
+open(dst, "w").write("held, 0, " + ", ".join(str(999 if p in free else p) for p in pos)
+                     + ", " + ", ".join(rot) + "\n")
+print("ok: fixture keeps rows 8..15 of the right band, empties rows 0..7")
+EOF
+    bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_hold.csv" --rounds 1 --strip_width 3 \
+        --rotate 0 --hold_band --ties 1 --out_dir "$OUT/rh_hold" \
+        > "$OUT/roundhouse_hold.log" 2>&1
+    grep -q "holding 24 piece(s) = 8 chain level(s)" "$OUT/roundhouse_hold.log" || \
+        { cat "$OUT/roundhouse_hold.log"; fail "--hold_band did not hold the standing levels"; }
+    comp=$(first_match "$OUT"/rh_hold/roundhouse_*_miss0.csv)
+    [ -s "$comp" ] || { tail -5 "$OUT/roundhouse_hold.log"; fail "--hold_band emitted nothing"; }
+    python3 - "$comp" "$OUT/rh_hold.csv" data/synth_solution_480.csv <<'EOF' || exit 1
+import sys
+def row(p):
+    l = [x for x in open(p) if x.strip() and not x.lstrip().startswith(("#", "%"))][0]
+    f = [t.strip() for t in l.split(",")]
+    return f[0], [int(x) for x in f[-512:-256]], f[-256:]
+oid, opos, orot = row(sys.argv[1])
+_,   hpos, hrot = row(sys.argv[2])
+_,   tpos, trot = row(sys.argv[3])
+held = [p for p in range(256) if hpos[p] != 999]
+moved = [p for p in held if opos[p] != hpos[p] or orot[p] != hrot[p]]
+assert not moved, "held pieces were moved: %s" % moved[:5]
+assert "999" not in [str(x) for x in opos], "the board is not complete"
+assert opos == tpos and orot == trot, "the completion is not the known solution"
+assert oid.startswith("held_"), "the input config_id was not kept: %s" % oid
+print("ok: 232 held/core pieces untouched, 24 filled to meet them, id %s" % oid)
+EOF
+    # A band that cannot be held is NOT a refusal: it is freed and searched from
+    # nothing, exactly as without the flag, so a damaged band still gets a run.
+    bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_damaged.csv" --rounds 1 \
+        --strip_width 3 --hold_band --out_dir "$OUT/rh_hold_fb" \
+        > "$OUT/roundhouse_hold_fb.log" 2>&1 || true
+    grep -q "not holdable" "$OUT/roundhouse_hold_fb.log" || \
+        { cat "$OUT/roundhouse_hold_fb.log"; fail "an unholdable band was not reported"; }
+    fb=$(first_match "$OUT"/rh_hold_fb/roundhouse_*_miss0.csv)
+    [ -s "$fb" ] || { tail -5 "$OUT/roundhouse_hold_fb.log"; fail "the fallback did not search"; }
+    # --stop_row would move the strip's top, which the held block already fixes.
+    bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_hold.csv" --rounds 1 --strip_width 3 \
+        --hold_band --stop_row 5 --out_dir "$OUT/rh_hold_bad" \
+        > "$OUT/roundhouse_hold_bad.log" 2>&1 && fail "--hold_band --stop_row was accepted"
+    grep -q "both set where the strip ends" "$OUT/roundhouse_hold_bad.log" || \
+        { cat "$OUT/roundhouse_hold_bad.log"; fail "the conflicting pair was not explained"; }
+    echo "ok: held levels met, a damaged band falls back and still runs, --stop_row refused"
+}
+
 # The roundhouse only ever places pieces matching on every committed side, so a
 # break or a frame violation in its output is a bug, not merely a worse board.
 step_roundhouse_legal() {
@@ -879,6 +1016,32 @@ step_example_roundhouse() {
     nf=$(awk -F, '!/^ *[#%]/{print NF; exit}' "$comp")
     [ "$nf" = "514" ] || fail "examples/03 wrote $nf fields, want 514"
     echo "ok: examples/03 refilled one strip, canonical output"
+}
+
+# examples/06 chains two roundhouse passes per board, once each way round, and
+# --hold_band lets the second keep what the first left. On the synthetic board
+# the first pass of each chain already closes the puzzle, so both chains report
+# 480 and the ids carry every stage: the input's own, the tool's suffix, then
+# the pass that wrote it.
+step_example_bothways() {
+    rh_fixtures
+    SEED=data/synth_seed.txt PARTIALS="$OUT/rh_rows12.csv" OUT_DIR="$OUT/ex06" \
+    ROUNDS=1 WIDTH=3 ROTATE=1 N_LINES=1 HOLD=1 CLUES=0 MAX_WALL=120 \
+        bash examples/06_roundhouse_both_ways.sh > "$OUT/ex06.log" \
+        || { tail -5 "$OUT/ex06.log"; fail "examples/06 exited non-zero"; }
+    grep -q "chains 480/480" "$OUT/ex06.log" || \
+        { tail -8 "$OUT/ex06.log"; fail "both chains should reach the known solution"; }
+    comp=$(first_match "$OUT/ex06"/cfg0/a1/roundhouse_*_miss0.csv)
+    [ -s "$comp" ] || { tail -5 "$OUT/ex06.log"; fail "examples/06 emitted nothing"; }
+    nf=$(awk -F, '!/^ *[#%]/{print NF; exit}' "$comp")
+    [ "$nf" = "514" ] || fail "examples/06 wrote $nf fields, want 514"
+    id=$(awk -F, '!/^ *[#%]/{print $1; exit}' "$comp")
+    case "$id" in board_*_a1) ;; *) fail "id lost its provenance: $id" ;; esac
+    # Holding a whole band leaves no pool and no strip. That is a result, not a
+    # failure: the run says so and the chain carries on.
+    grep -q "nothing to search" "$OUT/ex06/cfg0/a2/log" || \
+        { tail -5 "$OUT/ex06/cfg0/a2/log"; fail "a fully held band should report, not abort"; }
+    echo "ok: examples/06 ran both chains to 480, id $id"
 }
 
 step_example_cpsat() {

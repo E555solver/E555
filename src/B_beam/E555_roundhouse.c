@@ -84,8 +84,9 @@
  *   bin/E555_roundhouse data/seed_Edge5.txt partial.csv --rounds 3 --max_breaks 12
  *
  * VOCABULARY (used throughout the file)
- *   frame       the board after --rotate clockwise quarter-turns. All internal
- *               coordinates are frame coordinates; output is un-rotated back.
+ *   frame       the board after the --reverse mirror and --rotate clockwise
+ *               quarter-turns. All internal coordinates are frame coordinates;
+ *               output is un-rotated and un-mirrored back.
  *               A rotation maps cell (r,c) -> (15-c, r) and spin s -> (s+3)&3.
  *   strip       the W rightmost columns of the frame -- the cells being filled.
  *   level       one row of the strip. Level 0 and (when the strip reaches the
@@ -153,6 +154,67 @@
  *   last and re-cuts the bottom band first -- the band the pipeline fixes at row
  *   0 by random sampling and never revisits.
  *
+ * --reverse: THE SPIRAL THE OTHER WAY ROUND
+ *   Every strip level ends on a frame-RIGHT edge terminal, so the spiral has one
+ *   handedness and no --rotate can turn it round -- the four rows above are all
+ *   there is. --reverse MIRRORS THE BOARD left-right instead, which costs one
+ *   swap per piece and gives the other four:
+ *
+ *      --reverse  round 1   round 2   round 3   core hugs
+ *         0       left      top       right     bottom
+ *         1       top       right     bottom    left
+ *         2       right     bottom    left      top
+ *      3 or -1    bottom    left      top       right
+ *
+ *   At the default K=1 round 1 is still the input's top either way; only rounds
+ *   2 and 3 diverge. Mirroring twice is the identity, so the mirrored pieces --
+ *   which do not exist in the box -- never leave this process: boards come in,
+ *   are mirrored, are searched, and are mirrored back before they are written.
+ *
+ *   WHAT IT DOES NOT DO is free a region --rotate cannot already free. The kept
+ *   core is either mirror-symmetric or lands on another --rotate's core: at
+ *   --rounds 3 --strip_width 5 the 11x6 core sits on columns 5..10, dead centre,
+ *   so --reverse --rotate 0 keeps exactly the same 66 cells as --rotate 0. What
+ *   changes is the SEARCH. Each band is traversed the other way with the wall on
+ *   the other side, so the strip DFS and the oracle's layered graph are
+ *   different problems over the same cells; and because the rounds nest, the
+ *   order in which bands are rebuilt decides which partial the run reaches. Run
+ *   to exhaustion both directions prove the same theorem. The value is in the
+ *   case that does NOT exhaust -- the wide cut, which the section above admits
+ *   ends on a budget -- where the two directions reach different deepest boards.
+ *   Eight distinct searches instead of four.
+ *
+ * --hold_band: LET THE TWO SPIRALS COMPOUND
+ *   By default every band outside the core is freed, and that includes whatever
+ *   a previous roundhouse pass managed to put in the LAST one. Run CCW and then
+ *   CW on its output and the second pass tears out the first pass's work in that
+ *   band before it starts: measured over 25 boards, pass 1 placed 100 pieces in
+ *   the last band and pass 2 kept none of them. Nor does the search win them
+ *   back, because a strip is filled in whole chain LEVELS and a scatter of cells
+ *   is not a reachable prefix.
+ *
+ *   --hold_band keeps them instead. It works because of what the other spiral
+ *   leaves behind: the two handednesses traverse the same band from OPPOSITE
+ *   ends, so pass 1 stops having filled k complete levels at the far end of
+ *   pass 2's strip -- exactly the shape this search can terminate against. The
+ *   held levels stay on the board, their pieces stay out of the pool, the strip
+ *   stops one level below them, and the oracle is seeded with the single
+ *   signature they sit on. Every other way of filling the level underneath is
+ *   then dead on colour before a piece is tried, so the search does not merely
+ *   avoid disturbing the block, it fills up to MEET it.
+ *
+ *   The point is that a chain can only improve: pass 2 starts from everything
+ *   pass 1 proved and adds to it. The cost is that it also starts CONSTRAINED --
+ *   a pass free to rebuild the whole band sometimes finds a better arrangement
+ *   than one that must keep the far end. Both are worth running; that is why
+ *   this is a flag and not the default.
+ *
+ *   NOT EVERY BAND CAN BE HELD, and an unholdable one is not a refusal. If what
+ *   stands there is a partial level, or carries a break, or is mis-seated, the
+ *   band is freed and searched from nothing exactly as without the flag -- the
+ *   run still happens, and the reason is printed with the offending cell in the
+ *   input board's coordinates. Rounds 1..N-1 always free their bands.
+ *
  * INPUT REQUIREMENTS
  *   Only the kept region is validated, and it is validated completely: every
  *   cell placed, every piece legally seated against the frame, every junction
@@ -176,18 +238,22 @@
  *   trust break-free, and the two never have to be told apart afterwards. Routing
  *   is on the board's OWN break count, so a greedy fill that lands perfectly is
  *   filed with the clean boards. Files open on first write: a run that emits
- *   nothing leaves nothing behind. Ids are p<line><tag><n> with n counting boards
- *   written by this run, and the tag saying what the board is:
+ *   nothing leaves nothing behind. THE INPUT BOARD'S config_id IS KEPT, and this
+ *   run appends `_<line><tag><n>` to it -- the input data line, the tag below, and
+ *   a counter unique within the run. So a board carries every stage it came
+ *   through, chained roundhouse passes included, and a board with no id of its own
+ *   is given `p<line>` to carry. The tag says what the board is:
  *
  *     s   SOLVED     complete and break-free. The puzzle, for this cut.
  *     d   DEEPEST    the furthest the exhaustive break-free search got.
  *     f   FILLED     complete, produced by the --max_breaks greedy fill.
  *
  *   BOARDS ARE ALWAYS WRITTEN IN THE INPUT'S ORIENTATION. The frame is rotated
- *   back before writing, so cell (r,c) in the output means what it meant in the
- *   input, whatever --rotate was. Output feeds any Stage B or Stage C tool
- *   unchanged -- including this one, with a different --rotate, which is how the
- *   core (the one region a run never touches) moves.
+ *   and un-mirrored back before writing, so cell (r,c) in the output means what
+ *   it meant in the input, whatever --rotate and --reverse were. Output feeds
+ *   any Stage B or Stage C tool unchanged -- including this one, with a
+ *   different --rotate or --reverse, which is how the core (the one region a run
+ *   never touches) moves.
  */
 
 #include <stdio.h>
@@ -218,8 +284,10 @@ static uint32_t g_line_count   = 1;     /* --border_row_N */
 static int      g_opt_W        = 5;     /* --strip_width, 0 = narrowest usable */
 static int      g_rounds       = 3;
 static int      g_rotate       = 1;
+static bool     g_reverse      = false; /* --reverse: mirror the board left-right */
 static int      g_stop_level   = -1;    /* --stop_row, -1 = the strip's last */
-static int      g_pin_corner[4] = { -1, -1, -1, -1 };   /* BL BR TL TR (original) */
+static bool     g_hold_band    = false; /* --hold_band: keep the last band's pieces */
+static int      g_pin_corner[4] = { -1, -1, -1, -1 };   /* BL BR TL TR (input) */
 static uint64_t g_max_nodes    = 0;
 static uint32_t g_ties         = 1;     /* boards to emit at the deepest reach */
 static int      g_max_breaks   = 0;     /* --max_breaks: greedy fill budget */
@@ -229,8 +297,8 @@ static double   g_max_wall_sec = 0.0;
 static uint64_t g_max_boards   = 0;
 static bool     g_selfcheck    = false; /* --selfcheck: validate the oracle */
 
-/* Corner roles, indexed as g_pin_corner: 0=BL 1=BR 2=TL 3=TR, in ORIGINAL board
-   coordinates (cell (0,0), (0,15), (15,0), (15,15)). */
+/* Corner roles, indexed as g_pin_corner: 0=BL 1=BR 2=TL 3=TR, in the INPUT
+   board's coordinates (cell (0,0), (0,15), (15,0), (15,15)). */
 static const char *k_corner_name[4] = { "BL", "BR", "TL", "TR" };
 
 /* -- Board (frame coordinates) --------------------------------------------- */
@@ -239,6 +307,7 @@ static Oriented g_grid[PUZZLE_SIDE][PUZZLE_SIDE];
 static bool     g_has[PUZZLE_SIDE][PUZZLE_SIDE];
 static uint64_t g_placed[4];            /* pieces currently on the board */
 static int      g_rot_applied;          /* CW quarter-turns vs the input board */
+static char     g_in_id[96];            /* the input board's config_id, kept on output */
 static int      g_W;                    /* strip width in force */
 static int      g_n_placed;             /* pieces on the board: the depth metric */
 static int      g_avail[NUM_COLORS_TOTAL];   /* free inner-color sides, for parity */
@@ -277,10 +346,16 @@ static struct {
 } g_stats;
 
 /* Which side of the INPUT board a round refills. The frame always cuts right,
-   then top, then left; --rotate decides what that means on the board handed in.
-   (--rotate 1, the default, makes round 1 the input's top.) */
+   then top, then left; --rotate and --reverse decide what that means on the
+   board handed in. (--rotate 1, the default, makes round 1 the input's top,
+   either way round.) */
 static const char *k_side_name[4] = { "RIGHT", "TOP", "LEFT", "BOTTOM" };
-static const char *round_side(int round) { return k_side_name[(g_rotate + round - 1) & 3]; }
+/* Under --reverse the frame is a mirror image of the input, and a left-right
+   mirror swaps exactly those two sides. */
+static const char *k_side_name_rev[4] = { "LEFT", "TOP", "RIGHT", "BOTTOM" };
+static const char *round_side(int round) {
+    return (g_reverse ? k_side_name_rev : k_side_name)[(g_rotate + round - 1) & 3];
+}
 
 /* Every stopping condition in one place. Anything that returns true here means
    the answer is no longer a proof, so callers also set g_truncated. */
@@ -310,6 +385,55 @@ static Oriented rh_oriented(uint16_t pid, uint8_t spin) {
 static int rh_zero_count(int pid) {
     return (g_seed_top[pid] == 0) + (g_seed_right[pid] == 0) +
            (g_seed_bottom[pid] == 0) + (g_seed_left[pid] == 0);
+}
+
+/* -- --reverse: the left-right mirror ---------------------------------------
+   The bands are always freed right, then top, then left IN THE FRAME, and every
+   strip level ends on a frame-RIGHT edge terminal, so the spiral has one
+   handedness and no --rotate can turn it round. Mirroring does, for free.
+
+   Reflecting the board left-right maps side d to (4-d)&3 -- top and bottom stay,
+   left and right swap -- so the mirrored piece is the real one with its left and
+   right colours exchanged. Writing R_s for a spin, the reflection M satisfies
+   M R_s = R_{-s} M, so one placement mirrors to
+
+       piece p at cell (r,c) spin s   ->   piece p at (r, 15-c) spin (4-s)&3
+
+   with the piece id untouched and the whole map its own inverse. The mirrored
+   pieces do not exist in the box, but they form a legal seed: swapping left and
+   right preserves each piece's grey count (and a corner's two greys stay
+   adjacent), which is all load_seed_and_catalog validates, so every derived
+   table -- catalog, (left,bottom) buckets, edge-terminal pool, colour totals --
+   builds unchanged. And rotate_cw advances a spin by 3, which under s -> -s is a
+   real ANTICLOCKWISE quarter-turn: the untouched frame spiral then walks the
+   real board the other way round, which is the whole point.
+
+   The search therefore runs entirely in mirror space. The mirror is applied at
+   exactly four boundaries -- the seed, the clue table, each input board and each
+   emitted board -- and nowhere else. */
+
+/* Swap every piece's left and right colours, then rebuild the oriented catalog
+   the way load_seed_and_catalog does. Called between that and
+   build_catalog_indices(), so nothing downstream ever sees the real seed. */
+static void mirror_seed(void) {
+    for (int i = 0; i < NUM_PIECES; i++) {
+        int t = g_seed_left[i]; g_seed_left[i] = g_seed_right[i]; g_seed_right[i] = t;
+    }
+    g_cat_count = 0;
+    for (int k = 0; k < g_num_inner; k++)
+        for (uint8_t spin = 0; spin < 4; spin++)
+            g_cat[g_cat_count++] = rh_oriented((uint16_t)g_inner_ids[k], spin);
+}
+
+/* Mirror one board in the canonical pos[]/rot[] layout, in place. Used on the
+   way in (before anything reads the board) and on the way out (on a copy). */
+static void mirror_line(int pos[NUM_PIECES], int rot[NUM_PIECES]) {
+    for (int pid = 0; pid < NUM_PIECES; pid++) {
+        if (pos[pid] == 999) continue;
+        int r = pos[pid] / PUZZLE_SIDE, c = pos[pid] % PUZZLE_SIDE;
+        pos[pid] = r * PUZZLE_SIDE + (PUZZLE_SIDE - 1 - c);
+        rot[pid] = (4 - rot[pid]) & 3;
+    }
 }
 
 /* Side indices as in rh_oriented: 0=top 1=right 2=bottom 3=left. */
@@ -363,11 +487,22 @@ static void rotate_cw(void) {
     g_rot_applied = (g_rot_applied + 1) & 3;
 }
 
-/* Map a frame cell back to the original board, undoing `k` clockwise turns. One
-   turn back is (R,C) -> (C, 15-R). */
+/* Map a frame cell back out of the turns, undoing `k` of them. One turn back is
+   (R,C) -> (C, 15-R). This lands in the space the SEARCH calls the board, which
+   under --reverse is still mirrored -- frame_to_input below goes the last step. */
 static void frame_to_orig(int R, int C, int k, int *r, int *c) {
     for (int i = 0; i < (k & 3); i++) { int nr = C, nc = PUZZLE_SIDE-1-R; R = nr; C = nc; }
     *r = R; *c = C;
+}
+
+/* The same map carried one step further, to the board the user actually handed
+   in: undo the turns, then the --reverse mirror. Messages, corner roles and the
+   emitted boards go through here; the search itself never does, because it
+   works in mirror space throughout. Identical to frame_to_orig without
+   --reverse. */
+static void frame_to_input(int R, int C, int k, int *r, int *c) {
+    frame_to_orig(R, C, k, r, c);
+    if (g_reverse) *c = PUZZLE_SIDE - 1 - *c;
 }
 
 /* -- Eternity II clue pieces ------------------------------------------------
@@ -418,6 +553,26 @@ static inline bool clue_on(int k) {
     return (k == 0) ? (g_clue_mask & CLUE_CENTER) != 0 : (g_clue_mask & CLUE_CORNERS) != 0;
 }
 
+/* The clue table this run searches against. It is g_clue, and under --reverse it
+   is g_clue mirrored: a reflected board's clues are not any of the four
+   quarter-turns g_clue holds, so without this every clued board would be
+   skipped for "carries none of the enabled clue pieces". The row index keeps its
+   meaning -- the input board is mirrored too, so a board that was orientation o
+   still matches at row o -- and g_clue itself stays untouched, so a message that
+   names a cell on the user's board reads it from there. */
+static ClueCell g_rh_clue[4][CLUE_N];
+
+static void init_clue_table(void) {
+    memcpy(g_rh_clue, g_clue, sizeof g_rh_clue);
+    if (!g_reverse) return;
+    for (int o = 0; o < 4; o++)
+        for (int k = 0; k < CLUE_N; k++) {
+            ClueCell *cc = &g_rh_clue[o][k];
+            cc->col  = (uint8_t)(PUZZLE_SIDE - 1 - cc->col);
+            cc->spin = (uint8_t)((4 - cc->spin) & 3);
+        }
+}
+
 /* The orientation this board committed to: the one satisfying the most enabled
    clues. -1 when it satisfies none, which is the only case this tool cannot
    resolve on its own. */
@@ -427,7 +582,7 @@ static int rh_clue_orient_of(const int pos[NUM_PIECES], const int rot[NUM_PIECES
         int n = 0;
         for (int k = 0; k < CLUE_N; k++) {
             if (!clue_on(k)) continue;
-            const ClueCell *cc = &g_clue[o][k];
+            const ClueCell *cc = &g_rh_clue[o][k];
             if (pos[cc->piece] == cc->row * PUZZLE_SIDE + cc->col && rot[cc->piece] == cc->spin) n++;
         }
         if (n > best_n) { best = o; best_n = n; }
@@ -441,7 +596,7 @@ static int rh_clue_orient_of(const int pos[NUM_PIECES], const int rot[NUM_PIECES
 static inline bool rh_is_clue_piece(uint16_t pid) {
     if (!g_clue_mask || g_rh_orient < 0) return false;
     for (int k = 0; k < CLUE_N; k++)
-        if (clue_on(k) && g_clue[g_rh_orient][k].piece == pid) return true;
+        if (clue_on(k) && g_rh_clue[g_rh_orient][k].piece == pid) return true;
     return false;
 }
 
@@ -450,7 +605,7 @@ static const ClueCell *rh_clue_at_frame(int R, int C, int *spin_out) {
     if (!g_clue_mask || g_rh_orient < 0) return NULL;
     for (int k = 0; k < CLUE_N; k++) {
         if (!clue_on(k)) continue;
-        const ClueCell *cc = &g_clue[g_rh_orient][k];
+        const ClueCell *cc = &g_rh_clue[g_rh_orient][k];
         int fr, fc, fs;
         orig_to_frame(cc->row, cc->col, cc->spin, g_rot_applied, &fr, &fc, &fs);
         if (fr == R && fc == C) { *spin_out = fs; return cc; }
@@ -459,15 +614,15 @@ static const ClueCell *rh_clue_at_frame(int R, int C, int *spin_out) {
 }
 
 /* The same map on a whole frame rectangle, for the log. A quarter-turn sends a
-   rectangle to a rectangle, so mapping the two opposite corners and taking the
-   min/max is exact -- no scan needed. Used to say where the core and the strip
-   sit on the board the user handed in, which is the one thing no reader can
-   work out from frame coordinates. */
+   rectangle to a rectangle and so does the mirror, so mapping the two opposite
+   corners and taking the min/max is exact -- no scan needed. Used to say where
+   the core and the strip sit on the board the user handed in, which is the one
+   thing no reader can work out from frame coordinates. */
 static void box_to_orig(int R0, int R1, int C0, int C1, int k,
                         int *r0, int *r1, int *c0, int *c1) {
     int a_r, a_c, b_r, b_c;
-    frame_to_orig(R0, C0, k, &a_r, &a_c);
-    frame_to_orig(R1, C1, k, &b_r, &b_c);
+    frame_to_input(R0, C0, k, &a_r, &a_c);
+    frame_to_input(R1, C1, k, &b_r, &b_c);
     *r0 = a_r < b_r ? a_r : b_r; *r1 = a_r < b_r ? b_r : a_r;
     *c0 = a_c < b_c ? a_c : b_c; *c1 = a_c < b_c ? b_c : a_c;
 }
@@ -732,10 +887,12 @@ static void bc_dfs(int depth, int left_need, int frame_side, int pin_corner,
     }
 }
 
-/* Which original corner role sits at frame cell (R,15)? */
+/* Which corner role of the INPUT board sits at frame cell (R,15)? Reading the
+   role in input coordinates is what keeps --BL/--BR/--TL/--TR naming the board
+   the user handed in under --reverse, with no pin table to swap. */
 static int corner_role_at(int R) {
     int r, c;
-    frame_to_orig(R, PUZZLE_SIDE-1, g_rot_applied, &r, &c);
+    frame_to_input(R, PUZZLE_SIDE-1, g_rot_applied, &r, &c);
     return (r == 0 ? 0 : 2) + (c == 0 ? 0 : 1);
 }
 
@@ -777,6 +934,9 @@ static uint64_t *g_live[MAX_ROUNDS+2][MAX_LEVEL+2];
 static int       g_wall[MAX_ROUNDS+2][MAX_LEVEL+2];   /* wall colour per level */
 static int       g_top_level[MAX_ROUNDS+2];           /* last database level */
 static bool      g_close_top[MAX_ROUNDS+2];           /* is there a closure row? */
+static bool      g_held[MAX_ROUNDS+2];                /* --hold_band: levels held above */
+static int       g_held_n[MAX_ROUNDS+2];              /* how many, for the log */
+static uint32_t  g_held_sig[MAX_ROUNDS+2];            /* what they sit on */
 static size_t    g_live_words = 0;
 
 static inline bool live_test(const uint64_t *bs, uint32_t s) {
@@ -836,6 +996,15 @@ static void oracle_backward(int round, int lo, int hi) {
 static void oracle_seed_top(int round) {
     int t = g_top_level[round] + 1;
     uint64_t *live = g_live[round][t];
+    /* --hold_band: the level above is not open, it is the held block, and only
+       the signature it sits on can be reached. One bit, and the existing
+       backward sweep turns it into the meeting constraint for every level. */
+    if (g_held[round]) {
+        memset(live, 0, g_live_words * sizeof(uint64_t));
+        uint32_t sg = g_held_sig[round];
+        live[sg >> 6] |= 1ULL << (sg & 63);
+        return;
+    }
     if (!g_close_top[round]) {
         for (size_t i = 0; i < g_live_words; i++) live[i] = ~0ULL;
         return;
@@ -864,9 +1033,22 @@ static uint64_t live_count(int round, int level) {
 
 static int g_wall_suffix[MAX_ROUNDS+2][MAX_LEVEL+2][NUM_COLORS_TOTAL];
 static int g_cells_above[MAX_ROUNDS+2][MAX_LEVEL+2];
+/* --hold_band: the inner colours the held block's underside consumes. Without
+   this the count above is wrong in exactly the case the prune is active. */
+static int g_held_need[MAX_ROUNDS+2][NUM_COLORS_TOTAL];
 
 static void parity_prepare(int round) {
     memset(g_wall_suffix[round], 0, sizeof g_wall_suffix[round]);
+    /* The strip's topmost level does not face the frame when a block is held --
+       it faces the block, and those sides are spoken for. The prune's premise is
+       that every side of an unplaced piece pairs off or meets a KNOWN boundary,
+       so this one has to be counted with the others or the surplus comes out too
+       high and its parity flips, refuting arrangements that are perfectly good. */
+    memset(g_held_need[round], 0, sizeof g_held_need[round]);
+    if (g_held[round]) {
+        uint8_t bot[MAX_W]; sig_bottoms(g_held_sig[round], bot);
+        for (int i = 0; i < chain_w() - 1; i++) g_held_need[round][bot[i]]++;
+    }
     for (int r = g_top_level[round]; r >= 0; r--) {
         memcpy(g_wall_suffix[round][r], g_wall_suffix[round][r+1],
                sizeof g_wall_suffix[round][r]);
@@ -884,12 +1066,18 @@ static void parity_prepare(int round) {
    nothing can be concluded. */
 static bool parity_ok(int round, int level, uint32_t sig) {
     if (g_cells_above[round][level] != NUM_PIECES - g_n_placed) return true;
+    /* Nothing above still to place: there are no sides left to pair off, and the
+       junction `sig` names is between two levels that are already down. Only a
+       held block reaches this level with the strip complete -- an open top means
+       a later round still has cells, so the test above has already returned. */
+    if (!g_cells_above[round][level]) return true;
     const int W = chain_w();
     uint8_t bot[MAX_W]; sig_bottoms(sig, bot);
     int need[NUM_COLORS_TOTAL] = {0};
     for (int i = 0; i < W - 1; i++) need[bot[i]]++;
     for (int c = COLOR_MIN; c <= COLOR_MAX; c++) {
-        int s = g_avail[c] - need[c] - g_wall_suffix[round][level][c];
+        int s = g_avail[c] - need[c] - g_wall_suffix[round][level][c]
+                - g_held_need[round][c];
         if (s < 0 || (s & 1)) return false;
     }
     return true;
@@ -1028,18 +1216,39 @@ static void score_snap(const Snap *s, int *matched, int *breaks) {
 /* Write one board as a canonical CSV line and say what it is. It is routed by
    the board's OWN break count, not by its tag: a greedy fill that happens to
    land perfectly belongs with the break-free boards. */
-static void emit_snap(const Snap *s, const char *tag) {
-    if (g_only_complete && s->placed < NUM_PIECES) return;
+static void emit_snap(const Snap *snap_in, const char *tag) {
+    if (g_only_complete && snap_in->placed < NUM_PIECES) return;
+
+    /* The score is read off the board the SEARCH holds, because score_snap
+       rebuilds each piece from g_seed_*, which under --reverse is the mirrored
+       seed: scoring an un-mirrored board against it would compare real
+       placements with mirrored colours. Mirroring is a symmetry of the puzzle,
+       so the two agree -- as long as board and seed are in the same space. */
     int matched, breaks;
-    score_snap(s, &matched, &breaks);
+    score_snap(snap_in, &matched, &breaks);
+
+    /* --reverse: back out of mirror space for everything that leaves this
+       function -- the CSV fields and the hole box alike. On a COPY, because
+       g_best[] entries and the greedy fill's base snapshot are both read again
+       after they are emitted. */
+    Snap mirrored;
+    const Snap *s = snap_in;
+    if (g_reverse) { mirrored = *snap_in; mirror_line(mirrored.pos, mirrored.rot); s = &mirrored; }
 
     int which = breaks ? OUT_BROKEN : OUT_CLEAN;
     if (!g_out_fp[which]) {
         g_out_fp[which] = fopen(g_out_path[which], "a");
         if (!g_out_fp[which]) fatal("cannot open %s: %s", g_out_path[which], strerror(errno));
     }
+    /* Provenance, the way Stage C does it: the input's config_id is KEPT and this
+       run appends its own suffix after an underscore -- the input line, the tag,
+       and a counter unique within the run. Chain two roundhouse passes and the id
+       carries both, so a merged corpus still says where every row came from. */
+    char id[128];
+    snprintf(id, sizeof id, "%s_%u%s%" PRIu64, g_in_id, g_line_id, tag, g_emitted);
+
     FILE *fp = g_out_fp[which];
-    fprintf(fp, "p%u%s%" PRIu64 ", %d", g_line_id, tag, g_emitted, matched);
+    fprintf(fp, "%s, %d", id, matched);
     for (int i = 0; i < NUM_PIECES; i++) fprintf(fp, ", %d", s->pos[i]);
     for (int i = 0; i < NUM_PIECES; i++) fprintf(fp, ", %d", s->rot[i]);
     fputc('\n', fp);
@@ -1061,8 +1270,8 @@ static void emit_snap(const Snap *s, const char *tag) {
         snprintf(hole, sizeof hole, "%d empty in rows %d..%d x cols %d..%d",
                  NUM_PIECES - s->placed, r0, r1, c0, c1);
     }
-    printf("[emit] p%u%s%" PRIu64 "  %d/%d placed  %d/480 matched  %d break(s)  %s\n",
-           g_line_id, tag, g_emitted, s->placed, NUM_PIECES, matched, breaks, hole);
+    printf("[emit] %s  %d/%d placed  %d/480 matched  %d break(s)  %s\n",
+           id, s->placed, NUM_PIECES, matched, breaks, hole);
     g_emitted++;
     if      (tag[0] == 's') g_stats.emit_solved++;
     else if (tag[0] == 'f') g_stats.emit_filled++;
@@ -1215,12 +1424,49 @@ static bool strip_geometry(int round) {
         top = r;
     }
     if (top < 1) return false;
-    for (int r = 0; r <= top; r++)
-        for (int c = PUZZLE_SIDE-g_W; c < PUZZLE_SIDE; c++)
-            if (g_has[r][c]) return false;                /* strip must be empty */
 
-    g_close_top[round] = (top == PUZZLE_SIDE-1);
-    g_top_level[round] = g_close_top[round] ? PUZZLE_SIDE-2 : top;
+    /* The strip is normally empty: everything outside the core was freed. Under
+       --hold_band the last round's band still carries the pieces it arrived
+       with, and they must form COMPLETE chain levels stacked at the far end --
+       which is exactly the shape the other spiral leaves, having filled that
+       band from the opposite side until it stopped. Anything else (a partial
+       level, or a gap underneath the block) is not a shape this search can meet,
+       and is refused rather than quietly freed. */
+    int held = 0;
+    for (int r = 0; r <= top; r++) {
+        int n = 0;
+        for (int c = PUZZLE_SIDE-g_W; c < PUZZLE_SIDE; c++) if (g_has[r][c]) n++;
+        if (n == 0) {
+            if (held) return false;            /* a gap below the held block */
+            continue;
+        }
+        if (n != g_W) return false;            /* a level only partly standing */
+        held++;
+    }
+    if (held && !g_hold_band) return false;    /* without the flag: as before */
+
+    g_held[round] = (held > 0);
+    g_held_n[round] = held;
+    g_close_top[round] = (top == PUZZLE_SIDE-1) && !held;
+    g_top_level[round] = g_close_top[round] ? PUZZLE_SIDE-2 : top - held;
+
+    /* What the held block sits on, packed the way the database keys a level.
+       Seeding the oracle with this one signature is what makes the search meet
+       the held pieces: every other way of filling the level below is dead on
+       colour before a single piece is tried. */
+    if (held) {
+        if (g_top_level[round] < 1) return false;      /* nothing left to search */
+        const int W = chain_w();
+        int lvl = g_top_level[round] + 1, inner[MAX_W];
+        for (int k = 0; k < W-1; k++) {
+            int b = g_grid[lvl][PUZZLE_SIDE-W+k].bottom;
+            if (!color_is_inner(b)) return false;
+            inner[k] = INNER_IDX(b);
+        }
+        int iface = g_grid[lvl][PUZZLE_SIDE-1].bottom;
+        if (iface < 1 || iface > MAX_EDGE_SIDE_COLOR) return false;
+        g_held_sig[round] = sig_make(inner, iface);
+    }
     /* --stop_row truncates the strip. Anything at or below the last database
        level drops the top border, and the strip stops there with its top open. */
     if (g_stop_level >= 0 && g_stop_level <= g_top_level[round]) {
@@ -1308,7 +1554,11 @@ static void do_strip(int round) {
         printf("[round %d] refills the input's %s band: rows %d..%d x cols %d..%d, "
                "%d chain level(s) of %d%s\n", round, round_side(round),
                sr0, sr1, sc0, sc1, g_top_level[round], g_W,
-               g_close_top[round] ? " + a top border closure" : " (far end left open)");
+               g_close_top[round] ? " + a top border closure" :
+               g_held[round] ? "" : " (far end left open)");
+        if (g_held[round])
+            printf("[round %d] %d level(s) held at the far end; the strip fills up to meet "
+                   "them\n", round, g_held_n[round]);
     }
 
     /* Closure chains first: the backward sweep is seeded from them. */
@@ -1495,11 +1745,11 @@ static void restore_snap(const Snap *s) {
 
 /* -- Input ----------------------------------------------------------------- */
 
-static bool parse_fields(char *s, char id_out[64], int pos[NUM_PIECES], int rot[NUM_PIECES]) {
+static bool parse_fields(char *s, char id_out[96], int pos[NUM_PIECES], int rot[NUM_PIECES]) {
     char *tok = strtok(s, ",\r\n");
     if (!tok) return false;
     while (*tok == ' ') tok++;
-    if (id_out) snprintf(id_out, 64, "%s", tok);
+    if (id_out) snprintf(id_out, 96, "%s", tok);
     tok = strtok(NULL, ",\r\n");
     if (!tok) return false;
     for (int k = 0; k < 2*NUM_PIECES; k++) {
@@ -1513,7 +1763,7 @@ static bool parse_fields(char *s, char id_out[64], int pos[NUM_PIECES], int rot[
 
 /* Read the want-th data line of a board CSV; blank and '#'/'%' comment lines do
    not count. Any leading metadata is skipped -- only the last 512 fields matter. */
-static bool read_line(const char *path, uint32_t want, char id_out[64],
+static bool read_line(const char *path, uint32_t want, char id_out[96],
                       int pos[NUM_PIECES], int rot[NUM_PIECES]) {
     FILE *f = fopen(path, "r");
     if (!f) fatal("cannot open boards CSV %s: %s", path, strerror(errno));
@@ -1601,6 +1851,16 @@ static bool cell_kept(int r, int c, int W) {
     return keep;
 }
 
+/* Which round's strip refills a freed cell: 1, 2 or 3. The clauses in cell_kept
+   nest, so a cell belongs to the first one that frees it, and the three bands
+   tile the board's freed part exactly. Only meaningful where cell_kept is false.
+   --hold_band reads this to find the band the LAST round will refill. */
+static int band_of(int r, int c, int W) {
+    if (c > PUZZLE_SIDE-1-W) return 1;      /* right band, full height   */
+    if (r > PUZZLE_SIDE-1-W) return 2;      /* top band, clipped by 1    */
+    return 3;                               /* left band, clipped by 1+2 */
+}
+
 /* The same rectangle on the INPUT board -- the only form a reader can check
    against their own CSV. Same bounds as cell_kept, mapped back. */
 static void core_box_orig(int W, int *r0, int *r1, int *c0, int *c1) {
@@ -1619,7 +1879,7 @@ static bool core_usable(int W, char why[128]) {
     for (int r = 0; r < PUZZLE_SIDE; r++)
         for (int c = 0; c < PUZZLE_SIDE; c++) {
             if (!cell_kept(r, c, W)) continue;
-            int ar, ac; frame_to_orig(r, c, g_rot_applied, &ar, &ac);
+            int ar, ac; frame_to_input(r, c, g_rot_applied, &ar, &ac);
             if (!g_has[r][c]) {
                 if (why) snprintf(why, 128, "it keeps cell (%d,%d), which is unplaced", ar, ac);
                 return false;
@@ -1640,7 +1900,7 @@ static bool core_usable(int W, char why[128]) {
                      g_grid[r][c].top != g_grid[r+1][c].bottom) { nr = r+1; nc = c; }
             if (nr < 0) continue;
             if (why) {
-                int br, bc; frame_to_orig(nr, nc, g_rot_applied, &br, &bc);
+                int br, bc; frame_to_input(nr, nc, g_rot_applied, &br, &bc);
                 snprintf(why, 128, "break inside the kept region at (%d,%d)-(%d,%d)",
                          ar, ac, br, bc);
             }
@@ -1649,14 +1909,86 @@ static bool core_usable(int W, char why[128]) {
     return true;
 }
 
+/* --hold_band pre-flight, run once per board while the supply counts are still
+   about to be built from scratch.
+ *
+ * Holding the last band only makes sense if what stands in it is something the
+ * strip search can MEET: whole chain levels, legally seated, and break-free both
+ * inside themselves and against the core they touch. A band that holds a partial
+ * level, or one with a break in it, is not refused -- the run is still worth
+ * making, it just has to start that band from nothing like any other. So the
+ * band is freed, the reason is printed, and the search carries on unheld.
+ *
+ * Returning false is reserved for a board that cannot be searched at all. */
+static bool hold_band_prepare(uint32_t line) {
+    const int W = g_W;
+    int n = 0, bad_r = -1, bad_c = -1; const char *why = NULL;
+
+    /* The cut has just run, so the only cells still standing outside the core
+       are the ones it deliberately kept: the last round's band. Scanning
+       everything outside the core therefore scans exactly the held band. */
+
+    for (int r = 0; r < PUZZLE_SIDE && !why; r++)
+        for (int c = 0; c < PUZZLE_SIDE && !why; c++) {
+            if (cell_kept(r, c, W) || !g_has[r][c]) continue;
+            n++;
+            const Oriented *o = &g_grid[r][c];
+            bool fb = (r==0), ft = (r==PUZZLE_SIDE-1), fl = (c==0), fr = (c==PUZZLE_SIDE-1);
+            if (rh_zero_count(o->piece_id) != (fb+ft+fl+fr) ||
+                (fb && o->bottom != 0) || (ft && o->top   != 0) ||
+                (fl && o->left   != 0) || (fr && o->right != 0)) {
+                why = "a piece in it does not seat legally"; bad_r = r; bad_c = c; break;
+            }
+            if (c+1 < PUZZLE_SIDE && g_has[r][c+1] && o->right != g_grid[r][c+1].left) {
+                why = "it holds a break"; bad_r = r; bad_c = c; break;
+            }
+            if (r+1 < PUZZLE_SIDE && g_has[r+1][c] && o->top != g_grid[r+1][c].bottom) {
+                why = "it holds a break"; bad_r = r; bad_c = c; break;
+            }
+        }
+
+    if (!why && n && n % W) why = "it holds a partial chain level";
+    if (!why) {
+        if (n) {
+            printf("[hold] line %u: holding %d piece(s) = %d chain level(s) in the %s band; "
+                   "round %d will fill up to meet them\n",
+                   line, n, n / W, round_side(g_rounds), g_rounds);
+        }
+        return true;
+    }
+
+    int ar, ac; frame_to_input(bad_r < 0 ? 0 : bad_r, bad_c < 0 ? 0 : bad_c,
+                               g_rot_applied, &ar, &ac);
+    if (bad_r >= 0)
+        printf("[hold] line %u: the %s band is not holdable -- %s at (%d,%d). Freeing it and "
+               "searching it from nothing, as without --hold_band\n",
+               line, round_side(g_rounds), why, ar, ac);
+    else
+        printf("[hold] line %u: the %s band is not holdable -- %s (%d piece(s), width %d). "
+               "Freeing it and searching it from nothing, as without --hold_band\n",
+               line, round_side(g_rounds), why, n, W);
+
+    for (int r = 0; r < PUZZLE_SIDE; r++)
+        for (int c = 0; c < PUZZLE_SIDE; c++)
+            if (!cell_kept(r, c, W)) g_has[r][c] = false;
+    return true;
+}
+
 /* Load one CSV line into the frame, apply --rotate, choose the strip width and
    free everything outside the core. */
 static bool load_and_cut(const char *path, uint32_t line, int forced_W) {
-    int pos[NUM_PIECES], rot[NUM_PIECES]; char id[64];
-    if (!read_line(path, line, id, pos, rot)) return false;
+    int pos[NUM_PIECES], rot[NUM_PIECES];
+    if (!read_line(path, line, g_in_id, pos, rot)) return false;
+    /* A board with no id of its own still needs one to carry. */
+    if (!g_in_id[0]) snprintf(g_in_id, sizeof g_in_id, "p%u", line);
+
+    /* --reverse: into mirror space first, so everything below -- the clue
+       orientation included -- reads a board that agrees with the mirrored seed
+       and the mirrored clue table. */
+    if (g_reverse) mirror_line(pos, rot);
 
     /* Read the board's committed orientation before anything is rotated or
-       freed: the clue table is in ORIGINAL coordinates, and this is the only
+       freed: the clue table is in unturned coordinates, and this is the only
        moment the board is still in them. */
     g_rh_orient = g_clue_mask ? rh_clue_orient_of(pos, rot) : -1;
     if (g_clue_mask && g_rh_orient < 0) {
@@ -1710,9 +2042,18 @@ static bool load_and_cut(const char *path, uint32_t line, int forced_W) {
         g_W = chosen;
     }
 
+    /* Free everything outside the core -- except, under --hold_band, whatever is
+       already standing in the band the LAST round refills. Those pieces are the
+       previous pass's work at the far end of this pass's strip, and holding them
+       is the whole point of the flag: the search fills up to MEET them. */
     for (int r = 0; r < PUZZLE_SIDE; r++)
-        for (int c = 0; c < PUZZLE_SIDE; c++)
-            if (!cell_kept(r, c, g_W)) g_has[r][c] = false;
+        for (int c = 0; c < PUZZLE_SIDE; c++) {
+            if (cell_kept(r, c, g_W)) continue;
+            if (g_hold_band && g_has[r][c] && band_of(r, c, g_W) == g_rounds) continue;
+            g_has[r][c] = false;
+        }
+
+    if (g_hold_band && !hold_band_prepare(line)) return false;
 
     /* Clue viability. A clue whose cell survives the cut is never re-placed by
        any strip, so if it is wrong there it is wrong for good and searching this
@@ -1721,15 +2062,18 @@ static bool load_and_cut(const char *path, uint32_t line, int forced_W) {
        verifies here rather than pinning anything. */
     for (int k = 0; k < CLUE_N && g_clue_mask; k++) {
         if (!clue_on(k)) continue;
-        const ClueCell *cc = &g_clue[g_rh_orient][k];
+        const ClueCell *cc = &g_rh_clue[g_rh_orient][k];
         int R, C, S;
         orig_to_frame(cc->row, cc->col, cc->spin, g_rot_applied, &R, &C, &S);
         if (!g_has[R][C]) continue;                 /* freed: a strip will pin it */
         if (g_grid[R][C].piece_id != cc->piece || g_grid[R][C].rotation != (uint8_t)S) {
+            /* The cell is named from the UNMIRRORED table, so the message points
+               at the board the user handed in rather than at mirror space. */
+            const ClueCell *say = &g_clue[g_rh_orient][k];
             printf("[skip] line %u: clue %d of orientation %d needs piece %u at board cell\n"
                    "       (%d,%d), but that cell is inside the retained core holding piece %u,\n"
                    "       and no strip can re-place it\n",
-                   line, k, g_rh_orient, cc->piece, cc->row, cc->col, g_grid[R][C].piece_id);
+                   line, k, g_rh_orient, cc->piece, say->row, say->col, g_grid[R][C].piece_id);
             return false;
         }
     }
@@ -1804,8 +2148,25 @@ static const char *k_usage =
 "                         0 = the narrowest width with a usable core)\n"
 "  --rotate K             -3..3 quarter-turns before the cut (default 1, which\n"
 "                         makes round 1 the INPUT's top band)\n"
+"  --reverse              spiral the other way round: right/top/left becomes\n"
+"                         left/top/right on the input board. Implemented by\n"
+"                         mirroring the seed, so the strip is traversed the\n"
+"                         other way over the same cells -- a second exhaustive\n"
+"                         attack, not a new region\n"
 "  --stop_row R           stop each strip at level R instead of its last\n"
-"  --BL/--BR/--TL/--TR P  pin a corner piece by its ORIGINAL board role\n"
+"  --hold_band            do not free what is already standing in the band the LAST\n"
+"                         round refills. Those pieces must form complete chain levels\n"
+"                         stacked at the far end of the strip -- the shape the other\n"
+"                         spiral leaves behind, having filled that band from the\n"
+"                         opposite side until it stopped -- and the search then fills\n"
+"                         up to MEET them instead of starting the band from nothing.\n"
+"                         This is what lets CCW and CW compound: run one, feed its\n"
+"                         board to the other with this flag, and the second pass keeps\n"
+"                         the first pass's work instead of tearing it out. A band that\n"
+"                         holds a partial level, or a gap under the block, is refused\n"
+"                         rather than silently freed. Ignored by rounds 1..N-1, whose\n"
+"                         bands are freed and re-searched as usual (default off)\n"
+"  --BL/--BR/--TL/--TR P  pin a corner piece by its role on the INPUT board\n"
 "\n"
 "SEARCH -- exhaustive unless a budget bites\n"
 "  --max_breaks B         after the exhaustive search, greedily fill the rest of\n"
@@ -1900,7 +2261,9 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--strip_width") && i+1 < argc) g_opt_W = atoi(argv[++i]);
         else if (!strcmp(a, "--rounds") && i+1 < argc) g_rounds = atoi(argv[++i]);
         else if (!strcmp(a, "--rotate") && i+1 < argc) g_rotate = atoi(argv[++i]);
+        else if (!strcmp(a, "--reverse"))             g_reverse = true;
         else if (!strcmp(a, "--stop_row") && i+1 < argc) g_stop_level = atoi(argv[++i]);
+        else if (!strcmp(a, "--hold_band")) g_hold_band = true;
         else if (!strcmp(a, "--max_breaks") && i+1 < argc) g_max_breaks = atoi(argv[++i]);
         else if (!strcmp(a, "--clue_center"))  g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(a, "--clue_corners")) g_clue_mask |= CLUE_CORNERS;
@@ -1921,6 +2284,9 @@ int main(int argc, char **argv) {
     if (g_rotate < -3 || g_rotate > 3) fatal("--rotate must be -3..3");
     g_rotate = (g_rotate + 4) & 3;      /* -1 == 3, one turn anticlockwise */
     if (g_ties < 1) fatal("--ties must be >= 1");
+    if (g_hold_band && g_stop_level >= 0)
+        fatal("--hold_band and --stop_row both set where the strip ends: the held "
+              "block already fixes it. Drop one.");
     if (g_max_breaks < 0) fatal("--max_breaks must be >= 0");
 
     if (nthreads > 0) { omp_set_num_threads(nthreads); g_nthreads = nthreads; }
@@ -1935,11 +2301,13 @@ int main(int argc, char **argv) {
     char wtag[8];
     if (g_opt_W) snprintf(wtag, sizeof wtag, "%d", g_opt_W);
     else         snprintf(wtag, sizeof wtag, "auto");
+    const char *rtag = g_reverse ? "rev" : "";
     snprintf(g_out_path[OUT_CLEAN], sizeof g_out_path[0],
-             "%s/roundhouse_round%d_rot%d_W%s_miss0.csv", g_out_dir, g_rounds, g_rotate, wtag);
+             "%s/roundhouse_round%d_rot%d%s_W%s_miss0.csv",
+             g_out_dir, g_rounds, g_rotate, rtag, wtag);
     snprintf(g_out_path[OUT_BROKEN], sizeof g_out_path[0],
-             "%s/roundhouse_round%d_rot%d_W%s_miss%d.csv",
-             g_out_dir, g_rounds, g_rotate, wtag, g_max_breaks);
+             "%s/roundhouse_round%d_rot%d%s_W%s_miss%d.csv",
+             g_out_dir, g_rounds, g_rotate, rtag, wtag, g_max_breaks);
 
     uint32_t csv_lines = count_data_lines(csv_path);
     char sbuf[24];
@@ -1952,8 +2320,9 @@ int main(int argc, char **argv) {
        infer, which side of THEIR board each round tears up, is the [plan] line. */
     printf("\n=== E555 roundhouse ===\n\n");
     printf("[cfg] seed=%s boards=%s out_dir=%s\n", seed_path, csv_path, g_out_dir);
-    printf("[cfg] rounds=%d rotate=%d strip_width=%s stop_row=%s ties=%u only_complete=%d\n",
-           g_rounds, g_rotate, wtag, sbuf, g_ties, g_only_complete?1:0);
+    printf("[cfg] rounds=%d rotate=%d reverse=%d strip_width=%s stop_row=%s ties=%u "
+           "only_complete=%d hold_band=%d\n", g_rounds, g_rotate, g_reverse?1:0, wtag, sbuf,
+           g_ties, g_only_complete?1:0, g_hold_band?1:0);
     printf("[cfg] max_breaks=%d max_nodes=%" PRIu64 " config_time=%.0fs max_wall=%.0fs "
            "max_boards=%" PRIu64 " threads=%d\n", g_max_breaks, g_max_nodes,
            g_config_time_sec, g_max_wall_sec, g_max_boards, g_nthreads);
@@ -1969,12 +2338,19 @@ int main(int argc, char **argv) {
     printf(" band; a break outside them makes a board unusable%s\n",
            (g_rounds == 3 && g_opt_W == 5)
                ? ". This cut keeps only 66 pieces: expect a budget, not a proof" : "");
+    if (g_hold_band)
+        printf("[plan] --hold_band: the %s band keeps whatever is already standing in\n"
+               "       it, and round %d fills up to meet it. Rounds 1..%d free their\n"
+               "       bands and re-search them as usual\n",
+               round_side(g_rounds), g_rounds, g_rounds-1);
     if (g_line_first >= csv_lines)
         printf("[warn] --border_row %u is past the end of the CSV: nothing to do\n", g_line_first);
     fflush(stdout);
 
     g_free_edges = true;                 /* the roundhouse always re-chooses its border */
     load_seed_and_catalog(seed_path);
+    if (g_reverse) mirror_seed();        /* before anything is derived from it */
+    init_clue_table();
     build_catalog_indices();
     build_inner_color_totals();
     if (g_clue_mask) check_frame_maps();
@@ -2006,6 +2382,18 @@ int main(int argc, char **argv) {
         }
         g_stats.lines_used++;
         g_line_id = li;
+
+        /* --hold_band can leave nothing to search: hold a whole band and the
+           freed region, and the piece pool with it, goes empty. That is a
+           result rather than an error -- the board already stands where this
+           round would have left it -- so say so and take the next line, instead
+           of asking for a chain database with no pieces to build it from. */
+        if (NUM_PIECES - g_n_placed < g_W) {
+            printf("[line %u] nothing to search: the cut frees %d cell(s), fewer than one "
+                   "width-%d chain, so this round has no strip. The board already stands as "
+                   "it would leave it\n", li, NUM_PIECES - g_n_placed, g_W);
+            continue;
+        }
 
         /* Sizes depend on W, which is per line: (re)size the index space. */
         s_nsig = MAX_EDGE_SIDE_COLOR;
