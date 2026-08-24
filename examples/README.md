@@ -27,6 +27,7 @@ accepts it as input, so you can keep pushing the same board along.
 | `03_roundhouse_strip.sh` | roundhouse | rotate the board, refill a border strip; can prove a board dead in milliseconds | megabytes |
 | `04_stage_c_close.sh` | topper + ender | the whole CP-SAT tail in the documented order: herd the breaks onto a band, sweep the ring, then patch what is left | `pip install ortools` |
 | `05_backtracker_dives.sh` | backtracker | greedy dives to triage, exhaustive DFS to prove | minutes to overnight |
+| `06_roundhouse_both_ways.sh` | roundhouse | chain two roundhouse passes per board, once each way round, so the two spirals cover all four sides; `--hold_band` lets the second keep what the first left | seconds to minutes |
 
 ## They all speak the same CSV
 

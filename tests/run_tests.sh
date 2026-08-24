@@ -73,6 +73,7 @@ ALL_STEPS=(
     "scripts_parse|every shipped example and pipeline script parses"
     "example_finalizer|examples/02 re-grows the synthetic board"
     "example_roundhouse|examples/03 refills one strip"
+    "example_bothways|examples/06 runs both chains over one board, ids intact"
     "example_cpsat|examples/04, the whole Stage C chain"
     "example_backtracker|examples/05 dives on the example board"
     "pipeline_topper_sweep|pipeline/topper_sweep.sh through a two-pass plan"
@@ -1015,6 +1016,32 @@ step_example_roundhouse() {
     nf=$(awk -F, '!/^ *[#%]/{print NF; exit}' "$comp")
     [ "$nf" = "514" ] || fail "examples/03 wrote $nf fields, want 514"
     echo "ok: examples/03 refilled one strip, canonical output"
+}
+
+# examples/06 chains two roundhouse passes per board, once each way round, and
+# --hold_band lets the second keep what the first left. On the synthetic board
+# the first pass of each chain already closes the puzzle, so both chains report
+# 480 and the ids carry every stage: the input's own, the tool's suffix, then
+# the pass that wrote it.
+step_example_bothways() {
+    rh_fixtures
+    SEED=data/synth_seed.txt PARTIALS="$OUT/rh_rows12.csv" OUT_DIR="$OUT/ex06" \
+    ROUNDS=1 WIDTH=3 ROTATE=1 N_LINES=1 HOLD=1 CLUES=0 MAX_WALL=120 \
+        bash examples/06_roundhouse_both_ways.sh > "$OUT/ex06.log" \
+        || { tail -5 "$OUT/ex06.log"; fail "examples/06 exited non-zero"; }
+    grep -q "chains 480/480" "$OUT/ex06.log" || \
+        { tail -8 "$OUT/ex06.log"; fail "both chains should reach the known solution"; }
+    comp=$(first_match "$OUT/ex06"/cfg0/a1/roundhouse_*_miss0.csv)
+    [ -s "$comp" ] || { tail -5 "$OUT/ex06.log"; fail "examples/06 emitted nothing"; }
+    nf=$(awk -F, '!/^ *[#%]/{print NF; exit}' "$comp")
+    [ "$nf" = "514" ] || fail "examples/06 wrote $nf fields, want 514"
+    id=$(awk -F, '!/^ *[#%]/{print $1; exit}' "$comp")
+    case "$id" in board_*_a1) ;; *) fail "id lost its provenance: $id" ;; esac
+    # Holding a whole band leaves no pool and no strip. That is a result, not a
+    # failure: the run says so and the chain carries on.
+    grep -q "nothing to search" "$OUT/ex06/cfg0/a2/log" || \
+        { tail -5 "$OUT/ex06/cfg0/a2/log"; fail "a fully held band should report, not abort"; }
+    echo "ok: examples/06 ran both chains to 480, id $id"
 }
 
 step_example_cpsat() {

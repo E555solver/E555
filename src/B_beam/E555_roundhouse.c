@@ -2383,6 +2383,18 @@ int main(int argc, char **argv) {
         g_stats.lines_used++;
         g_line_id = li;
 
+        /* --hold_band can leave nothing to search: hold a whole band and the
+           freed region, and the piece pool with it, goes empty. That is a
+           result rather than an error -- the board already stands where this
+           round would have left it -- so say so and take the next line, instead
+           of asking for a chain database with no pieces to build it from. */
+        if (NUM_PIECES - g_n_placed < g_W) {
+            printf("[line %u] nothing to search: the cut frees %d cell(s), fewer than one "
+                   "width-%d chain, so this round has no strip. The board already stands as "
+                   "it would leave it\n", li, NUM_PIECES - g_n_placed, g_W);
+            continue;
+        }
+
         /* Sizes depend on W, which is per line: (re)size the index space. */
         s_nsig = MAX_EDGE_SIDE_COLOR;
         for (int i = 0; i < chain_w() - 1; i++) s_nsig *= DIM_INNER;
