@@ -184,6 +184,37 @@
  *   ends on a budget -- where the two directions reach different deepest boards.
  *   Eight distinct searches instead of four.
  *
+ * --hold_band: LET THE TWO SPIRALS COMPOUND
+ *   By default every band outside the core is freed, and that includes whatever
+ *   a previous roundhouse pass managed to put in the LAST one. Run CCW and then
+ *   CW on its output and the second pass tears out the first pass's work in that
+ *   band before it starts: measured over 25 boards, pass 1 placed 100 pieces in
+ *   the last band and pass 2 kept none of them. Nor does the search win them
+ *   back, because a strip is filled in whole chain LEVELS and a scatter of cells
+ *   is not a reachable prefix.
+ *
+ *   --hold_band keeps them instead. It works because of what the other spiral
+ *   leaves behind: the two handednesses traverse the same band from OPPOSITE
+ *   ends, so pass 1 stops having filled k complete levels at the far end of
+ *   pass 2's strip -- exactly the shape this search can terminate against. The
+ *   held levels stay on the board, their pieces stay out of the pool, the strip
+ *   stops one level below them, and the oracle is seeded with the single
+ *   signature they sit on. Every other way of filling the level underneath is
+ *   then dead on colour before a piece is tried, so the search does not merely
+ *   avoid disturbing the block, it fills up to MEET it.
+ *
+ *   The point is that a chain can only improve: pass 2 starts from everything
+ *   pass 1 proved and adds to it. The cost is that it also starts CONSTRAINED --
+ *   a pass free to rebuild the whole band sometimes finds a better arrangement
+ *   than one that must keep the far end. Both are worth running; that is why
+ *   this is a flag and not the default.
+ *
+ *   NOT EVERY BAND CAN BE HELD, and an unholdable one is not a refusal. If what
+ *   stands there is a partial level, or carries a break, or is mis-seated, the
+ *   band is freed and searched from nothing exactly as without the flag -- the
+ *   run still happens, and the reason is printed with the offending cell in the
+ *   input board's coordinates. Rounds 1..N-1 always free their bands.
+ *
  * INPUT REQUIREMENTS
  *   Only the kept region is validated, and it is validated completely: every
  *   cell placed, every piece legally seated against the frame, every junction
@@ -252,6 +283,7 @@ static int      g_rounds       = 3;
 static int      g_rotate       = 1;
 static bool     g_reverse      = false; /* --reverse: mirror the board left-right */
 static int      g_stop_level   = -1;    /* --stop_row, -1 = the strip's last */
+static bool     g_hold_band    = false; /* --hold_band: keep the last band's pieces */
 static int      g_pin_corner[4] = { -1, -1, -1, -1 };   /* BL BR TL TR (input) */
 static uint64_t g_max_nodes    = 0;
 static uint32_t g_ties         = 1;     /* boards to emit at the deepest reach */
@@ -898,6 +930,9 @@ static uint64_t *g_live[MAX_ROUNDS+2][MAX_LEVEL+2];
 static int       g_wall[MAX_ROUNDS+2][MAX_LEVEL+2];   /* wall colour per level */
 static int       g_top_level[MAX_ROUNDS+2];           /* last database level */
 static bool      g_close_top[MAX_ROUNDS+2];           /* is there a closure row? */
+static bool      g_held[MAX_ROUNDS+2];                /* --hold_band: levels held above */
+static int       g_held_n[MAX_ROUNDS+2];              /* how many, for the log */
+static uint32_t  g_held_sig[MAX_ROUNDS+2];            /* what they sit on */
 static size_t    g_live_words = 0;
 
 static inline bool live_test(const uint64_t *bs, uint32_t s) {
@@ -957,6 +992,15 @@ static void oracle_backward(int round, int lo, int hi) {
 static void oracle_seed_top(int round) {
     int t = g_top_level[round] + 1;
     uint64_t *live = g_live[round][t];
+    /* --hold_band: the level above is not open, it is the held block, and only
+       the signature it sits on can be reached. One bit, and the existing
+       backward sweep turns it into the meeting constraint for every level. */
+    if (g_held[round]) {
+        memset(live, 0, g_live_words * sizeof(uint64_t));
+        uint32_t sg = g_held_sig[round];
+        live[sg >> 6] |= 1ULL << (sg & 63);
+        return;
+    }
     if (!g_close_top[round]) {
         for (size_t i = 0; i < g_live_words; i++) live[i] = ~0ULL;
         return;
@@ -1350,15 +1394,52 @@ static bool strip_geometry(int round) {
         top = r;
     }
     if (top < 1) return false;
-    for (int r = 0; r <= top; r++)
-        for (int c = PUZZLE_SIDE-g_W; c < PUZZLE_SIDE; c++)
-            if (g_has[r][c]) return false;                /* strip must be empty */
 
-    g_close_top[round] = (top == PUZZLE_SIDE-1);
-    g_top_level[round] = g_close_top[round] ? PUZZLE_SIDE-2 : top;
+    /* The strip is normally empty: everything outside the core was freed. Under
+       --hold_band the last round's band still carries the pieces it arrived
+       with, and they must form COMPLETE chain levels stacked at the far end --
+       which is exactly the shape the other spiral leaves, having filled that
+       band from the opposite side until it stopped. Anything else (a partial
+       level, or a gap underneath the block) is not a shape this search can meet,
+       and is refused rather than quietly freed. */
+    int held = 0;
+    for (int r = 0; r <= top; r++) {
+        int n = 0;
+        for (int c = PUZZLE_SIDE-g_W; c < PUZZLE_SIDE; c++) if (g_has[r][c]) n++;
+        if (n == 0) {
+            if (held) return false;            /* a gap below the held block */
+            continue;
+        }
+        if (n != g_W) return false;            /* a level only partly standing */
+        held++;
+    }
+    if (held && !g_hold_band) return false;    /* without the flag: as before */
+
+    g_held[round] = (held > 0);
+    g_held_n[round] = held;
+    g_close_top[round] = (top == PUZZLE_SIDE-1) && !held;
+    g_top_level[round] = g_close_top[round] ? PUZZLE_SIDE-2 : top - held;
+
+    /* What the held block sits on, packed the way the database keys a level.
+       Seeding the oracle with this one signature is what makes the search meet
+       the held pieces: every other way of filling the level below is dead on
+       colour before a single piece is tried. */
+    if (held) {
+        if (g_top_level[round] < 1) return false;      /* nothing left to search */
+        const int W = chain_w();
+        int lvl = g_top_level[round] + 1, inner[MAX_W];
+        for (int k = 0; k < W-1; k++) {
+            int b = g_grid[lvl][PUZZLE_SIDE-W+k].bottom;
+            if (!color_is_inner(b)) return false;
+            inner[k] = INNER_IDX(b);
+        }
+        int iface = g_grid[lvl][PUZZLE_SIDE-1].bottom;
+        if (iface < 1 || iface > MAX_EDGE_SIDE_COLOR) return false;
+        g_held_sig[round] = sig_make(inner, iface);
+    }
     /* --stop_row truncates the strip. Anything at or below the last database
        level drops the top border, and the strip stops there with its top open. */
-    if (g_stop_level >= 0 && g_stop_level <= g_top_level[round]) {
+    if (g_stop_level >= 0 && g_stop_level <= g_top_level[round] && !g_held[round]) {
         if (g_stop_level < 1) fatal("--stop_row must be >= 1");
         g_top_level[round] = g_stop_level;
         g_close_top[round] = false;
@@ -1443,7 +1524,11 @@ static void do_strip(int round) {
         printf("[round %d] refills the input's %s band: rows %d..%d x cols %d..%d, "
                "%d chain level(s) of %d%s\n", round, round_side(round),
                sr0, sr1, sc0, sc1, g_top_level[round], g_W,
-               g_close_top[round] ? " + a top border closure" : " (far end left open)");
+               g_close_top[round] ? " + a top border closure" :
+               g_held[round] ? "" : " (far end left open)");
+        if (g_held[round])
+            printf("[round %d] %d level(s) held at the far end; the strip fills up to meet "
+                   "them\n", round, g_held_n[round]);
     }
 
     /* Closure chains first: the backward sweep is seeded from them. */
@@ -1736,6 +1821,16 @@ static bool cell_kept(int r, int c, int W) {
     return keep;
 }
 
+/* Which round's strip refills a freed cell: 1, 2 or 3. The clauses in cell_kept
+   nest, so a cell belongs to the first one that frees it, and the three bands
+   tile the board's freed part exactly. Only meaningful where cell_kept is false.
+   --hold_band reads this to find the band the LAST round will refill. */
+static int band_of(int r, int c, int W) {
+    if (c > PUZZLE_SIDE-1-W) return 1;      /* right band, full height   */
+    if (r > PUZZLE_SIDE-1-W) return 2;      /* top band, clipped by 1    */
+    return 3;                               /* left band, clipped by 1+2 */
+}
+
 /* The same rectangle on the INPUT board -- the only form a reader can check
    against their own CSV. Same bounds as cell_kept, mapped back. */
 static void core_box_orig(int W, int *r0, int *r1, int *c0, int *c1) {
@@ -1781,6 +1876,67 @@ static bool core_usable(int W, char why[128]) {
             }
             return false;
         }
+    return true;
+}
+
+/* --hold_band pre-flight, run once per board while the supply counts are still
+   about to be built from scratch.
+ *
+ * Holding the last band only makes sense if what stands in it is something the
+ * strip search can MEET: whole chain levels, legally seated, and break-free both
+ * inside themselves and against the core they touch. A band that holds a partial
+ * level, or one with a break in it, is not refused -- the run is still worth
+ * making, it just has to start that band from nothing like any other. So the
+ * band is freed, the reason is printed, and the search carries on unheld.
+ *
+ * Returning false is reserved for a board that cannot be searched at all. */
+static bool hold_band_prepare(uint32_t line) {
+    const int W = g_W;
+    int n = 0, bad_r = -1, bad_c = -1; const char *why = NULL;
+
+    for (int r = 0; r < PUZZLE_SIDE && !why; r++)
+        for (int c = 0; c < PUZZLE_SIDE && !why; c++) {
+            if (cell_kept(r, c, W) || !g_has[r][c]) continue;
+            n++;
+            const Oriented *o = &g_grid[r][c];
+            bool fb = (r==0), ft = (r==PUZZLE_SIDE-1), fl = (c==0), fr = (c==PUZZLE_SIDE-1);
+            if (rh_zero_count(o->piece_id) != (fb+ft+fl+fr) ||
+                (fb && o->bottom != 0) || (ft && o->top   != 0) ||
+                (fl && o->left   != 0) || (fr && o->right != 0)) {
+                why = "a piece in it does not seat legally"; bad_r = r; bad_c = c; break;
+            }
+            if (c+1 < PUZZLE_SIDE && g_has[r][c+1] && o->right != g_grid[r][c+1].left) {
+                why = "it holds a break"; bad_r = r; bad_c = c; break;
+            }
+            if (r+1 < PUZZLE_SIDE && g_has[r+1][c] && o->top != g_grid[r+1][c].bottom) {
+                why = "it holds a break"; bad_r = r; bad_c = c; break;
+            }
+        }
+
+    if (!why && n && n % W) why = "it holds a partial chain level";
+    if (!why) {
+        if (n) {
+            printf("[hold] line %u: holding %d piece(s) = %d chain level(s) in the %s band; "
+                   "round %d will fill up to meet them\n",
+                   line, n, n / W, round_side(g_rounds), g_rounds);
+        }
+        return true;
+    }
+
+    int ar, ac; frame_to_input(bad_r < 0 ? 0 : bad_r, bad_c < 0 ? 0 : bad_c,
+                               g_rot_applied, &ar, &ac);
+    if (bad_r >= 0)
+        printf("[hold] line %u: the %s band is not holdable -- %s at (%d,%d). Freeing it and "
+               "searching it from nothing, as without --hold_band\n",
+               line, round_side(g_rounds), why, ar, ac);
+    else
+        printf("[hold] line %u: the %s band is not holdable -- %s (%d piece(s), width %d). "
+               "Freeing it and searching it from nothing, as without --hold_band\n",
+               line, round_side(g_rounds), why, n, W);
+
+    for (int r = 0; r < PUZZLE_SIDE; r++)
+        for (int c = 0; c < PUZZLE_SIDE; c++)
+            if (!cell_kept(r, c, W)) g_has[r][c] = false;
     return true;
 }
 
@@ -1850,9 +2006,18 @@ static bool load_and_cut(const char *path, uint32_t line, int forced_W) {
         g_W = chosen;
     }
 
+    /* Free everything outside the core -- except, under --hold_band, whatever is
+       already standing in the band the LAST round refills. Those pieces are the
+       previous pass's work at the far end of this pass's strip, and holding them
+       is the whole point of the flag: the search fills up to MEET them. */
     for (int r = 0; r < PUZZLE_SIDE; r++)
-        for (int c = 0; c < PUZZLE_SIDE; c++)
-            if (!cell_kept(r, c, g_W)) g_has[r][c] = false;
+        for (int c = 0; c < PUZZLE_SIDE; c++) {
+            if (cell_kept(r, c, g_W)) continue;
+            if (g_hold_band && g_has[r][c] && band_of(r, c, g_W) == g_rounds) continue;
+            g_has[r][c] = false;
+        }
+
+    if (g_hold_band && !hold_band_prepare(line)) return false;
 
     /* Clue viability. A clue whose cell survives the cut is never re-placed by
        any strip, so if it is wrong there it is wrong for good and searching this
@@ -1953,6 +2118,18 @@ static const char *k_usage =
 "                         other way over the same cells -- a second exhaustive\n"
 "                         attack, not a new region\n"
 "  --stop_row R           stop each strip at level R instead of its last\n"
+"  --hold_band            do not free what is already standing in the band the LAST\n"
+"                         round refills. Those pieces must form complete chain levels\n"
+"                         stacked at the far end of the strip -- the shape the other\n"
+"                         spiral leaves behind, having filled that band from the\n"
+"                         opposite side until it stopped -- and the search then fills\n"
+"                         up to MEET them instead of starting the band from nothing.\n"
+"                         This is what lets CCW and CW compound: run one, feed its\n"
+"                         board to the other with this flag, and the second pass keeps\n"
+"                         the first pass's work instead of tearing it out. A band that\n"
+"                         holds a partial level, or a gap under the block, is refused\n"
+"                         rather than silently freed. Ignored by rounds 1..N-1, whose\n"
+"                         bands are freed and re-searched as usual (default off)\n"
 "  --BL/--BR/--TL/--TR P  pin a corner piece by its role on the INPUT board\n"
 "\n"
 "SEARCH -- exhaustive unless a budget bites\n"
@@ -2050,6 +2227,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--rotate") && i+1 < argc) g_rotate = atoi(argv[++i]);
         else if (!strcmp(a, "--reverse"))             g_reverse = true;
         else if (!strcmp(a, "--stop_row") && i+1 < argc) g_stop_level = atoi(argv[++i]);
+        else if (!strcmp(a, "--hold_band")) g_hold_band = true;
         else if (!strcmp(a, "--max_breaks") && i+1 < argc) g_max_breaks = atoi(argv[++i]);
         else if (!strcmp(a, "--clue_center"))  g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(a, "--clue_corners")) g_clue_mask |= CLUE_CORNERS;
@@ -2104,8 +2282,8 @@ int main(int argc, char **argv) {
     printf("\n=== E555 roundhouse ===\n\n");
     printf("[cfg] seed=%s boards=%s out_dir=%s\n", seed_path, csv_path, g_out_dir);
     printf("[cfg] rounds=%d rotate=%d reverse=%d strip_width=%s stop_row=%s ties=%u "
-           "only_complete=%d\n", g_rounds, g_rotate, g_reverse?1:0, wtag, sbuf, g_ties,
-           g_only_complete?1:0);
+           "only_complete=%d hold_band=%d\n", g_rounds, g_rotate, g_reverse?1:0, wtag, sbuf,
+           g_ties, g_only_complete?1:0, g_hold_band?1:0);
     printf("[cfg] max_breaks=%d max_nodes=%" PRIu64 " config_time=%.0fs max_wall=%.0fs "
            "max_boards=%" PRIu64 " threads=%d\n", g_max_breaks, g_max_nodes,
            g_config_time_sec, g_max_wall_sec, g_max_boards, g_nthreads);
@@ -2121,6 +2299,11 @@ int main(int argc, char **argv) {
     printf(" band; a break outside them makes a board unusable%s\n",
            (g_rounds == 3 && g_opt_W == 5)
                ? ". This cut keeps only 66 pieces: expect a budget, not a proof" : "");
+    if (g_hold_band)
+        printf("[plan] --hold_band: the %s band keeps whatever is already standing in\n"
+               "       it, and round %d fills up to meet it. Rounds 1..%d free their\n"
+               "       bands and re-search them as usual\n",
+               round_side(g_rounds), g_rounds, g_rounds-1);
     if (g_line_first >= csv_lines)
         printf("[warn] --border_row %u is past the end of the CSV: nothing to do\n", g_line_first);
     fflush(stdout);
