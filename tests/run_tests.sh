@@ -61,6 +61,7 @@ ALL_STEPS=(
     "roundhouse_selfcheck|the relaxed oracle against brute-force enumeration"
     "roundhouse_legal|every emitted board is break-free and frame-legal"
     "roundhouse_reverse|--reverse mirrors the seed, so the spiral runs the other way round"
+    "roundhouse_hold_band|--hold_band keeps the last band's standing levels and fills up to meet them"
     "backtracker_dives|greedy dives on the example board, plus an own-output round-trip"
     "backtracker_exhaustive|exhaustive enumeration identical at 1 and 4 threads"
     "backtracker_stop_band|--stop_row/--stop_column emit exact, finalizer-shaped bands"
@@ -551,6 +552,69 @@ EOF
     grep -qE "break inside the kept region at \(4,[0-9]+\)-\(4,[0-9]+\)" "$OUT/roundhouse_rev_cb.log" || \
         { cat "$OUT/roundhouse_rev_cb.log"; fail "the core break was not reported in the input's coordinates"; }
     echo "ok: a core break is reported on the input board, not on its mirror"
+}
+
+# --hold_band stops the last round freeing what is already standing in its band,
+# so two passes can compound instead of the second erasing the first. The fixture
+# is the known solution with the near half of the right band emptied: eight
+# complete chain levels stay at the far end, and the search has to fill up to
+# MEET them. Getting all 256 pieces back is the assertion -- the held pieces are
+# never re-placed, so the run can only reach 480 by filling to fit them.
+step_roundhouse_hold_band() {
+    rh_fixtures
+    python3 - data/synth_solution_480.csv "$OUT/rh_hold.csv" <<'EOF' || exit 1
+import sys
+src, dst = sys.argv[1:3]
+line = [l for l in open(src) if l.strip() and not l.lstrip().startswith(("#", "%"))][0]
+f = [t.strip() for t in line.split(",")]
+pos, rot = [int(x) for x in f[-512:-256]], f[-256:]
+# Columns 13..15 are the band a W=3 --rounds 1 --rotate 0 run frees; emptying
+# rows 0..7 of it leaves rows 8..15 standing as eight whole levels.
+free = {r * 16 + c for r in range(8) for c in range(13, 16)}
+open(dst, "w").write("held, 0, " + ", ".join(str(999 if p in free else p) for p in pos)
+                     + ", " + ", ".join(rot) + "\n")
+print("ok: fixture keeps rows 8..15 of the right band, empties rows 0..7")
+EOF
+    bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_hold.csv" --rounds 1 --strip_width 3 \
+        --rotate 0 --hold_band --ties 1 --out_dir "$OUT/rh_hold" \
+        > "$OUT/roundhouse_hold.log" 2>&1
+    grep -q "holding 24 piece(s) = 8 chain level(s)" "$OUT/roundhouse_hold.log" || \
+        { cat "$OUT/roundhouse_hold.log"; fail "--hold_band did not hold the standing levels"; }
+    comp=$(first_match "$OUT"/rh_hold/roundhouse_*_miss0.csv)
+    [ -s "$comp" ] || { tail -5 "$OUT/roundhouse_hold.log"; fail "--hold_band emitted nothing"; }
+    python3 - "$comp" "$OUT/rh_hold.csv" data/synth_solution_480.csv <<'EOF' || exit 1
+import sys
+def row(p):
+    l = [x for x in open(p) if x.strip() and not x.lstrip().startswith(("#", "%"))][0]
+    f = [t.strip() for t in l.split(",")]
+    return f[0], [int(x) for x in f[-512:-256]], f[-256:]
+oid, opos, orot = row(sys.argv[1])
+_,   hpos, hrot = row(sys.argv[2])
+_,   tpos, trot = row(sys.argv[3])
+held = [p for p in range(256) if hpos[p] != 999]
+moved = [p for p in held if opos[p] != hpos[p] or orot[p] != hrot[p]]
+assert not moved, "held pieces were moved: %s" % moved[:5]
+assert "999" not in [str(x) for x in opos], "the board is not complete"
+assert opos == tpos and orot == trot, "the completion is not the known solution"
+assert oid.startswith("held_"), "the input config_id was not kept: %s" % oid
+print("ok: 232 held/core pieces untouched, 24 filled to meet them, id %s" % oid)
+EOF
+    # A band that cannot be held is NOT a refusal: it is freed and searched from
+    # nothing, exactly as without the flag, so a damaged band still gets a run.
+    bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_damaged.csv" --rounds 1 \
+        --strip_width 3 --hold_band --out_dir "$OUT/rh_hold_fb" \
+        > "$OUT/roundhouse_hold_fb.log" 2>&1 || true
+    grep -q "not holdable" "$OUT/roundhouse_hold_fb.log" || \
+        { cat "$OUT/roundhouse_hold_fb.log"; fail "an unholdable band was not reported"; }
+    fb=$(first_match "$OUT"/rh_hold_fb/roundhouse_*_miss0.csv)
+    [ -s "$fb" ] || { tail -5 "$OUT/roundhouse_hold_fb.log"; fail "the fallback did not search"; }
+    # --stop_row would move the strip's top, which the held block already fixes.
+    bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_hold.csv" --rounds 1 --strip_width 3 \
+        --hold_band --stop_row 5 --out_dir "$OUT/rh_hold_bad" \
+        > "$OUT/roundhouse_hold_bad.log" 2>&1 && fail "--hold_band --stop_row was accepted"
+    grep -q "both set where the strip ends" "$OUT/roundhouse_hold_bad.log" || \
+        { cat "$OUT/roundhouse_hold_bad.log"; fail "the conflicting pair was not explained"; }
+    echo "ok: held levels met, a damaged band falls back and still runs, --stop_row refused"
 }
 
 # The roundhouse only ever places pieces matching on every committed side, so a

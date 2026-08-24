@@ -238,8 +238,11 @@
  *   trust break-free, and the two never have to be told apart afterwards. Routing
  *   is on the board's OWN break count, so a greedy fill that lands perfectly is
  *   filed with the clean boards. Files open on first write: a run that emits
- *   nothing leaves nothing behind. Ids are p<line><tag><n> with n counting boards
- *   written by this run, and the tag saying what the board is:
+ *   nothing leaves nothing behind. THE INPUT BOARD'S config_id IS KEPT, and this
+ *   run appends `_<line><tag><n>` to it -- the input data line, the tag below, and
+ *   a counter unique within the run. So a board carries every stage it came
+ *   through, chained roundhouse passes included, and a board with no id of its own
+ *   is given `p<line>` to carry. The tag says what the board is:
  *
  *     s   SOLVED     complete and break-free. The puzzle, for this cut.
  *     d   DEEPEST    the furthest the exhaustive break-free search got.
@@ -304,6 +307,7 @@ static Oriented g_grid[PUZZLE_SIDE][PUZZLE_SIDE];
 static bool     g_has[PUZZLE_SIDE][PUZZLE_SIDE];
 static uint64_t g_placed[4];            /* pieces currently on the board */
 static int      g_rot_applied;          /* CW quarter-turns vs the input board */
+static char     g_in_id[96];            /* the input board's config_id, kept on output */
 static int      g_W;                    /* strip width in force */
 static int      g_n_placed;             /* pieces on the board: the depth metric */
 static int      g_avail[NUM_COLORS_TOTAL];   /* free inner-color sides, for parity */
@@ -1029,9 +1033,22 @@ static uint64_t live_count(int round, int level) {
 
 static int g_wall_suffix[MAX_ROUNDS+2][MAX_LEVEL+2][NUM_COLORS_TOTAL];
 static int g_cells_above[MAX_ROUNDS+2][MAX_LEVEL+2];
+/* --hold_band: the inner colours the held block's underside consumes. Without
+   this the count above is wrong in exactly the case the prune is active. */
+static int g_held_need[MAX_ROUNDS+2][NUM_COLORS_TOTAL];
 
 static void parity_prepare(int round) {
     memset(g_wall_suffix[round], 0, sizeof g_wall_suffix[round]);
+    /* The strip's topmost level does not face the frame when a block is held --
+       it faces the block, and those sides are spoken for. The prune's premise is
+       that every side of an unplaced piece pairs off or meets a KNOWN boundary,
+       so this one has to be counted with the others or the surplus comes out too
+       high and its parity flips, refuting arrangements that are perfectly good. */
+    memset(g_held_need[round], 0, sizeof g_held_need[round]);
+    if (g_held[round]) {
+        uint8_t bot[MAX_W]; sig_bottoms(g_held_sig[round], bot);
+        for (int i = 0; i < chain_w() - 1; i++) g_held_need[round][bot[i]]++;
+    }
     for (int r = g_top_level[round]; r >= 0; r--) {
         memcpy(g_wall_suffix[round][r], g_wall_suffix[round][r+1],
                sizeof g_wall_suffix[round][r]);
@@ -1049,12 +1066,18 @@ static void parity_prepare(int round) {
    nothing can be concluded. */
 static bool parity_ok(int round, int level, uint32_t sig) {
     if (g_cells_above[round][level] != NUM_PIECES - g_n_placed) return true;
+    /* Nothing above still to place: there are no sides left to pair off, and the
+       junction `sig` names is between two levels that are already down. Only a
+       held block reaches this level with the strip complete -- an open top means
+       a later round still has cells, so the test above has already returned. */
+    if (!g_cells_above[round][level]) return true;
     const int W = chain_w();
     uint8_t bot[MAX_W]; sig_bottoms(sig, bot);
     int need[NUM_COLORS_TOTAL] = {0};
     for (int i = 0; i < W - 1; i++) need[bot[i]]++;
     for (int c = COLOR_MIN; c <= COLOR_MAX; c++) {
-        int s = g_avail[c] - need[c] - g_wall_suffix[round][level][c];
+        int s = g_avail[c] - need[c] - g_wall_suffix[round][level][c]
+                - g_held_need[round][c];
         if (s < 0 || (s & 1)) return false;
     }
     return true;
@@ -1217,8 +1240,15 @@ static void emit_snap(const Snap *snap_in, const char *tag) {
         g_out_fp[which] = fopen(g_out_path[which], "a");
         if (!g_out_fp[which]) fatal("cannot open %s: %s", g_out_path[which], strerror(errno));
     }
+    /* Provenance, the way Stage C does it: the input's config_id is KEPT and this
+       run appends its own suffix after an underscore -- the input line, the tag,
+       and a counter unique within the run. Chain two roundhouse passes and the id
+       carries both, so a merged corpus still says where every row came from. */
+    char id[128];
+    snprintf(id, sizeof id, "%s_%u%s%" PRIu64, g_in_id, g_line_id, tag, g_emitted);
+
     FILE *fp = g_out_fp[which];
-    fprintf(fp, "p%u%s%" PRIu64 ", %d", g_line_id, tag, g_emitted, matched);
+    fprintf(fp, "%s, %d", id, matched);
     for (int i = 0; i < NUM_PIECES; i++) fprintf(fp, ", %d", s->pos[i]);
     for (int i = 0; i < NUM_PIECES; i++) fprintf(fp, ", %d", s->rot[i]);
     fputc('\n', fp);
@@ -1240,8 +1270,8 @@ static void emit_snap(const Snap *snap_in, const char *tag) {
         snprintf(hole, sizeof hole, "%d empty in rows %d..%d x cols %d..%d",
                  NUM_PIECES - s->placed, r0, r1, c0, c1);
     }
-    printf("[emit] p%u%s%" PRIu64 "  %d/%d placed  %d/480 matched  %d break(s)  %s\n",
-           g_line_id, tag, g_emitted, s->placed, NUM_PIECES, matched, breaks, hole);
+    printf("[emit] %s  %d/%d placed  %d/480 matched  %d break(s)  %s\n",
+           id, s->placed, NUM_PIECES, matched, breaks, hole);
     g_emitted++;
     if      (tag[0] == 's') g_stats.emit_solved++;
     else if (tag[0] == 'f') g_stats.emit_filled++;
@@ -1439,7 +1469,7 @@ static bool strip_geometry(int round) {
     }
     /* --stop_row truncates the strip. Anything at or below the last database
        level drops the top border, and the strip stops there with its top open. */
-    if (g_stop_level >= 0 && g_stop_level <= g_top_level[round] && !g_held[round]) {
+    if (g_stop_level >= 0 && g_stop_level <= g_top_level[round]) {
         if (g_stop_level < 1) fatal("--stop_row must be >= 1");
         g_top_level[round] = g_stop_level;
         g_close_top[round] = false;
@@ -1715,11 +1745,11 @@ static void restore_snap(const Snap *s) {
 
 /* -- Input ----------------------------------------------------------------- */
 
-static bool parse_fields(char *s, char id_out[64], int pos[NUM_PIECES], int rot[NUM_PIECES]) {
+static bool parse_fields(char *s, char id_out[96], int pos[NUM_PIECES], int rot[NUM_PIECES]) {
     char *tok = strtok(s, ",\r\n");
     if (!tok) return false;
     while (*tok == ' ') tok++;
-    if (id_out) snprintf(id_out, 64, "%s", tok);
+    if (id_out) snprintf(id_out, 96, "%s", tok);
     tok = strtok(NULL, ",\r\n");
     if (!tok) return false;
     for (int k = 0; k < 2*NUM_PIECES; k++) {
@@ -1733,7 +1763,7 @@ static bool parse_fields(char *s, char id_out[64], int pos[NUM_PIECES], int rot[
 
 /* Read the want-th data line of a board CSV; blank and '#'/'%' comment lines do
    not count. Any leading metadata is skipped -- only the last 512 fields matter. */
-static bool read_line(const char *path, uint32_t want, char id_out[64],
+static bool read_line(const char *path, uint32_t want, char id_out[96],
                       int pos[NUM_PIECES], int rot[NUM_PIECES]) {
     FILE *f = fopen(path, "r");
     if (!f) fatal("cannot open boards CSV %s: %s", path, strerror(errno));
@@ -1894,6 +1924,10 @@ static bool hold_band_prepare(uint32_t line) {
     const int W = g_W;
     int n = 0, bad_r = -1, bad_c = -1; const char *why = NULL;
 
+    /* The cut has just run, so the only cells still standing outside the core
+       are the ones it deliberately kept: the last round's band. Scanning
+       everything outside the core therefore scans exactly the held band. */
+
     for (int r = 0; r < PUZZLE_SIDE && !why; r++)
         for (int c = 0; c < PUZZLE_SIDE && !why; c++) {
             if (cell_kept(r, c, W) || !g_has[r][c]) continue;
@@ -1943,8 +1977,10 @@ static bool hold_band_prepare(uint32_t line) {
 /* Load one CSV line into the frame, apply --rotate, choose the strip width and
    free everything outside the core. */
 static bool load_and_cut(const char *path, uint32_t line, int forced_W) {
-    int pos[NUM_PIECES], rot[NUM_PIECES]; char id[64];
-    if (!read_line(path, line, id, pos, rot)) return false;
+    int pos[NUM_PIECES], rot[NUM_PIECES];
+    if (!read_line(path, line, g_in_id, pos, rot)) return false;
+    /* A board with no id of its own still needs one to carry. */
+    if (!g_in_id[0]) snprintf(g_in_id, sizeof g_in_id, "p%u", line);
 
     /* --reverse: into mirror space first, so everything below -- the clue
        orientation included -- reads a board that agrees with the mirrored seed
@@ -2248,6 +2284,9 @@ int main(int argc, char **argv) {
     if (g_rotate < -3 || g_rotate > 3) fatal("--rotate must be -3..3");
     g_rotate = (g_rotate + 4) & 3;      /* -1 == 3, one turn anticlockwise */
     if (g_ties < 1) fatal("--ties must be >= 1");
+    if (g_hold_band && g_stop_level >= 0)
+        fatal("--hold_band and --stop_row both set where the strip ends: the held "
+              "block already fixes it. Drop one.");
     if (g_max_breaks < 0) fatal("--max_breaks must be >= 0");
 
     if (nthreads > 0) { omp_set_num_threads(nthreads); g_nthreads = nthreads; }
