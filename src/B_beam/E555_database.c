@@ -999,6 +999,19 @@ void db_cache_save(const char *path) {
     fflush(stdout);
 }
 
+/* Undo a partially rebuilt pointer array. Every post-mapping failure in
+   db_cache_load MUST call this before unmapping: the loop below assigns
+   flat[fi] as it walks the index table, and db_layout only ever WRITES the
+   cells it finds non-empty -- it never clears the others. So a stale pointer
+   left here survives the rebuild that follows, and update_fanout dereferences
+   every non-NULL entry it finds. A truncated cache file would then be a
+   segfault at startup instead of the clean rebuild it is meant to be. */
+static void db_clear_inner_cells(void) {
+    Cell **flat = &g_db[0][0][0][0][0][0];
+    for (uint64_t fi = 0; fi < NCELL_DB; fi++)
+        if (color_is_inner((int)(fi % DIM_B5))) flat[fi] = NULL;
+}
+
 bool db_cache_load(const char *path) {
     double t0 = omp_get_wtime();
     int fd = open(path, O_RDONLY);
@@ -1056,6 +1069,7 @@ bool db_cache_load(const char *path) {
         uint64_t fi = tab[j].fi; uint32_t n = tab[j].n;
         if (fi >= NCELL_DB || !color_is_inner((int)(fi % DIM_B5)) || n == 0) {
             printf("[init] DB cache %s: corrupt table; rebuilding\n", path);
+            db_clear_inner_cells();
             munmap(arena, hdr.arena_bytes); free(tab); return false;
         }
         flat[fi] = (Cell *)(arena + off);
@@ -1067,8 +1081,7 @@ bool db_cache_load(const char *path) {
     free(tab);
     if (off != hdr.arena_bytes) {
         printf("[init] DB cache %s: arena size mismatch; rebuilding\n", path);
-        for (uint64_t fi = 0; fi < NCELL_DB; fi++)
-            if (color_is_inner((int)(fi % DIM_B5))) flat[fi] = NULL;
+        db_clear_inner_cells();
         munmap(arena, hdr.arena_bytes);
         return false;
     }

@@ -275,10 +275,16 @@ as Euler trails and ranked by fan-out -- one beam advances row by row:
 1. **Expand.** Every board fills its next row A→B→C from the database, with
    exact 256-bit piece-disjointness masks. Cells are pre-sorted by promise, so
    a first budgeted phase scans the most continuable chains; a second phase
-   visits the cell in a random full-cycle permutation (random start + coprime
-   stride) so random exploration never regenerates a duplicate child within a
-   slice. Per-parent work is bounded by `--scan_factor` (decode budget) and
-   `--pool_factor` (child quota).
+   visits, in a random full-cycle permutation (random start + coprime stride),
+   exactly the records phase 1 did NOT reach -- both phases index the same
+   slice-local space, so no A record is ever tried twice for one parent. That
+   matters most where quota is not the binding constraint, i.e. the early rows
+   and the collapsing rows 9-12: permuting the whole cell there re-walked
+   everything phase 1 had just done, and `try_A` is deterministic in its record,
+   so every one of those was a bit-identical duplicate child. Measured before
+   the fix, candidates/unique sat at exactly 2.0000 on every row with quota
+   headroom. Per-parent work is bounded by `--pool_factor` (child quota) and a
+   fixed decode budget.
 2. **Score.** See below.
 3. **Select.** Children dedup by a 64-bit *frontier signature* -- a hash of
    (used-piece set, exposed top colors), which provably determines a board's
@@ -304,26 +310,16 @@ effort there (K = `--beam_width`, E = `--beam_expand`, R = `--beam_expand_row`):
 Early rows explore (the heuristic knows little about an empty board); late
 rows are pure exploitation.
 
-**Gumbel top-K selection** (`--gumbel_tau0`, `--gumbel_tau1`; 0 = off, the
-default). The `frac_rand` band above is *uniform over survivors* -- blind to
-the score -- and it is switched off entirely from row R on, exactly where
-extinction pressure peaks. An alternative is to perturb the sort key instead:
-
-```
-key = score/tau + Gumbel(0,1),      Gumbel = -log(-log U)
-```
-
-Top-K of that is provably a sample of K **distinct** boards drawn without
-replacement with probability proportional to `exp(score/tau)` (Kool, van Hoof &
-Welling 2019) -- one RNG call per survivor, in a loop that already touches every
-survivor, replacing ~196 k serial rejection draws at default settings. Because
-the score is already a log record count, **tau = 1 samples in proportion to
-estimated completions**; tau -> 0 is greedy and large tau is near-uniform. Tau
-interpolates linearly from `tau0` at row 1 to `tau1` at `--stop_row`, so one
-monotone knob expresses the whole "trust the score more as the board fills"
-schedule. When tau > 0 the `frac_rand` band stands down; the pool's own scores
-are never perturbed, so the beam, the emission order and every reported score
-stay real.
+**Gumbel top-K selection on the beam rows was removed.** The idea was to
+perturb the sort key with `score/tau + Gumbel(0,1)`, whose top-K is provably a
+sample of K distinct boards drawn without replacement with probability
+proportional to `exp(score/tau)` (Kool, van Hoof & Welling 2019). It is a
+prettier instrument than the uniform `frac_rand` band and it measured worse:
+`--gumbel_tau0 1` lost to a plain `--frac_rand 0.10` on 20 of 20 paired
+configurations (0.89x row-10 width). The principled sampler did not beat the
+blunt one here, so the beam keeps the blunt one and `dedup_and_rank` keeps one
+code path instead of two. The primitive survives where it does earn its place --
+on the border ranking, below.
 
 **The same primitive on the borders** (`--gumbel_tau_bottoms`,
 `--gumbel_tau_columns`; 0 = off, the default; the finalizer takes the columns
@@ -382,15 +378,17 @@ one-row proof of death and rejects the child (below the stop row).
 exposed tops but disjoint remaining piece sets score identically. At row 3 that
 is a mild overcount; at row 11, with 154 of 196 pieces consumed, most counted
 records are unbuildable and the overcount is large and board-dependent.
-`--avail_correct` discounts it by `sum over the 14 inner frontier colors of
-log(R_c/tot_c)` -- the fraction of each color's half-edges still in the
-reservoir, a first-order estimate of how many counted chains survive. It
-decodes nothing and scans nothing (that is what the fan-out table exists to
-avoid); it is a closed-form correction on numbers already looked up, and it is
-self-scheduling, since the ratios sit near 1 until the reservoir empties.
+There is no correction for this in the beamer any more. `--avail_correct` used
+to discount the fan-out by each frontier colour's remaining supply; it was
+removed after losing all 61 paired configurations it was measured on (0.82x
+against the plain baseline, 0.70x against Mahalanobis, 0.68x against closure).
+It rewards holding abundant frontier colours, while the closure term often wants
+to spend a colour whose demand is already covered -- the two pull against each
+other. The overcount itself is largest at rows 10-11, where selection no longer
+discards anything, so correcting it there changes no decision.
 
-**The J objective** (`--score_model J`, `--lambda_J`). An alternative to the
-Mahalanobis term below, derived rather than tuned. Every free inner half-edge
+**The closure objective** (`--lambda_J`), the primary colour term, derived
+rather than tuned. Every free inner half-edge
 must eventually meet another of the *same* color; of the `(2A-1)!!` ways to
 pair up `2A = sum_c S_c` free half-edges, `prod_c (S_c-1)!!` are
 color-consistent, so
@@ -669,18 +667,13 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--stop_row R` | 12 | last row filled (1-13) |
 | `--beam_expand E` | 5 | late-search width multiplier |
 | `--beam_expand_row R` | 8 | row with the full ExK width |
-| `--score_model M` | `legacy` | color term: `legacy` (Mahalanobis) or `J` (pairing combinatorics) |
-| `--lambda_J F` | 1 | weight of the J terms (1 = as derived) |
-| `--lambda_Mahalanobis F` | 0 | weight of the color-usage atypicality bonus (legacy model) |
-| `--avail_correct` | off | discount B/C fan-out by each frontier color's remaining supply |
+| `--lambda_J F` | 0.75 | weight of the CLOSURE term, the primary color objective (useful 0.5-1) |
+| `--lambda_Mahalanobis F` | 0.6 | weight of the piece-structure correction, in units of its own measured per-row SD (useful 0.3-0.7) |
 | `--no_free_demand` | -- | **disable** the free-mode demand accounting (on by default) |
 | `--frac_rand F` | 0.75 | random selection band (halved at R-1, zero from R) |
-| `--gumbel_tau0 T` | 0 | selection temperature at row 1 (0 = off, exact legacy) |
-| `--gumbel_tau1 T` | 0 | selection temperature at `--stop_row` |
 | `--parent_cap N` | 5 | children per parent in the score band |
 | `--pool_factor N` | 8 | candidate-pool target, x beam width |
-| `--scan_factor N` | 1024 | decode budget per requested child |
-| `--bc_window nB,nC` | `3,2` | score up to nB x nC (B,C) completions per A record, keep the best |
+| `--bc_window nB,nC` | `3,2` | while the beam is FULL, score up to nB x nC (B,C) completions per A record and keep the best; while it is BELOW capacity, enumerate and keep every one |
 | `--top_bottoms N` | 300 | ranked bottom orderings tried per border row |
 | `--top_columns N` | 10 | ranked left columns per bottom |
 | `--gumbel_tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
@@ -702,10 +695,12 @@ more candidates. Without it `try_A` commits to the **first** conflict-free
 chosen by the database's global, board-blind fan-out sort: the score filters an
 unbiased sample but never steers it. With a window open, up to nB workable B
 chains x nC C completions are scored with the same formula used for selection and
-only the best is kept. **Either way exactly one child per A record survives** --
-the window is not a narrowing, it is the same width with a better choice inside
-it. Note `--scan_factor`'s budget counts segment-A decodes only,
-so an open window multiplies work the budget does not see. There is no
+only the best is kept. **While the beam is at capacity, exactly one child per A
+record survives** -- there the window is not a narrowing, it is the same width
+with a better choice inside it. While the beam is BELOW capacity the window
+opens instead: `select_beam` discards nothing once the pool stops filling the
+row width, so the other candidates are not losers but completions being thrown
+away, and every one is kept (quota still bounds the total). There is no
 counterpart in the finalizer, whose beam rows already enumerate *every*
 conflict-free (B, C) -- the defect the window fixes does not exist there.
 
@@ -887,10 +882,10 @@ The scoring and certificate options are shared with the beamer and mean the
 same thing here, with one exception: **`--bc_window` does not exist in the
 finalizer**, because (1) above already does more than any window -- the defect
 the window fixes is the beamer's "take the first (B, C) that fits", and this
-loop never did. `--score_model J` is a better fit here than in the beamer:
-`maha_term` infers the placed-piece count from `n = 14*row`, whereas `J` reads
-the colour counts straight off the board and stays exact from a locked partial
-at any `--finalize_from`.
+loop never did. The closure term is a better fit here than the
+Mahalanobis one: `maha_d2n` infers the placed-piece count from `n = 14*row`,
+whereas closure reads the colour counts straight off the board and stays exact
+from a locked partial at any `--finalize_from`.
 
 **Output** appends to `beam_completions_finalized_<stop_row>.csv` with config
 ids `p<line>r<repeat>l<column>`; several instances on the same machine may
@@ -1803,7 +1798,7 @@ bash tests/run_tests.sh
 ## Search-strategy trade-offs
 
 After the one-time DB build, wall-clock is roughly
-`(configs searched) x (rows reached x K x pool_factor x scan_factor x const)`.
+`(configs searched) x (rows reached x K x pool_factor x const)`.
 Dead configurations cost almost nothing; the budget is spent on those that
 survive several rows.
 

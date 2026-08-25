@@ -127,8 +127,12 @@ typedef struct {
    by our own search, so which physical side is "the bottom" is free, and a
    solution rotated 90 degrees satisfies the edge rules but NOT the clues -- so
    completeness needs all four. Index 0 is the center clue; 1..2 are the two
-   corner clues a bottom-up beam can reach; 3..4 sit on row 13, above any legal
-   --stop_row, and are only ever RESERVED so the supply accounting stays exact. */
+   corner clues a bottom-up beam can reach; 3..4 sit on row 13 and are only ever
+   RESERVED, never pinned, so the supply accounting stays exact. --stop_row 13
+   IS legal (MAX_DRILL_DEPTH is 13): searching row 13 simply builds it from other
+   pieces and leaves those two clues off the board, which is the deliberate
+   choice -- there is no point spending the hardest rows in the search on two
+   optional pieces this close to the top. */
 typedef struct { uint8_t row, col; uint16_t piece; uint8_t spin; } ClueCell;
 
 #define CLUE_N            5      /* entries per orientation                   */

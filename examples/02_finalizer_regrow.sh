@@ -64,7 +64,7 @@ CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
     --border_row "$FIRST_LINE" --border_row_N "$N_LINES" \
     --finalize_from "$FROM" --finalize_repeats "$REPEATS" \
     --beam_width "$BEAM_WIDTH" --stop_row "$STOP_ROW" \
-    --top_columns 0 --lambda_Mahalanobis 10 \
+    --top_columns 0 \
     --max_wall_sec "$MAX_WALL" --out_dir "$OUT_DIR" --verbose
 
 RESULT="$OUT_DIR/beam_completions_finalized_$STOP_ROW.csv"
