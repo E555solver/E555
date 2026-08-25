@@ -310,6 +310,31 @@ effort there (K = `--beam_width`, E = `--beam_expand`, R = `--beam_expand_row`):
 Early rows explore (the heuristic knows little about an empty board); late
 rows are pure exploitation.
 
+The random band is deliberately small. Both bands are drawn from the SAME
+deduplicated pool and sum to the row's width -- `k_rand = frac_rand * rem`,
+`k_top = rem - k_rand` -- so lowering `frac_rand` does not send more states
+forward, it sends better-chosen ones. Measured over 18 viable configs on the
+annealed border set at production width, two seeds, counting configs that
+filled row 11:
+
+| `--frac_rand` | 0.75 | 0.50 | 0.25 | **0.10** | 0 |
+|---|---|---|---|---|---|
+| configs of 18 | 9.0 | 12.0 | 12.5 | **15.0** | 14.5 |
+| sweep wall | 513s | 547s | 566s | **581s** | 835s |
+
+0.10 is the only point in that sweep that wins on both depth and throughput,
+and it is also the steadiest: `--frac_rand 0` swung from 594s to 1075s between
+seeds for less depth. Lower is not free -- the band is the only diversity
+source besides `parent_cap`, and 0 removes it entirely. A separate check
+confirmed the extra depth is real material and not a collapsed lineage: at
+0.10 and 0 the emitted row-10 boards are 34-39% MORE numerous than at 0.75,
+100% distinct in every arm, with the same mean pairwise separation (317/512)
+and the same ~46 different pieces available per cell.
+
+The finalizer keeps its own `--frac_rand 0.75`. Its schedule is different
+(`row <= finalize_from + 1`, not keyed to `beam_expand_row`), so this result
+does not transfer and it has not been measured there.
+
 **Gumbel top-K selection on the beam rows was removed.** The idea was to
 perturb the sort key with `score/tau + Gumbel(0,1)`, whose top-K is provably a
 sample of K distinct boards drawn without replacement with probability
@@ -670,7 +695,7 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--lambda_J F` | 0.75 | weight of the CLOSURE term, the primary color objective (useful 0.5-1) |
 | `--lambda_Mahalanobis F` | 0.6 | weight of the piece-structure correction, in units of its own measured per-row SD (useful 0.3-0.7) |
 | `--no_free_demand` | -- | **disable** the free-mode demand accounting (on by default) |
-| `--frac_rand F` | 0.75 | random selection band (halved at R-1, zero from R) |
+| `--frac_rand F` | 0.10 | random selection band (halved at R-1, zero from R) |
 | `--parent_cap N` | 5 | children per parent in the score band |
 | `--pool_factor N` | 8 | candidate-pool target, x beam width |
 | `--bc_window nB,nC` | `3,2` | while the beam is FULL, score up to nB x nC (B,C) completions per A record and keep the best; while it is BELOW capacity, enumerate and keep every one |
