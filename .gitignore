@@ -8,6 +8,7 @@ CLAUDE.md
 beam_out/
 round_out/
 roundhouse_out/
+bothways_out/
 final_out/
 stage_c_out/
 topper_out/
