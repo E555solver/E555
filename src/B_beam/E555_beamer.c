@@ -2095,6 +2095,75 @@ static int cmp_u64(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
+/* Does a left column's window score read the board the right way up?
+ *
+ * left_window_logfanout claims that rotating the column a quarter-turn CCW turns
+ * a vertical 5-strip of col-1 pieces into an ordinary DB chain, so that the
+ * strip standing against rows r..r+4 is counted by feeding right[] DOWNWARD.
+ * The direction is the whole claim and it fails silently: the database is dense
+ * enough that a reversed read still returns a large, plausible-looking number
+ * for every column -- just the count of a tuple no column ever presents -- so
+ * the ranking would quietly become noise. Hence a check rather than trust.
+ *
+ * Build a real strip out of the database instead of a board file: decode a
+ * record, giving a horizontal chain q0..q4 with q_i.bottom = b_i and
+ * q_i.left = q_{i-1}.right. Rotate each piece CW (the inverse turn) and stack
+ * them, q0 on top. Then v_i.left = q_i.bottom = b_i and v_i.bottom = q_i.right
+ * = q_{i+1}.left = v_{i+1}.top, so the pieces really do stack -- that assertion
+ * is what catches a wrong face map. Laying v_i at row r+4-i makes right[r+4-i]
+ * = b_i, so a correct downward read must return EXACTLY the cell we decoded
+ * from, and the test is that equality rather than a mere non-zero: the database
+ * is dense enough (about two thirds of cells occupied, and the fan-out sums 17
+ * of them) that almost any 5-tuple of inner colours scores above zero, so "the
+ * reversed order also scores" is true and proves nothing. The reversed count is
+ * reported only to show the test has teeth -- it is a different tuple, so it
+ * should usually differ. The board-level direction is settled independently:
+ * on data/synth_solution_480.csv the downward read is a legal chain for 10 of
+ * 10 windows of the true left column, the upward read for 0 of 10. */
+static void verify_column_rotation(void) {
+    if (!getenv("E555_COL_VERIFY")) return;
+    RNG r = rng_for(0xC01C01C0u, 0, 0, 0);
+    const uint64_t zero[4] = {0,0,0,0};
+    int checked = 0, tried = 0, bad = 0, fwd_hit = 0, rev_hit = 0;
+    while (checked < 300 && tried < 200000) {
+        tried++;
+        int la = COLOR_MIN + (int)rng_uniform(&r, DIM_INNER);
+        uint8_t b[CHAIN_LEN];
+        for (int i = 0; i < CHAIN_LEN; i++) b[i] = (uint8_t)(COLOR_MIN + rng_uniform(&r, DIM_INNER));
+        const Cell *c = g_db[INNER_IDX(la)][INNER_IDX(b[0])][INNER_IDX(b[1])]
+                            [INNER_IDX(b[2])][INNER_IDX(b[3])][b[4]];
+        if (!c || c->n == 0) continue;
+
+        uint32_t w = rec_load(c->rec, 0, g_rec_bytes_inner);
+        uint8_t f[CHAIN_LEN]; unpack_inner(w, f, g_lb_bits);
+        uint16_t ci[CHAIN_LEN]; uint64_t m[4] = {0,0,0,0};
+        if (!decode_inner_chain(f, CHAIN_LEN, la, b, ci, m, zero)) { bad++; continue; }
+        checked++;
+
+        /* Turn the chain back a quarter-turn and stand it up, q0 on top. */
+        Oriented v[CHAIN_LEN];
+        for (int i = 0; i < CHAIN_LEN; i++)
+            v[i] = g_cat[cat_index_of(g_cat[ci[i]].piece_id, (uint8_t)((g_cat[ci[i]].rotation + 3) & 3))];
+        for (int i = 0; i < CHAIN_LEN; i++)
+            if (v[i].left != b[i]) { printf("[colv] FACE MAP: v[%d].left=%u b=%u\n", i, v[i].left, b[i]); bad++; }
+        for (int i = 0; i + 1 < CHAIN_LEN; i++)
+            if (v[i].bottom != v[i+1].top) { printf("[colv] STACK BREAK at %d\n", i); bad++; }
+
+        /* Lay it against rows 1..5 of a column and score it both ways round. */
+        int right[PUZZLE_SIDE], rev[PUZZLE_SIDE];
+        memset(right, 0, sizeof right); memset(rev, 0, sizeof rev);
+        for (int i = 0; i < CHAIN_LEN; i++) { right[CHAIN_LEN - i] = v[i].left; rev[1 + i] = v[i].left; }
+        double want = log1p((double)db_seg_fanout(b[0], b[1], b[2], b[3], b[4]));
+        double got  = left_window_logfanout(right, 1);
+        if (got == want) fwd_hit++;
+        else { printf("[colv] WRONG WINDOW: got %.6f want %.6f\n", got, want); bad++; }
+        if (left_window_logfanout(rev, 1) != want) rev_hit++;
+    }
+    printf("[colv] %d strips: downward %d/%d exact, reversed differs %d/%d, %d error(s)\n",
+           checked, fwd_hit, checked, rev_hit, checked, bad);
+    if (bad) fatal("column rotation self-check failed");
+}
+
 /* E555_SEG_VERIFY=1: assert that the pinned-segment walk with NO pin reproduces
    the database cell for the same key, chain for chain. The walk reads the raw
    (left,bottom) buckets while the cell holds packed records built by a separate
@@ -2253,19 +2322,25 @@ static void usage(const char *a0) {
 "                         first (<1 = all; default 10). A bottom on a NEW border is\n"
 "                         worth more than another bottom on one already tried, so\n"
 "                         spend the budget on --border_row_N before raising this\n"
-"  --top_columns N        left-column orderings tried per bottom (<1 = all; default 12)\n"
+"  --top_columns N        left-column orderings tried per bottom (<1 = all; default 12).\n"
+"                         Ranked SEPARATELY FOR EACH BOTTOM, since a column's rank is\n"
+"                         conditional on the bottom it shares the board with, so l0\n"
+"                         means the best column for THIS bottom. Columns that cannot\n"
+"                         complete row 1 with it are dropped, which is why the [rank]\n"
+"                         line can show fewer run than asked for\n"
 "  --gumbel_tau_bottoms T selection temperature for the bottom ranking: above 0 the\n"
 "                         --top_bottoms tried are a sample without replacement with\n"
 "                         probability proportional to exp(rank/tau) rather than the\n"
 "                         greedy head. 0 = off, exact legacy (default 0; ~2 buys\n"
 "                         variety at no measured yield cost)\n"
-"  --gumbel_tau_columns T the same for the left-column ranking. That rank is a sum\n"
-"                         over rows and so is symmetric in the row index, giving huge\n"
-"                         tie classes that memcmp settles, so the top L are\n"
-"                         lexicographically adjacent -- an argument for a high tau\n"
-"                         that a single-seed A/B did NOT confirm (see PROJECT_E555).\n"
-"                         Measure before raising it. 0 = off (default 0; ~4 buys\n"
-"                         variety at no measured yield cost)\n"
+"  --gumbel_tau_columns T the same for the left-column ranking. EVERY MEASUREMENT OF\n"
+"                         THIS FLAG BEFORE THE COLUMN RANK WAS REWRITTEN IS VOID: the\n"
+"                         old rank was one constant across all columns of a border\n"
+"                         row (see left_rank_of), so rank/tau cancelled and tau chose\n"
+"                         nothing -- tau 2 and tau 4 picked identical columns run for\n"
+"                         run, while the same test on --gumbel_tau_bottoms did not.\n"
+"                         There is now a real rank to perturb. 0 = off (default 0);\n"
+"                         re-measure before raising it\n"
 "  --bail_columns N       abandon a bottom after N consecutive columns that emitted\n"
 "                         nothing, instead of running all --top_columns. Most useful\n"
 "                         with --incomplete_top, which emits below the stop row; on\n"
@@ -2475,6 +2550,7 @@ int main(int argc, char *argv[]) {
         if (g_db_file) db_cache_save(g_db_file);
     }
     verify_segment_enumerator();
+    verify_column_rotation();
 
     if (g_free_edges) {                       /* edge cells are border-independent */
         build_edge_terminal_pool();
@@ -2590,15 +2666,13 @@ int main(int argc, char *argv[]) {
         /* Separate streams per border row, so the bottoms drawn for one row do
            not depend on how many columns the previous row happened to enumerate. */
         RNG brng = rng_for(g_master_seed, cur_row, 0xB0770D15u, 0);
-        RNG lrng = rng_for(g_master_seed, cur_row, 0x1EF7C015u, 0);
         rank_bottoms(g_tau_bottoms, &brng);
-        rank_lefts(g_tau_columns, &lrng);
 
         size_t nb = g_bottom_n, nl = g_left_n;
         size_t run_b = (g_top_bottoms >= 1 && (size_t)g_top_bottoms < nb) ? (size_t)g_top_bottoms : nb;
-        size_t run_l = (g_top_columns >= 1 && (size_t)g_top_columns < nl) ? (size_t)g_top_columns : nl;
-        printf("[sweep] bottoms=%zu (run %zu)  left-cols=%zu (run %zu)  -> %zu configs\n",
-               nb, run_b, nl, run_l, run_b*run_l); fflush(stdout);
+        size_t cap_l = (g_top_columns >= 1 && (size_t)g_top_columns < nl) ? (size_t)g_top_columns : nl;
+        printf("[sweep] bottoms=%zu (run %zu)  left-cols=%zu enumerated, up to %zu per bottom\n",
+               nb, run_b, nl, cap_l); fflush(stdout);
         if (nb == 0 || nl == 0) fatal("no border configs for row %u", cur_row);
 
         htable_init();
@@ -2626,6 +2700,20 @@ int main(int argc, char *argv[]) {
         else g_solution_idx = 0;
 
         for (size_t bi = start_bi; bi < run_b && !g_stop; bi++) {
+            /* A column's rank is conditional on the bottom (left_rank_of), so the
+               ranking belongs here, not once per border row. Its stream is keyed
+               by bi so each bottom draws its own and --resume re-derives the same
+               ordering for the bottom it re-enters. */
+            RNG lrng = rng_for(g_master_seed, cur_row, 0x1EF7C015u, (uint32_t)bi);
+            size_t distinct = 0;
+            size_t viable = rank_lefts(&g_bottoms[bi], g_tau_columns, &lrng, &distinct);
+            size_t run_l = viable < cap_l ? viable : cap_l;
+            printf("[rank] r%ub%zu: columns %zu -> %zu viable, %zu distinct rank(s), run %zu\n",
+                   cur_row, bi, nl, viable, distinct, run_l); fflush(stdout);
+            if (run_l == 0) {                /* no column completes row 1 with it */
+                write_checkpoint(ckpath, cur_row, (uint32_t)(bi+1), 0);
+                continue;
+            }
             uint32_t barren = 0;            /* consecutive columns that emitted nothing */
             for (size_t li = (bi == start_bi ? start_li : 0); li < run_l && !g_stop; li++) {
                 if (g_max_wall_sec > 0.0 && omp_get_wtime() - t_start >= g_max_wall_sec) { printf("[sweep] max_wall reached.\n"); g_stop = 1; break; }

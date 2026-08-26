@@ -148,7 +148,9 @@ abstract quality score -- it *is* the size of the space Stage B enumerates.
 The bottom count is exactly the number of bottom-row orderings the beamer
 sweeps and the left count the number of left columns per bottom: the border
 `TOP=17280 RIGHT=11520 BOTTOM=1152 LEFT=2880` makes the beamer print
-`bottoms=1152 ... left-cols=2880 -> 9000 configs`. So a bottom of 5000 with
+`bottoms=1152 ... left-cols=2880 enumerated`, followed by one `[rank]` line per
+bottom saying how many of those 2880 can actually start row 1 with it. So a
+bottom of 5000 with
 `--top_bottoms 300` means the sweep only ever sees 6 % of its own space, while
 a bottom of 400 means it sees three quarters of it. That is the argument for
 targets: you are sizing a search, not maximizing a number.
@@ -267,10 +269,93 @@ over all 17 possible left neighbours (~1.9 M entries, 15 MB): "how continuable
 are these five exposed tops?" in one lookup. It powers the in-cell promise
 sort, border ranking, and the beam's one-row lookahead.
 
+### Ranking a left column
+
+A bottom row is ranked by `bottom_rank_of`: the log fan-out of the three
+segments it presents, `db_seg_fanout(rt[1..5]) + (rt[6..10]) + (rt[11..15])`.
+Those three windows are not a cut someone chose -- they *are* the 5-5-5
+architecture, so the score counts the search's actual first move.
+
+A column has no such decomposition. It faces fourteen different rows and each
+row's segment A takes exactly **one** colour from it, as the `left_color` key --
+never five. `left_rank_of` scores it in two parts.
+
+**Windows, by rotation.** Turn the board a quarter-turn counter-clockwise and the
+left column *is* a bottom row: per piece CCW sends N→W, W→S, S→E, E→N, so
+`phi(v).bottom = v.left` and `phi(v).top = v.right`. The column's fixed rightward
+faces become the fixed bottom colours a chain sits on, the free leftward faces of
+col 1 become its free tops, and the chain axis becomes bottom↔top read
+**downward**. So the vertical 5-strip of inner pieces standing against rows
+`r..r+4` is counted by
+
+```
+db_seg_fanout(right[r+4], right[r+3], right[r+2], right[r+1], right[r])
+```
+
+marginalised over the unknown colour above it -- the same marginalisation
+`bottom_rank_of` accepts over the unknown colour to its left. This is an exact
+count, not an analogy: `g_cat` holds all four spins of every inner piece, so the
+record set is closed under the rotation. **The argument order is load-bearing.**
+Read the other way round, a real board's own column counts zero: on
+`data/synth_solution_480.csv` the downward read is a legal chain for 10 of 10
+windows of the true left column and the upward read for 0 of 10.
+`E555_COL_VERIFY=1` guards it at startup by rebuilding strips out of the database
+and asserting the window returns exactly the cell they came from (300/300 exact,
+and the reversed order differs on 299 of 300, so the check has teeth).
+
+The windows **slide** (`r = 1..10`) rather than partitioning into three the way
+the bottom's do. Since a 5-window is a proxy object here, no cut point is
+privileged, and partitioning at 1-5/6-10/10-14 would blind the score across rows
+5-6 and 10-11 by accident of where counting started -- when order-awareness is
+the entire point of doing this at all. Sliding also keeps every window all-inner:
+one reaching row 0 would need the DB's edge cells, whose terminal pool is the
+*right* edges, where the rotation calls for the *bottom* edges.
+
+**The joint term.** `right[1]` **is** segment A's `left_color` at row 1, and the
+bottom fixes `rtop0[1..5]`, so `db_seg_count(right[1], rt[1..5])` is the exact
+number of legal row-1 segment-A chains for this pair -- precisely the quantity
+`bottom_rank_of` has to marginalise away, un-marginalised by the column. It is
+the only place in the database where the two borders meet, and **zero proves the
+pair cannot complete row 1**. Such columns sort last and are not run: on 150
+distinct configs from an earlier sweep, 17 (11.3 %) died at row 1 in 0.0 s, and
+for two bottoms it was 3 of their 6 columns.
+
+Because of that term the ranking is **per bottom**, inside the sweep's bottom
+loop rather than once per border row, and `l0` means the best column for *this*
+bottom. Its RNG stream is keyed by the bottom index so `--resume` re-derives the
+same ordering. Cost is a few thousand table lookups and a qsort of at most a few
+thousand structs -- sub-millisecond against a 600 s config slice.
+
+**The finalizer keeps the old measure.** `fin_left_rank` is still
+`sum_r log1p(la_total[right[r]])`, and deliberately so. Its column is half
+locked -- col 1 at rows `1..finalize_from` is already occupied, and the reduced
+database has had those very pieces removed -- so a rotation window reaching
+below the lock line counts strips for cells nothing will fill, against a
+database skewed against them. Restricting to windows above the line is correct
+but leaves none at all once fewer than five rows are free, which is the common
+case. And unlike the beamer's, its measure is not degenerate: `fin_enumerate_lefts`
+and `fin_sample_left` draw from the remaining edge pool, so piece sets genuinely
+vary between samples and a multiset census still discriminates. Measured both
+ways, the rotation windows cost the `clue_orient` regression its emissions
+outright, where the old measure passes it.
+
+**Why there is no colour-supply term beside it.** Every enumerated column of a
+border row is a permutation of the *same* `EDGE_LEN` pieces, so its exposed
+colour multiset is invariant, so every functional of that multiset is constant
+across columns: `sum_c D_c log R_c`, the ratio form `sum_c D_c log(D_c/R_c)`, and
+`closure_raw` on the initial board alike -- the last because `color_consumed` is
+all zero there and the bottom's demands are an additive constant inside the
+bottom loop. Only **positional** information distinguishes columns, and database
+lookups are how it is read. (`--random_edges` differs: columns are drawn from the
+56-edge pool minus the bottom's, so piece sets genuinely vary and the old measure
+was merely order-blind there rather than constant. Both terms above are live in
+both modes, so one score serves both.)
+
 ### The beam loop
 
 For each (bottom ordering x left-column ordering) configuration -- enumerated
-as Euler trails and ranked by fan-out -- one beam advances row by row:
+as Euler trails, the bottoms ranked by fan-out and the columns ranked per
+bottom (above) -- one beam advances row by row:
 
 1. **Expand.** Every board fills its next row A→B→C from the database, with
    exact 256-bit piece-disjointness masks. Cells are pre-sorted by promise, so
@@ -353,15 +438,25 @@ and the `--random_edges` and finalizer samplers are the K=1 case, an argmax over
 key, so `--top_bottoms`/`--top_columns` become a sample without replacement
 rather than the greedy head.
 
-It is the **column** rank that needs this. `left_rank_of` is
-`sum_r log1p(la_total[c_r])`: a board-blind census that never looks at the
-bottom, and -- decisively -- a sum over rows, hence *symmetric in the row index*.
-Two columns exposing the same colour multiset score identically however they
-order it, though position is what matters (row 1 meets the bottom, row 14 the
-top border). The tie classes are therefore large, `cmp_left_rank` settles them
-by `memcmp`, and taking the top L hands the sweep L lexicographically adjacent
-columns -- correlated, which is worse than random. Since the perturbation only
-decides which configs run, it costs no search time at all.
+**On the column rank, every measurement of this predating the column rewrite is
+void.** The old `left_rank_of` was `sum_r log1p(la_total[c_r])` -- a sum over
+rows, hence symmetric in the row index, hence a function of the column's exposed
+colour **multiset** alone. And that multiset is invariant:
+`classify_deal_from_rotations` pins `g_left_pool` to exactly `EDGE_LEN` pieces
+(it is fatal if not), and `rec_left` permutes them, so every enumerated column of
+a border row exposes the same colours in a different order. The rank was
+therefore *one constant*. At `tau 0`, `cmp_left_rank` fell through to `memcmp`
+and ordered columns lexicographically by exposed colour; at `tau > 0` the
+constant cancelled out of `rank/tau`, leaving the Gumbel noise alone -- so the
+ordering did not depend on tau at all. Measured: `--gumbel_tau_columns 2` and
+`4` chose identical columns config for config across a whole run, while the same
+comparison on `--gumbel_tau_bottoms` differed. That is also the explanation for
+the sweep's puzzling finding that columns at ranks 2-4 outlived rank 1 by 2.2x
+(p = 0.0008) while bottoms showed no such inversion: there was no column ranking
+to invert.
+
+The rank is now real (see **Ranking a left column**, below), so the perturbation
+has something to perturb. Re-measure before raising it.
 
 **That argument is structural, and one measurement does not back it.** A
 240 s-per-arm, single-seed `--random_edges` run at `--stop_row 11
@@ -698,9 +793,9 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--pool_factor N` | 8 | candidate-pool target, x beam width |
 | `--bc_window nB,nC` | `3,3` | while the beam is FULL, score up to nB x nC (B,C) completions per A record and keep the best; while it is BELOW capacity, enumerate and keep every one |
 | `--top_bottoms N` | 10 | ranked bottom orderings tried per border row |
-| `--top_columns N` | 12 | ranked left columns per bottom |
+| `--top_columns N` | 12 | ranked left columns per bottom, ranked separately for each bottom |
 | `--gumbel_tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
-| `--gumbel_tau_columns T` | 0 | ditto for left columns (measure before raising: see above) |
+| `--gumbel_tau_columns T` | 0 | ditto for left columns (every measurement predating the column rewrite is void: see above) |
 | `--bail_columns N` | 0 | abandon a bottom after N consecutive columns that emitted nothing (0 = off) |
 | `--clue_center` | off | force the published centre clue (piece 138) onto its cell, at its orientation's spin |
 | `--clue_corners` | off | force the two reachable corner clues (row 2); the row-13 pair is reserved, never pinned |

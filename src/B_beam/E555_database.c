@@ -81,11 +81,6 @@ Cell *g_db[DIM_INNER][DIM_INNER][DIM_INNER][DIM_INNER][DIM_INNER][DIM_B5];
 uint32_t  g_db_max_cell_n = 0;
 uint64_t *g_fanout = NULL;
 
-/* Per-left_color inner-record totals (for rank_lefts). Computed during the
-   fan-out build (or from the cache index table) so ranking never has to touch
-   the multi-GB inner arena. */
-static uint64_t g_la_total_inner[DIM_INNER];
-
 BottomOrder *g_bottoms = NULL;  size_t g_bottom_n = 0;
 LeftOrder   *g_lefts   = NULL;  size_t g_left_n   = 0;
 
@@ -579,7 +574,6 @@ static void db_layout(const uint32_t *cnt, bool inner_phase,
     const int rb = inner_phase ? g_rec_bytes_inner : g_rec_bytes_edge;
     uint64_t total_bytes = 0, total_recs = 0, total_cells = 0, sum_sq = 0;
     uint32_t max_n = 0, min_n = UINT32_MAX;
-    uint64_t la_tot[DIM_INNER] = {0};   /* per-left_color totals, inner phase */
     Cell **flat = &g_db[0][0][0][0][0][0];
 
     int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
@@ -591,7 +585,6 @@ static void db_layout(const uint32_t *cnt, bool inner_phase,
 
     #pragma omp parallel for schedule(static) num_threads(nt) \
             reduction(+:total_bytes,total_recs,total_cells,sum_sq) \
-            reduction(+:la_tot[:DIM_INNER]) \
             reduction(max:max_n) reduction(min:min_n)
     for (int k = 0; k < nchunk; k++) {
         uint64_t bytes = 0;
@@ -602,7 +595,6 @@ static void db_layout(const uint32_t *cnt, bool inner_phase,
             bytes += cell_stride(n, rb);
             total_recs += n; total_cells++;
             sum_sq += (uint64_t)n * (uint64_t)n;
-            la_tot[fi / FANOUT_N] += n;
             if (n > max_n) max_n = n;
             if (n < min_n) min_n = n;
         }
@@ -611,11 +603,6 @@ static void db_layout(const uint32_t *cnt, bool inner_phase,
     }
     if (total_cells == 0) fatal("%s is empty; seed/border inconsistent", name);
     if (max_n > g_db_max_cell_n) g_db_max_cell_n = max_n;
-    /* The per-left_color totals rank_lefts needs. Free here: the counts are
-       already in hand. Computing them later means dereferencing every pointer
-       in the arena, i.e. reading all of it a second time. */
-    if (inner_phase) memcpy(g_la_total_inner, la_tot, sizeof g_la_total_inner);
-
     double mean = (double)total_recs / (double)total_cells;
     double var  = (double)sum_sq / (double)total_cells - mean*mean;
     printf("[init] %s: %" PRIu64 " records  %" PRIu64 " cells  %.2f GB  rec=%dB  n: min=%u mean=%.1f max=%u stdev=%.1f\n",
@@ -710,13 +697,7 @@ static void update_fanout(bool inner_phase) {
     }
 }
 
-void build_fanout_inner(void) {
-    update_fanout(true);
-    /* g_la_total_inner is filled by db_layout, which has the same counts in
-       registers while it sizes the arena; the --db_file load path fills it from
-       the cache for the same reason. Recomputing it here meant a second full
-       read of the multi-GB arena for numbers already known. */
-}
+void build_fanout_inner(void) { update_fanout(true); }
 
 /* Records that can sit on five given bottom colors, summed over all left
  * neighbours (c0..c3 inner, c4 raw inner-or-edge). Left-agnostic productivity;
@@ -725,6 +706,21 @@ uint64_t db_seg_fanout(int c0, int c1, int c2, int c3, int c4raw) {
     if (!color_is_inner(c0)||!color_is_inner(c1)||!color_is_inner(c2)||!color_is_inner(c3)) return 0;
     if (c4raw < 0 || c4raw >= DIM_B5) return 0;
     return g_fanout[fan_flat(INNER_IDX(c0), INNER_IDX(c1), INNER_IDX(c2), INNER_IDX(c3), c4raw)];
+}
+
+/* The same count with the left neighbour KNOWN: one cell instead of the 17 the
+ * fan-out table sums. This is the quantity db_seg_fanout has to marginalise
+ * away, and the only place where a bottom row and a left column meet inside the
+ * database -- right[r] is exactly the left_color key of row r's segment A. Zero
+ * is a proof, not an estimate: no chain of inner pieces can sit there at all. */
+uint64_t db_seg_count(int la, int c0, int c1, int c2, int c3, int c4raw) {
+    if (!color_is_inner(la)) return 0;
+    if (!color_is_inner(c0)||!color_is_inner(c1)||!color_is_inner(c2)||!color_is_inner(c3)) return 0;
+    if (c4raw < 0 || c4raw >= DIM_B5) return 0;
+    Cell **flat = &g_db[0][0][0][0][0][0];
+    const Cell *c = flat[db_flat(INNER_IDX(la), INNER_IDX(c0), INNER_IDX(c1),
+                                 INNER_IDX(c2), INNER_IDX(c3), c4raw)];
+    return c ? c->n : 0;
 }
 
 /* -- Fan-out sort ---------------------------------------------------------- */
@@ -1062,7 +1058,6 @@ bool db_cache_load(const char *path) {
         g_fanout = xmalloc(FANOUT_N * sizeof(uint64_t));
         memset(g_fanout, 0, FANOUT_N * sizeof(uint64_t));
     }
-    memset(g_la_total_inner, 0, sizeof g_la_total_inner);
     Cell **flat = &g_db[0][0][0][0][0][0];
     uint64_t off = 0, recs = 0;
     for (uint64_t j = 0; j < hdr.ncells; j++) {
@@ -1076,7 +1071,6 @@ bool db_cache_load(const char *path) {
         off += cell_stride(n, g_rec_bytes_inner);
         recs += n;
         g_fanout[fi % FANOUT_N] += n;
-        g_la_total_inner[fi / FANOUT_N] += n;
     }
     free(tab);
     if (off != hdr.arena_bytes) {
@@ -1180,6 +1174,10 @@ static int cmp_bottom_rank(const void *a, const void *b) {
     if (x->rank != y->rank) return (x->rank < y->rank) ? 1 : -1;
     return memcmp(x->rtop0, y->rtop0, sizeof x->rtop0);
 }
+static int cmp_double_asc(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
 static int cmp_left_rank(const void *a, const void *b) {
     const LeftOrder *x = a, *y = b;
     if (x->rank != y->rank) return (x->rank < y->rank) ? 1 : -1;
@@ -1205,48 +1203,111 @@ void rank_bottoms(double tau, RNG *rng) {
     qsort(g_bottoms, g_bottom_n, sizeof(BottomOrder), cmp_bottom_rank);
 }
 
-/* Per-left_color record totals: inner part precomputed at DB build/load; edge
- * part summed here (edge cells are few and change per edge-pool rebuild). */
-static void compute_la_totals(uint64_t la_total[DIM_INNER]) {
-    memcpy(la_total, g_la_total_inner, DIM_INNER * sizeof(uint64_t));
-    Cell **flat = &g_db[0][0][0][0][0][0];
-    /* b5 is the last index and the non-inner colors are exactly 0..COLOR_MIN-1,
-       so the edge cells are the first COLOR_MIN slots of every DIM_B5-slot
-       group. Walking that comb visits 6 slots in every 23 instead of testing
-       all 32.6 M -- the same shape clear_edge_cells uses. */
-    for (uint64_t base = 0; base < NCELL_DB; base += DIM_B5) {
-        uint64_t la = base / FANOUT_N;      /* FANOUT_N is a multiple of DIM_B5,
-                                               so one division per group */
-        for (uint64_t b5 = 0; b5 < COLOR_MIN; b5++) {
-            Cell *c = flat[base + b5];
-            if (c) la_total[la] += c->n;
-        }
-    }
+/* A column the chosen bottom cannot start row 1 with. Sorts last at any tau:
+   -HUGE_VAL/tau is still -inf, and adding finite Gumbel noise leaves it there. */
+#define LEFT_RANK_DEAD (-HUGE_VAL)
+
+/* How well a left column supports the interior, given the bottom row it will
+ * share the board with.
+ *
+ * ROTATE THE COLUMN AND IT IS A BOTTOM ROW. A quarter-turn counter-clockwise
+ * sends each piece's N->W, W->S, S->E, E->N, so phi(v).bottom = v.left and
+ * phi(v).top = v.right: the column's fixed rightward faces become the fixed
+ * BOTTOM colours a chain sits on, the free leftward faces of col 1 become its
+ * free tops, and the chain axis becomes bottom<->top read DOWNWARD. A vertical
+ * 5-strip of inner pieces in col 1 spanning rows r..r+4 is therefore counted by
+ *
+ *     db_seg_fanout(right[r+4], right[r+3], right[r+2], right[r+1], right[r])
+ *
+ * marginalised over the unknown colour above it -- the same marginalisation
+ * bottom_rank_of accepts over the unknown colour to its left. The count is
+ * EXACT, not an analogy: g_cat holds all four spins of every inner piece, so
+ * the record set is closed under the rotation. Argument order is load-bearing;
+ * read the other way round, a real board's own column counts zero.
+ *
+ * THE WINDOWS SLIDE, they do not partition. A bottom row really is built as
+ * three DB lookups -- that is the 5-5-5 architecture, and bottom_rank_of counts
+ * the search's actual first move, not a proxy for it. A column has no such
+ * decomposition: each row's segment A takes exactly ONE colour from it, as the
+ * left_color key, never five. So a 5-window here is a proxy object and no cut
+ * point is privileged; partitioning at 1-5/6-10/10-14 would blind the score
+ * across rows 5-6 and 10-11 by accident of where counting started, and
+ * order-awareness is the entire point of doing this at all. Sliding also keeps
+ * every window all-inner: one reaching row 0 would need the DB's edge cells,
+ * whose terminal pool is the RIGHT edges, where the rotation calls for the
+ * BOTTOM edges -- the wrong 14 in fixed mode, a 56-piece superset in free mode.
+ *
+ * THE LAST TERM IS THE JOINT ONE. right[1] IS segment A's left_color at row 1
+ * and the bottom fixes rtop0[1..5], so db_seg_count of the two together is the
+ * exact number of legal row-1 segment-A chains for this pair: precisely the
+ * quantity bottom_rank_of has to marginalise away, un-marginalised by the
+ * column. It is the only place in the database where the two borders meet, and
+ * zero PROVES the pair cannot complete row 1 -- so those columns sort last and
+ * the sweep can spend its --top_columns budget on the rest.
+ *
+ * The sum is unweighted. The ten window terms span about 10*log1p(~2400) with a
+ * spread of order 10, and the joint term spans 0..~8 over the at most 14
+ * distinct right[1] values a border row offers, so the two already carry
+ * comparable influence and a weight flag would be one more thing to tune.
+ *
+ * WHAT THIS REPLACED, and why no colour-supply term stands beside it: the old
+ * measure was sum_r log1p(la_total[right[r]]), the DB records keyed by each
+ * left_color the column exposes. That is a sum over rows, hence symmetric in
+ * the row index, hence a function of the column's colour MULTISET alone -- and
+ * classify_deal_from_rotations pins g_left_pool to exactly EDGE_LEN pieces
+ * which rec_left then permutes, so every enumerated column of a border row
+ * exposes the SAME multiset. The measure was therefore one constant: at tau = 0
+ * cmp_left_rank fell through to memcmp and ordered columns lexicographically by
+ * exposed colour, and at tau > 0 the constant cancelled out of rank/tau and
+ * left the Gumbel noise alone -- which is why --gumbel_tau_columns 2 and 4 were
+ * observed to pick identical columns run for run while --gumbel_tau_bottoms 2
+ * and 4 differed. The same argument voids every supply/demand variant of it,
+ * closure_raw on the initial board included: any functional of that multiset is
+ * constant across columns. Only POSITIONAL information distinguishes them, and
+ * database lookups are how it is read. */
+double left_window_logfanout(const int right[PUZZLE_SIDE], int r) {
+    return log1p((double)db_seg_fanout(right[r+4], right[r+3], right[r+2],
+                                       right[r+1], right[r]));
 }
 
-/* How connectable a left column's exposed inner colors are: the total DB
- * records keyed by each left_color it presents to col 1 (rows 1..14). This is
- * the "rotate the side to the bottom and score with the DB" heuristic. */
-static double left_rank_of(const int right[PUZZLE_SIDE], const uint64_t la_total[DIM_INNER]) {
-    double s = 0.0;
-    for (int r = 1; r <= EDGE_LEN; r++)
-        if (color_is_inner(right[r])) s += log1p((double)la_total[INNER_IDX(right[r])]);
+static double left_rank_of(const int right[PUZZLE_SIDE], const BottomOrder *bot) {
+    const int *rt = bot->rtop0;
+    uint64_t joint = db_seg_count(right[1], rt[1], rt[2], rt[3], rt[4], rt[5]);
+    if (joint == 0) return LEFT_RANK_DEAD;      /* no row-1 segment A: dead pair */
+    double s = log1p((double)joint);
+    for (int r = 1; r + CHAIN_LEN - 1 <= EDGE_LEN; r++)
+        s += left_window_logfanout(right, r);
     return s;
 }
 
-/* At tau > 0, as rank_bottoms. This measure needs the perturbation more than
-   any other in the project: it is a sum over rows, so it is SYMMETRIC in the
-   row index -- two columns exposing the same colour multiset score identically
-   however they order it. The tie classes are therefore large, cmp_left_rank
-   settles them by memcmp, and taking the top L hands the sweep L
-   lexicographically adjacent columns. Perturbing the key breaks those ties
-   uniformly, which is most of the benefit here. */
-void rank_lefts(double tau, RNG *rng) {
-    uint64_t la_total[DIM_INNER];
-    compute_la_totals(la_total);
-    for (size_t i = 0; i < g_left_n; i++)
-        g_lefts[i].rank = gumbel_key(left_rank_of(g_lefts[i].right, la_total), tau, rng);
+/* Rank this bottom's left columns, best first; returns how many are viable (a
+   dead pair sorts last at any tau, since LEFT_RANK_DEAD survives both branches
+   of gumbel_key). At tau > 0, as rank_bottoms -- and unlike the measure this
+   replaced, the perturbation now has a real rank to perturb.
+
+   *distinct, if asked for, counts distinct values of the UNPERTURBED rank. That
+   is the diagnostic worth printing: the measure this replaced returned one value
+   for every column of a border row, so a 1 here means the ranking is not
+   ranking. Counting the stored keys instead would hide it, since above tau = 0
+   the Gumbel noise makes almost every key distinct whatever the rank did. */
+size_t rank_lefts(const BottomOrder *bot, double tau, RNG *rng, size_t *distinct) {
+    size_t viable = 0;
+    double *raw = distinct ? xmalloc(g_left_n * sizeof(double)) : NULL;
+    for (size_t i = 0; i < g_left_n; i++) {
+        double r = left_rank_of(g_lefts[i].right, bot);
+        if (r != LEFT_RANK_DEAD) viable++;
+        if (raw) raw[i] = r;
+        g_lefts[i].rank = gumbel_key(r, tau, rng);
+    }
+    if (raw) {
+        qsort(raw, g_left_n, sizeof(double), cmp_double_asc);
+        size_t d = 0;
+        for (size_t i = 0; i < g_left_n; i++) if (i == 0 || raw[i] != raw[i-1]) d++;
+        *distinct = d;
+        free(raw);
+    }
     qsort(g_lefts, g_left_n, sizeof(LeftOrder), cmp_left_rank);
+    return viable;
 }
 
 /* -- Random border sampling (--random_edges mode) --------------------------- */
@@ -1450,9 +1511,6 @@ bool sample_random_left(RNG *rng, double tau, const BottomOrder *bot, LeftOrder 
     Oriented TL, TR;
     if (s_tl_id < 0 || !orient_corner_role(s_tl_id, 2, &TL) || !orient_corner_role(s_tr_id, 3, &TR))
         fatal("sample_random_left called before sample_random_bottom");
-    uint64_t la_total[DIM_INNER];
-    compute_la_totals(la_total);
-
     /* have_best: see sample_random_bottom -- the Gumbel key goes negative. */
     Oriented best[PUZZLE_SIDE]; double best_key = 0.0, best_rank = 0.0;
     bool have_best = false;
@@ -1487,7 +1545,7 @@ bool sample_random_left(RNG *rng, double tau, const BottomOrder *bot, LeftOrder 
         got++;
         int right[PUZZLE_SIDE];
         for (int r = 0; r < PUZZLE_SIDE; r++) right[r] = seq[r].right;
-        double rank = left_rank_of(right, la_total);
+        double rank = left_rank_of(right, bot);
         double key  = gumbel_key(rank, tau, rng);
         if (!have_best || key > best_key) {
             memcpy(best, seq, sizeof best);

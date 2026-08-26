@@ -534,15 +534,46 @@ void db_cache_save(const char *path);    /* write the built+sorted inner DB */
    (c0..c3 inner, c4raw inner-or-edge raw color). One fan-out table lookup. */
 uint64_t db_seg_fanout(int c0, int c1, int c2, int c3, int c4raw);
 
+/* The same, with the left neighbour known: the one cell db_seg_fanout sums over
+   17 of. Zero means no chain of inner pieces fits there at all. */
+uint64_t db_seg_count(int la, int c0, int c1, int c2, int c3, int c4raw);
+
+/* log1p of the number of 5-piece VERTICAL strips of inner pieces that can stand
+   in col 1 against rows r..r+4 of a left column. A quarter-turn CCW makes the
+   column a bottom row -- phi(v).bottom = v.left, phi(v).top = v.right -- so the
+   strip is an ordinary chain and db_seg_fanout counts it, marginalised over the
+   unknown colour above. right[] is indexed by board row, so the arguments run
+   DOWNWARD; read the other way a real board's own column counts zero. That
+   ordering is the entire content of this function, so left_rank_of and the
+   E555_COL_VERIFY self-check share it rather than each spelling it out.
+
+   The finalizer deliberately does NOT use this. Its column is half locked --
+   col 1 at rows 1..finalize_from is already occupied, and the reduced database
+   has had those very pieces removed -- so a window reaching below the lock line
+   counts strips for cells nothing will fill, against a database skewed against
+   them; and restricting to windows above the line leaves none at all once fewer
+   than CHAIN_LEN rows are free, which is the common case. Its own piece pools
+   also vary from sample to sample, so its la_total measure is merely
+   order-blind rather than constant, and it measured better: swapping it for
+   this cost the clue_orient regression its emissions outright. */
+double left_window_logfanout(const int right[PUZZLE_SIDE], int r);
+
 void enumerate_bottoms(void);            /* fills g_bottoms / g_bottom_n */
 void enumerate_lefts(void);              /* fills g_lefts / g_left_n */
 /* Both need the DB; both set .rank and sort descending, so the caller's
    "take the first --top_bottoms/--top_columns" is the selection. tau = 0 stores
    the plain fan-out rank (greedy head, the default); tau > 0 stores the
    Gumbel-perturbed key instead, turning that same prefix into a sample without
-   replacement. rng is unused at tau = 0. */
+   replacement. rng is unused at tau = 0.
+
+   rank_lefts takes the bottom because a column's rank is conditional on it (see
+   left_rank_of), so it belongs INSIDE the caller's bottom loop, once per bottom,
+   not once per border row. It returns how many columns can complete row 1 at
+   all; the rest sort last and are worth skipping. distinct, if non-NULL, gets
+   the number of distinct UNPERTURBED ranks -- 1 would mean the ranking is not
+   ranking, which is what the measure this replaced did. */
 void rank_bottoms(double tau, RNG *rng);
-void rank_lefts(double tau, RNG *rng);
+size_t rank_lefts(const BottomOrder *bot, double tau, RNG *rng, size_t *distinct);
 
 /* -- Random border sampling (--random_edges mode) -------------------------- */
 /* Instead of a Stage A rotation row, borders are drawn directly from the

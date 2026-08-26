@@ -960,8 +960,14 @@ step_beamer_micro() {
          --border_row_N 1 --top_columns 1 --beam_width 20000 --stop_row 10
          --lambda_Mahalanobis 8 --seed 1 --out_dir "$OUT/beam")
     [ -n "${DB_FILE:-}" ] && CMD+=(--db_file "$DB_FILE")
-    "${CMD[@]}" > "$OUT/beamer.log"
+    # E555_COL_VERIFY needs a real database to build strips out of, and this is
+    # the only check that has one. It asserts the left-column window score reads
+    # the board the right way up -- a direction that fails silently, since a
+    # reversed read still returns a large plausible number for every column.
+    E555_COL_VERIFY=1 "${CMD[@]}" > "$OUT/beamer.log"
     grep -q "run summary" "$OUT/beamer.log" || fail "no run summary in beamer log"
+    grep -qE "^\[colv\] [0-9]+ strips: downward ([0-9]+)/\1 exact,.* 0 error" "$OUT/beamer.log" \
+        || { grep "^\[colv\]" "$OUT/beamer.log"; fail "column rotation self-check did not pass"; }
     comp="$OUT/beam/beam_completions_random_10.csv"
     if [ -s "$comp" ]; then
         python3 tools/E555_viewer.py "$comp" --no-board --no-url
