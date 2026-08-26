@@ -100,7 +100,7 @@ static uint32_t g_stop_row        = 12;
 static uint32_t g_beam_expand     = 5;
 static uint32_t g_beam_expand_row = 8;
 static double   g_lambda_maha     = 0.6;   /* --lambda_Mahalanobis, in score-SD */
-static double   g_frac_rand       = 0.10;  /* --frac_rand; see the help text */
+static double   g_frac_rand       = 0.75;
 /* Share of the beam reserved as a per-orientation floor, split evenly over the
    four orientations (so K/8 each). Not a CLI knob: it exists to stop one
    orientation crowding the others out, and unused floor is handed straight
@@ -2216,15 +2216,7 @@ static void usage(const char *a0) {
 "                         and constrains no searched row. Clue pieces leave the database\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by\n"
 "                         score; halved at beam_expand_row-1, zero from\n"
-"                         beam_expand_row on, so it shapes the material handed\n"
-"                         to the deep rows rather than the deep rows themselves.\n"
-"                         The two bands partition a fixed-width beam, so lowering\n"
-"                         this sends BETTER-chosen states forward, not more of\n"
-"                         them (default 0.10; measured 0.75->9.0, 0.50->12.0,\n"
-"                         0.25->12.5, 0.10->15.0, 0->14.5 configs of 18 filling\n"
-"                         row 11, and 0.10 also had the best fills/second and the\n"
-"                         least run-to-run spread. 0 is available and trusts the\n"
-"                         objective completely, at more variance for less depth)\n"
+"                         beam_expand_row on (default 0.75)\n"
 "  --parent_cap N         max children per parent in the score-selected band;\n"
 "                         doubled from beam_expand_row-1 on; 0 = uncapped (default 5)\n"
 "\n"
