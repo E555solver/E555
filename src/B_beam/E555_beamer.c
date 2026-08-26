@@ -704,9 +704,11 @@ static inline double maha_d2n(const BeamEntry *t, int row) {
  * usable measurement return 0, so the term simply stands down. */
 #define MAX_ACC_THREADS 256
 #define ACC_STRIDE      8               /* one cache line per thread, no sharing */
+#define MAHA_MIN_SAMPLES 64.0           /* below this a spread is mostly noise */
 static double g_d2n_acc[MAX_ACC_THREADS][ACC_STRIDE];   /* [0]=sum [1]=sumsq [2]=n */
 static double g_maha_mean[EDGE_LEN + 2];
-static double g_maha_sd[EDGE_LEN + 2];  /* 0 = row not measured */
+static double g_maha_sd[EDGE_LEN + 2];  /* 0 = row never measured */
+static double g_maha_n[EDGE_LEN + 2];   /* samples behind the stored estimate */
 
 static inline void maha_acc(double d2n) {
     int th = omp_get_thread_num();
@@ -726,13 +728,18 @@ static void maha_close_row(int row) {
         g_d2n_acc[th][0] = g_d2n_acc[th][1] = g_d2n_acc[th][2] = 0.0;
     }
     if (row < 0 || row > EDGE_LEN + 1) return;
-    /* Too small a sample gives a spread that is mostly noise; leaving the row
-       unmeasured stands the correction down rather than dividing by garbage. */
-    if (n < 64.0) { g_maha_mean[row] = 0.0; g_maha_sd[row] = 0.0; return; }
+    /* Too small a sample to RE-estimate the spread -- so keep the estimate that
+       is already there rather than erasing it. The table outlives a config on
+       purpose, and zeroing here let one config that died early strip the
+       calibration every later config would have scored against. An old estimate
+       of this row's spread beats no estimate. The sample count travels with it
+       so --verbose can show how much weight each row's figure carries. */
+    if (n < MAHA_MIN_SAMPLES) return;
     double mean = sum / n;
     double var  = sumsq / n - mean * mean;
     g_maha_mean[row] = mean;
     g_maha_sd[row]   = (var > 1e-18) ? sqrt(var) : 0.0;
+    g_maha_n[row]    = n;
 }
 
 /* -- The J objective: exact pairing combinatorics (--score_model J) ---------- */
@@ -2071,8 +2078,10 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
            correction down, and a table far from the reference values means the
            regime moved and the weight no longer means what it did. */
         printf("[sum] maha sd by row:");
+        bool anysd = false;
         for (int r = 1; r <= (int)g_stop_row; r++)
-            if (g_maha_sd[r] > 0.0) printf("  r%d:%.3f", r, g_maha_sd[r]);
+            if (g_maha_sd[r] > 0.0) { printf("  r%d:%.3f(n=%.0f)", r, g_maha_sd[r], g_maha_n[r]); anysd = true; }
+        if (!anysd) printf("  none measured (every row under the %.0f-sample floor)", MAHA_MIN_SAMPLES);
         printf("\n");
     }
     if (g_clue_debug)

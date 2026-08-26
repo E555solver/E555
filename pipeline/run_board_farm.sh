@@ -121,7 +121,7 @@ while true; do
         "$REPO/bin/E555_finalizer" "$SEED" "$RUN/in.csv" \
             --out_dir "$RUN/fin" --threads "$THREADS" \
             --finalize_from 7 --finalize_repeats 3 --stop_row 12 \
-            --beam_width 150000 --top_columns 0 --lambda_Mahalanobis 10 \
+            --beam_width 150000 --top_columns 0 \
             --border_row_N "$RESAMPLE_TOP" --incomplete_top \
             --max_wall_sec "$PASS_FIN_WALL" "${CLUE_ARG[@]}" 2>/dev/null
 

@@ -414,9 +414,22 @@ collapsed lineage: the emitted row-10 boards are 34-39% MORE numerous at 0.10
 than at 0.75, 100% distinct, with the same mean pairwise separation (317 of
 512 cells) and the same ~46 pieces available per cell.
 
-The finalizer keeps its own tapering `--frac_rand 0.75`: its schedule keys off
-`finalize_from` rather than `beam_expand_row`, so none of this transfers and it
-has not been measured there.
+**The finalizer's band is flat too, but at 0.30 -- and that difference is
+deliberate.** Its taper was worse than the beamer's, because a schedule written
+for a search starting at row 1 does not survive being handed a board already
+filled to `finalize_from`. At the default `finalize_from 8` the searched rows
+are 9..12 and `beam_expand_row` is 8, so exactly one row kept any randomness and
+the other three were purely fan-out selected -- the old code carved out that one
+row as an explicit exception and named the cost in its own comment ("repeated
+runs over the same partial would retrace each other"). Repeated runs are how the
+tool is used; `--finalize_repeats` exists for them. So the band that makes them
+differ has to be alive on every row.
+
+It sits at 0.30 rather than the beamer's 0.10 because the two tools spend a pass
+differently. The beamer gets one pass at a configuration and wants its budget on
+what the objective likes best. The finalizer can be re-run over the same partial
+as often as it is worth doing, so a wider random band is not a tax on one pass
+but coverage across many.
 
 **Gumbel top-K selection on the beam rows was removed.** The idea was to
 perturb the sort key with `score/tau + Gumbel(0,1)`, whose top-K is provably a
@@ -871,10 +884,49 @@ workspace scales linearly in `beam_width x beam_expand` (~9 KB per unit).
 bin/E555_finalizer seed.txt partials.csv [rotations.csv] --finalize_from 10 --stop_row 14 ...
 ```
 
+**Settings track the beamer's where the meaning is the same** -- `--beam_width
+250000`, `--beam_expand 4`, `--parent_cap 4`, `--lambda_J 1.0`,
+`--lambda_Mahalanobis 0.6`, `--pool_factor 8`, `--top_columns 12`,
+`--stop_row 11`, `--config_time_sec 600` -- so one number means one thing across
+Stage B, and
+`--bail_columns` exists here too (it abandons a partial line after N consecutive
+columns that report nothing). Two deliberately differ:
+
+- `--frac_rand 0.30` against 0.10, for the reason given above.
+- `--beam_expand_row 8` against 7. The row number is absolute in both, but this
+  search starts at `finalize_from + 1`, so at the default it is already past the
+  threshold on its first row and the two numbers do not mean the same thing.
+
+`--bc_window` has no counterpart here on purpose: this tool enumerates *every*
+conflict-free (B, C) completion of an A record rather than scoring a window and
+keeping the best, which is the right economy when the beam grows from a single
+locked board over a sparse database.
+
+**The Mahalanobis correction needs a row that was actually searched.** It is
+denominated in the per-row spread of `d2n`, measured live, and the beamer can
+simply use row `r-1` because it searched it a moment ago. This tool cannot: its
+first searched row is `finalize_from + 1` and everything below is locked, so
+`r-1` has no sample at all -- at the default that is row 9 normalising against
+row 8. A run short enough to search only two rows therefore never applied the
+correction once, whatever `--lambda_Mahalanobis` said. It now prefers *this*
+row's own spread, which an earlier configuration over the same database will
+have measured, then the row below, then the nearest measured row either way.
+Only the very first configuration of a run scores its first row uncorrected.
+
+Two things made that worse than it had to be, both fixed in both binaries: a row
+whose sample fell under the 64-sample floor used to **zero** the stored spread
+rather than leave the last good estimate standing, so one narrow configuration
+stripped the calibration every later one would have scored against; and the
+`--verbose` table printed nothing at all when no row was measured, which reads
+as "no correction needed" rather than "the correction never ran". It now prints
+the sample count behind each figure and says so explicitly when there is none.
+
 **Locking.** `--border_row/--border_row_N` select the CSV lines; each line is
 structurally validated (piece types per cell, frame orientation, every color
 match inside the locked region). Pieces at or below `--finalize_from`
-(default 8) are locked; pieces placed above return to the pool.
+(default 5) are locked; pieces placed above return to the pool. That default is
+low on purpose: the beam grows from a single locked board, so it needs rows to
+widen in before selection means anything -- see below.
 
 **Input dedup.** Long partial lists are full of near-siblings that seed
 *identical* searches once their top rows are freed. Every line is hashed on

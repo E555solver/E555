@@ -163,7 +163,7 @@ echo
 BEAM_CMD=("$REPO/bin/E555_beamer" "$SEED" 1_rotations.csv
     --out_dir beam --threads "$THREADS"
     --beam_width "$BEAM_WIDTH" --stop_row "$BEAM_STOP_ROW"
-    --border_row_N "$((ROUNDS/2))" --top_columns "$BEAM_COLUMNS" --lambda_Mahalanobis 10
+    --border_row_N "$((ROUNDS/2))" --top_columns "$BEAM_COLUMNS"
     --incomplete_top --max_partials "$BEAM_MAX_PARTIALS"
     --max_wall_sec "$BEAM_MAX_WALL" --verbose "${CLUE_ARG[@]}")
 [ -n "$DB_FILE" ] && BEAM_CMD+=(--db_file "$DB_FILE")
@@ -192,7 +192,7 @@ echo
 "$REPO/bin/E555_finalizer" "$SEED" "$BEAM_OUT" \
     --out_dir final --threads "$THREADS" --finalize_repeats 1 --frac_rand 0.0 \
     --beam_width "$FIN_WIDTH" --stop_row "$FIN_STOP_ROW" --finalize_from "$FIN_FROM" \
-    --border_row_N "$BEAM_MAX_PARTIALS" --top_columns 0 --lambda_Mahalanobis 10 \
+    --border_row_N "$BEAM_MAX_PARTIALS" --top_columns 0 \
     --incomplete_top --max_partials "$FIN_MAX_PARTIALS" \
     --max_wall_sec "$FIN_MAX_WALL" --verbose "${CLUE_ARG[@]}"
 
