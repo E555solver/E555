@@ -40,7 +40,7 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # ---- settings: edit here, or override from the environment ------------------
 SEED="${SEED:-$REPO/data/seed_Edge5.txt}"
 OUT_DIR="${OUT_DIR:-beam_out}"
-BEAM_WIDTH="${BEAM_WIDTH:-50000}"   # boards kept per row. Production: 262144
+BEAM_WIDTH="${BEAM_WIDTH:-50000}"   # boards kept per row. Production: 250000
 STOP_ROW="${STOP_ROW:-10}"          # last row filled. Higher = harder = slower
 MAX_WALL="${MAX_WALL:-0}"           # seconds for the whole run, 0 = unlimited
 CLUES="${CLUES:-0}"                # 1 = hold the published Eternity II clue

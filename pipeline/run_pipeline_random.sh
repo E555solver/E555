@@ -65,8 +65,8 @@ BEAM_COLUMNS="${BEAM_COLUMNS:-8}"   # random left columns per random bottom row
 # (bottom, column) PAIR, not of either ranking, so sampling the borders instead
 # of taking the best-ranked costs nothing measurable and spreads the run over
 # many more frames -- which is the whole point of the random-edges pipeline.
-# The beam's own band is the one that pays: 0.25 beat the --frac_rand 0.75
-# default by ~28% (a nonzero tau0/tau1 stands that band down).
+# The beam's own band is the one that pays: back when --frac_rand defaulted to
+# 0.75, 0.25 beat it by ~28%. The default is 0.10 now; see BEAM_FRAC_RAND below.
 BEAM_TAU_BOTTOMS="${BEAM_TAU_BOTTOMS:-2}"
 BEAM_TAU_COLUMNS="${BEAM_TAU_COLUMNS:-4}"
 # Replaced --gumbel_tau0/--gumbel_tau1, which are gone: the beam-row Gumbel

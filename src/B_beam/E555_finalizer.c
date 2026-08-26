@@ -925,7 +925,7 @@ static inline int maha_ref_row(int row) {
     return -1;
 }
 
-/* -- The J objective: exact pairing combinatorics (--score_model J) ---------- */
+/* -- The closure objective: exact pairing combinatorics (--lambda_J) --------- */
 /* Every free inner half-edge must eventually meet another of the SAME color. Of
  * the (2A-1)!! ways to pair up 2A = sum_c S_c free half-edges, prod_c (S_c-1)!!
  * are color-consistent, so
@@ -1546,8 +1546,11 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
         if (at_stop && g_incomplete_top && sl == 0) try_BC(ctx, &beam[pi], row);
         Expand e;
         if (!expand_prepare(&e, &beam[pi], pi, row, at_stop)) continue;
-        /* Seeded per parent, NOT per slice: the slices of one parent have to
-           agree on the phase-2 permutation in order to divide it between them. */
+        /* Seeded per parent, not per slice. That used to be load-bearing: the
+           slices shared ONE cycle over the whole cell and had to agree on it to
+           divide it. Phase 2 now permutes only the slice's own untouched tail,
+           so the shared key merely keeps a parent's randomness a function of the
+           parent and the row rather than of where its work landed. */
         e.rng = rng_for(cfg_hash, (uint32_t)row, pi, 0xFFFFFFFFu);
         e.quota = quota_slice; e.budget = budget_slice;
 
@@ -1858,8 +1861,8 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
             break;
         }
 
-        /* No perturbation at the stop row: ctx->keep drives emit_stop_row, and
-           emission is deliberately ranked by the real score. */
+        /* ctx->keep drives emit_stop_row, so the stop row's emission order IS
+           this ranking -- by the real score, and by nothing else. */
         uint32_t kept = dedup_and_rank(ctx, pool_n, nt);
         g_stats.t_select += omp_get_wtime() - t_exp;
         res.row = (uint32_t)row;
@@ -1884,8 +1887,6 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
 
         RNG sel_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFFu, 1u);
         uint32_t eff_K = beam_eff_K(row);
-        /* At tau > 0 the Gumbel perturbation IS the exploration, so the uniform
-           band stands down rather than randomizing an already-random order. */
         uint32_t n_sel = select_beam(ctx, kept, beam_n, eff_K,
                                      parent_cap_eff(row), g_frac_rand, &sel_rng);
         double t0 = omp_get_wtime();
@@ -1896,8 +1897,8 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
 
         if (g_verbose) {
             double dt = omp_get_wtime() - t_row;
-            /* The real best score of the row, read from the pool -- ctx->srt
-               holds the Gumbel-perturbed sort key when --gumbel_tau0 is on. */
+            /* The row's best score, read from the pool. ctx->srt now carries
+               the same number, nothing perturbing the sort key any more. */
             printf("[beam] %s row=%d cands=%" PRIu64 " uniq=%u beam=%u/%u smax=%.2f t=%.2fs (%.0f kc/s)\n",
                    g_config_id_str, row, pool_n, kept, beam_n, eff_K,
                    (double)ctx->pool[ctx->keep[0]].score, dt, (double)pool_n/dt/1e3);

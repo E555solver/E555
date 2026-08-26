@@ -124,11 +124,12 @@ BEAM_TAU_COLUMNS="${BEAM_TAU_COLUMNS:-4}"
 # Replaced --gumbel_tau0/--gumbel_tau1, which are gone: the beam-row Gumbel
 # selection lost 0-for-20 paired configs to a plain random band.
 BEAM_FRAC_RAND="${BEAM_FRAC_RAND:-0.10}"
-# Score up to nB x nC (B, C) completions per segment-A record and keep the best,
-# instead of taking the first that fits. The repo default is 3,2, which won a
-# two-seed sweep on foundations/minute; 3,3 scores one more column per B chain
-# and is the setting asked for here. Beamer only -- the finalizer's rows already
-# enumerate every conflict-free (B, C), so it has no --bc_window.
+# While the beam is FULL, score up to nB x nC (B, C) completions per segment-A
+# record and keep the best, instead of taking the first that fits; below capacity
+# the beamer keeps every child and the window does not apply. 3,3 is the repo
+# default now, so this line pins the setting rather than overriding it. Beamer
+# only -- the finalizer's rows already enumerate every conflict-free (B, C), so
+# it has no --bc_window.
 BC_WINDOW="${BC_WINDOW:-3,3}"
 
 # ---- the whirlpool ----------------------------------------------------------
