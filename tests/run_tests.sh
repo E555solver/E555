@@ -56,6 +56,7 @@ ALL_STEPS=(
     "annealer|Stage A short run: BEST lines and a beamer-format --out CSV"
     "finalizer_synth|REGRESSION: rediscovers the synthetic solution from row 10"
     "finalizer_rotations|re-imposes a matching rotations row's side assignment"
+    "finalizer_determinism|one seed re-run reproduces the search exactly"
     "roundhouse_synth|REGRESSION: rebuilds the solution at strip widths 3 and 5"
     "roundhouse_two_rounds|closes the board in two rounds, rotating between them"
     "roundhouse_selfcheck|the relaxed oracle against brute-force enumeration"
@@ -70,7 +71,7 @@ ALL_STEPS=(
     "band_with_frame|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
     "cpsat_chain|topper -> ender(ring) -> ender(patch), each fed by the last"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
-    "scripts_parse|every shipped example and pipeline script parses"
+    "scripts_parse|every shipped script parses, and passes only flags that exist"
     "example_finalizer|examples/02 re-grows the synthetic board"
     "example_roundhouse|examples/03 refills one strip"
     "example_bothways|examples/06 runs both chains over one board, ids intact"
@@ -402,6 +403,58 @@ EOF
         || fail "a non-matching rotations file was not rejected"
     grep -q "mode=free" "$OUT/rot_nomatch.log" || fail "no-match did not fall back to free mode"
     echo "ok: non-matching rotations file falls back to free mode"
+}
+
+# A randomized, threaded beam that cannot be reproduced cannot be bisected: a
+# regression shows up as a run that went differently, with no way to tell a real
+# change from the scheduler. Two runs on one seed must produce the same search,
+# configuration for configuration.
+#
+# What this fixture had to get right, and nearly did not:
+#
+#   * --beam_width 200, not the 20000 the other synthetic checks use. Above the
+#     candidate pool, select_beam returns early and the entire selection path --
+#     score, random band, parent cap -- never runs. At 20000 on this board it
+#     never ran: two DIFFERENT seeds produced byte-identical output, so the
+#     check would have passed with the RNG disconnected.
+#   * --finalize_from 5, so several rows clear the 64-sample Mahalanobis floor
+#     and the per-thread reduction behind it is actually exercised.
+#
+# Both arms fix --threads. Reproducibility across thread counts is deliberately
+# NOT asserted, because the finalizer does not offer it: the work partition
+# follows the thread count, and a beam that keeps a bounded number of candidates
+# keeps a different subset from a different partition -- at 2 vs 4 threads this
+# board scores 8731 candidates against 9009. Same count, same seed, same answer
+# is the contract; reproducing a run means recording --threads with the seed.
+step_finalizer_determinism() {
+    for arm in a b; do
+        bin/E555_finalizer data/synth_seed.txt data/synth_solution_480.csv \
+            --finalize_from 5 --stop_row 10 --beam_width 200 --frac_rand 0.30 \
+            --finalize_repeats 2 --threads 4 --seed 777 --verbose \
+            --out_dir "$OUT/det_$arm" > "$OUT/det_$arm.log" \
+            || { tail -5 "$OUT/det_$arm.log"; fail "the finalizer failed on arm $arm"; }
+        # keep the lines that describe the SEARCH, drop every timing field
+        grep -E "^\[sweep\] p|^\[sum\] (configs|rows|extinctions|emitted|maha)" \
+            "$OUT/det_$arm.log" \
+          | sed -E 's/wall=[0-9.]+s//g
+                    s/\([0-9.]+ s\/config, [0-9.]+ configs\/hour\)//g
+                    s/\([0-9.]+ Mcand\/s in expand\)//g' > "$OUT/det_$arm.norm"
+    done
+
+    # Three guards against a check that passes without testing anything -- the
+    # state the first version of this check was actually in.
+    n=$(grep -c "^\[sweep\] p" "$OUT/det_a.norm" || true)
+    [ "${n:-0}" -ge 2 ] || fail "only $n configurations captured (want >= 2)"
+    grep -q "maha sd by row:  r" "$OUT/det_a.norm" \
+        || fail "no row cleared the Mahalanobis sample floor -- its reduction went unchecked"
+    # If selection were inert the repeats would be identical to each other, and
+    # two runs matching would prove nothing.
+    [ "$(sort -u "$OUT/det_a.norm" | grep -c "^\[sweep\] p" || true)" -ge 2 ] \
+        || fail "every repeat searched identically -- the random band is not running"
+
+    diff "$OUT/det_a.norm" "$OUT/det_b.norm" > "$OUT/det.diff" \
+        || { head -10 "$OUT/det.diff"; fail "two runs on one seed searched differently"; }
+    echo "ok: $n configurations reproduced exactly on a re-run"
 }
 
 # The roundhouse rebuilds a board from a rotated frame, so a wrong rotation, a
@@ -956,12 +1009,23 @@ step_cpsat_chain() {
 
 step_beamer_micro() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    # No --lambda_Mahalanobis: it used to pass 8, a value in the raw-d2n units
+    # the term had before it was normalised by the live per-row spread. In
+    # score-SD, 8 is enormous and drowns the colour objective. The same stale
+    # value came out of the pipelines; leaving the flag off exercises the
+    # shipped default, which is what a smoke test should be testing.
     CMD=(bin/E555_beamer data/seed_Edge5.txt --random_edges
          --border_row_N 1 --top_columns 1 --beam_width 20000 --stop_row 10
-         --lambda_Mahalanobis 8 --seed 1 --out_dir "$OUT/beam")
+         --seed 1 --out_dir "$OUT/beam")
     [ -n "${DB_FILE:-}" ] && CMD+=(--db_file "$DB_FILE")
-    "${CMD[@]}" > "$OUT/beamer.log"
+    # E555_COL_VERIFY needs a real database to build strips out of, and this is
+    # the only check that has one. It asserts the left-column window score reads
+    # the board the right way up -- a direction that fails silently, since a
+    # reversed read still returns a large plausible number for every column.
+    E555_COL_VERIFY=1 "${CMD[@]}" > "$OUT/beamer.log"
     grep -q "run summary" "$OUT/beamer.log" || fail "no run summary in beamer log"
+    grep -qE "^\[colv\] [0-9]+ strips: downward ([0-9]+)/\1 exact,.* 0 error" "$OUT/beamer.log" \
+        || { grep "^\[colv\]" "$OUT/beamer.log"; fail "column rotation self-check did not pass"; }
     comp="$OUT/beam/beam_completions_random_10.csv"
     if [ -s "$comp" ]; then
         python3 tools/E555_viewer.py "$comp" --no-board --no-url
@@ -987,6 +1051,12 @@ step_scripts_parse() {
         n=$((n + 1))
     done
     echo "ok: $n scripts parse"
+    # Parsing is not running. When --gumbel_tau0/--gumbel_tau1 were removed
+    # from the beamer, two pipelines went on passing them and went on parsing
+    # perfectly; the binary rejects an unknown flag at startup, so the failure
+    # waited for whoever ran the pipeline next. This reads the accepted flags
+    # out of the parsers themselves, so it cannot drift from the code.
+    python3 tests/check_script_flags.py || fail "a script passes a flag its binary rejects"
 }
 
 # On the synthetic fixture, where the finalizer's chain database is 0.03 GB and

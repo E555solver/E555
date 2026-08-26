@@ -87,31 +87,28 @@
 
 static uint64_t g_master_seed = 0;
 
-static uint32_t g_beam_width      = 262144;
-static uint32_t g_stop_row        = 12;
-static uint32_t g_beam_expand     = 5;
+static uint32_t g_beam_width      = 250000;
+static uint32_t g_stop_row        = 11;
+static uint32_t g_beam_expand     = 4;
 static uint32_t g_beam_expand_row = 8;
-static double   g_lambda_maha     = 0.0;
-static double   g_frac_rand       = 0.75;
-static bool     g_score_model_J   = false;  /* --score_model J (default legacy) */
-static double   g_lambda_J        = 1.0;
-static bool     g_avail_correct   = false;
+static double   g_lambda_maha     = 0.6;   /* --lambda_Mahalanobis, in score-SD */
+static double   g_frac_rand       = 0.30;  /* flat; deliberately above the beamer */
+static double   g_lambda_J        = 1.0;    /* --lambda_J, the closure weight */
 static bool     g_free_demand     = true;   /* --no_free_demand turns it off */
-static double   g_gumbel_tau0     = 0.0;    /* 0 = off (exact legacy selection) */
-static double   g_gumbel_tau1     = 0.0;
-static uint32_t g_parent_cap      = 5;
+static uint32_t g_parent_cap      = 4;
 static uint32_t g_pool_factor     = 8;
-static uint32_t g_scan_factor     = 1024;
+#define SCAN_FACTOR 1024u   /* was --scan_factor; a sweep found it inert */
 static const char *g_out_dir      = "beam_out";
 
 static uint32_t g_border_row_index = 0;   /* first data line of the partials CSV */
 static uint32_t g_border_row_N     = 1;   /* number of consecutive lines to load */
-static uint32_t g_finalize_from    = 8;   /* lock rows 0..N; search starts at N+1 */
+static uint32_t g_finalize_from    = 5;   /* lock rows 0..N; search starts at N+1 */
 static uint32_t g_finalize_repeats = 1;   /* full sweeps per input partial */
 static double   g_config_time_sec  = 600.0;
 static double   g_max_wall_sec     = 0.0;
 static uint64_t g_max_partials     = 0;   /* reported-board budget; 0 = unlimited */
-static long     g_top_columns      = 10;  /* sampled left columns per partial (free mode) */
+static long     g_top_columns      = 12;  /* sampled left columns per partial (free mode) */
+static uint32_t g_bail_columns     = 0;   /* give up on a line after N barren columns */
 /* Selection temperature for the left-column rank, as in the beamer. 0 = off,
    i.e. the published column is simply the best of the samples. */
 static double   g_tau_columns      = 0.0;
@@ -206,34 +203,26 @@ static uint32_t beam_eff_K(int row) {
     return K * E;
 }
 
-/* Random selection band: full early (the fan-out heuristic knows little when the
-   board is mostly empty), half at expand_row-1, zero from expand_row on (pure
-   fan-out selection where only a few legal completions remain). Finalizer
-   exception: the FIRST searched row (finalize_from + 1) always keeps the full
-   input fraction, whatever the expansion schedule says -- with a high
-   finalize_from every searched row would otherwise be purely fan-out selected
-   and repeated runs over the same partial would retrace each other. */
-static double frac_rand_eff(int row) {
-    if ((uint32_t)row <= g_finalize_from + 1) return g_frac_rand;
-    if ((uint32_t)row < g_beam_expand_row - 1) return g_frac_rand;
-    if ((uint32_t)row == g_beam_expand_row - 1) return g_frac_rand * 0.5;
-    return 0.0;
-}
-
-/* Selection temperature (--gumbel_tau0/--gumbel_tau1), interpolated linearly
-   from tau0 at row 1 to tau1 at --stop_row -- absolute row meaning, like every
-   other schedule here, so a high --finalize_from starts already cooled. 0 = off,
-   the default, which restores the legacy path exactly (frac_rand's uniform band
-   plus greedy top-K). Because the score is already a log record count, tau = 1
-   samples boards in proportion to their estimated number of completions. */
-static double gumbel_tau_eff(int row) {
-    if (g_gumbel_tau0 <= 0.0 && g_gumbel_tau1 <= 0.0) return 0.0;
-    if (g_stop_row <= 1) return g_gumbel_tau0;
-    double f = (double)(row - 1) / (double)(g_stop_row - 1);
-    if (f < 0.0) f = 0.0; else if (f > 1.0) f = 1.0;
-    double tau = g_gumbel_tau0 + f * (g_gumbel_tau1 - g_gumbel_tau0);
-    return tau > 0.0 ? tau : 0.0;
-}
+/* The random selection band is FLAT: --frac_rand applies at every row, as in the
+   beamer, though at a deliberately higher default.
+ 
+   It used to taper -- full up to expand_row-1, half there, ZERO from expand_row
+   on -- with one exception carved out to keep the first searched row random.
+   That schedule was written for a search running from row 1, and it does not
+   survive being handed a board already filled to finalize_from. At the default
+   finalize_from of 8 the searched rows are 9..12 and expand_row is 8, so exactly
+   ONE row kept any randomness and the other three were purely fan-out selected.
+   The old comment names the cost of that itself: "repeated runs over the same
+   partial would retrace each other". Repeated runs are how this tool is used --
+   --finalize_repeats exists for it -- so the band that makes them differ has to
+   be alive on every row, not just the first.
+ 
+   Why higher than the beamer's 0.10 rather than equal to it: the beamer gets one
+   pass at a configuration and wants its budget spent on what the objective likes
+   best. The finalizer can be re-run over the same partial as often as it is
+   worth doing, so a wider random band is not a tax on one pass, it is coverage
+   across many -- and it is the only thing keeping those passes from being copies
+   of each other. */
 
 /* gumbel_noise() and gumbel_key() are shared with the side samplers -- see
    E555_database.h. */
@@ -367,7 +356,7 @@ static int fin_zero_count(int pid) {
    beamer's border init followed by commit_row for every locked row: used
    covers the locked pieces, the column and the two reserved top corners;
    color_consumed counts the four sides of every locked inner piece (so
-   maha_term's n = 14*depth stays exact); req_exposed carries the locked
+   maha_d2n's n = 14*depth stays exact); req_exposed carries the locked
    frontier's tops plus, in fixed mode, only the interfaces the REMAINING rows
    must still satisfy (the beamer's init demands minus what the locked rows
    already consumed -- the edge-terminal pool already excludes locked
@@ -394,14 +383,14 @@ static void fin_init_entry(BeamEntry *p, const LeftOrder *lft) {
     for (int r = 1; r <= (int)g_finalize_from; r++)
         for (int c = 1; c <= EDGE_LEN; c++) {
             const Oriented *o = &g_grid[r][c];
-            p->color_consumed[o->top]++;    p->color_consumed[o->right]++;
-            p->color_consumed[o->bottom]++; p->color_consumed[o->left]++;
+            p->color_consumed[INNER_IDX(o->top)]++;    p->color_consumed[INNER_IDX(o->right)]++;
+            p->color_consumed[INNER_IDX(o->bottom)]++; p->color_consumed[INNER_IDX(o->left)]++;
         }
 
     for (int c = 0; c < PUZZLE_SIDE; c++)
         p->rtop[c] = g_grid[g_finalize_from][c].top;
     for (int c = 1; c <= EDGE_LEN; c++)         /* inner frontier (cols 1..14) */
-        if (color_is_inner(p->rtop[c])) p->req_exposed[p->rtop[c]]++;
+        if (color_is_inner(p->rtop[c])) p->req_exposed[INNER_IDX(p->rtop[c])]++;
 
     if (!g_free_edges) {
         /* Remaining left interfaces. Every unlocked left-side edge ends up in some
@@ -412,14 +401,14 @@ static void fin_init_entry(BeamEntry *p, const LeftOrder *lft) {
         for (int k = 0; k < g_left_count_pool; k++) {
             const Oriented *lp = &g_left_pool[k];
             if (used_test(g_lock_mask, lp->piece_id)) continue;
-            if (color_is_inner(lp->right)) p->req_exposed[lp->right]++;
+            if (color_is_inner(lp->right)) p->req_exposed[INNER_IDX(lp->right)]++;
         }
         for (int t = 0; t < g_edge_term_count; t++) {  /* remaining right edges */
             int cl = g_edge_term[t].left;
-            if (color_is_inner(cl)) p->req_exposed[cl]++;
+            if (color_is_inner(cl)) p->req_exposed[INNER_IDX(cl)]++;
         }
         for (int c = COLOR_MIN; c <= COLOR_MAX; c++)
-            p->req_exposed[c] = (int16_t)(p->req_exposed[c] + g_top_border_inner_count[c]);
+            p->req_exposed[INNER_IDX(c)] = (int16_t)(p->req_exposed[INNER_IDX(c)] + g_top_border_inner_count[c]);
     } else if (g_free_demand) {
         /* Free mode owes exactly the same demands; only the bookkeeping differs.
            An edge piece carries ONE inner color, and in either remaining role --
@@ -443,12 +432,12 @@ static void fin_init_entry(BeamEntry *p, const LeftOrder *lft) {
         for (int r = (int)g_finalize_from + 1; r <= EDGE_LEN; r++) {
             if (!lft->p[r]) continue;                  /* column stops here */
             int cr = lft->right[r];
-            if (color_is_inner(cr)) p->req_exposed[cr]++;
+            if (color_is_inner(cr)) p->req_exposed[INNER_IDX(cr)]++;
         }
         for (int t = 0; t < g_edge_term_count; t++) {
             if (used_test(p->used, g_edge_term[t].piece_id)) continue;  /* already placed */
             int cl = g_edge_term[t].left;
-            if (color_is_inner(cl)) p->req_exposed[cl]++;
+            if (color_is_inner(cl)) p->req_exposed[INNER_IDX(cl)]++;
         }
     }
 
@@ -462,8 +451,8 @@ static void commit_row(BeamEntry *p, int row, const RowChoice *rc) {
     for (int i = 0; i < EDGE_LEN; i++) {
         const Oriented *o = &g_cat[rc->ci[i]];
         used_set(p->used, o->piece_id);
-        p->color_consumed[o->top]++;    p->color_consumed[o->right]++;
-        p->color_consumed[o->bottom]++; p->color_consumed[o->left]++;
+        p->color_consumed[INNER_IDX(o->top)]++;    p->color_consumed[INNER_IDX(o->right)]++;
+        p->color_consumed[INNER_IDX(o->bottom)]++; p->color_consumed[INNER_IDX(o->left)]++;
     }
     used_set(p->used, term->piece_id);
 
@@ -484,19 +473,19 @@ static void commit_row(BeamEntry *p, int row, const RowChoice *rc) {
     const bool demand_exact = (!g_free_edges || g_free_demand);
     for (int c = 1; c < PUZZLE_SIDE; c++) {
         int old_t = p->rtop[c], new_t = new_top[c];
-        if (color_is_inner(old_t)) p->req_exposed[old_t]--;
+        if (color_is_inner(old_t)) p->req_exposed[INNER_IDX(old_t)]--;
         if (color_is_inner(new_t)) {
-            if (row < EDGE_LEN)      p->req_exposed[new_t]++;
-            else if (demand_exact)   p->req_exposed[new_t]--;
+            if (row < EDGE_LEN)      p->req_exposed[INNER_IDX(new_t)]++;
+            else if (demand_exact)   p->req_exposed[INNER_IDX(new_t)]--;
         }
     }
     for (int c = 0; c < PUZZLE_SIDE; c++) p->rtop[c] = new_top[c];
 
     if (demand_exact) {
         int la = g_cur_left->right[row];           /* segment-A interface satisfied */
-        if (color_is_inner(la)) p->req_exposed[la]--;
+        if (color_is_inner(la)) p->req_exposed[INNER_IDX(la)]--;
         int tl = term->left;                       /* right-edge interface satisfied */
-        if (color_is_inner(tl)) p->req_exposed[tl]--;
+        if (color_is_inner(tl)) p->req_exposed[INNER_IDX(tl)]--;
     }
 
 }
@@ -512,7 +501,7 @@ static void commit_row(BeamEntry *p, int row, const RowChoice *rc) {
 static bool parity_ok(const BeamEntry *p) {
     const bool demand_exact = (!g_free_edges || g_free_demand);
     for (int c = COLOR_MIN; c <= COLOR_MAX; c++) {
-        int S = g_inner_color_total[c] - p->color_consumed[c] - p->req_exposed[c];
+        int S = g_inner_color_total[c] - p->color_consumed[INNER_IDX(c)] - p->req_exposed[INNER_IDX(c)];
         if (S < 0) return false;
         if (demand_exact && (S & 1)) return false;
     }
@@ -747,6 +736,26 @@ static void emit_incomplete(const BeamCtx *ctx, const BeamEntry *parent,
     }
 }
 
+/* BeamEntry.color_consumed is indexed by INNER_IDX and commit_row writes all four
+   faces of every placed inner piece without a color_is_inner guard -- the guard
+   would cost four branches per piece in the hottest loop in the program. That is
+   sound only because an inner piece carries inner colors on every face: the seed
+   loader keeps a piece as inner exactly when it has no frame side, and the
+   canonical seed's 196 inner pieces have all 784 faces in COLOR_MIN..COLOR_MAX.
+   It is a property of the seed file, not of the code, so check it once here
+   rather than trusting it. */
+static void init_check_inner_faces(void) {
+    for (int i = 0; i < g_cat_count; i++) {
+        const Oriented *o = &g_cat[i];
+        int f[4] = { o->top, o->right, o->bottom, o->left };
+        for (int k = 0; k < 4; k++)
+            if (!color_is_inner(f[k]))
+                fatal("inner piece %u presents non-inner color %d; the beam's "
+                      "color counters are indexed over inner colors only",
+                      o->piece_id, f[k]);
+    }
+}
+
 /* -- Mahalanobis scoring (full finite-population covariance) ----------------- */
 /* Measures how atypical the placed pieces' inner-color consumption vector is,
  * relative to drawing the same number of pieces uniformly without replacement
@@ -809,27 +818,111 @@ static void build_maha_tables(void) {
     for (int k = 0; k < DM; k++) { double s = 0.0; for (int ci = 0; ci < NC; ci++) s += g_maha_W[k][ci]*total[ci]; g_maha_Wtotal[k] = s; }
 }
 
-/* The maha term is active in the mid-board (rows 3..9), peaking at row 6: early
-   rows have too little signal, late rows should be pure fan-out. */
-static inline double maha_schedule(int row) {
-    if (row < 3 || row > 9) return 0.0;
-    return 1.0 / (1.0 + (double)abs(6 - row));
-}
-static inline double maha_term(const BeamEntry *t, int row) {
-    if (g_lambda_maha == 0.0) return 0.0;
-    double sched = maha_schedule(row);
-    if (sched == 0.0) return 0.0;
+/* The RAW statistic: d2n, with no weight and no row schedule.
+ *
+ * The schedule this replaced returned 0 outside rows 3..9 and peaked at row 6.
+ * That was the wrong shape twice over. Selection only binds where the deduped
+ * pool exceeds the row width -- measured at rows 4..7, since select_beam returns
+ * every candidate untouched when kept <= K -- so the row-3 and row-8/9 tails
+ * were weightless anyway, and killing the term at rows 10+ removed nothing that
+ * was acting. What the term actually needed was not a schedule but a common
+ * SCALE: d2n's spread varies by row (measured ~0.44 to ~0.73), so a fixed
+ * coefficient means a different effective weight at every depth. color_term
+ * divides that spread out instead. */
+static inline double maha_d2n(const BeamEntry *t, int row) {
     int n = EDGE_LEN * row, M = g_maha_M;
     double fn = (double)n*(double)(M-n) / ((double)M*(double)M*(double)(M-1));
     if (fn <= 0.0) return 0.0;
     double n_over_M = (double)n/(double)M, d2 = 0.0;
     for (int k = 0; k < MAHA_DIM; k++) {
         double wx = -n_over_M*g_maha_Wtotal[k];
-        for (int ci = 0; ci < NUM_INNER_COLORS; ci++) wx += g_maha_W[k][ci]*(double)t->color_consumed[COLOR_MIN+ci];
+        for (int ci = 0; ci < NUM_INNER_COLORS; ci++) wx += g_maha_W[k][ci]*(double)t->color_consumed[ci];
         d2 += wx*wx;
     }
-    double d2n = d2 / (fn*16.0);
-    return sched * g_lambda_maha * d2n;
+    return d2 / (fn*16.0);
+}
+
+/* Live per-row normalisation of d2n.
+ *
+ * The hybrid wants the Mahalanobis correction to carry a FIXED spread in score
+ * units at every depth -- lambda_Mahalanobis is read as a score standard
+ * deviation, not as a raw coefficient. That needs sigma_r, which is measured
+ * rather than tabulated: every scored candidate feeds a padded per-thread
+ * accumulator, and expand_row reduces them at the end of the row. Scoring row r
+ * therefore uses row r-1's spread.
+ *
+ * Measuring beats freezing a table here. A frozen table is a calibration tied to
+ * the seed, the borders and the beam shape, and it goes stale silently when any
+ * of them move -- which they will, since the generation changes in this same
+ * commit are meant to move exactly the rows this is measured over. The cost is
+ * that r-1's sigma is an approximation to r's: adjacent rows differ by ~5-6% in
+ * the reference table, well inside the useful band for lambda. Rows with no
+ * usable measurement return 0, so the term simply stands down. */
+#define MAX_ACC_THREADS 256
+#define ACC_STRIDE      8               /* one cache line per thread, no sharing */
+#define MAHA_MIN_SAMPLES 64.0           /* below this a spread is mostly noise */
+static double g_d2n_acc[MAX_ACC_THREADS][ACC_STRIDE];   /* [0]=sum [1]=sumsq [2]=n */
+static double g_maha_mean[EDGE_LEN + 2];
+static double g_maha_sd[EDGE_LEN + 2];  /* 0 = row never measured */
+static double g_maha_n[EDGE_LEN + 2];   /* samples behind the stored estimate */
+
+static inline void maha_acc(double d2n) {
+    int th = omp_get_thread_num();
+    if (th >= MAX_ACC_THREADS) return;          /* absurd --threads: stand down */
+    g_d2n_acc[th][0] += d2n;
+    g_d2n_acc[th][1] += d2n * d2n;
+    g_d2n_acc[th][2] += 1.0;
+}
+
+/* Reduce the row's accumulators and reset them. Summed in a FIXED thread order,
+   so the result does not depend on how the row's work happened to be scheduled;
+   it still depends on the thread COUNT, as every other float sum here does. */
+static void maha_close_row(int row) {
+    double sum = 0.0, sumsq = 0.0, n = 0.0;
+    for (int th = 0; th < MAX_ACC_THREADS; th++) {
+        sum += g_d2n_acc[th][0]; sumsq += g_d2n_acc[th][1]; n += g_d2n_acc[th][2];
+        g_d2n_acc[th][0] = g_d2n_acc[th][1] = g_d2n_acc[th][2] = 0.0;
+    }
+    if (row < 0 || row > EDGE_LEN + 1) return;
+    /* Too small a sample to RE-estimate the spread -- so keep the estimate that
+       is already there. Zeroing it here was a bug, and a bad one for a tool that
+       runs many small configurations over one database: a single narrow config
+       wiped the calibration a wider one had measured, and every config after it
+       scored with the correction stood down. An old estimate of this row's
+       spread beats no estimate; the sample count travels with it so --verbose
+       can show how much weight it carries. */
+    if (n < MAHA_MIN_SAMPLES) return;
+    double mean = sum / n;
+    double var  = sumsq / n - mean * mean;
+    g_maha_mean[row] = mean;
+    g_maha_sd[row]   = (var > 1e-18) ? sqrt(var) : 0.0;
+    g_maha_n[row]    = n;
+}
+
+/* Which row's spread normalises row `row`.
+ *
+ * The beamer can simply use row-1: it searches from row 1 upwards, so by the
+ * time it scores row r it has just measured r-1. The finalizer cannot. Its
+ * first searched row is finalize_from+1 and everything below is locked, so
+ * row-1 was never searched and never measured -- and with the default
+ * finalize_from that is row 9 normalising against row 8, which has no sample at
+ * all. A run short enough to search only two rows therefore never applied the
+ * correction once, whatever --lambda_Mahalanobis said.
+ *
+ * So: prefer THIS row's own spread, which a previous configuration over the same
+ * database will have measured (the table deliberately outlives a config), then
+ * the row below, then the nearest measured row in either direction. Same-row is
+ * the better normaliser anyway -- it is the population being scored rather than
+ * an adjacent approximation to it. Only the very first configuration of a run
+ * scores its first row uncorrected, and it is the one row nothing can calibrate.
+ *
+ * Deterministic for a fixed run: the table changes only between configurations,
+ * which execute in a fixed order, never within a row. */
+static inline int maha_ref_row(int row) {
+    if (row >= 1 && row <= EDGE_LEN + 1 && g_maha_sd[row] > 0.0) return row;
+    for (int r = row - 1; r >= 1; r--)             if (g_maha_sd[r] > 0.0) return r;
+    for (int r = row + 1; r <= EDGE_LEN + 1; r++)  if (g_maha_sd[r] > 0.0) return r;
+    return -1;
 }
 
 /* -- The J objective: exact pairing combinatorics (--score_model J) ---------- */
@@ -856,11 +949,11 @@ static inline double maha_term(const BeamEntry *t, int row) {
  * Both are written centred (S_c/Sbar, R_c/Rbar). Both sums are constant across
  * siblings at a given row, so centring cannot change the ranking; it keeps the
  * value near 0 instead of near 1600 nats, so any swept weight keeps its
- * meaning when --score_model is flipped.
+ * meaning when the weights are swept.
  *
- * This matters more here than in the beamer: maha_term infers the placed-piece
- * count from n = 14*row, whereas J reads S and R straight off the board, so it
- * stays exact from a locked partial at any --finalize_from. */
+ * This matters more here than in the beamer: maha_d2n infers the placed-piece
+ * count from n = 14*row, whereas closure reads S and R straight off the board,
+ * so it stays exact from a locked partial at any --finalize_from. */
 #define LOGTAB_N 801                    /* > 784 = every inner half-edge */
 static double g_logtab[LOGTAB_N];
 
@@ -869,13 +962,13 @@ static void build_logtab(void) {
     for (int i = 1; i < LOGTAB_N; i++) g_logtab[i] = log((double)i);
 }
 
-static inline double j_term(const BeamEntry *t) {
+static inline double closure_raw(const BeamEntry *t) {
     int S[NUM_INNER_COLORS], R[NUM_INNER_COLORS], D[NUM_INNER_COLORS];
     int sumS = 0, sumR = 0;
     for (int ci = 0; ci < NUM_INNER_COLORS; ci++) {
         int c = COLOR_MIN + ci;
-        R[ci] = g_inner_color_total[c] - t->color_consumed[c];
-        D[ci] = t->req_exposed[c];
+        R[ci] = g_inner_color_total[c] - t->color_consumed[INNER_IDX(c)];
+        D[ci] = t->req_exposed[INNER_IDX(c)];
         S[ci] = R[ci] - D[ci];
         sumR += R[ci]; sumS += S[ci];
     }
@@ -886,34 +979,43 @@ static inline double j_term(const BeamEntry *t) {
         if (S[ci] > 0) conc += (double)S[ci] * (g_logtab[S[ci]] - logSbar);
         if (D[ci] > 0) dem  += (double)D[ci] * (g_logtab[R[ci]] - logRbar);
     }
-    return g_lambda_J * (0.5 * conc + dem);
+    return 0.5 * conc + dem;
 }
 
-/* Availability correction (--avail_correct). fB and fC come from db_seg_fanout,
- * which sums record counts over all 17 left colors with NO reference to used[],
- * so two boards with identical exposed tops but disjoint remaining piece sets
- * score identically. alpha_c = R_c/tot_c is the fraction of color-c inner
- * half-edges still in the reservoir, so a chain sitting on colors b1..b5
- * survives with probability ~ prod_k alpha_{b_k} to first order; summed in log
- * space over the 14 inner frontier colors that is one term per segment-A/B/C
- * bottom (segment C's fifth bottom is an edge-interface color, whose terminals
- * come from a different pool). No record is decoded and no cell is scanned:
- * a closed-form discount on numbers already looked up, self-scheduling because
- * alpha ~ 1 until the reservoir actually empties. */
-static inline double avail_term(const BeamEntry *t) {
-    double s = 0.0;
-    for (int c = 1; c <= EDGE_LEN; c++) {
-        int col = t->rtop[c];                       /* inner: checked by the caller */
-        int R = g_inner_color_total[col] - t->color_consumed[col];
-        if (R <= 0) return -1000.0;                 /* unreachable: parity_ok rejects S<0 */
-        s += g_logtab[R] - g_logtab[g_inner_color_total[col]];
+/* The colour part of the score: closure, plus a small piece-structure correction.
+ *
+ *     lambda_J * C(t)  +  lambda_Mahalanobis * (d2n - mu_r) / sigma_r
+ *
+ * Closure is the primary objective -- it is demand-aware, it is a log
+ * probability so it adds to the fan-out log count in the same units, and a
+ * sweep put it 2.64x ahead of no colour term on 20 of 20 paired configs.
+ * Mahalanobis is the correction, not a co-equal term: the two correlate ~0.88,
+ * so most of what it adds repeats closure, and the genuinely new signal -- the
+ * part that knows half-edges arrive four at a time on indivisible pieces --
+ * has a spread of only ~0.29 nats at the recommended weight.
+ *
+ * Both terms are always live. A model is chosen by zeroing a weight, which is
+ * why there is no --score_model any more: --lambda_Mahalanobis 0 is closure
+ * alone, --lambda_J 0 is Mahalanobis alone.
+ *
+ * The d2n sample is taken for EVERY scored candidate, whether or not the
+ * correction can be normalised yet -- that is what gives the next row its
+ * sigma. It is also taken before the --bc_window best child is chosen, so the
+ * population measured is the population the score ranks.
+ *
+ * (--avail_correct used to be added here. It is gone: it lost 61 of 61 paired
+ * configs, and cost 32% against closure and 13% against the hybrid. It rewards
+ * holding abundant frontier colours, while closure often wants to spend a
+ * colour whose demand is already covered -- they pull against each other.) */
+static inline double color_term(const BeamEntry *t, int row) {
+    double s = g_lambda_J * closure_raw(t);
+    if (g_lambda_maha != 0.0) {
+        double d2n = maha_d2n(t, row);
+        maha_acc(d2n);
+        int ref = maha_ref_row(row);
+        if (ref >= 0) s += g_lambda_maha * (d2n - g_maha_mean[ref]) / g_maha_sd[ref];
     }
     return s;
-}
-
-/* The color-structure part of the score, under whichever model is selected. */
-static inline double color_term(const BeamEntry *t, int row) {
-    return g_score_model_J ? j_term(t) : maha_term(t, row);
 }
 
 /* -- Scoring (one-row lookahead + heuristic terms) --------------------------- */
@@ -944,7 +1046,6 @@ static bool score_child(const BeamEntry *t, int row, float *out) {
        gates above), so the product is >= 4 and log is safely in range. */
     double s = log((double)cA->n * (1.0 + (double)fB) * (1.0 + (double)fC))
                + color_term(t, row);
-    if (g_avail_correct) s += avail_term(t);
     *out = (float)s;
     return true;
 }
@@ -1404,7 +1505,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
     uint64_t pool_target = (uint64_t)g_pool_factor * g_beam_width;
     uint32_t quota_parent = (uint32_t)(pool_target / beam_n);
     if (quota_parent < 8) quota_parent = 8;
-    uint64_t budget_parent = (uint64_t)quota_parent * g_scan_factor;
+    uint64_t budget_parent = (uint64_t)quota_parent * SCAN_FACTOR;
     if (budget_parent < MIN_DECODE_BUDGET) budget_parent = MIN_DECODE_BUDGET;
     /* Slicing is a pure parallel decomposition: both scan phases below are
        strided by n_slices and the quota/budget are divided by it, so a parent is
@@ -1455,28 +1556,46 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
            reserving a quarter of the budget for the randomized phase. */
         const uint64_t rand_budget = budget_slice / 4;
         const uint32_t n = e.cA->n;
-        for (uint64_t j = sl; j < n; j += n_slices) {
+        /* Slice sl owns the slice-local indices m = 0..n_sl-1, which are the
+           global records sl, sl+n_slices, ... Phase 1 walks them in order; m_done
+           records how far it got, so phase 2 can take the rest and ONLY the
+           rest. */
+        const uint32_t n_sl = (sl < n) ? ((n - sl + n_slices - 1) / n_slices) : 0;
+        uint32_t m_done = 0;
+        for (; m_done < n_sl; m_done++) {
             if (e.quota == 0 || e.budget <= rand_budget) break;
-            try_A(&e, ctx, (uint32_t)j, sc);
+            try_A(&e, ctx, sl + m_done * n_slices, sc);
         }
-        /* Phase 2: one random full-cycle permutation of the cell (random start +
-           stride coprime to n visits every record exactly once), DIVIDED among
-           the parent's slices -- slice sl takes cycle positions sl, sl+n_slices,
-           ... so between them they still visit each record exactly once. Giving
-           every slice the whole cycle, as this did before, had two slices calling
-           try_A on the same record; try_A is deterministic in that record, so the
-           loser spent budget rebuilding a child the pool already held. It also
-           made a parent's work grow with the slice count, and so with --threads. */
-        if (e.quota > 0 && e.budget > 0 && n > 1) {
-            uint32_t start = rng_uniform(&e.rng, n);
+        /* Phase 2: the records phase 1 did not reach, in one random full-cycle
+           permutation (random start + stride coprime to the length visits every
+           position exactly once).
+
+           Phase 1 covers a PREFIX of the slice in the cell's fan-out order, so
+           the tail is what is left to sample -- and permuting only the tail is
+           what makes the two phases disjoint. Permuting the whole cell instead,
+           as this did before, re-walked everything phase 1 had just done
+           whenever quota was not the binding constraint; try_A is deterministic
+           in its record, so every one of those was a bit-identical duplicate
+           child. That is not a rare corner: quota only binds while the beam is
+           full, so the waste was exactly 2x at the early rows AND at the
+           collapsing rows 9-12, and near zero in between. Measured before this
+           change, candidates/unique sat at 2.0000 for every row with quota
+           headroom.
+
+           When phase 1 exhausted the slice, L is 0 and phase 2 correctly does
+           nothing. */
+        const uint32_t L = n_sl - m_done;
+        if (e.quota > 0 && e.budget > 0 && L > 1) {
+            uint32_t start = rng_uniform(&e.rng, L);
             uint32_t step = 1;
-            do step = 1 + rng_uniform(&e.rng, n - 1); while (gcd_u32(step, n) != 1);
-            uint64_t j = ((uint64_t)start + (uint64_t)sl * step) % n;
-            const uint64_t jump = ((uint64_t)n_slices * step) % n;
-            for (uint32_t m = sl; m < n && e.quota > 0 && e.budget > 0; m += n_slices) {
-                try_A(&e, ctx, (uint32_t)j, sc);
-                j += jump; if (j >= n) j -= n;
+            if (L > 2) { do step = 1 + rng_uniform(&e.rng, L - 1); while (gcd_u32(step, L) != 1); }
+            uint32_t pos = start;
+            for (uint32_t k = 0; k < L && e.quota > 0 && e.budget > 0; k++) {
+                try_A(&e, ctx, sl + (m_done + pos) * n_slices, sc);
+                pos += step; if (pos >= L) pos -= L;
             }
+        } else if (e.quota > 0 && e.budget > 0 && L == 1) {
+            try_A(&e, ctx, sl + m_done * n_slices, sc);
         }
         pool_flush(ctx, sc);
     }
@@ -1489,6 +1608,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
        then fails; a clue row takes the `continue` for every parent, so there it
        is not a corner case but the whole row. */
     for (int t = 0; t < nt; t++) pool_flush(ctx, scratch[t]);
+    maha_close_row(row);        /* this row's spread calibrates the next one */
 }
 
 /* -- Beam selection --------------------------------------------------------- */
@@ -1530,8 +1650,7 @@ static void sort_recs_desc(SortRec *a, SortRec *tmp, uint32_t n, int nt) {
    with the survivors' pool indices, best score first; returns the count. */
 static int g_dedup_drop_warned = 0;
 
-static uint32_t dedup_and_rank(BeamCtx *ctx, uint64_t pool_n, int nt,
-                               double tau, RNG *rng) {
+static uint32_t dedup_and_rank(BeamCtx *ctx, uint64_t pool_n, int nt) {
     /* Size the table to the pool actually in hand, not to the worst case the
        arena was reserved for. ctx->sig_sz is next_pow2(2*pool_cap) -- 33.5 M
        slots at default settings -- so using all of it every row costs a 268 MB
@@ -1589,31 +1708,12 @@ static uint32_t dedup_and_rank(BeamCtx *ctx, uint64_t pool_n, int nt,
                 (unsigned long long)dropped, sz, (unsigned long long)pool_n);
     }
 
-    /* The SORT KEY only. At tau > 0 each survivor's key is score/tau plus an
-       independent Gumbel draw, whose top-K is provably a sample of K DISTINCT
-       boards drawn without replacement with probability proportional to
-       exp(score/tau) (Kool, van Hoof & Welling 2019). That replaces the uniform
-       random band -- which is blind to the score and switched off entirely from
-       beam_expand_row on -- with one score-aware, monotone knob. The pool's own
-       scores are untouched, so the beam, the emission order and every reported
-       score stay real. */
     uint32_t kept = 0;
-    if (tau > 0.0) {
-        const double inv_tau = 1.0 / tau;
-        for (size_t h = 0; h < sz; h++) {
-            if (!ctx->sig_key[h]) continue;
-            ctx->srt[kept].score = (float)((double)ctx->sig_score[h] * inv_tau
-                                           + gumbel_noise(rng));
-            ctx->srt[kept].idx   = ctx->sig_idx[h];
-            kept++;
-        }
-    } else {
-        for (size_t h = 0; h < sz; h++) {
-            if (!ctx->sig_key[h]) continue;
-            ctx->srt[kept].score = ctx->sig_score[h];
-            ctx->srt[kept].idx   = ctx->sig_idx[h];
-            kept++;
-        }
+    for (size_t h = 0; h < sz; h++) {
+        if (!ctx->sig_key[h]) continue;
+        ctx->srt[kept].score = ctx->sig_score[h];
+        ctx->srt[kept].idx   = ctx->sig_idx[h];
+        kept++;
     }
     sort_recs_desc(ctx->srt, ctx->srt_tmp, kept, nt);
     for (uint32_t i = 0; i < kept; i++) ctx->keep[i] = ctx->srt[i].idx;
@@ -1760,9 +1860,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
 
         /* No perturbation at the stop row: ctx->keep drives emit_stop_row, and
            emission is deliberately ranked by the real score. */
-        RNG gum_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFEu, 2u);
-        double tau = ((uint32_t)row == g_stop_row) ? 0.0 : gumbel_tau_eff(row);
-        uint32_t kept = dedup_and_rank(ctx, pool_n, nt, tau, &gum_rng);
+        uint32_t kept = dedup_and_rank(ctx, pool_n, nt);
         g_stats.t_select += omp_get_wtime() - t_exp;
         res.row = (uint32_t)row;
         g_stats.rows_advanced++;
@@ -1788,9 +1886,8 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         uint32_t eff_K = beam_eff_K(row);
         /* At tau > 0 the Gumbel perturbation IS the exploration, so the uniform
            band stands down rather than randomizing an already-random order. */
-        double fr = (tau > 0.0) ? 0.0 : frac_rand_eff(row);
         uint32_t n_sel = select_beam(ctx, kept, beam_n, eff_K,
-                                     parent_cap_eff(row), fr, &sel_rng);
+                                     parent_cap_eff(row), g_frac_rand, &sel_rng);
         double t0 = omp_get_wtime();
         materialize_beam(ctx, cur, nxt, n_sel, row);
         g_stats.t_mat += omp_get_wtime() - t0;
@@ -2714,6 +2811,19 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         if (!any) printf("  none");
         printf("   reached stop_row: %" PRIu64 "\n", g_stats.reached_stop);
     }
+    if (g_verbose && g_lambda_maha != 0.0) {
+        /* The measured Mahalanobis spread per row -- what --lambda_Mahalanobis
+           is denominated in. Printed so the calibration is visible rather than
+           implicit: a row reading 0 had too small a sample and stood the
+           correction down, and a table far from the reference values means the
+           regime moved and the weight no longer means what it did. */
+        printf("[sum] maha sd by row:");
+        bool anysd = false;
+        for (int r = 1; r <= (int)g_stop_row; r++)
+            if (g_maha_sd[r] > 0.0) { printf("  r%d:%.3f(n=%.0f)", r, g_maha_sd[r], g_maha_n[r]); anysd = true; }
+        if (!anysd) printf("  none measured (every row under the %.0f-sample floor)", MAHA_MIN_SAMPLES);
+        printf("\n");
+    }
     printf("[sum] emitted unique boards: %" PRIu64 "\n", g_stats.emitted_total);
     if (g_incomplete_top)
         printf("[sum] incomplete-top partials: %zu  (A+B %zu, A+C %zu, B+C %zu)\n",
@@ -2755,8 +2865,15 @@ static void usage(const char *a0) {
 "  --out_dir DIR          output directory for the completions CSV (default beam_out)\n"
 "  --border_row N         first data line of partials.csv to load (default 0)\n"
 "  --border_row_N N       number of consecutive lines to load (default 1)\n"
-"  --finalize_from N      lock rows 0..N and start the beam at row N+1 (default 8;\n"
-"                         a line with an unplaced cell at or below N is skipped)\n"
+"  --finalize_from N      lock rows 0..N and start the beam at row N+1 (default 5;\n"
+"                         a line with an unplaced cell at or below N is skipped).\n"
+"                         Low on purpose: the beam grows from ONE locked board, so it\n"
+"                         needs rows to widen in before selection can do anything --\n"
+"                         start too high and the pool never reaches --beam_width, the\n"
+"                         score is never consulted (select_beam returns every\n"
+"                         candidate untouched when the pool is under the row width)\n"
+"                         and the run degenerates into exhaustive enumeration of\n"
+"                         whatever the last few rows allow\n"
 "  --finalize_repeats N   sweep each loaded partial N times, with fresh randomness\n"
 "                         and (free mode) fresh left columns each time (default 1)\n"
 "  --free_edges           free every edge piece above finalize_from into a shared\n"
@@ -2799,43 +2916,42 @@ static void usage(const char *a0) {
 "                         adds to whatever the out_dir already holds\n"
 "\n"
 "Beam shape:\n"
-"  --beam_width K         boards kept per row (default 262144)\n"
+"  --beam_width K         boards kept per row (default 250000, as the beamer)\n"
 "  --stop_row R           last row the beam fills, finalize_from+1..14; reaching\n"
-"                         boards are emitted (default 12; row 15 is never searched:\n"
-"                         placing the top border is trivial for an external tool)\n"
-"  --beam_expand E        late-search width multiplier (default 5; 1 = no expansion)\n"
+"                         boards are emitted (default 11, as the beamer; row 15 is\n"
+"                         never searched: placing the top border is trivial for an\n"
+"                         external tool)\n"
+"  --beam_expand E        late-search width multiplier (default 4; 1 = no expansion)\n"
 "  --beam_expand_row R    absolute board row with the full ExK width; half of the\n"
-"                         extra width is granted one row earlier (default 8)\n"
+"                         extra width is granted one row earlier (default 8). This is\n"
+"                         one of the few settings NOT matched to the beamer's: the row\n"
+"                         number is absolute in both, but the search here starts at\n"
+"                         finalize_from+1, so at the default it is already past this\n"
+"                         threshold on its very first row\n"
 "\n"
 "Scoring / selection:\n"
-"  --score_model M        color-structure term: 'legacy' (the Mahalanobis bonus below)\n"
-"                         or 'J', the objective derived from pairing combinatorics --\n"
-"                         A_tot*KL(free-color mix || flat) plus a demand term, both in\n"
-"                         nats like the fan-out terms, no schedule. J reads the color\n"
-"                         counts off the board, so unlike the Mahalanobis term it is\n"
-"                         exact from a locked partial at any --finalize_from\n"
-"                         (default legacy)\n"
-"  --lambda_J F           weight of the J terms; 1 = as derived (default 1)\n"
-"  --lambda_Mahalanobis F weight of the color-usage atypicality bonus, active in\n"
-"                         rows 3..9 and peaking at row 6; legacy model only (default 0)\n"
-"  --avail_correct        discount the B/C fan-out counts by the fraction of each\n"
-"                         frontier color still unplaced, so the lookahead stops being\n"
-"                         blind to which pieces are gone (default off)\n"
-"  --frac_rand F          fraction of the beam selected at random instead of by\n"
-"                         score; the FIRST searched row always uses the full value\n"
-"                         (variability injection), later rows follow the beamer\n"
-"                         schedule: halved at beam_expand_row-1, zero after\n"
-"                         (default 0.75)\n"
-"  --gumbel_tau0 T        selection temperature at row 1, falling linearly to\n"
-"  --gumbel_tau1 T        --gumbel_tau1 at --stop_row. Above 0 the beam is chosen by\n"
-"                         top-K of score/tau + Gumbel noise, which samples K distinct\n"
-"                         boards with probability proportional to exp(score/tau); as\n"
-"                         the score is a log record count, tau=1 samples in proportion\n"
-"                         to estimated completions. Replaces --frac_rand's uniform\n"
-"                         band, which is blind to the score. 0 = off, exact legacy\n"
-"                         (default 0; 0.25 flat measured best, above 1 hurts)\n"
+"  --lambda_J F           weight of the CLOSURE term, the objective derived from\n"
+"                         pairing combinatorics: A_tot*KL(free-color mix || flat) plus\n"
+"                         a demand term, in nats like the fan-out terms. The primary\n"
+"                         color objective; 0 turns it off (default 1.0, useful 0.5-1)\n"
+"  --lambda_Mahalanobis F weight of the piece-structure CORRECTION, in units of its own\n"
+"                         per-row standard deviation -- the spread is measured live and\n"
+"                         divided out, so F means the same thing at every depth. Small\n"
+"                         by design: it correlates ~0.88 with closure, so only the\n"
+"                         residual is new (default 0.6, useful 0.3-0.7; 0 = off)\n"
+"                         Both terms are always live. --lambda_Mahalanobis 0 is closure\n"
+"                         alone and --lambda_J 0 is Mahalanobis alone, which is why\n"
+"                         there is no --score_model.\n"
+"  --frac_rand F          fraction of the beam selected at random instead of by score,\n"
+"                         FLAT across every row (default 0.30). Deliberately well above\n"
+"                         the beamer's 0.10 and the one place these two tools should\n"
+"                         not agree: the beamer gets one pass at a configuration, while\n"
+"                         this one is meant to be re-run over the same partial (see\n"
+"                         --finalize_repeats), so the random band is not a tax on one\n"
+"                         pass but coverage across many -- and it is the only thing\n"
+"                         stopping repeated passes from retracing each other\n"
 "  --parent_cap N         max children per parent in the score-selected band;\n"
-"                         doubled from beam_expand_row-1 on; 0 = uncapped (default 5)\n"
+"                         doubled from beam_expand_row-1 on; 0 = uncapped (default 4)\n"
 "\n"
 "Feasibility certificates:\n"
 "  --no_free_demand       DISABLE the free-mode demand accounting. On by default: an\n"
@@ -2847,15 +2963,18 @@ static void usage(const char *a0) {
 "\n"
 "Expansion effort:\n"
 "  --pool_factor N        candidate-pool target as a multiple of beam_width (default 8)\n"
-"  --scan_factor N        decode-attempt budget per requested child (default 1024)\n"
 "\n"
 "Sweep control:\n"
 "  --top_columns N        left-column completions sampled per partial per repeat\n"
 "                         whenever the column is not fixed by the partial itself\n"
-"                         (default 10; a complete border always uses exactly 1).\n"
+"                         (default 12; a complete border always uses exactly 1).\n"
 "                         N<=0 enumerates EVERY legal left column exhaustively (no\n"
 "                         sampling) -- for an exhaustive top-row search; pass a\n"
 "                         rotations.csv to enumerate only the annealer's left edges\n"
+"  --bail_columns N       abandon a partial line after N consecutive columns that\n"
+"                         reported nothing (completions or --incomplete_top partials),\n"
+"                         instead of running all --top_columns x --finalize_repeats.\n"
+"                         0 = never bail (default 0), as in the beamer\n"
 "  --gumbel_tau_columns T selection temperature for the sampled left column: above 0\n"
 "                         the published column is drawn with probability proportional\n"
 "                         to exp(rank/tau) instead of being the best of the samples,\n"
@@ -2905,21 +3024,12 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--beam_expand") && i+1 < argc) g_beam_expand = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--beam_expand_row") && i+1 < argc) g_beam_expand_row = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--lambda_Mahalanobis") && i+1 < argc) g_lambda_maha = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--score_model") && i+1 < argc) {
-            const char *m = argv[++i];
-            if      (!strcmp(m, "legacy")) g_score_model_J = false;
-            else if (!strcmp(m, "J"))      g_score_model_J = true;
-            else fatal("--score_model must be 'legacy' or 'J'");
-        }
         else if (!strcmp(argv[i], "--lambda_J")    && i+1 < argc) g_lambda_J = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--avail_correct"))             g_avail_correct = true;
         else if (!strcmp(argv[i], "--no_free_demand"))            g_free_demand = false;
-        else if (!strcmp(argv[i], "--gumbel_tau0") && i+1 < argc) g_gumbel_tau0 = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--gumbel_tau1") && i+1 < argc) g_gumbel_tau1 = atof(argv[++i]);
         else if (!strcmp(argv[i], "--frac_rand")   && i+1 < argc) g_frac_rand = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--bail_columns") && i+1 < argc) g_bail_columns = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--parent_cap")  && i+1 < argc) g_parent_cap = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pool_factor") && i+1 < argc) g_pool_factor = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--scan_factor") && i+1 < argc) g_scan_factor = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--top_columns") && i+1 < argc) g_top_columns = atol(argv[++i]);
         else if (!strcmp(argv[i], "--gumbel_tau_columns") && i+1 < argc) g_tau_columns = atof(argv[++i]);
         else if (!strcmp(argv[i], "--threads")     && i+1 < argc) g_nthreads = atoi(argv[++i]);
@@ -2957,12 +3067,9 @@ int main(int argc, char *argv[]) {
     if (g_finalize_repeats < 1) g_finalize_repeats = 1;
     if (!(fabs(g_lambda_maha) <= 1e6)) fatal("--lambda_Mahalanobis in [-1e6,1e6]");
     if (!(fabs(g_lambda_J) <= 1e6))    fatal("--lambda_J in [-1e6,1e6]");
-    if (!(g_gumbel_tau0 >= 0.0 && g_gumbel_tau0 <= 1e6)) fatal("--gumbel_tau0 in [0,1e6]");
-    if (!(g_gumbel_tau1 >= 0.0 && g_gumbel_tau1 <= 1e6)) fatal("--gumbel_tau1 in [0,1e6]");
     if (!(g_tau_columns >= 0.0 && g_tau_columns <= 1e6)) fatal("--gumbel_tau_columns in [0,1e6]");
     if (g_frac_rand < 0.0 || g_frac_rand > 1.0) fatal("--frac_rand must be in [0,1]");
     if (g_pool_factor == 0) g_pool_factor = 1;
-    if (g_scan_factor == 0) g_scan_factor = 1;
 
     printf("\n=== E555 finalizer ===\n\n");
     printf("[cfg] seed_file=%s partials_file=%s out_dir=%s\n",
@@ -2970,17 +3077,15 @@ int main(int argc, char *argv[]) {
     printf("[cfg] seed=%" PRIu64 " threads=%d lines=%u+%u finalize_from=%u repeats=%u incomplete_top=%d\n",
            g_master_seed, g_nthreads, g_border_row_index, g_border_row_N,
            g_finalize_from, g_finalize_repeats, g_incomplete_top ? 1 : 0);
-    printf("[cfg] beam_width=%u stop_row=%u expand=%ux@row%u lambda_Maha=%.3f\n",
-           g_beam_width, g_stop_row, g_beam_expand, g_beam_expand_row, g_lambda_maha);
-    printf("[cfg] frac_rand=%.2f (full at row %u) parent_cap=%u pool_factor=%u scan_factor=%u\n",
-           g_frac_rand, g_finalize_from + 1, g_parent_cap, g_pool_factor, g_scan_factor);
-    printf("[cfg] score_model=%s lambda_J=%.3f avail_correct=%d free_demand=%d"
-           " gumbel_tau=%.2f->%.2f\n",
-           g_score_model_J ? "J" : "legacy", g_lambda_J, g_avail_correct ? 1 : 0,
-           g_free_demand ? 1 : 0, g_gumbel_tau0, g_gumbel_tau1);
+    printf("[cfg] beam_width=%u stop_row=%u expand=%ux@row%u\n",
+           g_beam_width, g_stop_row, g_beam_expand, g_beam_expand_row);
+    printf("[cfg] frac_rand=%.2f (flat) parent_cap=%u pool_factor=%u\n",
+           g_frac_rand, g_parent_cap, g_pool_factor);
+    printf("[cfg] lambda_J=%.3f lambda_Maha=%.3f free_demand=%d\n",
+           g_lambda_J, g_lambda_maha, g_free_demand ? 1 : 0);
     printf("[cfg] gumbel_tau_columns=%.2f\n", g_tau_columns);
-    printf("[cfg] top_columns=%ld config_time=%.0fs max_wall=%.0fs max_partials=%" PRIu64 " free_edges=%s\n",
-           g_top_columns, g_config_time_sec, g_max_wall_sec, g_max_partials,
+    printf("[cfg] top_columns=%ld bail_columns=%u config_time=%.0fs max_wall=%.0fs max_partials=%" PRIu64 " free_edges=%s\n",
+           g_top_columns, g_bail_columns, g_config_time_sec, g_max_wall_sec, g_max_partials,
            g_opt_free_edges ? "forced" : "auto (per line)");
     if (g_clue_mask) {
         char oz[16]; size_t on = 0;
@@ -3002,6 +3107,7 @@ int main(int argc, char *argv[]) {
     load_seed_and_catalog(seed_path);
     build_catalog_indices();
     build_inner_color_totals();
+    init_check_inner_faces();
     build_maha_tables();
     build_logtab();
     fin_init_clue_tables();          /* needs the oriented catalog, nothing else */
@@ -3121,6 +3227,7 @@ int main(int argc, char *argv[]) {
                              : (g_top_columns >= 1 ? (size_t)g_top_columns : 1);
                 uint64_t *tried = xmalloc(run_l * sizeof(uint64_t));
 
+                uint32_t barren = 0;      /* consecutive columns that reported nothing */
                 for (uint32_t rep = 0; rep < g_finalize_repeats && !g_stop; rep++) {
                     size_t tried_n = 0;
                     LeftOrder lft;
@@ -3153,8 +3260,17 @@ int main(int argc, char *argv[]) {
                         } else {
                             fin_left_fixed(&lft);
                         }
+                        uint64_t got0 = g_stats.emitted_total + g_partial_total;
                         run_left_config(&ctx, scratch, t_start, line, rep, li, &lft);
+                        barren = (g_stats.emitted_total + g_partial_total > got0) ? 0 : barren + 1;
+                        if (g_bail_columns && barren >= g_bail_columns) {
+                            printf("[bail] line %u: %u column(s) in a row reported nothing, "
+                                   "moving to the next line\n", line, barren);
+                            fflush(stdout);
+                            break;
+                        }
                     }
+                    if (g_bail_columns && barren >= g_bail_columns) break;
                 }
                 free(tried);
             }

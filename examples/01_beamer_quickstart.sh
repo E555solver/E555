@@ -88,7 +88,6 @@ CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 "$REPO/bin/E555_beamer" "$SEED" "${BORDERS[@]}" "${CLUE_ARG[@]}" \
     --beam_width "$BEAM_WIDTH" \
     --stop_row "$STOP_ROW" \
-    --lambda_Mahalanobis 8 \
     --max_wall_sec "$MAX_WALL" \
     --seed 1 \
     --out_dir "$OUT_DIR" \

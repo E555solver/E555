@@ -121,8 +121,9 @@ BEAM_WALL="${BEAM_WALL:-900}"
 BEAM_COLUMNS="${BEAM_COLUMNS:-8}"
 BEAM_TAU_BOTTOMS="${BEAM_TAU_BOTTOMS:-2}"
 BEAM_TAU_COLUMNS="${BEAM_TAU_COLUMNS:-4}"
-BEAM_TAU0="${BEAM_TAU0:-0.25}"
-BEAM_TAU1="${BEAM_TAU1:-0.25}"
+# Replaced --gumbel_tau0/--gumbel_tau1, which are gone: the beam-row Gumbel
+# selection lost 0-for-20 paired configs to a plain random band.
+BEAM_FRAC_RAND="${BEAM_FRAC_RAND:-0.10}"
 # Score up to nB x nC (B, C) completions per segment-A record and keep the best,
 # instead of taking the first that fits. The repo default is 3,2, which won a
 # two-seed sweep on foundations/minute; 3,3 scores one more column per B chain
@@ -305,8 +306,8 @@ BEAM_CMD=("$REPO/bin/E555_beamer" "$SEED" --random_edges
     --beam_width "$BEAM_WIDTH" --stop_row "$BEAM_STOP"
     --border_row_N "$BEAM_BOARDS" --top_columns "$BEAM_COLUMNS"
     --gumbel_tau_bottoms "$BEAM_TAU_BOTTOMS" --gumbel_tau_columns "$BEAM_TAU_COLUMNS"
-    --gumbel_tau0 "$BEAM_TAU0" --gumbel_tau1 "$BEAM_TAU1"
-    --lambda_Mahalanobis 10 --bc_window "$BC_WINDOW"
+    --frac_rand "$BEAM_FRAC_RAND"
+    --bc_window "$BC_WINDOW"
     --max_partials "$BEAM_BOARDS" --max_wall_sec "$BEAM_WALL" --verbose "${CLUE_ARG[@]}")
 [ -n "$DB_FILE" ] && BEAM_CMD+=(--db_file "$DB_FILE")
 [ "$RNG_SEED" != "0" ] && BEAM_CMD+=(--seed "$RNG_SEED")
@@ -386,12 +387,17 @@ lap() {
     fi
 
     # --- re-grow rows BAND_ROW+1 .. target -----------------------------------
+    # --lambda_Mahalanobis 0 is deliberate and specific to this lap: the band
+    # below was rebuilt exactly by the backtracker, so the closure objective is
+    # the only one with anything left to say about it. --frac_rand 0.0, though,
+    # is the same unmeasured holdover as in the other two pipelines -- see the
+    # note above the finalizer call in run_pipeline_random.sh.
     "$REPO/bin/E555_finalizer" "$SEED" "${k}_band.csv" \
         --out_dir "lap$k" --threads "$THREADS" \
         --finalize_from "$BAND_ROW" --finalize_repeats 1 \
         --beam_width "$FIN_WIDTH" --stop_row "$target" \
         --border_row_N "$nband" --top_columns "$FIN_COLUMNS" \
-        --score_model J --frac_rand 0.0 \
+        --lambda_Mahalanobis 0 --frac_rand 0.0 \
         --max_partials "$FIN_BOARDS" --max_wall_sec "$FIN_WALL" \
         --verbose "${inc[@]}" "${CLUE_ARG[@]}" > "${k}_fin.log" 2>&1 || true
 

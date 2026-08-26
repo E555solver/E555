@@ -71,7 +71,7 @@ FIN_MAX_WALL="${FIN_MAX_WALL:-600}"
 # top row still empty and the finalizer skips any line with an unplaced cell at or
 # below the lock; and locking right under the frontier only asks the finalizer
 # to redo the very row the beamer already failed to fill, with the same pieces.
-# Freeing four rows gives it a genuinely different way up.
+# Freeing five rows gives it a genuinely different way up.
 FIN_FROM="${FIN_FROM:-$((BEAM_STOP_ROW - 5))}"
 
 # -- stage 4: roundhouse ------------------------------------------------------
@@ -163,7 +163,7 @@ echo
 BEAM_CMD=("$REPO/bin/E555_beamer" "$SEED" 1_rotations.csv
     --out_dir beam --threads "$THREADS"
     --beam_width "$BEAM_WIDTH" --stop_row "$BEAM_STOP_ROW"
-    --border_row_N "$((ROUNDS/2))" --top_columns "$BEAM_COLUMNS" --lambda_Mahalanobis 10
+    --border_row_N "$((ROUNDS/2))" --top_columns "$BEAM_COLUMNS"
     --incomplete_top --max_partials "$BEAM_MAX_PARTIALS"
     --max_wall_sec "$BEAM_MAX_WALL" --verbose "${CLUE_ARG[@]}")
 [ -n "$DB_FILE" ] && BEAM_CMD+=(--db_file "$DB_FILE")
@@ -186,13 +186,19 @@ banner "STAGE 3/7  finalizer -- beam $FIN_WIDTH, rows 0..$FIN_FROM locked, up to
 # -----------------------------------------------------------------------------
 echo "Restarting the beam from each stage-2 board: rows 0..$FIN_FROM stay put, every"
 echo "piece above them goes back in the pool and the search redoes rows $((FIN_FROM+1))..$FIN_STOP_ROW."
-echo "The randomized beam search is repeated 3 times for each configuration."
+echo "One deterministic pass per board: --finalize_repeats 1 --frac_rand 0.0."
 echo
 
+# --frac_rand 0.0 overrides the finalizer's default of 0.30. It dates from when
+# that default was 0.75 and plainly too high, and it has NOT been re-measured
+# against 0.30. The default assumes repeated passes over one board, which is not
+# what happens here (--finalize_repeats 1), so turning the band off is at least
+# self-consistent -- but 0 is not a measured setting either: the beamer ships
+# 0.10, and 0.25 beat 0.75 by ~28%.
 "$REPO/bin/E555_finalizer" "$SEED" "$BEAM_OUT" \
     --out_dir final --threads "$THREADS" --finalize_repeats 1 --frac_rand 0.0 \
     --beam_width "$FIN_WIDTH" --stop_row "$FIN_STOP_ROW" --finalize_from "$FIN_FROM" \
-    --border_row_N "$BEAM_MAX_PARTIALS" --top_columns 0 --lambda_Mahalanobis 10 \
+    --border_row_N "$BEAM_MAX_PARTIALS" --top_columns 0 \
     --incomplete_top --max_partials "$FIN_MAX_PARTIALS" \
     --max_wall_sec "$FIN_MAX_WALL" --verbose "${CLUE_ARG[@]}"
 

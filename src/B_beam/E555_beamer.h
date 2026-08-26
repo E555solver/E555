@@ -59,12 +59,21 @@ typedef struct {
    The per-row move history lives OUTSIDE the entry, in the beam context's
    ancestry log (RowLog); log_idx points at this board's own entry in the log of
    its depth row, from which the full board is reconstructed at emission time.
-   Keeping the hot struct small (~150 B vs ~570 B with an inline move log) makes
-   the per-candidate scratch copy and the per-row materialization ~4x cheaper. */
+   Keeping the hot struct small (128 B vs ~570 B with an inline move log) makes
+   the per-candidate scratch copy and the per-row materialization ~4x cheaper.
+
+   Both counter arrays are indexed by INNER_IDX(color), not by the raw color:
+   only the 17 inner colors are ever counted, and spanning all 23 cost 24 bytes
+   that pushed the struct to 152 -- three cache lines per entry instead of the
+   two an aligned 128 always takes, and ~50 MB across two beams at a 1,048,576
+   effective width. Every req_exposed write is already behind color_is_inner;
+   commit_row's color_consumed writes are not, and do not need to be, because an
+   inner catalog piece carries inner colors on all four faces -- an invariant
+   init_check_inner_faces() enforces at startup rather than assuming. */
 typedef struct {
     uint64_t used[4];
-    int16_t  color_consumed[NUM_COLORS_TOTAL];
-    int16_t  req_exposed[NUM_COLORS_TOTAL];
+    int16_t  color_consumed[NUM_INNER_COLORS];
+    int16_t  req_exposed[NUM_INNER_COLORS];
     uint8_t  rtop[PUZZLE_SIDE];     /* exposed tops; [1..14] inner, [15] edge-iface */
     uint16_t depth;                 /* last committed row (0 = only border) */
     uint8_t  flags;                 /* FLAG_* */
@@ -72,6 +81,11 @@ typedef struct {
     uint32_t log_idx;               /* own entry in ctx->log[depth]; unused at depth 0 */
     float    score;
 } BeamEntry;
+
+/* 128 bytes = exactly two cache lines per entry, and the whole point of
+   indexing the counters by INNER_IDX. Assert it so a future field cannot
+   quietly cost the third line back. */
+_Static_assert(sizeof(BeamEntry) == 128, "BeamEntry must stay two cache lines");
 
 /* One candidate child in the per-row pool: which beam board it extends, the move
    that extends it, its score, and its frontier signature for the dedup. */
@@ -145,6 +159,8 @@ typedef struct {
     RNG       rng;
     uint64_t  budget;            /* full decode attempts remaining */
     uint32_t  quota;             /* accepted children remaining */
+    bool      keep_all;          /* beam under capacity: keep every B/C child,
+                                    not just the best-scored one (see expand_row) */
 } Expand;
 
 typedef struct { uint32_t row, width; const char *reason; } BeamResult;

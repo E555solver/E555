@@ -23,6 +23,22 @@
 #   the exact row that already failed, with the same pieces. Leave four or five
 #   rows of daylight.
 #
+#   FROM=7 here, though the tool's own default is 5. That default is for the
+#   ordinary case, a beamer partial whose border is complete: the left column is
+#   fixed, --top_columns samples a handful of orderings, and freeing more rows
+#   buys a wider search. This script's board has an INCOMPLETE border, so the
+#   finalizer falls back to --free_edges and --top_columns 0 below enumerates
+#   every legal left column -- and that enumeration grows explosively as FROM
+#   drops. Measured on the shipped board_partial_row12.csv, MAX_WALL=600:
+#
+#       FROM=7    3512 columns    6 boards    6.2 s
+#       FROM=6   40098 columns    6 boards   50.2 s
+#       FROM=5    8606 columns    0 boards    budget exhausted
+#       FROM=4     127 columns    0 boards    budget exhausted
+#
+#   So on this board lower is emphatically not better, and 7 is not a stale
+#   value left behind by a default change. Raise MAX_WALL before lowering FROM.
+#
 # CHAINS WITH ITSELF
 #   Output is the same canonical CSV as the input, so you can feed this script
 #   its own output with a different FROM or SEED_RNG.
@@ -40,7 +56,11 @@ PARTIALS="${PARTIALS:-$REPO/data/board_partial_row12.csv}"
 ROTATIONS="${ROTATIONS:-}"        # optional Stage A borders CSV; see the note below
 OUT_DIR="${OUT_DIR:-final_out}"
 FROM="${FROM:-7}"                 # lock rows 0..FROM, re-search everything above
-STOP_ROW="${STOP_ROW:-12}"        # up to 14; the top border is Stage C's job
+STOP_ROW="${STOP_ROW:-12}"        # up to 14; the top border is Stage C's job.
+                                  # 12, not the tool default of 11: the input
+                                  # board already reaches row 12, and stopping
+                                  # below it would emit boards shallower than
+                                  # the ones handed in
 REPEATS="${REPEATS:-3}"           # re-runs per distinct input board
 BEAM_WIDTH="${BEAM_WIDTH:-150000}"
 FIRST_LINE="${FIRST_LINE:-0}"     # first input CSV line to use
@@ -64,7 +84,7 @@ CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
     --border_row "$FIRST_LINE" --border_row_N "$N_LINES" \
     --finalize_from "$FROM" --finalize_repeats "$REPEATS" \
     --beam_width "$BEAM_WIDTH" --stop_row "$STOP_ROW" \
-    --top_columns 0 --lambda_Mahalanobis 10 \
+    --top_columns 0 \
     --max_wall_sec "$MAX_WALL" --out_dir "$OUT_DIR" --verbose
 
 RESULT="$OUT_DIR/beam_completions_finalized_$STOP_ROW.csv"

@@ -69,8 +69,9 @@ BEAM_COLUMNS="${BEAM_COLUMNS:-8}"   # random left columns per random bottom row
 # default by ~28% (a nonzero tau0/tau1 stands that band down).
 BEAM_TAU_BOTTOMS="${BEAM_TAU_BOTTOMS:-2}"
 BEAM_TAU_COLUMNS="${BEAM_TAU_COLUMNS:-4}"
-BEAM_TAU0="${BEAM_TAU0:-0.25}"
-BEAM_TAU1="${BEAM_TAU1:-0.25}"
+# Replaced --gumbel_tau0/--gumbel_tau1, which are gone: the beam-row Gumbel
+# selection lost 0-for-20 paired configs to a plain random band.
+BEAM_FRAC_RAND="${BEAM_FRAC_RAND:-0.10}"
 
 # ---- stage 2: finalizer -----------------------------------------------------
 FIN_STOP="${FIN_STOP:-12}"
@@ -152,8 +153,8 @@ BEAM_CMD=("$REPO/bin/E555_beamer" "$SEED" --random_edges
     --beam_width "$BEAM_WIDTH" --stop_row "$BEAM_STOP"
     --border_row_N "$BEAM_BOARDS" --top_columns "$BEAM_COLUMNS"
     --gumbel_tau_bottoms "$BEAM_TAU_BOTTOMS" --gumbel_tau_columns "$BEAM_TAU_COLUMNS"
-    --gumbel_tau0 "$BEAM_TAU0" --gumbel_tau1 "$BEAM_TAU1"
-    --lambda_Mahalanobis 10 --incomplete_top
+    --frac_rand "$BEAM_FRAC_RAND"
+    --incomplete_top
     --max_partials "$BEAM_BOARDS" --max_wall_sec "$BEAM_WALL" --verbose "${CLUE_ARG[@]}")
 [ -n "$DB_FILE" ] && BEAM_CMD+=(--db_file "$DB_FILE")
 [ "$RNG_SEED" != "0" ] && BEAM_CMD+=(--seed "$RNG_SEED")
@@ -180,12 +181,18 @@ echo "$((FIN_FROM+1))..$FIN_STOP are searched again over a database rebuilt with
 echo "the locked pieces."
 echo
 
+# --frac_rand 0.0 overrides the finalizer's default of 0.30. It dates from when
+# that default was 0.75 and plainly too high, and it has NOT been re-measured
+# against 0.30. The default assumes repeated passes over one board, which is not
+# what happens here (--finalize_repeats 1), so turning the band off is at least
+# self-consistent -- but 0 is not a measured setting either: the beamer ships
+# 0.10, and 0.25 beat 0.75 by ~28%.
 "$REPO/bin/E555_finalizer" "$SEED" 1_beam.csv \
     --out_dir final --threads "$THREADS" \
     --finalize_from "$FIN_FROM" --finalize_repeats 1 \
     --beam_width "$FIN_WIDTH" --stop_row "$FIN_STOP" \
     --border_row_N "$BEAM_BOARDS" --top_columns 0 \
-    --lambda_Mahalanobis 10 --frac_rand 0.0 --incomplete_top \
+    --frac_rand 0.0 --incomplete_top \
     --max_partials "$FIN_BOARDS" --max_wall_sec "$FIN_WALL" --verbose "${CLUE_ARG[@]}"
 
 cat final/beam_completions_finalized_"$FIN_STOP".csv          > 2_final.csv 2>/dev/null || true

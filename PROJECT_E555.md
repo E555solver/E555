@@ -148,7 +148,9 @@ abstract quality score -- it *is* the size of the space Stage B enumerates.
 The bottom count is exactly the number of bottom-row orderings the beamer
 sweeps and the left count the number of left columns per bottom: the border
 `TOP=17280 RIGHT=11520 BOTTOM=1152 LEFT=2880` makes the beamer print
-`bottoms=1152 ... left-cols=2880 -> 9000 configs`. So a bottom of 5000 with
+`bottoms=1152 ... left-cols=2880 enumerated`, followed by one `[rank]` line per
+bottom saying how many of those 2880 can actually start row 1 with it. So a
+bottom of 5000 with
 `--top_bottoms 300` means the sweep only ever sees 6 % of its own space, while
 a bottom of 400 means it sees three quarters of it. That is the argument for
 targets: you are sizing a search, not maximizing a number.
@@ -267,18 +269,107 @@ over all 17 possible left neighbours (~1.9 M entries, 15 MB): "how continuable
 are these five exposed tops?" in one lookup. It powers the in-cell promise
 sort, border ranking, and the beam's one-row lookahead.
 
+### Ranking a left column
+
+A bottom row is ranked by `bottom_rank_of`: the log fan-out of the three
+segments it presents, `db_seg_fanout(rt[1..5]) + (rt[6..10]) + (rt[11..15])`.
+Those three windows are not a cut someone chose -- they *are* the 5-5-5
+architecture, so the score counts the search's actual first move.
+
+A column has no such decomposition. It faces fourteen different rows and each
+row's segment A takes exactly **one** colour from it, as the `left_color` key --
+never five. `left_rank_of` scores it in two parts.
+
+**Windows, by rotation.** Turn the board a quarter-turn counter-clockwise and the
+left column *is* a bottom row: per piece CCW sends N→W, W→S, S→E, E→N, so
+`phi(v).bottom = v.left` and `phi(v).top = v.right`. The column's fixed rightward
+faces become the fixed bottom colours a chain sits on, the free leftward faces of
+col 1 become its free tops, and the chain axis becomes bottom↔top read
+**downward**. So the vertical 5-strip of inner pieces standing against rows
+`r..r+4` is counted by
+
+```
+db_seg_fanout(right[r+4], right[r+3], right[r+2], right[r+1], right[r])
+```
+
+marginalised over the unknown colour above it -- the same marginalisation
+`bottom_rank_of` accepts over the unknown colour to its left. This is an exact
+count, not an analogy: `g_cat` holds all four spins of every inner piece, so the
+record set is closed under the rotation. **The argument order is load-bearing.**
+Read the other way round, a real board's own column counts zero: on
+`data/synth_solution_480.csv` the downward read is a legal chain for 10 of 10
+windows of the true left column and the upward read for 0 of 10.
+`E555_COL_VERIFY=1` guards it at startup by rebuilding strips out of the database
+and asserting the window returns exactly the cell they came from (300/300 exact,
+and the reversed order differs on 299 of 300, so the check has teeth).
+
+The windows **slide** (`r = 1..10`) rather than partitioning into three the way
+the bottom's do. Since a 5-window is a proxy object here, no cut point is
+privileged, and partitioning at 1-5/6-10/10-14 would blind the score across rows
+5-6 and 10-11 by accident of where counting started -- when order-awareness is
+the entire point of doing this at all. Sliding also keeps every window all-inner:
+one reaching row 0 would need the DB's edge cells, whose terminal pool is the
+*right* edges, where the rotation calls for the *bottom* edges.
+
+**The joint term.** `right[1]` **is** segment A's `left_color` at row 1, and the
+bottom fixes `rtop0[1..5]`, so `db_seg_count(right[1], rt[1..5])` is the exact
+number of legal row-1 segment-A chains for this pair -- precisely the quantity
+`bottom_rank_of` has to marginalise away, un-marginalised by the column. It is
+the only place in the database where the two borders meet, and **zero proves the
+pair cannot complete row 1**. Such columns sort last and are not run: on 150
+distinct configs from an earlier sweep, 17 (11.3 %) died at row 1 in 0.0 s, and
+for two bottoms it was 3 of their 6 columns.
+
+Because of that term the ranking is **per bottom**, inside the sweep's bottom
+loop rather than once per border row, and `l0` means the best column for *this*
+bottom. Its RNG stream is keyed by the bottom index so `--resume` re-derives the
+same ordering. Cost is a few thousand table lookups and a qsort of at most a few
+thousand structs -- sub-millisecond against a 600 s config slice.
+
+**The finalizer keeps the old measure.** `fin_left_rank` is still
+`sum_r log1p(la_total[right[r]])`, and deliberately so. Its column is half
+locked -- col 1 at rows `1..finalize_from` is already occupied, and the reduced
+database has had those very pieces removed -- so a rotation window reaching
+below the lock line counts strips for cells nothing will fill, against a
+database skewed against them. Restricting to windows above the line is correct
+but leaves none at all once fewer than five rows are free, which is the common
+case. And unlike the beamer's, its measure is not degenerate: `fin_enumerate_lefts`
+and `fin_sample_left` draw from the remaining edge pool, so piece sets genuinely
+vary between samples and a multiset census still discriminates. Measured both
+ways, the rotation windows cost the `clue_orient` regression its emissions
+outright, where the old measure passes it.
+
+**Why there is no colour-supply term beside it.** Every enumerated column of a
+border row is a permutation of the *same* `EDGE_LEN` pieces, so its exposed
+colour multiset is invariant, so every functional of that multiset is constant
+across columns: `sum_c D_c log R_c`, the ratio form `sum_c D_c log(D_c/R_c)`, and
+`closure_raw` on the initial board alike -- the last because `color_consumed` is
+all zero there and the bottom's demands are an additive constant inside the
+bottom loop. Only **positional** information distinguishes columns, and database
+lookups are how it is read. (`--random_edges` differs: columns are drawn from the
+56-edge pool minus the bottom's, so piece sets genuinely vary and the old measure
+was merely order-blind there rather than constant. Both terms above are live in
+both modes, so one score serves both.)
+
 ### The beam loop
 
 For each (bottom ordering x left-column ordering) configuration -- enumerated
-as Euler trails and ranked by fan-out -- one beam advances row by row:
+as Euler trails, the bottoms ranked by fan-out and the columns ranked per
+bottom (above) -- one beam advances row by row:
 
 1. **Expand.** Every board fills its next row A→B→C from the database, with
    exact 256-bit piece-disjointness masks. Cells are pre-sorted by promise, so
    a first budgeted phase scans the most continuable chains; a second phase
-   visits the cell in a random full-cycle permutation (random start + coprime
-   stride) so random exploration never regenerates a duplicate child within a
-   slice. Per-parent work is bounded by `--scan_factor` (decode budget) and
-   `--pool_factor` (child quota).
+   visits, in a random full-cycle permutation (random start + coprime stride),
+   exactly the records phase 1 did NOT reach -- both phases index the same
+   slice-local space, so no A record is ever tried twice for one parent. That
+   matters most where quota is not the binding constraint, i.e. the early rows
+   and the collapsing rows 9-12: permuting the whole cell there re-walked
+   everything phase 1 had just done, and `try_A` is deterministic in its record,
+   so every one of those was a bit-identical duplicate child. Measured before
+   the fix, candidates/unique sat at exactly 2.0000 on every row with quota
+   headroom. Per-parent work is bounded by `--pool_factor` (child quota) and a
+   fixed decode budget.
 2. **Score.** See below.
 3. **Select.** Children dedup by a 64-bit *frontier signature* -- a hash of
    (used-piece set, exposed top colors), which provably determines a board's
@@ -298,32 +389,58 @@ effort there (K = `--beam_width`, E = `--beam_expand`, R = `--beam_expand_row`):
 | rows | width | random band | parent cap |
 |---|---|---|---|
 | 1 ... R-2 | K | `frac_rand` | `parent_cap` |
-| R-1 | max(K, K*E/2) | `frac_rand`/2 | 2x`parent_cap` |
-| R ... stop_row | K*E | 0 | 2x`parent_cap` |
+| R-1 | max(K, K*E/2) | `frac_rand` | 2x`parent_cap` |
+| R ... stop_row | K*E | `frac_rand` | 2x`parent_cap` |
 
-Early rows explore (the heuristic knows little about an empty board); late
-rows are pure exploitation.
+Width and the offspring cap still step up late, where extinction pressure is
+highest. The random band does NOT: `--frac_rand` is flat across every row.
 
-**Gumbel top-K selection** (`--gumbel_tau0`, `--gumbel_tau1`; 0 = off, the
-default). The `frac_rand` band above is *uniform over survivors* -- blind to
-the score -- and it is switched off entirely from row R on, exactly where
-extinction pressure peaks. An alternative is to perturb the sort key instead:
+It used to taper -- full early, half at R-1, zero from R on -- which was the
+right shape for a band of 0.75, where the late rows needed protecting from it.
+At 0.10 the taper buys nothing and costs the late rows their only hedge
+against a biased objective. It is also close to a no-op either way: the band
+is split off inside `select_beam`, which only runs when the pool EXCEEDS the
+row width, and at the expanded rows it usually does not (measured mean
+occupancy at row 8 was 700k of 1.31M slots). Where selection does not bind,
+every candidate survives and the fraction never applies.
 
-```
-key = score/tau + Gumbel(0,1),      Gumbel = -log(-log U)
-```
+Both bands are drawn from the same deduplicated pool and sum to the row width
+(`k_rand = frac_rand * rem`, `k_top = rem - k_rand`), so lowering `frac_rand`
+does not send more states forward -- it sends better-chosen ones. Measured
+over 18 viable configs at production width, two seeds, counting configs that
+filled row 11: 0.75 -> 9.0, 0.50 -> 12.0, 0.25 -> 12.5, 0.10 -> 15.0, 0 ->
+14.5. A separate check confirmed the extra depth is real material and not a
+collapsed lineage: the emitted row-10 boards are 34-39% MORE numerous at 0.10
+than at 0.75, 100% distinct, with the same mean pairwise separation (317 of
+512 cells) and the same ~46 pieces available per cell.
 
-Top-K of that is provably a sample of K **distinct** boards drawn without
-replacement with probability proportional to `exp(score/tau)` (Kool, van Hoof &
-Welling 2019) -- one RNG call per survivor, in a loop that already touches every
-survivor, replacing ~196 k serial rejection draws at default settings. Because
-the score is already a log record count, **tau = 1 samples in proportion to
-estimated completions**; tau -> 0 is greedy and large tau is near-uniform. Tau
-interpolates linearly from `tau0` at row 1 to `tau1` at `--stop_row`, so one
-monotone knob expresses the whole "trust the score more as the board fills"
-schedule. When tau > 0 the `frac_rand` band stands down; the pool's own scores
-are never perturbed, so the beam, the emission order and every reported score
-stay real.
+**The finalizer's band is flat too, but at 0.30 -- and that difference is
+deliberate.** Its taper was worse than the beamer's, because a schedule written
+for a search starting at row 1 does not survive being handed a board already
+filled to `finalize_from`. At the default `finalize_from 8` the searched rows
+are 9..12 and `beam_expand_row` is 8, so exactly one row kept any randomness and
+the other three were purely fan-out selected -- the old code carved out that one
+row as an explicit exception and named the cost in its own comment ("repeated
+runs over the same partial would retrace each other"). Repeated runs are how the
+tool is used; `--finalize_repeats` exists for them. So the band that makes them
+differ has to be alive on every row.
+
+It sits at 0.30 rather than the beamer's 0.10 because the two tools spend a pass
+differently. The beamer gets one pass at a configuration and wants its budget on
+what the objective likes best. The finalizer can be re-run over the same partial
+as often as it is worth doing, so a wider random band is not a tax on one pass
+but coverage across many.
+
+**Gumbel top-K selection on the beam rows was removed.** The idea was to
+perturb the sort key with `score/tau + Gumbel(0,1)`, whose top-K is provably a
+sample of K distinct boards drawn without replacement with probability
+proportional to `exp(score/tau)` (Kool, van Hoof & Welling 2019). It is a
+prettier instrument than the uniform `frac_rand` band and it measured worse:
+`--gumbel_tau0 1` lost to a plain `--frac_rand 0.10` on 20 of 20 paired
+configurations (0.89x row-10 width). The principled sampler did not beat the
+blunt one here, so the beam keeps the blunt one and `dedup_and_rank` keeps one
+code path instead of two. The primitive survives where it does earn its place --
+on the border ranking, below.
 
 **The same primitive on the borders** (`--gumbel_tau_bottoms`,
 `--gumbel_tau_columns`; 0 = off, the default; the finalizer takes the columns
@@ -334,15 +451,25 @@ and the `--random_edges` and finalizer samplers are the K=1 case, an argmax over
 key, so `--top_bottoms`/`--top_columns` become a sample without replacement
 rather than the greedy head.
 
-It is the **column** rank that needs this. `left_rank_of` is
-`sum_r log1p(la_total[c_r])`: a board-blind census that never looks at the
-bottom, and -- decisively -- a sum over rows, hence *symmetric in the row index*.
-Two columns exposing the same colour multiset score identically however they
-order it, though position is what matters (row 1 meets the bottom, row 14 the
-top border). The tie classes are therefore large, `cmp_left_rank` settles them
-by `memcmp`, and taking the top L hands the sweep L lexicographically adjacent
-columns -- correlated, which is worse than random. Since the perturbation only
-decides which configs run, it costs no search time at all.
+**On the column rank, every measurement of this predating the column rewrite is
+void.** The old `left_rank_of` was `sum_r log1p(la_total[c_r])` -- a sum over
+rows, hence symmetric in the row index, hence a function of the column's exposed
+colour **multiset** alone. And that multiset is invariant:
+`classify_deal_from_rotations` pins `g_left_pool` to exactly `EDGE_LEN` pieces
+(it is fatal if not), and `rec_left` permutes them, so every enumerated column of
+a border row exposes the same colours in a different order. The rank was
+therefore *one constant*. At `tau 0`, `cmp_left_rank` fell through to `memcmp`
+and ordered columns lexicographically by exposed colour; at `tau > 0` the
+constant cancelled out of `rank/tau`, leaving the Gumbel noise alone -- so the
+ordering did not depend on tau at all. Measured: `--gumbel_tau_columns 2` and
+`4` chose identical columns config for config across a whole run, while the same
+comparison on `--gumbel_tau_bottoms` differed. That is also the explanation for
+the sweep's puzzling finding that columns at ranks 2-4 outlived rank 1 by 2.2x
+(p = 0.0008) while bottoms showed no such inversion: there was no column ranking
+to invert.
+
+The rank is now real (see **Ranking a left column**, below), so the perturbation
+has something to perturb. Re-measure before raising it.
 
 **That argument is structural, and one measurement does not back it.** A
 240 s-per-arm, single-seed `--random_edges` run at `--stop_row 11
@@ -382,15 +509,17 @@ one-row proof of death and rejects the child (below the stop row).
 exposed tops but disjoint remaining piece sets score identically. At row 3 that
 is a mild overcount; at row 11, with 154 of 196 pieces consumed, most counted
 records are unbuildable and the overcount is large and board-dependent.
-`--avail_correct` discounts it by `sum over the 14 inner frontier colors of
-log(R_c/tot_c)` -- the fraction of each color's half-edges still in the
-reservoir, a first-order estimate of how many counted chains survive. It
-decodes nothing and scans nothing (that is what the fan-out table exists to
-avoid); it is a closed-form correction on numbers already looked up, and it is
-self-scheduling, since the ratios sit near 1 until the reservoir empties.
+There is no correction for this in the beamer any more. `--avail_correct` used
+to discount the fan-out by each frontier colour's remaining supply; it was
+removed after losing all 61 paired configurations it was measured on (0.82x
+against the plain baseline, 0.70x against Mahalanobis, 0.68x against closure).
+It rewards holding abundant frontier colours, while the closure term often wants
+to spend a colour whose demand is already covered -- the two pull against each
+other. The overcount itself is largest at rows 10-11, where selection no longer
+discards anything, so correcting it there changes no decision.
 
-**The J objective** (`--score_model J`, `--lambda_J`). An alternative to the
-Mahalanobis term below, derived rather than tuned. Every free inner half-edge
+**The closure objective** (`--lambda_J`), the primary colour term, derived
+rather than tuned. Every free inner half-edge
 must eventually meet another of the *same* color; of the `(2A-1)!!` ways to
 pair up `2A = sum_c S_c` free half-edges, `prod_c (S_c-1)!!` are
 color-consistent, so
@@ -665,26 +794,21 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--random_edges` | off | sample borders from the seed; rotations CSV optional |
 | `--BL/--BR/--TL/--TR P` | -- | pin corner piece P (random mode) |
 | `--incomplete_top` | off | also emit stop-row boards holding two of the three segments -- A+B, A+C or B+C |
-| `--beam_width K` | 262144 | boards kept per row |
-| `--stop_row R` | 12 | last row filled (1-13) |
-| `--beam_expand E` | 5 | late-search width multiplier |
-| `--beam_expand_row R` | 8 | row with the full ExK width |
-| `--score_model M` | `legacy` | color term: `legacy` (Mahalanobis) or `J` (pairing combinatorics) |
-| `--lambda_J F` | 1 | weight of the J terms (1 = as derived) |
-| `--lambda_Mahalanobis F` | 0 | weight of the color-usage atypicality bonus (legacy model) |
-| `--avail_correct` | off | discount B/C fan-out by each frontier color's remaining supply |
+| `--beam_width K` | 250000 | boards kept per row |
+| `--stop_row R` | 11 | last row filled (1-13); the beam fills 11 and dies at 12, so 11 emits |
+| `--beam_expand E` | 4 | late-search width multiplier |
+| `--beam_expand_row R` | 7 | row with the full ExK width |
+| `--lambda_J F` | 1.0 | weight of the CLOSURE term, the primary color objective (useful 0.5-1.5) |
+| `--lambda_Mahalanobis F` | 0.6 | weight of the piece-structure correction, in units of its own measured per-row SD (useful 0.3-0.7) |
 | `--no_free_demand` | -- | **disable** the free-mode demand accounting (on by default) |
-| `--frac_rand F` | 0.75 | random selection band (halved at R-1, zero from R) |
-| `--gumbel_tau0 T` | 0 | selection temperature at row 1 (0 = off, exact legacy) |
-| `--gumbel_tau1 T` | 0 | selection temperature at `--stop_row` |
-| `--parent_cap N` | 5 | children per parent in the score band |
+| `--frac_rand F` | 0.10 | random selection band, flat across rows |
+| `--parent_cap N` | 4 | children per parent in the score band |
 | `--pool_factor N` | 8 | candidate-pool target, x beam width |
-| `--scan_factor N` | 1024 | decode budget per requested child |
-| `--bc_window nB,nC` | `3,2` | score up to nB x nC (B,C) completions per A record, keep the best |
-| `--top_bottoms N` | 300 | ranked bottom orderings tried per border row |
-| `--top_columns N` | 10 | ranked left columns per bottom |
+| `--bc_window nB,nC` | `3,3` | while the beam is FULL, score up to nB x nC (B,C) completions per A record and keep the best; while it is BELOW capacity, enumerate and keep every one |
+| `--top_bottoms N` | 10 | ranked bottom orderings tried per border row |
+| `--top_columns N` | 12 | ranked left columns per bottom, ranked separately for each bottom |
 | `--gumbel_tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
-| `--gumbel_tau_columns T` | 0 | ditto for left columns (measure before raising: see above) |
+| `--gumbel_tau_columns T` | 0 | ditto for left columns (every measurement predating the column rewrite is void: see above) |
 | `--bail_columns N` | 0 | abandon a bottom after N consecutive columns that emitted nothing (0 = off) |
 | `--clue_center` | off | force the published centre clue (piece 138) onto its cell, at its orientation's spin |
 | `--clue_corners` | off | force the two reachable corner clues (row 2); the row-13 pair is reserved, never pinned |
@@ -702,10 +826,12 @@ more candidates. Without it `try_A` commits to the **first** conflict-free
 chosen by the database's global, board-blind fan-out sort: the score filters an
 unbiased sample but never steers it. With a window open, up to nB workable B
 chains x nC C completions are scored with the same formula used for selection and
-only the best is kept. **Either way exactly one child per A record survives** --
-the window is not a narrowing, it is the same width with a better choice inside
-it. Note `--scan_factor`'s budget counts segment-A decodes only,
-so an open window multiplies work the budget does not see. There is no
+only the best is kept. **While the beam is at capacity, exactly one child per A
+record survives** -- there the window is not a narrowing, it is the same width
+with a better choice inside it. While the beam is BELOW capacity the window
+opens instead: `select_beam` discards nothing once the pool stops filling the
+row width, so the other candidates are not losers but completions being thrown
+away, and every one is kept (quota still bounds the total). There is no
 counterpart in the finalizer, whose beam rows already enumerate *every*
 conflict-free (B, C) -- the defect the window fixes does not exist there.
 
@@ -758,10 +884,49 @@ workspace scales linearly in `beam_width x beam_expand` (~9 KB per unit).
 bin/E555_finalizer seed.txt partials.csv [rotations.csv] --finalize_from 10 --stop_row 14 ...
 ```
 
+**Settings track the beamer's where the meaning is the same** -- `--beam_width
+250000`, `--beam_expand 4`, `--parent_cap 4`, `--lambda_J 1.0`,
+`--lambda_Mahalanobis 0.6`, `--pool_factor 8`, `--top_columns 12`,
+`--stop_row 11`, `--config_time_sec 600` -- so one number means one thing across
+Stage B, and
+`--bail_columns` exists here too (it abandons a partial line after N consecutive
+columns that report nothing). Two deliberately differ:
+
+- `--frac_rand 0.30` against 0.10, for the reason given above.
+- `--beam_expand_row 8` against 7. The row number is absolute in both, but this
+  search starts at `finalize_from + 1`, so at the default it is already past the
+  threshold on its first row and the two numbers do not mean the same thing.
+
+`--bc_window` has no counterpart here on purpose: this tool enumerates *every*
+conflict-free (B, C) completion of an A record rather than scoring a window and
+keeping the best, which is the right economy when the beam grows from a single
+locked board over a sparse database.
+
+**The Mahalanobis correction needs a row that was actually searched.** It is
+denominated in the per-row spread of `d2n`, measured live, and the beamer can
+simply use row `r-1` because it searched it a moment ago. This tool cannot: its
+first searched row is `finalize_from + 1` and everything below is locked, so
+`r-1` has no sample at all -- at the default that is row 9 normalising against
+row 8. A run short enough to search only two rows therefore never applied the
+correction once, whatever `--lambda_Mahalanobis` said. It now prefers *this*
+row's own spread, which an earlier configuration over the same database will
+have measured, then the row below, then the nearest measured row either way.
+Only the very first configuration of a run scores its first row uncorrected.
+
+Two things made that worse than it had to be, both fixed in both binaries: a row
+whose sample fell under the 64-sample floor used to **zero** the stored spread
+rather than leave the last good estimate standing, so one narrow configuration
+stripped the calibration every later one would have scored against; and the
+`--verbose` table printed nothing at all when no row was measured, which reads
+as "no correction needed" rather than "the correction never ran". It now prints
+the sample count behind each figure and says so explicitly when there is none.
+
 **Locking.** `--border_row/--border_row_N` select the CSV lines; each line is
 structurally validated (piece types per cell, frame orientation, every color
 match inside the locked region). Pieces at or below `--finalize_from`
-(default 8) are locked; pieces placed above return to the pool.
+(default 5) are locked; pieces placed above return to the pool. That default is
+low on purpose: the beam grows from a single locked board, so it needs rows to
+widen in before selection means anything -- see below.
 
 **Input dedup.** Long partial lists are full of near-siblings that seed
 *identical* searches once their top rows are freed. Every line is hashed on
@@ -887,10 +1052,10 @@ The scoring and certificate options are shared with the beamer and mean the
 same thing here, with one exception: **`--bc_window` does not exist in the
 finalizer**, because (1) above already does more than any window -- the defect
 the window fixes is the beamer's "take the first (B, C) that fits", and this
-loop never did. `--score_model J` is a better fit here than in the beamer:
-`maha_term` infers the placed-piece count from `n = 14*row`, whereas `J` reads
-the colour counts straight off the board and stays exact from a locked partial
-at any `--finalize_from`.
+loop never did. The closure term is a better fit here than the
+Mahalanobis one: `maha_d2n` infers the placed-piece count from `n = 14*row`,
+whereas closure reads the colour counts straight off the board and stays exact
+from a locked partial at any `--finalize_from`.
 
 **Output** appends to `beam_completions_finalized_<stop_row>.csv` with config
 ids `p<line>r<repeat>l<column>`; several instances on the same machine may
@@ -1803,7 +1968,7 @@ bash tests/run_tests.sh
 ## Search-strategy trade-offs
 
 After the one-time DB build, wall-clock is roughly
-`(configs searched) x (rows reached x K x pool_factor x scan_factor x const)`.
+`(configs searched) x (rows reached x K x pool_factor x const)`.
 Dead configurations cost almost nothing; the budget is spent on those that
 survive several rows.
 
@@ -1817,12 +1982,32 @@ survive several rows.
 - **`--random_edges`** -- unlimited fresh borders, zero Stage A cost, weaker
   guarantees per border. The breadth end of the spectrum.
 - **finalizer `--finalize_from`** -- lower = more re-searched rows per partial
-  (deeper resampling, costlier); higher = cheap top-row re-rolls.
+  (deeper resampling, costlier); higher = cheap top-row re-rolls. The useful
+  range depends on whether the partial's border is COMPLETE, and the two cases
+  pull opposite ways. On a beamer partial with a complete border the left column
+  is fixed and `--top_columns` samples orderings, so lower is better until the
+  beam stops filling: measured on `board_partial_row12.csv` with 12 sampled
+  columns, `4` reached row 11 on 8 configurations of 12 and `5` on 6, while `6`
+  and above reached it on none and left the beam under 1% of its cap -- an
+  exhaustive walk wearing a beam's clothes, which is why the default is `5`.
+  With an INCOMPLETE border the finalizer falls back to `--free_edges`, and
+  `--top_columns 0` then enumerates every legal left column; that enumeration
+  grows explosively as rows are freed, so the same board wants `7` (see the
+  measured table in `examples/02_finalizer_regrow.sh`).
 
 **Practical default:** breadth first (`--random_edges` or many border rows,
-moderate K), finalize the survivors from row 8-10 with repeats, topper the
+moderate K), finalize the survivors from row 4-5 with repeats, topper the
 best finals through the sliding window, then throw the backtracker and the
 ender at anything above ~460.
+
+**Reproducibility.** A run is reproducible from `--seed` **together with
+`--threads`**, not from the seed alone. The work partition follows the thread
+count, and a beam that keeps a bounded number of candidates keeps a different
+subset from a different partition -- on the synthetic board at a 200-wide beam,
+2 threads score 8731 candidates where 4 score 9009, and the searches diverge
+from there. Both are valid searches; neither is the other. Record the thread
+count with the seed, and `finalizer_determinism` in the release gate holds the
+tools to the same-seed-same-threads contract.
 
 ---
 
@@ -1845,3 +2030,5 @@ ender at anything above ~460.
 | `examples/` | One small script per tool: read these first. |
 | `pipeline/` | The full pipeline, the board farm and the topper sweeps -- long unattended runs. |
 | `tests/run_tests.sh` | The release gate. |
+| `tests/check_script_flags.py` | Gate check: every `--flag` a shipped script passes is one its binary accepts. |
+| `tests/compare_sweeps.py` | Turns two `--verbose` logs into a paired A/B with a sign test. Not part of the gate. |
