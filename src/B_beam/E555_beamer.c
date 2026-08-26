@@ -43,10 +43,9 @@
  * WIDTH AND RANDOMNESS SCHEDULES
  *   The beam expands late, where extinction pressure is highest: half of the
  *   extra (--beam_expand - 1) x width arrives at --beam_expand_row - 1, the rest
- *   at --beam_expand_row. In the same region the random selection band shrinks
- *   (full --frac_rand early, half at expand_row-1, zero after) and the
- *   per-parent offspring cap doubles: early rows explore, late rows exploit the
- *   fan-out heuristic to thread the few remaining legal completions.
+ *   at --beam_expand_row, and the per-parent offspring cap doubles there: late
+ *   rows get more room to thread the few remaining legal completions. The
+ *   random selection band does NOT taper -- --frac_rand is flat across rows.
  *
  * RANDOMNESS
  *   Runs are intentionally NOT reproducible unless --seed is given: by default
@@ -95,23 +94,23 @@
 
 static uint64_t g_master_seed = 0;
 
-static uint32_t g_beam_width      = 262144;
-static uint32_t g_stop_row        = 12;
-static uint32_t g_beam_expand     = 5;
-static uint32_t g_beam_expand_row = 8;
+static uint32_t g_beam_width      = 250000;
+static uint32_t g_stop_row        = 11;
+static uint32_t g_beam_expand     = 4;
+static uint32_t g_beam_expand_row = 7;
 static double   g_lambda_maha     = 0.6;   /* --lambda_Mahalanobis, in score-SD */
-static double   g_frac_rand       = 0.75;
+static double   g_frac_rand       = 0.10;  /* flat across rows; see below */
 /* Share of the beam reserved as a per-orientation floor, split evenly over the
    four orientations (so K/8 each). Not a CLI knob: it exists to stop one
    orientation crowding the others out, and unused floor is handed straight
    back to the score ranking, so there is nothing to tune. */
 #define CLUE_FLOOR_FRAC 0.5
 static uint16_t g_clue_ci[4][CLUE_N];      /* catalog index of each oriented clue */
-static double   g_lambda_J        = 0.75;   /* --lambda_J, the closure weight */
+static double   g_lambda_J        = 1.0;    /* --lambda_J, the closure weight */
 static bool     g_free_demand     = true;   /* --no_free_demand turns it off */
 static uint32_t g_bc_nB           = 3;      /* --bc_window nB,nC; 1,1 = legacy */
-static uint32_t g_bc_nC           = 2;
-static uint32_t g_parent_cap      = 5;
+static uint32_t g_bc_nC           = 3;
+static uint32_t g_parent_cap      = 4;
 static uint32_t g_pool_factor     = 8;
 /* Segment-A decode budget per requested child. Was --scan_factor; a sweep found
    8192 BYTE-identical to 1024 over 219 beam rows, because the per-parent quota
@@ -127,8 +126,8 @@ static uint32_t g_border_row_N     = 1;
 static double   g_config_time_sec  = 600.0;
 static double   g_max_wall_sec     = 0.0;
 static uint64_t g_max_partials     = 0;   /* reported-board budget; 0 = unlimited */
-static long     g_top_bottoms      = 300;   /* leading bottoms per border row (<1 = all) */
-static long     g_top_columns      = 10;    /* leading left columns per bottom (<1 = all) */
+static long     g_top_bottoms      = 10;    /* leading bottoms per border row (<1 = all) */
+static long     g_top_columns      = 12;    /* leading left columns per bottom (<1 = all) */
 /* Selection temperature for the border ranks themselves, the same Gumbel knob
    the beam rows use. 0 = off, i.e. the greedy head of the ranking as before. */
 static double   g_tau_bottoms      = 0.0;
@@ -214,14 +213,15 @@ static uint32_t beam_eff_K(int row) {
     return K * E;
 }
 
-/* Random selection band: full early (the fan-out heuristic knows little when the
-   board is mostly empty), half at expand_row-1, zero from expand_row on (pure
-   fan-out selection where only a few legal completions remain). */
-static double frac_rand_eff(int row) {
-    if ((uint32_t)row < g_beam_expand_row - 1) return g_frac_rand;
-    if ((uint32_t)row == g_beam_expand_row - 1) return g_frac_rand * 0.5;
-    return 0.0;
-}
+/* The random selection band is FLAT: --frac_rand applies at every row. It used
+   to taper to zero from --beam_expand_row on, which made sense when the band
+   was 0.75 and the late rows needed protecting from it. At 0.10 the taper buys
+   nothing and costs the late rows their only hedge against a biased objective.
+   It is also very nearly a no-op either way: the band is split off inside
+   select_beam, which only runs when the pool EXCEEDS the row width, and at the
+   expanded rows it rarely does -- measured mean occupancy at row 8 was 700k of
+   1.31M slots. Where selection does not bind, every candidate survives and the
+   fraction is moot. */
 
 /* gumbel_noise() and gumbel_key() are shared with the border ranking and the
    side samplers -- see E555_database.h. */
@@ -1426,7 +1426,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     /* Beam row, two regimes.
 
        BEAM AT CAPACITY -- up to B_TRY conflict-free B chains, and with
-       --bc_window nB,nC (default 3,2) up to nB workable B chains x nC C
+       --bc_window nB,nC (default 3,3) up to nB workable B chains x nC C
        completions are scored, of which the best is kept. The row's B and C
        segments -- 10 of its 14 pieces -- then stop being whatever the database's
        global, board-blind fan-out sort offered first, and the objective steers
@@ -1958,9 +1958,8 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         RNG sel_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFFu, 1u);
         uint32_t eff_K = beam_eff_K(row);
         g_beam_unpruned = (kept <= eff_K);
-        double fr = frac_rand_eff(row);
         uint32_t n_sel = select_beam(ctx, kept, beam_n, eff_K,
-                                     parent_cap_eff(row), fr, &sel_rng);
+                                     parent_cap_eff(row), g_frac_rand, &sel_rng);
         double t0 = omp_get_wtime();
         materialize_beam(ctx, cur, nxt, n_sel, row);
         g_stats.t_mat += omp_get_wtime() - t0;
@@ -2189,18 +2188,20 @@ static void usage(const char *a0) {
 "                         adds to whatever the out_dir already holds\n"
 "\n"
 "Beam shape:\n"
-"  --beam_width K         boards kept per row (default 262144)\n"
+"  --beam_width K         boards kept per row (default 250000)\n"
 "  --stop_row R           last row the beam fills, 1..13; reaching boards are emitted\n"
-"                         (default 12; rows 14-15 belong to Stage C)\n"
-"  --beam_expand E        late-search width multiplier (default 5; 1 = no expansion)\n"
+"                         (default 11: the beam reliably FILLS row 11 and reliably\n"
+"                         dies attempting 12, so stopping at 11 emits that material\n"
+"                         instead of discarding it -- hand row 12 to the finalizer)\n"
+"  --beam_expand E        late-search width multiplier (default 4; 1 = no expansion)\n"
 "  --beam_expand_row R    row with the full ExK width; half of the extra width is\n"
-"                         granted one row earlier (default 8)\n"
+"                         granted one row earlier (default 7)\n"
 "\n"
 "Scoring / selection:\n"
 "  --lambda_J F           weight of the CLOSURE term, the objective derived from\n"
 "                         pairing combinatorics: A_tot*KL(free-color mix || flat) plus\n"
 "                         a demand term, in nats like the fan-out terms. The primary\n"
-"                         color objective; 0 turns it off (default 0.75, useful 0.5-1)\n"
+"                         color objective; 0 turns it off (default 1.0, useful 0.5-1.5)\n"
 "  --lambda_Mahalanobis F weight of the piece-structure CORRECTION, in units of its own\n"
 "                         per-row standard deviation -- the spread is measured live and\n"
 "                         divided out, so F means the same thing at every depth. Small\n"
@@ -2215,10 +2216,14 @@ static void usage(const char *a0) {
 "                         both on row 2; the row-13 pair is only reserved, never pinned,\n"
 "                         and constrains no searched row. Clue pieces leave the database\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by\n"
-"                         score; halved at beam_expand_row-1, zero from\n"
-"                         beam_expand_row on (default 0.75)\n"
+"                         score, FLAT across rows. Both bands are drawn from the\n"
+"                         same deduplicated pool and sum to the row width, so a\n"
+"                         lower value does not send more states forward -- it sends\n"
+"                         better-chosen ones. Only bites where the pool exceeds the\n"
+"                         width; where it does not, every candidate survives anyway\n"
+"                         (default 0.10; 0 trusts the objective completely)\n"
 "  --parent_cap N         max children per parent in the score-selected band;\n"
-"                         doubled from beam_expand_row-1 on; 0 = uncapped (default 5)\n"
+"                         doubled from beam_expand_row-1 on; 0 = uncapped (default 4)\n"
 "\n"
 "Feasibility certificates:\n"
 "  --no_free_demand       DISABLE the free-mode demand accounting. On by default: an\n"
@@ -2241,12 +2246,14 @@ static void usage(const char *a0) {
 "                         Selection only discards states while the pool exceeds the row\n"
 "                         width, so where it does not, an extra child costs nothing and\n"
 "                         a discarded sibling is a completion thrown away. 1,1 makes\n"
-"                         the full-beam regime take the first fit (default 3,2)\n"
+"                         the full-beam regime take the first fit (default 3,3)\n"
 "\n"
 "Sweep control:\n"
 "  --top_bottoms N        bottom-row orderings tried per border row, best-ranked\n"
-"                         first (<1 = all; default 300)\n"
-"  --top_columns N        left-column orderings tried per bottom (<1 = all; default 10)\n"
+"                         first (<1 = all; default 10). A bottom on a NEW border is\n"
+"                         worth more than another bottom on one already tried, so\n"
+"                         spend the budget on --border_row_N before raising this\n"
+"  --top_columns N        left-column orderings tried per bottom (<1 = all; default 12)\n"
 "  --gumbel_tau_bottoms T selection temperature for the bottom ranking: above 0 the\n"
 "                         --top_bottoms tried are a sample without replacement with\n"
 "                         probability proportional to exp(rank/tau) rather than the\n"

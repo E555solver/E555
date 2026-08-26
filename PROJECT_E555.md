@@ -304,11 +304,34 @@ effort there (K = `--beam_width`, E = `--beam_expand`, R = `--beam_expand_row`):
 | rows | width | random band | parent cap |
 |---|---|---|---|
 | 1 ... R-2 | K | `frac_rand` | `parent_cap` |
-| R-1 | max(K, K*E/2) | `frac_rand`/2 | 2x`parent_cap` |
-| R ... stop_row | K*E | 0 | 2x`parent_cap` |
+| R-1 | max(K, K*E/2) | `frac_rand` | 2x`parent_cap` |
+| R ... stop_row | K*E | `frac_rand` | 2x`parent_cap` |
 
-Early rows explore (the heuristic knows little about an empty board); late
-rows are pure exploitation.
+Width and the offspring cap still step up late, where extinction pressure is
+highest. The random band does NOT: `--frac_rand` is flat across every row.
+
+It used to taper -- full early, half at R-1, zero from R on -- which was the
+right shape for a band of 0.75, where the late rows needed protecting from it.
+At 0.10 the taper buys nothing and costs the late rows their only hedge
+against a biased objective. It is also close to a no-op either way: the band
+is split off inside `select_beam`, which only runs when the pool EXCEEDS the
+row width, and at the expanded rows it usually does not (measured mean
+occupancy at row 8 was 700k of 1.31M slots). Where selection does not bind,
+every candidate survives and the fraction never applies.
+
+Both bands are drawn from the same deduplicated pool and sum to the row width
+(`k_rand = frac_rand * rem`, `k_top = rem - k_rand`), so lowering `frac_rand`
+does not send more states forward -- it sends better-chosen ones. Measured
+over 18 viable configs at production width, two seeds, counting configs that
+filled row 11: 0.75 -> 9.0, 0.50 -> 12.0, 0.25 -> 12.5, 0.10 -> 15.0, 0 ->
+14.5. A separate check confirmed the extra depth is real material and not a
+collapsed lineage: the emitted row-10 boards are 34-39% MORE numerous at 0.10
+than at 0.75, 100% distinct, with the same mean pairwise separation (317 of
+512 cells) and the same ~46 pieces available per cell.
+
+The finalizer keeps its own tapering `--frac_rand 0.75`: its schedule keys off
+`finalize_from` rather than `beam_expand_row`, so none of this transfers and it
+has not been measured there.
 
 **Gumbel top-K selection on the beam rows was removed.** The idea was to
 perturb the sort key with `score/tau + Gumbel(0,1)`, whose top-K is provably a
@@ -663,19 +686,19 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--random_edges` | off | sample borders from the seed; rotations CSV optional |
 | `--BL/--BR/--TL/--TR P` | -- | pin corner piece P (random mode) |
 | `--incomplete_top` | off | also emit stop-row boards holding two of the three segments -- A+B, A+C or B+C |
-| `--beam_width K` | 262144 | boards kept per row |
-| `--stop_row R` | 12 | last row filled (1-13) |
-| `--beam_expand E` | 5 | late-search width multiplier |
-| `--beam_expand_row R` | 8 | row with the full ExK width |
-| `--lambda_J F` | 0.75 | weight of the CLOSURE term, the primary color objective (useful 0.5-1) |
+| `--beam_width K` | 250000 | boards kept per row |
+| `--stop_row R` | 11 | last row filled (1-13); the beam fills 11 and dies at 12, so 11 emits |
+| `--beam_expand E` | 4 | late-search width multiplier |
+| `--beam_expand_row R` | 7 | row with the full ExK width |
+| `--lambda_J F` | 1.0 | weight of the CLOSURE term, the primary color objective (useful 0.5-1.5) |
 | `--lambda_Mahalanobis F` | 0.6 | weight of the piece-structure correction, in units of its own measured per-row SD (useful 0.3-0.7) |
 | `--no_free_demand` | -- | **disable** the free-mode demand accounting (on by default) |
-| `--frac_rand F` | 0.75 | random selection band (halved at R-1, zero from R) |
-| `--parent_cap N` | 5 | children per parent in the score band |
+| `--frac_rand F` | 0.10 | random selection band, flat across rows |
+| `--parent_cap N` | 4 | children per parent in the score band |
 | `--pool_factor N` | 8 | candidate-pool target, x beam width |
-| `--bc_window nB,nC` | `3,2` | while the beam is FULL, score up to nB x nC (B,C) completions per A record and keep the best; while it is BELOW capacity, enumerate and keep every one |
-| `--top_bottoms N` | 300 | ranked bottom orderings tried per border row |
-| `--top_columns N` | 10 | ranked left columns per bottom |
+| `--bc_window nB,nC` | `3,3` | while the beam is FULL, score up to nB x nC (B,C) completions per A record and keep the best; while it is BELOW capacity, enumerate and keep every one |
+| `--top_bottoms N` | 10 | ranked bottom orderings tried per border row |
+| `--top_columns N` | 12 | ranked left columns per bottom |
 | `--gumbel_tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
 | `--gumbel_tau_columns T` | 0 | ditto for left columns (measure before raising: see above) |
 | `--bail_columns N` | 0 | abandon a bottom after N consecutive columns that emitted nothing (0 = off) |
