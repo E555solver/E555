@@ -1982,12 +1982,32 @@ survive several rows.
 - **`--random_edges`** -- unlimited fresh borders, zero Stage A cost, weaker
   guarantees per border. The breadth end of the spectrum.
 - **finalizer `--finalize_from`** -- lower = more re-searched rows per partial
-  (deeper resampling, costlier); higher = cheap top-row re-rolls.
+  (deeper resampling, costlier); higher = cheap top-row re-rolls. The useful
+  range depends on whether the partial's border is COMPLETE, and the two cases
+  pull opposite ways. On a beamer partial with a complete border the left column
+  is fixed and `--top_columns` samples orderings, so lower is better until the
+  beam stops filling: measured on `board_partial_row12.csv` with 12 sampled
+  columns, `4` reached row 11 on 8 configurations of 12 and `5` on 6, while `6`
+  and above reached it on none and left the beam under 1% of its cap -- an
+  exhaustive walk wearing a beam's clothes, which is why the default is `5`.
+  With an INCOMPLETE border the finalizer falls back to `--free_edges`, and
+  `--top_columns 0` then enumerates every legal left column; that enumeration
+  grows explosively as rows are freed, so the same board wants `7` (see the
+  measured table in `examples/02_finalizer_regrow.sh`).
 
 **Practical default:** breadth first (`--random_edges` or many border rows,
-moderate K), finalize the survivors from row 8-10 with repeats, topper the
+moderate K), finalize the survivors from row 4-5 with repeats, topper the
 best finals through the sliding window, then throw the backtracker and the
 ender at anything above ~460.
+
+**Reproducibility.** A run is reproducible from `--seed` **together with
+`--threads`**, not from the seed alone. The work partition follows the thread
+count, and a beam that keeps a bounded number of candidates keeps a different
+subset from a different partition -- on the synthetic board at a 200-wide beam,
+2 threads score 8731 candidates where 4 score 9009, and the searches diverge
+from there. Both are valid searches; neither is the other. Record the thread
+count with the seed, and `finalizer_determinism` in the release gate holds the
+tools to the same-seed-same-threads contract.
 
 ---
 
@@ -2010,3 +2030,5 @@ ender at anything above ~460.
 | `examples/` | One small script per tool: read these first. |
 | `pipeline/` | The full pipeline, the board farm and the topper sweeps -- long unattended runs. |
 | `tests/run_tests.sh` | The release gate. |
+| `tests/check_script_flags.py` | Gate check: every `--flag` a shipped script passes is one its binary accepts. |
+| `tests/compare_sweeps.py` | Turns two `--verbose` logs into a paired A/B with a sign test. Not part of the gate. |

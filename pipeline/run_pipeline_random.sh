@@ -181,6 +181,12 @@ echo "$((FIN_FROM+1))..$FIN_STOP are searched again over a database rebuilt with
 echo "the locked pieces."
 echo
 
+# --frac_rand 0.0 overrides the finalizer's default of 0.30. It dates from when
+# that default was 0.75 and plainly too high, and it has NOT been re-measured
+# against 0.30. The default assumes repeated passes over one board, which is not
+# what happens here (--finalize_repeats 1), so turning the band off is at least
+# self-consistent -- but 0 is not a measured setting either: the beamer ships
+# 0.10, and 0.25 beat 0.75 by ~28%.
 "$REPO/bin/E555_finalizer" "$SEED" 1_beam.csv \
     --out_dir final --threads "$THREADS" \
     --finalize_from "$FIN_FROM" --finalize_repeats 1 \

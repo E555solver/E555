@@ -387,6 +387,11 @@ lap() {
     fi
 
     # --- re-grow rows BAND_ROW+1 .. target -----------------------------------
+    # --lambda_Mahalanobis 0 is deliberate and specific to this lap: the band
+    # below was rebuilt exactly by the backtracker, so the closure objective is
+    # the only one with anything left to say about it. --frac_rand 0.0, though,
+    # is the same unmeasured holdover as in the other two pipelines -- see the
+    # note above the finalizer call in run_pipeline_random.sh.
     "$REPO/bin/E555_finalizer" "$SEED" "${k}_band.csv" \
         --out_dir "lap$k" --threads "$THREADS" \
         --finalize_from "$BAND_ROW" --finalize_repeats 1 \
