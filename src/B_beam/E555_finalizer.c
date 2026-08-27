@@ -2704,6 +2704,79 @@ static uint64_t fin_left_hash(const LeftOrder *lo) {
 /* Run one beam configuration for a chosen left column: reset the per-config emit
    state, search, and print the sweep line. Shared by the sampling loop and the
    exhaustive enumerator. */
+/* -- The [sweep] line, and the run-length collapse behind it ----------------- */
+/* Kept in step with the beamer's, which carries the full reasoning. In short: a
+   configuration that emitted nothing prints only what is not trivially zero, and
+   consecutive barren ones that died the same way under the same input line
+   collapse into one counted line; and `filled` and `died` are separate fields
+   because res.row is the last row COMPLETED for stop_row, time, interrupted and
+   parity, but the row that FAILED for an extinction -- where res.width is the
+   width the beam carried into that row rather than one it ever reached. */
+#define SWEEP_QUIET_SEC 30.0
+static char     g_sw_group[64] = "";   /* the line+repeat whose columns pend   */
+static char     g_sw_key[96]   = "";   /* how they died; identical or no run   */
+static bool     g_sw_armed = false;
+static long     g_sw_first = -1, g_sw_last = -1;   /* the SUPPRESSED span      */
+static uint32_t g_sw_n     = 0;
+static double   g_sw_wall  = 0.0;
+
+/* Does the committed clue orientation pin anything on this row? A clue pins the
+   row it sits on and the one below it, to the colour it will stand on. */
+static bool clue_row_pinned(int row) {
+    if (!g_clue_mask) return false;
+    int pi[3], pk[3]; uint16_t pv[3];
+    return fin_clue_pins_for(row, pi, pk, pv);
+}
+
+static const char *sweep_reason(const BeamResult *br) {
+    static char buf[64];
+    if (strcmp(br->reason, "extinct") || !clue_row_pinned((int)br->row))
+        return br->reason;
+    snprintf(buf, sizeof buf, "%s(clue_row)", br->reason);
+    return buf;
+}
+
+static void sweep_flush(void) {
+    if (g_sw_n == 1)
+        printf("[sweep] %sl%ld %s wall=%.1fs\n",
+               g_sw_group, g_sw_first, g_sw_key, g_sw_wall);
+    else if (g_sw_n > 1)
+        printf("[sweep] %sl%ld-l%ld x%u %s wall=%.1fs\n",
+               g_sw_group, g_sw_first, g_sw_last, g_sw_n, g_sw_key, g_sw_wall);
+    if (g_sw_n) fflush(stdout);
+    g_sw_group[0] = g_sw_key[0] = '\0';
+    g_sw_armed = false; g_sw_first = g_sw_last = -1; g_sw_n = 0; g_sw_wall = 0.0;
+}
+
+static void sweep_report(const char *group, long li, const BeamResult *br, double wall) {
+    const bool filled = strcmp(br->reason, "extinct") != 0;
+    char key[96];
+    snprintf(key, sizeof key, "%s=%u width=%u reason=%s",
+             filled ? "filled" : "died", br->row, br->width, sweep_reason(br));
+
+    if (g_emit_count + g_partial_count == 0) {
+        if (g_sw_armed && !strcmp(g_sw_group, group) && !strcmp(g_sw_key, key)) {
+            if (g_sw_n == 0) g_sw_first = li;
+            g_sw_last = li; g_sw_n++; g_sw_wall += wall;
+            if (g_sw_wall >= SWEEP_QUIET_SEC) sweep_flush();
+            return;
+        }
+        sweep_flush();
+        printf("[sweep] %sl%ld %s wall=%.1fs\n", group, li, key, wall);
+        fflush(stdout);
+        snprintf(g_sw_group, sizeof g_sw_group, "%s", group);
+        snprintf(g_sw_key,   sizeof g_sw_key,   "%s", key);
+        g_sw_armed = true; g_sw_first = g_sw_last = -1; g_sw_n = 0; g_sw_wall = 0.0;
+        return;
+    }
+
+    sweep_flush();
+    printf("[sweep] %sl%ld %s emitted=%zu", group, li, key, g_emit_count);
+    if (g_incomplete_top) printf(" partials=%zu part_total=%zu", g_partial_count, g_partial_total);
+    printf(" sol_total=%" PRIu64 " wall=%.1fs\n", g_solution_idx, wall);
+    fflush(stdout);
+}
+
 static void run_left_config(BeamCtx *ctx, Scratch **scratch, double t_start,
                             uint32_t line, uint32_t rep, size_t idx,
                             const LeftOrder *lft) {
@@ -2721,11 +2794,8 @@ static void run_left_config(BeamCtx *ctx, Scratch **scratch, double t_start,
     BeamResult br = beam_search_config(ctx, scratch, cfg_hash, slice_end);
     /* emitted/partials are this config's unique boards; sol_total/part_total are
        the run totals written so far (the CSVs accumulate across configs). */
-    printf("[sweep] %s row=%u width=%u emitted=%zu partials=%zu reason=%s sol_total=%" PRIu64
-           " part_total=%zu wall=%.1fs\n",
-           g_config_id_str, br.row, br.width, g_emit_count, g_partial_count, br.reason,
-           g_solution_idx, g_partial_total, omp_get_wtime()-tc0);
-    fflush(stdout);
+    { char grp[64]; snprintf(grp, sizeof grp, "p%ur%u", line, rep);
+      sweep_report(grp, (long)idx, &br, omp_get_wtime()-tc0); }
     if (g_completions_fp) fflush(g_completions_fp);
     if (g_partial_fp)     fflush(g_partial_fp);
     partials_budget_announce();
@@ -3075,8 +3145,8 @@ int main(int argc, char *argv[]) {
     printf("\n=== E555 finalizer ===\n\n");
     printf("[cfg] seed_file=%s partials_file=%s out_dir=%s\n",
            seed_path, csv_path, g_out_dir);
-    printf("[cfg] seed=%" PRIu64 " threads=%d lines=%u+%u finalize_from=%u repeats=%u incomplete_top=%d\n",
-           g_master_seed, g_nthreads, g_border_row_index, g_border_row_N,
+    printf("[cfg] seed=%" PRIu64 " threads=%d verbose=%d lines=%u+%u finalize_from=%u repeats=%u incomplete_top=%d\n",
+           g_master_seed, g_nthreads, g_verbose ? 1 : 0, g_border_row_index, g_border_row_N,
            g_finalize_from, g_finalize_repeats, g_incomplete_top ? 1 : 0);
     printf("[cfg] beam_width=%u stop_row=%u expand=%ux@row%u\n",
            g_beam_width, g_stop_row, g_beam_expand, g_beam_expand_row);
@@ -3265,12 +3335,14 @@ int main(int argc, char *argv[]) {
                         run_left_config(&ctx, scratch, t_start, line, rep, li, &lft);
                         barren = (g_stats.emitted_total + g_partial_total > got0) ? 0 : barren + 1;
                         if (g_bail_columns && barren >= g_bail_columns) {
+                            sweep_flush();
                             printf("[bail] line %u: %u column(s) in a row reported nothing, "
                                    "moving to the next line\n", line, barren);
                             fflush(stdout);
                             break;
                         }
                     }
+                    sweep_flush();   /* never straddle a repeat */
                     if (g_bail_columns && barren >= g_bail_columns) break;
                 }
                 free(tried);
@@ -3278,6 +3350,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    sweep_flush();
     double wall = omp_get_wtime() - t_start;
     print_summary(wall, init_s, omp_get_wtime() - t_sweep0);
     printf("[sum] completions file: %s\n", comp_path);

@@ -23,10 +23,19 @@ import re
 import sys
 
 # [sweep] r3b0l2 ... (beamer)   [sweep] p0r1l17 ... (finalizer)
+#
+# Three shapes have to parse. A configuration that produced boards carries
+# filled= and emitted=; one that died carries died= and drops the zero counters;
+# and a run of consecutive identical barren ones is collapsed by the tools into
+# a single "l1-l7 x7" line, which expands back to x7 configurations here so an
+# arm's totals do not depend on how the log happened to be folded. Its wall time
+# is the run's total, so it is split evenly over the configurations it stands
+# for -- the arm total is right either way, and the per-config figure stays sane.
 SWEEP_RE = re.compile(
-    r'\[sweep\]\s+(?P<id>(?:r\d+b\d+l\d+)|(?:p\d+r\d+l\d+))\s+'
-    r'row=(?P<row>\d+)\s+width=(?P<width>\d+)\s+emitted=(?P<emitted>\d+)\s+'
-    r'partials=(?P<partials>\d+)\s+reason=(?P<reason>\S+).*?wall=(?P<wall>[\d.]+)s')
+    r'\[sweep\]\s+(?P<id>(?:rnd|r\d+)b\d+l\d+(?:-l\d+)?|p\d+r\d+l\d+(?:-l\d+)?)'
+    r'(?:\s+x(?P<mult>\d+))?\s+'
+    r'(?:filled|died)=(?P<row>\d+)\s+width=(?P<width>\d+)\s+reason=(?P<reason>\S+)'
+    r'(?:\s+emitted=(?P<emitted>\d+))?.*?wall=(?P<wall>[\d.]+)s')
 ID_RE = re.compile(r'([a-z])(\d+)')
 
 
@@ -38,13 +47,16 @@ def parse(path):
             if not m:
                 continue
             parts = ID_RE.findall(m.group("id"))
-            rows.append(dict(
-                # the first two id components name the starting configuration;
-                # the last is which column/repeat was tried from it
-                pair=tuple(parts[:2]),
-                row=int(m.group("row")), width=int(m.group("width")),
-                emitted=int(m.group("emitted")), reason=m.group("reason"),
-                wall=float(m.group("wall"))))
+            mult = int(m.group("mult") or 1)
+            wall = float(m.group("wall")) / mult
+            for _ in range(mult):
+                rows.append(dict(
+                    # the first two id components name the starting configuration;
+                    # the last is which column/repeat was tried from it
+                    pair=tuple(parts[:2]),
+                    row=int(m.group("row")), width=int(m.group("width")),
+                    emitted=int(m.group("emitted") or 0),
+                    reason=m.group("reason"), wall=wall))
     if not rows:
         sys.exit("no [sweep] configuration lines in %s -- was it run with "
                  "--verbose?" % path)
@@ -84,7 +96,7 @@ def main():
             wall, 3600 * hit / max(wall, 1e-9),
             sum(r["row"] <= 1 for r in rows)))
 
-    print("\nrows reached (a configuration dying at row R filled R-1):")
+    print("\nrows reached (the row filled= or died= names; a death at R filled R-1):")
     for label, rows in arms.items():
         c = collections.Counter(r["row"] for r in rows)
         print("  %-6s " % label + "  ".join("r%d:%d" % kv for kv in sorted(c.items())))

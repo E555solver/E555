@@ -375,12 +375,52 @@ bottom (above) -- one beam advances row by row:
    (used-piece set, exposed top colors), which provably determines a board's
    entire future -- keeping the best copy. Survivors are pruned to the row's
    width by a score band (with a per-parent offspring cap) plus a random band.
-4. **Materialize.** Moves go to an ancestry log; beam entries stay ~150 B.
+4. **Materialize.** Moves go to an ancestry log; beam entries are exactly 128 B
+   (two cache lines, held there by a `_Static_assert`).
 
-An empty child pool **proves** the configuration dead below the current row
-(`extinct`); the sweep moves on. Every board that completes `--stop_row` is
-emitted, best first -- deliberately with no lookahead at the stop row: whether
-the board continues is the next stage's problem.
+An empty child pool ends the configuration (`extinct`); the sweep moves on. It
+is **not** a proof that the configuration is dead: the generator keeps a bounded
+number of children per segment-A record, spends a bounded quota per parent, and
+starts from an already-pruned beam, so an empty pool means only that this
+bounded search found no child from the states it still held. Every board that
+completes `--stop_row` is emitted, best first -- deliberately with no lookahead
+at the stop row: whether the board continues is the next stage's problem.
+
+### Reading the sweep log
+
+One `[sweep]` line per configuration, in one of three shapes:
+
+```
+[sweep] r1b3l4 filled=11 width=2 reason=stop_row emitted=2 sol_total=2 wall=13.6s
+[sweep] r0b0l0 died=1 width=1 reason=extinct(clue_row) wall=0.0s
+[sweep] r0b0l1-l19 x19 died=1 width=1 reason=extinct(clue_row) wall=0.1s
+```
+
+`filled=` and `died=` are separate fields because one number cannot be both.
+`filled=R` is the last row COMPLETED, and the width beside it is the beam that
+completed it; `died=R` is the row that FAILED, and the width beside it is what
+the beam carried INTO that row -- never a width row R ever reached, which is 0
+by definition of an extinction. `died=1 width=1` therefore says the search never
+got past the bare border board.
+
+A configuration that emitted nothing prints only those fields; `partials=` and
+`part_total=` appear only under `--incomplete_top`. Consecutive barren
+configurations that died identically under one bottom collapse into a single
+`l<first>-l<last> x<n>` line whose `wall=` is their combined time -- one clued
+production log spent 474 of its 653 lines on byte-identical deaths. The first of
+a run always prints in full, and a run is flushed once its configurations have
+cost 30 s between them, so a slow sequence still reports progress.
+
+`reason=extinct(clue_row)` marks a death on a row a clue constrains, which is
+worth calling out because it is rarely the row you expect: **a clue pins the row
+below it as well as its own**, to the colour it will stand on. `--clue_corners`
+names cells on row 2 and so bites at row 1, and with the four orientations all
+enabled the pinned walk must satisfy one of four different colour pairs at
+cols 2 and 13 on top of a border that already fixes all fourteen of row 1's
+bottom colours. Measured on `data/borders_annealed_fix12.csv` border row 0, that
+is the difference between every configuration reaching the stop row and every
+configuration dying at row 1. The `[cfg]` banner lists the pinned rows up front
+(`pinned_rows=1,2,6,7,8`) so a run that dies at row 1 explains itself.
 
 **Width and randomness schedules.** Extinction pressure concentrates in the
 high rows, where the piece supply thins. Three coupled schedules concentrate
@@ -1066,8 +1106,9 @@ share one output file (each line is one atomic append).
 written, counting completions and `--incomplete_top` partials together. The
 stop-row beam in flight is always reported in full, so the final count
 overshoots N by up to one beam width. Because the CSVs are *appended* to, the
-`[sweep]` line reports both the per-config counts (`emitted=`, `partials=`) and
-the run totals written so far (`sol_total=`, `part_total=`) -- a fresh run into a
+`[sweep]` line of a configuration that produced something reports both the
+per-config counts (`emitted=`, and `partials=` under `--incomplete_top`) and the
+run totals written so far (`sol_total=`, `part_total=`) -- a fresh run into a
 used `--out_dir` starts its totals at 0 while the file keeps growing.
 
 ---

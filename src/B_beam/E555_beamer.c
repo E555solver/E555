@@ -1936,7 +1936,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         if (pool_n > ctx->pool_cap) pool_n = ctx->pool_cap;
         g_stats.cands_total += pool_n;
         if (pool_n == 0) {
-            res.reason = "heuristic_extinction"; res.row = (uint32_t)row;
+            res.reason = "extinct"; res.row = (uint32_t)row;
             g_stats.extinct_at[row]++;
             break;
         }
@@ -2378,6 +2378,99 @@ static void usage(const char *a0) {
 "  --help                 this text\n", a0);
 }
 
+/* -- The [sweep] line, and the run-length collapse behind it ----------------- */
+/* One configuration used to print 130 characters of mostly zeros whether or not
+   it found anything, and a sweep that loses a whole CLASS of columns at one row
+   prints hundreds of those in a row: in one clued production log, 474 of 653
+   lines were byte-identical but for the column index. So a configuration that
+   emitted nothing prints only what is not trivially zero, and consecutive
+   barren ones that died the same way under the same bottom collapse into one
+   counted line.
+ 
+   The first of a run always prints in full, and a run is flushed once its
+   configurations have cost SWEEP_QUIET_SEC between them, so a slow sequence of
+   identical deaths still reports progress rather than going silent.
+ 
+   `filled` and `died` are separate fields because one number cannot be both.
+   res.row is the last row COMPLETED for stop_row, time and interrupted, and the
+   row that FAILED for an extinction -- where res.width is then the width the
+   beam carried into that row, not a width it ever reached. Printing both under
+   one name is what made "row=11 width=1292" read as though row 11 held 1292
+   boards, when row 11 held none and 1292 is what row 10 handed it. */
+#define SWEEP_QUIET_SEC 30.0
+static char     g_sw_group[64] = "";   /* the bottom whose columns are pending */
+static char     g_sw_key[96]   = "";   /* how they died; identical or no run   */
+static bool     g_sw_armed = false;    /* a run is open, even at zero suppressed */
+static long     g_sw_first = -1, g_sw_last = -1;   /* the SUPPRESSED span      */
+static uint32_t g_sw_n     = 0;        /* suppressed since the printed one     */
+static double   g_sw_wall  = 0.0;      /* their combined wall time             */
+
+/* Does any enabled orientation pin something on this row? A row is pinned by a
+   clue ON it and, one row earlier, by the colour that clue will sit on -- which
+   is why --clue_corners bites at row 1, two rows below the cells it names. */
+static bool clue_row_pinned(int row) {
+    if (!g_clue_mask) return false;
+    for (int o = 0; o < 4; o++) {
+        if (!(g_clue_orients & (1u << o))) continue;
+        int pi[3], pk[3]; uint16_t pv[3];
+        if (clue_pins_for(row, o, pi, pk, pv)) return true;
+    }
+    return false;
+}
+
+/* reason=, with the one qualifier that explains an otherwise baffling death. */
+static const char *sweep_reason(const BeamResult *br) {
+    static char buf[64];
+    if (strcmp(br->reason, "extinct") || !clue_row_pinned((int)br->row))
+        return br->reason;
+    snprintf(buf, sizeof buf, "%s(clue_row)", br->reason);
+    return buf;
+}
+
+static void sweep_flush(void) {
+    if (g_sw_n == 1)                    /* one held back is not worth a range */
+        printf("[sweep] %sl%ld %s wall=%.1fs\n",
+               g_sw_group, g_sw_first, g_sw_key, g_sw_wall);
+    else if (g_sw_n > 1)
+        printf("[sweep] %sl%ld-l%ld x%u %s wall=%.1fs\n",
+               g_sw_group, g_sw_first, g_sw_last, g_sw_n, g_sw_key, g_sw_wall);
+    if (g_sw_n) fflush(stdout);
+    g_sw_group[0] = g_sw_key[0] = '\0';
+    g_sw_armed = false; g_sw_first = g_sw_last = -1; g_sw_n = 0; g_sw_wall = 0.0;
+}
+
+/* Report one finished configuration. `group` is the id without its column
+   suffix ("r0b0", "rndb0"), `li` that suffix, so a collapsed run can name the
+   span it covers. */
+static void sweep_report(const char *group, long li, const BeamResult *br, double wall) {
+    const bool filled = strcmp(br->reason, "extinct") != 0;
+    char key[96];
+    snprintf(key, sizeof key, "%s=%u width=%u reason=%s",
+             filled ? "filled" : "died", br->row, br->width, sweep_reason(br));
+
+    if (g_emit_count + g_partial_count == 0) {          /* nothing to report */
+        if (g_sw_armed && !strcmp(g_sw_group, group) && !strcmp(g_sw_key, key)) {
+            if (g_sw_n == 0) g_sw_first = li;
+            g_sw_last = li; g_sw_n++; g_sw_wall += wall;
+            if (g_sw_wall >= SWEEP_QUIET_SEC) sweep_flush();
+            return;
+        }
+        sweep_flush();
+        printf("[sweep] %sl%ld %s wall=%.1fs\n", group, li, key, wall);
+        fflush(stdout);
+        snprintf(g_sw_group, sizeof g_sw_group, "%s", group);
+        snprintf(g_sw_key,   sizeof g_sw_key,   "%s", key);
+        g_sw_armed = true; g_sw_first = g_sw_last = -1; g_sw_n = 0; g_sw_wall = 0.0;
+        return;
+    }
+
+    sweep_flush();
+    printf("[sweep] %sl%ld %s emitted=%zu", group, li, key, g_emit_count);
+    if (g_incomplete_top) printf(" partials=%zu part_total=%zu", g_partial_count, g_partial_total);
+    printf(" sol_total=%" PRIu64 " wall=%.1fs\n", g_solution_idx, wall);
+    fflush(stdout);
+}
+
 int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
@@ -2496,8 +2589,8 @@ int main(int argc, char *argv[]) {
     printf("\n=== E555 beamer ===\n\n");
     printf("[cfg] seed_file=%s rotations_file=%s out_dir=%s\n",
            seed_path, csv_path ? csv_path : "(none: --random_edges)", g_out_dir);
-    printf("[cfg] seed=%" PRIu64 " threads=%d random_edges=%d free_edges=%d border_row=%u border_row_N=%u\n",
-           g_master_seed, g_nthreads, g_random_edges?1:0, g_free_edges?1:0,
+    printf("[cfg] seed=%" PRIu64 " threads=%d verbose=%d random_edges=%d free_edges=%d border_row=%u border_row_N=%u\n",
+           g_master_seed, g_nthreads, g_verbose?1:0, g_random_edges?1:0, g_free_edges?1:0,
            g_border_row_index, g_border_row_N);
     printf("[cfg] incomplete_top=%d resume=%d corners BL/BR/TL/TR=%d/%d/%d/%d\n",
            g_incomplete_top?1:0, resume?1:0, g_fixed_corner_pid[0], g_fixed_corner_pid[1],
@@ -2506,9 +2599,18 @@ int main(int argc, char *argv[]) {
            g_beam_width, g_stop_row, g_beam_expand, g_beam_expand_row);
     printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u\n",
            g_frac_rand, g_parent_cap, g_pool_factor);
-    if (g_clue_mask)
-        printf("[cfg] clue_center=%d clue_corners=%d (all 4 orientations)\n",
+    if (g_clue_mask) {
+        printf("[cfg] clue_center=%d clue_corners=%d (all 4 orientations) pinned_rows=",
                (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0);
+        /* Which rows the clues actually constrain, printed because it is not
+           the rows they sit on: a clue pins the row BELOW it too, to the colour
+           it will stand on. --clue_corners names cells on row 2 and bites at
+           row 1, and a sweep that dies there is otherwise a mystery. */
+        const char *sep = "";
+        for (int r = 1; r <= (int)g_stop_row; r++)
+            if (clue_row_pinned(r)) { printf("%s%d", sep, r); sep = ","; }
+        printf("%s (a clue pins its own row and the one below it)\n", *sep ? "" : "none");
+    }
     printf("[cfg] lambda_J=%.3f lambda_Maha=%.3f free_demand=%d bc_window=%u,%u\n",
            g_lambda_J, g_lambda_maha, g_free_demand?1:0, g_bc_nB, g_bc_nC);
     printf("[cfg] top_bottoms=%ld top_columns=%ld config_time=%.0fs max_wall=%.0fs max_partials=%" PRIu64 " db_file=%s\n",
@@ -2642,22 +2744,21 @@ int main(int argc, char *argv[]) {
                 BeamResult br = beam_search_config(&ctx, scratch, cfg_hash, slice_end);
                 /* emitted/partials are this config's unique boards; sol_total and
                    part_total are the run totals written so far. */
-                printf("[sweep] %s row=%u width=%u emitted=%zu partials=%zu reason=%s sol_total=%" PRIu64
-                       " part_total=%zu wall=%.1fs\n",
-                       g_config_id_str, br.row, br.width, g_emit_count, g_partial_count, br.reason,
-                       g_solution_idx, g_partial_total, omp_get_wtime()-tc0);
-                fflush(stdout);
+                { char grp[64]; snprintf(grp, sizeof grp, "rndb%zu", bi);
+                  sweep_report(grp, (long)li, &br, omp_get_wtime()-tc0); }
                 if (g_completions_fp) fflush(g_completions_fp);
                 if (g_partial_fp)     fflush(g_partial_fp);
                 partials_budget_announce();
                 barren = (g_emit_count + g_partial_count > 0) ? 0 : barren + 1;
                 if (g_bail_columns && barren >= g_bail_columns) {
+                    sweep_flush();
                     printf("[bail] rndb%zu: %u column(s) in a row emitted nothing, "
                            "moving to the next bottom\n", bi, barren);
                     fflush(stdout);
                     break;
                 }
             }
+            sweep_flush();      /* never straddle a bottom */
         }
     } else
     for (uint32_t cur_row = g_border_row_index; cur_row < g_border_row_index + g_border_row_N; cur_row++) {
@@ -2745,17 +2846,15 @@ int main(int argc, char *argv[]) {
                 BeamResult br = beam_search_config(&ctx, scratch, cfg_hash, slice_end);
                 /* emitted/partials are this config's unique boards; sol_total and
                    part_total are the run totals written so far. */
-                printf("[sweep] %s row=%u width=%u emitted=%zu partials=%zu reason=%s sol_total=%" PRIu64
-                       " part_total=%zu wall=%.1fs\n",
-                       g_config_id_str, br.row, br.width, g_emit_count, g_partial_count, br.reason,
-                       g_solution_idx, g_partial_total, omp_get_wtime()-tc0);
-                fflush(stdout);
+                { char grp[64]; snprintf(grp, sizeof grp, "r%ub%zu", cur_row, bi);
+                  sweep_report(grp, (long)li, &br, omp_get_wtime()-tc0); }
                 if (g_completions_fp) fflush(g_completions_fp);
                 if (g_partial_fp)     fflush(g_partial_fp);
                 partials_budget_announce();
                 write_checkpoint(ckpath, cur_row, (uint32_t)bi, (uint32_t)(li+1));
                 barren = (g_emit_count + g_partial_count > 0) ? 0 : barren + 1;
                 if (g_bail_columns && barren >= g_bail_columns) {
+                    sweep_flush();
                     printf("[bail] r%ub%zu: %u column(s) in a row emitted nothing, "
                            "moving to the next bottom\n", cur_row, bi, barren);
                     fflush(stdout);
@@ -2766,10 +2865,12 @@ int main(int argc, char *argv[]) {
                     break;
                 }
             }
+            sweep_flush();      /* never straddle a bottom, or the next [rank] */
         }
         g_resume_active = false;
     }
 
+    sweep_flush();
     double wall = omp_get_wtime() - t_start;
     print_summary(wall, init_s, omp_get_wtime() - t_sweep0);
     if (g_completions_fp) fclose(g_completions_fp);
