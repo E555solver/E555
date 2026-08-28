@@ -47,10 +47,10 @@ cd "$REPO"
 CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 
 bin/E555_roundhouse "$SEED" "$BOARDS" "${CLUE_ARG[@]}" \
-    --border_row "$FIRST_LINE" --border_row_N "$N_LINES" \
+    --start_row "$FIRST_LINE" --num_rows "$N_LINES" \
     --rounds "$ROUNDS" --strip_width "$WIDTH" --rotate "$ROTATE" \
-    --ties "$TIES" --max_breaks "$BREAKS" --threads "$THREADS" \
-    --max_wall_sec "$MAX_WALL" --out_dir "$OUT_DIR" --print-cmd --verbose
+    --ties "$TIES" --breaks "$BREAKS" --threads "$THREADS" \
+    --wall_time "$MAX_WALL" --out_dir "$OUT_DIR" --print_cmd --verbose
 
 # The tool names its files after the geometry and splits break-free boards from
 # break-bought ones, so read the list it wrote rather than guessing the names.
@@ -59,7 +59,7 @@ if [ -s "$OUT_DIR/outputs.txt" ]; then
     echo "Boards written:"
     sed 's/^/  /' "$OUT_DIR/outputs.txt"
     echo
-    echo "  python3 tools/E555_rank.py \$(head -1 $OUT_DIR/outputs.txt) --seed $SEED --top 10"
+    echo "  python3 tools/E555_rank.py \$(head -1 $OUT_DIR/outputs.txt) --seed_file $SEED --top 10"
     echo
     echo "A break-free partial scores 480 minus the junctions its EMPTY cells"
     echo "leave open, never a mismatch. Compare it with another partial."

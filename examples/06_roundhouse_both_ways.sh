@@ -54,11 +54,11 @@ pass() {
     local dir="$1" src="$2" line="$3"; shift 3
     mkdir -p "$dir"
     bin/E555_roundhouse "$SEED" "$src" \
-        --border_row "$line" --border_row_N 1 \
+        --start_row "$line" --num_rows 1 \
         --rounds "$ROUNDS" --strip_width "$WIDTH" --rotate "$ROTATE" \
-        --ties 1 --max_wall_sec "$MAX_WALL" --threads "$THREADS" \
-        --out_dir "$dir" --print-cmd "${CLUE_ARG[@]}" "$@" > "$dir/log" 2>&1
-    # Break-free boards go to the miss0 file; with --max_breaks 0 that is the
+        --ties 1 --wall_time "$MAX_WALL" --threads "$THREADS" \
+        --out_dir "$dir" --print_cmd "${CLUE_ARG[@]}" "$@" > "$dir/log" 2>&1
+    # Break-free boards go to the miss0 file; with --breaks 0 that is the
     # only file the tool can write, so the manifest holds it or is empty.
     local out; out=$(head -1 "$dir/outputs.txt")
     [ -n "$out" ] || return 0
@@ -75,7 +75,7 @@ pass() {
 # A board's score, or "-" when the chain stopped before producing one.
 score() {
     [ -n "$1" ] && [ -s "$1" ] || { echo -; return; }
-    python3 tools/E555_rank.py "$1" --seed "$SEED" --field score
+    python3 tools/E555_rank.py "$1" --seed_file "$SEED" --field score
 }
 
 echo "=== both ways: rounds=$ROUNDS width=$WIDTH rotate=$ROTATE hold=$HOLD ==="
@@ -109,4 +109,4 @@ echo
 echo "does the order matter?  CCW->CW $wins_a   CW->CCW $wins_b   tie $ties"
 echo "boards and per-pass logs under $OUT_DIR/cfg<N>/"
 echo "  cat $OUT_DIR/cfg*/[ab][12]/roundhouse_*_miss0.csv > all.csv"
-echo "  python3 tools/E555_rank.py all.csv --seed $SEED --top 10"
+echo "  python3 tools/E555_rank.py all.csv --seed_file $SEED --top 10"

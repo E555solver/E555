@@ -102,7 +102,7 @@ Stage C tools are the opposite: they spend real time on a few elite boards.
   instead. Readers take the LAST 512 fields as pos+rot and treat leading
   fields as metadata, so both variants (and the legacy 515-field layout with a
   rank column) parse everywhere. `#`/`%` lines are comments.
-  `tools/E555_rank.py --emit FILE --rescore` rewrites any of them canonically,
+  `tools/E555_rank.py --out FILE --rescore` rewrites any of them canonically,
   recomputing field 2 from the seed so the column can be sorted on.
 
 ---
@@ -157,7 +157,7 @@ targets: you are sizing a search, not maximizing a number.
 
 **Allocating within that space** (`--bail_columns N`, 0 = off). Every
 (bottom x left) config gets the same budget, which is the weakest allocation
-when config quality varies by orders of magnitude. `--config_time_sec` does not
+when config quality varies by orders of magnitude. `--time_limit` does not
 help: it is a per-row *deadline*, so on a config that finishes in seconds it
 never fires, and being wall-clock based it would shift meaning with the core
 count anyway. `--bail_columns` is work-based instead -- abandon a bottom once N
@@ -205,7 +205,7 @@ border as a `BEST,...` line (trail counts + the 60 border spins) that
 starts, so `--threads N` runs them in parallel; `--threads 0`, the default, uses
 one worker per core. They are worker *processes*, not threads: the hot loop is
 pure Python, so the GIL would serialize threads and buy nothing. Each restart
-derives its own RNG seed from `--seed` and its own index rather than drawing
+derives its own RNG seed from `--rng_seed` and its own index rather than drawing
 from a stream shared with the others, so **the thread count never changes the
 result**, and the parent replays the restarts -- stdout and the rotations CSV
 alike -- in restart order however the workers finish. The pool is capped at one
@@ -214,10 +214,10 @@ worker per restart. Measured on an 8-thread laptop the gain is ~3x (8 restarts x
 8x), which takes the `run_pipeline.sh` Stage A of 50 restarts x 500k
 steps from ~14 min to ~5.
 
-Key options: `--restarts`, `--steps`, `--seed`, `--threads`, `--verbose`,
-`--T0/--Tf`, `--w-top/right/bottom/left` (per-side target multipliers with
+Key options: `--restarts`, `--steps`, `--rng_seed`, `--threads`, `--verbose`,
+`--T0/--Tf`, `--w_top/right/bottom/left` (per-side target multipliers with
 `--target_scale`, and signed weights in log-sum mode, where a negative weight
-minimizes a side), `--tabu`, `--fix-corners {0,1,2}`, `--target_scale`, `--out`.
+minimizes a side), `--tabu`, `--fix_corners {0,1,2}`, `--target_scale`, `--out`.
 
 ---
 
@@ -482,8 +482,8 @@ blunt one here, so the beam keeps the blunt one and `dedup_and_rank` keeps one
 code path instead of two. The primitive survives where it does earn its place --
 on the border ranking, below.
 
-**The same primitive on the borders** (`--gumbel_tau_bottoms`,
-`--gumbel_tau_columns`; 0 = off, the default; the finalizer takes the columns
+**The same primitive on the borders** (`--tau_bottoms`,
+`--tau_columns`; 0 = off, the default; the finalizer takes the columns
 one). Choosing *which* borders to run has exactly the shape the perturbation is
 for -- the enumerated ranking is a top-K of `BottomOrder.rank`/`LeftOrder.rank`,
 and the `--random_edges` and finalizer samplers are the K=1 case, an argmax over
@@ -501,9 +501,9 @@ a border row exposes the same colours in a different order. The rank was
 therefore *one constant*. At `tau 0`, `cmp_left_rank` fell through to `memcmp`
 and ordered columns lexicographically by exposed colour; at `tau > 0` the
 constant cancelled out of `rank/tau`, leaving the Gumbel noise alone -- so the
-ordering did not depend on tau at all. Measured: `--gumbel_tau_columns 2` and
+ordering did not depend on tau at all. Measured: `--tau_columns 2` and
 `4` chose identical columns config for config across a whole run, while the same
-comparison on `--gumbel_tau_bottoms` differed. That is also the explanation for
+comparison on `--tau_bottoms` differed. That is also the explanation for
 the sweep's puzzling finding that columns at ranks 2-4 outlived rank 1 by 2.2x
 (p = 0.0008) while bottoms showed no such inversion: there was no column ranking
 to invert.
@@ -531,7 +531,7 @@ the known-good setting and measure on your own seed before moving either knob.
 
 Reproducibility note: at tau > 0 the ranked order is a seed-dependent
 permutation, and `sweep_checkpoint.txt` stores *indices* into it -- so `--resume`
-then requires the original `--seed`, and the beamer refuses the combination
+then requires the original `--rng_seed`, and the beamer refuses the combination
 without one.
 
 ### Scoring
@@ -699,12 +699,12 @@ rows 7 and 8 and so the centre clue's cell. Measured on the delivered clued
 boards at that exact setting, a run without the flags kept **2/5 clues on 2146
 boards and 3/5 on 226** -- never 5 -- while the same run with them kept **5/5 on
 all 222** it emitted. The roundhouse is as stark: a `--rounds 3 --strip_width 5`
-cut with `--max_breaks` returns complete boards holding **1/5** clues without the
+cut with `--breaks` returns complete boards holding **1/5** clues without the
 flags (only the centre, which it never frees) and **5/5** with them.
 
 **How Stage C holds them.** `E555_topper.py` and `E555_ender.py` take the
 same two flags, and without them they treat a clue like any other piece: the
-topper's `--side T --work-rows 4` band covers rows 12..15, exactly where the two
+topper's `--side T --band_depth 4` band covers rows 12..15, exactly where the two
 row-13 clues sit, and the ender's `--mode ring` opens the whole border with the
 centre clue inside any interior break box. Measured on 40 clued row-11 partials,
 a single default topper pass drops every board from 5/5 clues to 3/5; with
@@ -807,13 +807,13 @@ grows a random legal chain of 14 frame-down edges BL→BR; a left-column sample
 grows a chain BL→TL from the edges the bottom did not consume. Each published
 border is the best of 32 samples by the same fan-out measures used for
 enumerated borders. Corners can be pinned with `--BL/--BR/--TL/--TR <piece>`.
-Free-edges mode is implied; `--border_row_N` = number of random bottoms and
+Free-edges mode is implied; `--samples` = number of random bottoms and
 `--top_columns` = random left columns per bottom. Typical use is a long
 unattended run stocking varied partials for the finalizer and Stage C.
 
 ### Determinism and reproducibility
 
-Runs are intentionally **not** reproducible unless `--seed` is given: the
+Runs are intentionally **not** reproducible unless `--rng_seed` is given: the
 master seed defaults to a clock/PID mixture and is printed in the `[cfg]`
 banner. Passing that seed back reproduces the sampling decisions on the same
 build; bit-exact replay across thread counts is not a design goal.
@@ -827,8 +827,9 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | option | default | meaning |
 |---|---|---|
 | `--out_dir DIR` | `beam_out` | output directory (completions CSV + checkpoint) |
-| `--border_row N` | 0 | first rotations-CSV data row to use |
-| `--border_row_N N` | 1 | consecutive border rows to sweep (random mode: number of bottoms) |
+| `--start_row N` | 0 | first rotations-CSV data row to use (fixed mode only) |
+| `--num_rows N` | 0 | consecutive border rows to sweep (fixed mode only; 0 = every remaining row) |
+| `--samples N` | 1 | random bottoms to try (random mode only; 0 = uncapped, governed by `--wall_time`/`--max_emitted`) |
 | `--db_file PATH` | -- | on-disk DB cache (~6.5 GB; built on first run) |
 | `--free_edges` | off | any edge piece may terminate a row (relaxed parity) |
 | `--random_edges` | off | sample borders from the seed; rotations CSV optional |
@@ -847,17 +848,17 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--bc_window nB,nC` | `3,3` | while the beam is FULL, score up to nB x nC (B,C) completions per A record and keep the best; while it is BELOW capacity, enumerate and keep every one |
 | `--top_bottoms N` | 10 | ranked bottom orderings tried per border row |
 | `--top_columns N` | 12 | ranked left columns per bottom, ranked separately for each bottom |
-| `--gumbel_tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
-| `--gumbel_tau_columns T` | 0 | ditto for left columns (every measurement predating the column rewrite is void: see above) |
+| `--tau_bottoms T` | 0 | selection temperature for the bottom ranking (0 = off) |
+| `--tau_columns T` | 0 | ditto for left columns (every measurement predating the column rewrite is void: see above) |
 | `--bail_columns N` | 0 | abandon a bottom after N consecutive columns that emitted nothing (0 = off) |
 | `--clue_center` | off | force the published centre clue (piece 138) onto its cell, at its orientation's spin |
 | `--clue_corners` | off | force the two reachable corner clues (row 2); the row-13 pair is reserved, never pinned |
-| `--config_time_sec S` | 600 | wall-time slice per configuration |
-| `--max_wall_sec S` | 0 | total budget (0 = unlimited) |
-| `--max_partials N` | 0 | stop after N boards reported -- completions **plus** `--incomplete_top` partials (0 = unlimited) |
+| `--time_limit S` | 600 | wall-time slice per configuration |
+| `--wall_time S` | 0 | total budget (0 = unlimited) |
+| `--max_emitted N` | 0 | stop after N boards reported -- completions **plus** `--incomplete_top` partials (0 = unlimited) |
 | `--resume` | off | continue from the sweep checkpoint |
 | `--threads N` | all | OpenMP threads |
-| `--seed S` | random | master RNG seed |
+| `--rng_seed S` | random | master RNG seed |
 | `--verbose` | off | per-row `[beam]` progress lines |
 
 `--bc_window` is the one place where extra compute buys objective rather than
@@ -927,7 +928,7 @@ bin/E555_finalizer seed.txt partials.csv [rotations.csv] --finalize_from 10 --st
 **Settings track the beamer's where the meaning is the same** -- `--beam_width
 250000`, `--beam_expand 4`, `--parent_cap 4`, `--lambda_J 1.0`,
 `--lambda_Mahalanobis 0.6`, `--pool_factor 8`, `--top_columns 12`,
-`--stop_row 11`, `--config_time_sec 600` -- so one number means one thing across
+`--stop_row 11`, `--time_limit 600` -- so one number means one thing across
 Stage B, and
 `--bail_columns` exists here too (it abandons a partial line after N consecutive
 columns that report nothing). Two deliberately differ:
@@ -961,8 +962,8 @@ stripped the calibration every later one would have scored against; and the
 as "no correction needed" rather than "the correction never ran". It now prints
 the sample count behind each figure and says so explicitly when there is none.
 
-**Locking.** `--border_row/--border_row_N` select the CSV lines, and
-`--border_row_N 0` reads to the end of the file. Each line is structurally
+**Locking.** `--start_row/--num_rows` select the CSV lines, and
+`--num_rows 0` (also the default) reads to the end of the file. Each line is structurally
 validated (piece types per cell, frame orientation, every color match inside
 the locked region). Pieces at or below `--finalize_from`
 (default 5) are locked; pieces placed above return to the pool. That default is
@@ -1081,7 +1082,7 @@ and the parity invariant holds with equality on a completed inner board.
 over a sparse reduced database; (2) the first searched row always uses the
 full random band, so every repeat injects fresh variability.
 
-`--gumbel_tau_columns` works here as in the beamer: above 0 the sampled left
+`--tau_columns` works here as in the beamer: above 0 the sampled left
 column is drawn in proportion to `exp(rank/tau)` rather than being the best of
 the 32 samples. It has a second use on this side -- repeats dedup the columns
 they have already tried, so a mode-seeking argmax keeps re-drawing the same
@@ -1102,8 +1103,8 @@ from a locked partial at any `--finalize_from`.
 ids `p<line>r<repeat>l<column>`; several instances on the same machine may
 share one output file (each line is one atomic append).
 
-**Bounding a run.** Both tools accept `--max_wall_sec` (time) and
-`--max_partials` (output): the latter ends the run once N boards have been
+**Bounding a run.** Both tools accept `--wall_time` (time) and
+`--max_emitted` (output): the latter ends the run once N boards have been
 written, counting completions and `--incomplete_top` partials together. The
 stop-row beam in flight is always reported in full, so the final count
 overshoots N by up to one beam width. Because the CSVs are *appended* to, the
@@ -1258,7 +1259,7 @@ rejecting a record at the level its clue sits on simply prunes the subtree, and
 the "clue's bottom must meet the piece below" condition is already guaranteed by
 `rh_decode` matching every record against the level below. A second guard bars a
 clue piece from any cell but its own, so round 1 cannot spend a piece round 3
-still needs. `--max_breaks` respects both, or the dive would scatter the clues
+still needs. `--breaks` respects both, or the dive would scatter the clues
 the proof engine just held. The oracle stays deliberately clue-blind: it solves
 the colour-only relaxation, and ignoring pins keeps it admissible.
 
@@ -1328,8 +1329,8 @@ The search is **exhaustive and deterministic** - no beam, no sampling, no random
 seed - so it enumerates every break-free filling of the freed bands, and both
 outcomes are exact. A complete board is a solution; finishing without one proves
 this core admits no break-free refill of these bands. The only thing that can
-weaken that is a budget (`--max_nodes`, `--config_time_sec`, `--max_wall_sec`,
-`--max_boards`); when one bites, the summary marks that board **TRUNCATED**
+weaken that is a budget (`--max_nodes`, `--time_limit`, `--wall_time`,
+`--max_emitted`); when one bites, the summary marks that board **TRUNCATED**
 instead of exhausted.
 
 What comes out is **the furthest it got**: one board per input board, the state
@@ -1346,7 +1347,7 @@ geometry never share a file -- while runs with the *same* geometry do, which is
 what lets a corpus sweep accumulate.
 
 **Two files, split by breaks.** A board with no mismatch goes to `miss0`; one
-with mismatches goes to `miss<--max_breaks>`. So `miss0` is always a corpus you
+with mismatches goes to `miss<--breaks>`. So `miss0` is always a corpus you
 can trust break-free and the two never have to be told apart afterwards. Routing
 is on the board's *own* break count, so a greedy fill that happens to land
 perfectly is filed with the clean boards. Both open on first write, so a run that
@@ -1356,7 +1357,7 @@ emits nothing leaves nothing behind. Three kinds of board:
 |---|---|---|
 | solved | the board is complete **and** break-free: the puzzle, for this cut | `s` |
 | deepest | the furthest the exhaustive break-free search got | `d` |
-| filled | `--max_breaks B` bought a complete board with at most B mismatches | `f` |
+| filled | `--breaks B` bought a complete board with at most B mismatches | `f` |
 
 Ids are `p<line><tag><n>`, `n` counting boards written by this run, so every line
 is uniquely named and stdout names the id it just wrote.
@@ -1382,11 +1383,11 @@ level the relaxation dies at, and the summary repeats it with the fix to try
 next. Because the oracle ignores the piece supply, a refuted band cannot be
 filled by *any* arrangement of *any* pieces.
 
-**`--max_breaks B` finishes the board anyway.** A break-free refill usually does
+**`--breaks B` finishes the board anyway.** A break-free refill usually does
 not exist, and a board with 80 empty cells is awkward to hand on. With `B > 0`
 the run takes the deepest break-free board it found and greedily fills every
 remaining cell, spending at most B mismatched junctions - the same idiom as the
-backtracker's `--break-mode stuck`: most constrained cell first, prefer a piece
+backtracker's `--break_mode stuck`: most constrained cell first, prefer a piece
 that fits exactly, break an edge only when no cell has an exact fit. It is a
 dive, not a search: no backtracking, and B is not proved minimal. It always
 completes when B is large enough, because a cell's frame type fixes which pieces
@@ -1399,7 +1400,7 @@ rows 13-15: `--rounds 1 --strip_width 3` frees 48 cells and refills them for
 break per two cells filled. The fill is there so Stage C receives a full board
 rather than a hole, not because it beats the board you fed in.
 
-Volume is set by `--ties` (boards kept at the deepest reach), `--max_boards` and
+Volume is set by `--ties` (boards kept at the deepest reach), `--max_emitted` and
 `--only_complete`. There is no diversity knob and no need for one: the search
 enumerates every break-free filling, so what limits the output is the depth the
 board reaches, not which subtree the engine happened to explore.
@@ -1427,17 +1428,17 @@ feeds any stage unchanged.
 | option | default | meaning |
 |---|---|---|
 | `--out_dir DIR` | `round_out` | output directory; names carry the geometry, and break-free boards are filed apart from break-bought ones |
-| `--border_row N` / `--border_row_N N` | 0 / 1 | first input CSV data line, and how many (0 = to the end of the file) |
+| `--start_row N` / `--num_rows N` | 0 / 0 | first input CSV data line, and how many (0 = to the end of the file) |
 | `--strip_width W` | 5 | 2..5; chain length, and hence the core. 0 = narrowest usable |
 | `--rounds N` | 3 | 1..3; bands freed and refilled (right, top, left) |
 | `--rotate K` | 1 | quarter-turns before the cut, -3..3; negative turns anticlockwise |
 | `--reverse` | off | spiral the other way round, by mirroring the seed; a second exhaustive attack on the same cells, not a new region |
 | `--stop_row R` | last level | stop each strip at this level instead of its last |
 | `--BL/--BR/--TL/--TR P` | -- | pin a corner piece by its role on the **input** board |
-| `--max_breaks B` | 0 = off | after the exhaustive search, greedily fill the rest of the deepest board, spending at most B mismatches |
+| `--breaks B` | 0 = off | after the exhaustive search, greedily fill the rest of the deepest board, spending at most B mismatches |
 | `--max_nodes N` | 0 | node budget per input board |
-| `--config_time_sec S` | 600 | wall-time budget per input board |
-| `--max_wall_sec S` / `--max_boards N` | 0 / 0 | budgets for the whole run |
+| `--time_limit S` | 600 | wall-time budget per input board |
+| `--wall_time S` / `--max_emitted N` | 0 / 0 | budgets for the whole run |
 | `--ties N` | 1 | boards to emit at the deepest reach |
 | `--only_complete` | off | emit only boards with all 256 pieces placed |
 | `--selfcheck` | off | validate the oracle against brute force and exit |
@@ -1446,7 +1447,7 @@ feeds any stage unchanged.
 Retired in the exhaustive rewrite and now accepted with a warning, so older
 scripts keep running: `--beam_width`, `--mode`, `--frac_rand`, `--repeats`,
 `--finalize_repeats`, `--lambda_Mahalanobis`, `--top_bottoms`,
-`--emit_each_round`, `--emit_deepest`, `--seed`, `--max_partials`,
+`--emit_each_round`, `--emit_deepest`, `--rng_seed`, `--max_partials`,
 `--free_edges`. The search is exhaustive and deterministic, so none of them
 have anything left to do, and the deepest board is emitted by default.
 
@@ -1493,7 +1494,7 @@ That is its role here, and it is the whole reason the loop exists.
 rows 0..T full
   ├─ rotate +-90 deg    tools/E555_rotate.py in.csv 1   (and 3)
   │      T+1 complete COLUMNS, and zero complete rows
-  ├─ backtracker        --stop_row 5 --with_frame --order rowmajor --break-mode any
+  ├─ backtracker        --stop_row 5 --with_frame --order rowmajor --break_mode any
   │      completes rows 0..5 AND the outer frame, clears everything else
   └─ finalizer          --finalize_from 5 --stop_row T
          rows 6..T re-grown at full width over a reduced database,
@@ -1538,7 +1539,7 @@ so it is the control arm any claim about fixed borders has to beat.
 
 `--order rowmajor` at the cut is deliberate: after a turn the empty cells are
 whole *columns* of rows `0..5`, and rowmajor walks them row by row, closing the
-border row 0 first, which is the shape the finalizer's lock needs. `--break-mode
+border row 0 first, which is the shape the finalizer's lock needs. `--break_mode
 any` is required because the default `stuck` takes a minimal break where no
 exact fit exists and a broken band is dropped at emission.
 
@@ -1596,18 +1597,18 @@ not re-grow to `T`, drops out. The per-lap counts the script prints are
 therefore the real diagnostic, and a lap that returns what it was given means
 the neighbourhood is exhausted.
 
-### Cost, and why `--solution-limit` is load-bearing
+### Cost, and why `--max_emitted` is load-bearing
 
 The cut is effectively free and the finalizer is the whole cost, which is the
 opposite of what the shape of the pipeline suggests. Measured on **one** turned
-synthetic board, `--all-solutions`: **4 787 556 exact bands in 120 s** (6.9 GB
+synthetic board, `--max_emitted 0`: **4 787 556 exact bands in 120 s** (6.9 GB
 of CSV), 100% accepted, and still running when the clock stopped. Meanwhile
 every distinct band is a distinct locked set, so the finalizer rebuilds its
 reduced database for each one -- at `--finalize_from 5`, 337 M records, 0.82 GB,
 about 9 s.
 
 So the loop consumes a vanishing fraction of what the cut offers, and
-`--solution-limit` is not a safety net but the setting that defines the run.
+`--max_emitted` is not a safety net but the setting that defines the run.
 Bands per lap is `2 * POP * BT_LIMIT`. Two consequences worth knowing:
 
 - `BT_LIMIT` takes the DFS's **first** K bands, which share a long prefix.
@@ -1680,11 +1681,11 @@ four exposed colors) with `AddAllowedAssignments` tables filtered by the frame
 rule, `AddAllDifferent` per piece class. Lexicographic objective by dominating
 weights: (1) minimize total breaks; (2) push unavoidable breaks to the nearest
 horizontal border; (3) slide them along it to the nearest corner.
-`--work-rows`/`--unused_top_rows` implement the **overlapping sliding window**
+`--band_depth`/`--locked_rows` implement the **overlapping sliding window**
 (see the strategy guide in the file header and
 `pipeline/topper_sweep.sh PRESET=window`): move a constant-size work band across the
 board in overlapping steps, so early mistakes stay repairable.
-`--allow_break_increase` trades a slightly worse total for a longer push in the
+`--relax_breaks` trades a slightly worse total for a longer push in the
 middle steps.
 
 **Where breaks are pushed.** A naive "distance from the bottom" plus "distance
@@ -1705,7 +1706,7 @@ from all 480 -- with the smaller distance maxima (7+7, not 15+15) that keeps the
 objective one to two orders of magnitude smaller (`w_b` ~ 2.8e6 for a typical
 120-junction band), a friendlier LP relaxation than a whole-board cost would give.
 
-**Which border is opened.** `--side` picks the band(s), each `--work-rows`
+**Which border is opened.** `--side` picks the band(s), each `--band_depth`
 deep:
 
 | `--side` | opens | use |
@@ -1715,7 +1716,7 @@ deep:
 | `TR` / `TL` | an L of top + right (or left) | fold everything into one corner |
 | `TB` | top **and** bottom rows | test whether the opposite borders can be re-cut against each other |
 
-`--unused_rows N` (the old `--unused_top_rows`, still accepted) applies to each
+`--locked_rows N` applies to each
 open band: its outermost N rows/cols are **unset to 999** and locked empty for
 the run -- the freed pieces rejoin the pool, and the next window recovers the
 gap. Two rules keep a `--side` run confined to that side: a break cell is
@@ -1726,13 +1727,13 @@ outside the band stay empty.
 **`--holes FILE`** replaces all of that with an explicit 16x16 0/1 mask -- the
 same dialect the ender and the backtracker read -- and the mask is taken
 literally: free = exactly the cells marked `1`, with no band, no adjacency
-expansion and nothing held empty, so `--side`, `--work-rows` and
-`--unused_rows` no longer apply (the last is rejected outright). Use it for a
+expansion and nothing held empty, so `--side`, `--band_depth` and
+`--locked_rows` no longer apply (the last is rejected outright). Use it for a
 region a band cannot express: an L around one corner, a ragged patch following
 a cluster of breaks, or the board's interior -- including the `(16-2W)^2`
 centre the roundhouse retains and can never itself reopen.
 
-`--report_best N` is a real beam here: rank 1 is the optimum, and each further
+`--top N` is a real beam here: rank 1 is the optimum, and each further
 rank is re-solved under a no-good cut requiring >= `--beam_diff` cells to differ
 from every board already emitted, with the objective capped at
 `--beam_slack` extra breaks. A naive "last N incumbents of one search" beam
@@ -1769,7 +1770,7 @@ scripts:
 | `deep` | the same seven sides, each as a *pair*: a wide pass with the outer band locked empty (`7:3` for `T`, `5:2` elsewhere), then a narrow pass that refills it (`4:0`, `3:0`) | when the safe sweep has run out of moves and you are willing to spend breaks to buy freedom |
 | `closeT` `closeB` `closeR` `closeL` | `X:6:2 X:4:0` on the named side | closing a hole that sits against one border -- an `E555_roundhouse` `miss0` board, or any partial whose breaks are all on one side. The first pass reaches into the core, the second fills everything. Pick the letter for the band of the roundhouse's *last* round: `--rotate 1` (its default) ends on the bottom, so `closeB`; `--rotate -1` ends on the top, so `closeT`. `close` on its own means `closeT` |
 
-The pairs of the third driver are inseparable: `--unused_rows N` unsets those
+The pairs of the third driver are inseparable: `--locked_rows N` unsets those
 cells, so the wide pass *raises* the break count on purpose and only the narrow
 pass that follows brings it back down. Never stop between the two halves of a
 side, and never prune on score in between -- the driver prunes only after each
@@ -1785,14 +1786,14 @@ sound completion prunes (global empty-domain lower bound, incremental
 color/type accounting, Hall/deficiency bipartite bound). `--holes` reopens a
 masked region of a complete board.
 
-`--break-mode` selects between two very different engines, and the distinction
+`--break_mode` selects between two very different engines, and the distinction
 matters more than any other parameter here:
 
 - **`stuck` (default) -- greedy dives, for triage.** A dive takes an exact fit
   where one exists and a minimal break where none does, never backtracks, and
   therefore always reaches 256 pieces in one pass. Because piece-type counts are
   exactly balanced, the candidate set is never empty, so a dive is O(cells) and
-  cannot fail. `--stuck_restarts N` (default 100 000, ~5-10 s on four cores) runs
+  cannot fail. `--restarts N` (default 100 000, ~5-10 s on four cores) runs
   N randomized dives and keeps the best. Divergence comes from random tie-breaking
   alone, and that is ample: a 200 000-dive batch produced 200 000 distinct boards.
   Throughput is ~9k-18k dives/s on four cores, so N in the millions is practical.
@@ -1802,7 +1803,7 @@ matters more than any other parameter here:
   whose input carried 18); its job is ranking candidate partials cheaply, not
   improving them.
 - **`any` / `lds` -- exhaustive, for proof.** These keep the iterative-deepening
-  ladder over `k = input_breaks .. --max-mismatch`, so an exhausted level is a
+  ladder over `k = input_breaks .. --breaks`, so an exhausted level is a
   theorem: no completion exists with <= k broken edges. Cost per level grows
   roughly exponentially. Use them overnight, on partials that triage picked out.
 
@@ -1819,7 +1820,7 @@ still closes the border first but walks up the left column instead of along the
 bottom. For `mrv` it swaps the tie-break from row-major to column-major (this
 subsumes the former `mrv-colmajor` order, which was removed). It never changes the
 solution *set* (exhaustive counts are identical), only the order cells are visited,
-so under `--solution-limit 1` it returns a different first closure: two triage
+so under `--max_emitted 1` it returns a different first closure: two triage
 passes (forward and `--reverse`) yield border-distinct partials that the
 finalizer's fixed-mode dedup keeps separate. No effect on `2sides` or `4sides`.
 
@@ -1836,8 +1837,8 @@ enumerates exactly the distinct fillings, each leaf is one emission, and no two
 lines can repeat a band. `--reverse` anchors the band at the far side instead
 (rows `15-N..15`, columns `15-N..15`) *as well as* flipping static traversal --
 one flag, two effects, whenever a stop option is on. A band completion is the
-solution here, so `--solution-limit` caps emissions and defaults to **1**;
-`--all-solutions` enumerates, and should be used with care, since rows 0..3
+solution here, so `--max_emitted` caps emissions and defaults to **1**;
+`--max_emitted 0` enumerates, and should be used with care, since rows 0..3
 alone ran to 7.6 M bands and 11 GB in five minutes.
 
 **`--with_frame` -- keep the border instead of clearing it.** The outer frame is
@@ -1855,10 +1856,10 @@ does not freeze the frame: fixed mode pins the piece *set* per side, not the
 order, so the finalizer re-chooses each row's terminal and the frame is
 re-completed each lap rather than carried unchanged.
 
-Two options are refused rather than silently useless: `--max-mismatch` must be
+Two options are refused rather than silently useless: `--breaks` must be
 `0`, because the finalizer validates every colour match inside its locked region
 and would reject a broken band one stage later; and `--jump` must be off, since
-skipping a dead cell leaves the band forever incomplete. `--break-mode stuck`
+skipping a dead cell leaves the band forever incomplete. `--break_mode stuck`
 is accepted but takes a minimal break where no exact fit exists, so the bands it
 produces are dropped at emission -- the summary reports `band_accept_rate` so a
 run that emits nothing is diagnosable. Under `--rotate` the band is defined in
@@ -1866,7 +1867,7 @@ the original frame, the one the CSV is written in, unlike `--holes`, which is
 read in the rotated frame.
 
 Parallelism is automatic: one record per thread, or every thread on one record's
-search when there are no more records than threads (`--all-for-one` forces the
+search when there are no more records than threads (`--all_for_one` forces the
 latter). Note that this search is memory-system bound, not scheduling bound -- on
 a 4-core laptop, four *independent* single-threaded runs already slow each other
 to 2.44x aggregate, and the threaded search achieves 2.37x, so there is little
@@ -1876,11 +1877,11 @@ record; output is re-feedable.
 ### E555_ender.py -- the closer, two neighbourhoods ( power tool)
 
 For a full board the topper has already tidied. One CP-SAT engine opens a slice
-of the board, caps how many pieces may actually move (`--max-changes`), and
+of the board, caps how many pieces may actually move (`--max_changes`), and
 re-solves to cut breaks -- never returning a board worse than its input. An
 internal escalation ladder climbs (reach x budget) rungs, warm-starting from
 the best board so far and stopping the instant breaks hit zero; you set only the
-ceilings (`--reach`, `--max-changes`). `--mode` picks the neighbourhood and the
+ceilings (`--reach`, `--max_changes`). `--mode` picks the neighbourhood and the
 objective:
 
 | `--mode` | interior opened | objective | good for |
@@ -1903,7 +1904,7 @@ nothing. And its never-worse guard becomes lexicographic, clues before breaks,
 because a clue repair is often break-neutral and a break-only test would discard
 the repaired board. Both are recomputed per rung, so a clue fixed on one rung
 stops asking for cells on the next. Repairing a clue spends at least two of
-`--max-changes` (its cell and its donor), so the cheapest rungs of the ladder may
+`--max_changes` (its cell and its donor), so the cheapest rungs of the ladder may
 come back infeasible on a clue-broken board and the ladder simply climbs.
 
 ---
@@ -1912,7 +1913,7 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
 
 - **`tools/E555_viewer.py`** -- ASCII board (`#` marks broken junctions),
   placement/edge/solid statistics, frame-violation check, e2.bucas.name URL;
-  `--diff A B` overlays two rows of a CSV. `--seed PATH` (defaults to
+  `--diff A B` overlays two rows of a CSV. `--seed_file PATH` (defaults to
   `./seed_Edge5.txt`, then the repo's `data/` copy). It is also the toolkit's
   shared Python module: `E555_rank.py` and the two Stage C CP-SAT tools import
   it, and it holds the single copy of the Eternity II clue table
@@ -1930,9 +1931,9 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   five Eternity II clue pieces still sit at their published cell and spin,
   0..5, for whichever orientation the board matches -- always measured, no flag,
   and 0 for a board that never carried clues). `--sort` takes any of them,
-  best board first, several files at once; `--emit` re-orders the input rows
+  best board first, several files at once; `--out` re-orders the input rows
   verbatim, so the canonical format never changes and old files rank fine.
-  `--emit FILE --rescore` instead rewrites every row canonically
+  `--out FILE --rescore` instead rewrites every row canonically
   (`config_id, score, pos[256], rot[256]`) with the score recomputed from the
   seed -- the one way to make a mixed corpus sortable by field 2, since Stage B
   writes its solution index there and older dialects write other things again.
@@ -1946,13 +1947,13 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   root's agreement with the roots before it. On the 15 exact row-12 partials of
   a whirlpool run it returns one board from each of the four lineages the pool
   holds (199-202 of 203 cells shared inside a lineage, 0-14 across).
-  `--max-agree P` is the blunt version: drop anything agreeing with a kept
+  `--max_agree P` is the blunt version: drop anything agreeing with a kept
   board on more than fraction P of its placed cells.
   Memory is bounded rather than hoped for: a record is the input line plus its
   measures, about 1.8x the row on disk (51,000 boards of a 96 MB CSV peak at
   165 MB, against 2.2 GB before), `--top N` streams into a bounded heap so peak
   memory stops depending on file size at all (14 MB for the same input), and
-  without `--top` an input projected past `--max-mem` (default 8 GB) is refused
+  without `--top` an input projected past `--max_mem` (default 8 GB) is refused
   up front instead of being OOM-killed half way.
 - **`tools/E555_rotate.py`** -- turns every board in a CSV by `N` quarter-turns
   clockwise, same convention as `E555_roundhouse --rotate`. Lossless: the frame
@@ -2044,7 +2045,7 @@ moderate K), finalize the survivors from row 4-5 with repeats, topper the
 best finals through the sliding window, then throw the backtracker and the
 ender at anything above ~460.
 
-**Reproducibility.** A run is reproducible from `--seed` **together with
+**Reproducibility.** A run is reproducible from `--rng_seed` **together with
 `--threads`**, not from the seed alone. The work partition follows the thread
 count, and a beam that keeps a bounded number of candidates keeps a different
 subset from a different partition -- on the synthetic board at a 200-wide beam,

@@ -26,7 +26,7 @@
  *     - finishing without one is a PROOF that this core admits no break-free
  *       refill of these bands.
  *   The only thing that can weaken the proof is a budget (--max_nodes,
- *   --config_time_sec, --max_wall_sec, --max_boards). When one bites, the run
+ *   --time_limit, --wall_time, --max_emitted). When one bites, the run
  *   says so and the summary reports that board as TRUNCATED rather than
  *   exhausted. Nothing else stops the search early.
  *
@@ -44,12 +44,12 @@
  *   191-piece board scoring 350 is perfectly matched, not damaged. Compare a
  *   partial with a partial, or re-score both with tools/E555_rank.py.
  *
- * --max_breaks B: FINISH THE BOARD ANYWAY
+ * --breaks B: FINISH THE BOARD ANYWAY
  *   A break-free refill usually does not exist, and a board with 80 empty cells
- *   is awkward to hand on. With --max_breaks B the run takes the deepest
+ *   is awkward to hand on. With --breaks B the run takes the deepest
  *   break-free board it found and GREEDILY fills every remaining cell, spending
  *   at most B mismatched junctions. Same idiom as the backtracker's
- *   --break-mode stuck: take the most constrained empty cell, prefer a piece
+ *   --break_mode stuck: take the most constrained empty cell, prefer a piece
  *   that fits exactly, break an edge only when no cell has an exact fit.
  *
  *   This is a dive, not a search. It never backtracks and it does not prove B is
@@ -59,7 +59,7 @@
  *   balanced (4 corners, 56 edges, 196 inner).
  *
  *   The exhaustive part is untouched: the fill runs afterwards, from the best
- *   board the proof engine reached. --max_breaks 0 (the default) skips it.
+ *   board the proof engine reached. --breaks 0 (the default) skips it.
  *
  * BUILD
  *   make roundhouse                     # or plain `make`, which builds all four
@@ -81,7 +81,7 @@
  *   bin/E555_roundhouse data/seed_Edge5.txt partial.csv --rounds 3 --strip_width 5
  *
  *   # same, but hand back a COMPLETE board, buying it with up to 12 breaks
- *   bin/E555_roundhouse data/seed_Edge5.txt partial.csv --rounds 3 --max_breaks 12
+ *   bin/E555_roundhouse data/seed_Edge5.txt partial.csv --rounds 3 --breaks 12
  *
  * VOCABULARY (used throughout the file)
  *   frame       the board after the --reverse mirror and --rotate clockwise
@@ -234,7 +234,7 @@
  *   which is what makes a corpus sweep accumulate.
  *
  *   TWO FILES, SPLIT BY BREAKS. A board with no mismatch goes to `miss0`; one with
- *   mismatches goes to `miss<--max_breaks>`. So `miss0` is always a corpus you can
+ *   mismatches goes to `miss<--breaks>`. So `miss0` is always a corpus you can
  *   trust break-free, and the two never have to be told apart afterwards. Routing
  *   is on the board's OWN break count, so a greedy fill that lands perfectly is
  *   filed with the clean boards. Files open on first write: a run that emits
@@ -246,7 +246,7 @@
  *
  *     s   SOLVED     complete and break-free. The puzzle, for this cut.
  *     d   DEEPEST    the furthest the exhaustive break-free search got.
- *     f   FILLED     complete, produced by the --max_breaks greedy fill.
+ *     f   FILLED     complete, produced by the --breaks greedy fill.
  *
  *   BOARDS ARE ALWAYS WRITTEN IN THE INPUT'S ORIENTATION. The frame is rotated
  *   and un-mirrored back before writing, so cell (r,c) in the output means what
@@ -279,8 +279,8 @@
 /* -- Tunables (the file header explains what each one is for) --------------- */
 
 static const char *g_out_dir   = "round_out";
-static uint32_t g_line_first   = 0;     /* --border_row */
-static uint32_t g_line_count   = 1;     /* --border_row_N */
+static uint32_t g_line_first   = 0;     /* --start_row */
+static uint32_t g_line_count   = 0;     /* --num_rows; 0 = every remaining line */
 static int      g_opt_W        = 5;     /* --strip_width, 0 = narrowest usable */
 static int      g_rounds       = 3;
 static int      g_rotate       = 1;
@@ -290,7 +290,7 @@ static bool     g_hold_band    = false; /* --hold_band: keep the last band's pie
 static int      g_pin_corner[4] = { -1, -1, -1, -1 };   /* BL BR TL TR (input) */
 static uint64_t g_max_nodes    = 0;
 static uint32_t g_ties         = 1;     /* boards to emit at the deepest reach */
-static int      g_max_breaks   = 0;     /* --max_breaks: greedy fill budget */
+static int      g_max_breaks   = 0;     /* --breaks: greedy fill budget */
 static bool     g_only_complete = false;
 static double   g_config_time_sec = 600.0;
 static double   g_max_wall_sec = 0.0;
@@ -1634,9 +1634,9 @@ static void run_round(int round) {
     do_strip(round);
 }
 
-/* -- Greedy break fill (--max_breaks) -------------------------------------- */
+/* -- Greedy break fill (--breaks) -------------------------------------- */
 /* One descent, no backtracking: pick a cell, place a piece, never reconsider.
- * The same idiom as the backtracker's --break-mode stuck, and deliberately kept
+ * The same idiom as the backtracker's --break_mode stuck, and deliberately kept
  * apart from the proof engine above -- a change here cannot perturb it.
  *
  * WHY IT ALWAYS COMPLETES. A cell's frame type is fixed by its position, and the
@@ -1670,7 +1670,7 @@ static int placement_cost(const Oriented *o, int r, int c) {
 }
 
 /* Fill every empty cell of the board in place and return the breaks it cost.
-   It always runs to completion, even past --max_breaks: the caller wants the
+   It always runs to completion, even past --breaks: the caller wants the
    number either way, because "this board needs 61 breaks" is a far more useful
    answer than "more than 40". */
 static int greedy_fill(void) {
@@ -1683,7 +1683,7 @@ static int greedy_fill(void) {
                 if (g_has[r][c]) continue;
                 int need = (r == 0) + (r == PUZZLE_SIDE-1) + (c == 0) + (c == PUZZLE_SIDE-1);
                 int cell_cost = 5, ways = 0, pid_at = -1, spin_at = 0;
-                /* The dive respects clues too, or a --max_breaks run would hand
+                /* The dive respects clues too, or a --breaks run would hand
                    back a complete board with the clues scattered -- the exhaustive
                    half having held them for nothing. A clue cell takes only its
                    own piece at its own spin; every other cell refuses clue pieces
@@ -1782,7 +1782,7 @@ static bool read_line(const char *path, uint32_t want, char id_out[96],
     return found;
 }
 
-/* Data lines in a board CSV, so the banner can say what --border_row may ask
+/* Data lines in a board CSV, so the banner can say what --start_row may ask
    for. Cheap next to everything else, and it turns "0 searched, 0 emitted" into
    a sentence the reader can act on. */
 static uint32_t count_data_lines(const char *path) {
@@ -2126,7 +2126,7 @@ static void print_summary(double wall) {
     if (g_stats.lines_exhausted && !g_stats.emit_solved)
         printf("[sum] every exhaustively searched board is PROVED to admit no break-free "
                "refill of these bands. Change the geometry (--rotate, --strip_width, "
-               "--rounds), or take a complete board with --max_breaks.\n");
+               "--rounds), or take a complete board with --breaks.\n");
     if (g_stats.lines_truncated)
         printf("[sum] the truncated boards are NOT proofs. Raise the budget, or narrow the "
                "cut: --rounds 3 --strip_width 5 keeps only 66 pieces and is the one cut too "
@@ -2169,7 +2169,7 @@ static const char *k_usage =
 "  --BL/--BR/--TL/--TR P  pin a corner piece by its role on the INPUT board\n"
 "\n"
 "SEARCH -- exhaustive unless a budget bites\n"
-"  --max_breaks B         after the exhaustive search, greedily fill the rest of\n"
+"  --breaks B             after the exhaustive search, greedily fill the rest of\n"
 "                         the deepest board, spending at most B mismatches\n"
 "                         (default 0 = off, so the output stays break-free)\n"
 "  --clue_center          verify the published centre clue is on its cell. The core\n"
@@ -2179,16 +2179,16 @@ static const char *k_usage =
 "                         DO fall in the freed bands, and without the flag a --rounds 3\n"
 "                         cut re-places all four somewhere else. Both flags read the\n"
 "                         orientation off each input board and skip a board whose core\n"
-"                         already contradicts a clue; --max_breaks respects them too\n"
+"                         already contradicts a clue; --breaks respects them too\n"
 "  --max_nodes N          node budget per input board (0 = unlimited)\n"
-"  --config_time_sec S    wall-clock budget per input board (default 600)\n"
-"  --max_wall_sec S       wall-clock budget for the whole run (0 = unlimited)\n"
-"  --max_boards N         stop after N boards have been written\n"
+"  --time_limit S         wall-clock budget per input board (default 600)\n"
+"  --wall_time S          wall-clock budget for the whole run (0 = unlimited)\n"
+"  --max_emitted N        stop after N boards have been written\n"
 "\n"
 "INPUT / OUTPUT\n"
-"  --border_row N         first data line of the boards CSV (default 0)\n"
-"  --border_row_N N       consecutive lines to process (default 1; 0 = every\n"
-"                         line from --border_row to the end of the file)\n"
+"  --start_row N          first data line of the boards CSV (default 0)\n"
+"  --num_rows N           consecutive lines to process (default 0 = every\n"
+"                         line from --start_row to the end of the file)\n"
 "  --out_dir DIR          output directory (default round_out). Names carry the\n"
 "                         geometry, and break-free boards are filed separately\n"
 "                         from break-bought ones: ..._W5_miss0.csv and _miss12.csv\n"
@@ -2205,7 +2205,7 @@ static const char *k_usage =
 "\n"
 "RETIRED, accepted with a warning so older scripts keep running: --beam_width,\n"
 "--mode, --frac_rand, --repeats, --finalize_repeats, --lambda_Mahalanobis,\n"
-"--top_bottoms, --emit_each_round, --emit_deepest, --seed, --max_partials,\n"
+"--top_bottoms, --emit_each_round, --emit_deepest, --rng_seed, --max_partials,\n"
 "--free_edges. The search is exhaustive and deterministic, so none of them have\n"
 "anything left to do, and the deepest board is emitted by default.\n";
 
@@ -2223,8 +2223,9 @@ static int corner_index(const char *flag) {
 static bool retired_flag(const char *a, int *i, int argc) {
     static const char *takes_value[] = {
         "--beam_width", "--mode", "--frac_rand", "--repeats", "--finalize_repeats",
-        "--lambda_Mahalanobis", "--top_bottoms", "--emit_deepest", "--seed",
-        "--max_partials", NULL };
+        "--lambda_Mahalanobis", "--top_bottoms", "--emit_deepest", "--rng_seed",
+        "--max_partials",
+        NULL };
     static const char *no_value[] = { "--emit_each_round", "--free_edges", NULL };
     for (int k = 0; takes_value[k]; k++)
         if (!strcmp(a, takes_value[k])) {
@@ -2245,7 +2246,7 @@ static bool retired_flag(const char *a, int *i, int argc) {
 /* Parse the CLI, set up the seed and catalog once, then for each input line:
    load and cut, skip duplicate cores, build the width-W database for what is
    left, search the spiral exhaustively, and report the furthest it got. */
-/* -- --print-cmd ----------------------------------------------------------
+/* -- --print_cmd ----------------------------------------------------------
  * The whole invocation with every flag carrying the value the run will really
  * use. Copy the line and you have the run. Prints, then continues.
  * Every accepted flag must appear here; tests/check_script_flags.py enforces it.
@@ -2259,18 +2260,18 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_only_complete) printf(" --only_complete");
     if (g_selfcheck)     printf(" --selfcheck");
     if (g_verbose)       printf(" --verbose");
-    if (g_print_cmd)     printf(" --print-cmd");
+    if (g_print_cmd)     printf(" --print_cmd");
     if (g_clue_mask & CLUE_CENTER)  printf(" --clue_center");
     if (g_clue_mask & CLUE_CORNERS) printf(" --clue_corners");
     for (int k = 0; k < 4; k++)
         if (g_pin_corner[k] >= 0) printf(" %s %d", corner[k], g_pin_corner[k]);
     printf(" --out_dir %s", g_out_dir);
-    printf(" --border_row %u --border_row_N %u", g_line_first, g_line_count);
+    printf(" --start_row %u --num_rows %u", g_line_first, g_line_count);
     printf(" --rounds %d --rotate %d --strip_width %d", g_rounds, g_rotate, g_opt_W);
     if (g_stop_level >= 0) printf(" --stop_row %d", g_stop_level);
-    printf(" --ties %u --max_breaks %d", g_ties, g_max_breaks);
-    printf(" --max_nodes %" PRIu64 " --max_boards %" PRIu64, g_max_nodes, g_max_boards);
-    printf(" --config_time_sec %g --max_wall_sec %g", g_config_time_sec, g_max_wall_sec);
+    printf(" --ties %u --breaks %d", g_ties, g_max_breaks);
+    printf(" --max_nodes %" PRIu64 " --max_emitted %" PRIu64, g_max_nodes, g_max_boards);
+    printf(" --time_limit %g --wall_time %g", g_config_time_sec, g_max_wall_sec);
     printf(" --threads %d\n", nthreads > 0 ? nthreads : g_nthreads);
 }
 
@@ -2286,26 +2287,26 @@ int main(int argc, char **argv) {
         if (ci >= 0 && i+1 < argc) { g_pin_corner[ci] = atoi(argv[++i]); }
         else if (retired_flag(a, &i, argc)) { /* warned above */ }
         else if (!strcmp(a, "--out_dir") && i+1 < argc) g_out_dir = argv[++i];
-        else if (!strcmp(a, "--border_row") && i+1 < argc) g_line_first = (uint32_t)strtoul(argv[++i], NULL, 10);
-        else if (!strcmp(a, "--border_row_N") && i+1 < argc) g_line_count = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--start_row") && i+1 < argc) g_line_first = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--num_rows") && i+1 < argc) g_line_count = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(a, "--strip_width") && i+1 < argc) g_opt_W = atoi(argv[++i]);
         else if (!strcmp(a, "--rounds") && i+1 < argc) g_rounds = atoi(argv[++i]);
         else if (!strcmp(a, "--rotate") && i+1 < argc) g_rotate = atoi(argv[++i]);
         else if (!strcmp(a, "--reverse"))             g_reverse = true;
         else if (!strcmp(a, "--stop_row") && i+1 < argc) g_stop_level = atoi(argv[++i]);
         else if (!strcmp(a, "--hold_band")) g_hold_band = true;
-        else if (!strcmp(a, "--max_breaks") && i+1 < argc) g_max_breaks = atoi(argv[++i]);
+        else if (!strcmp(a, "--breaks") && i+1 < argc) g_max_breaks = atoi(argv[++i]);
         else if (!strcmp(a, "--clue_center"))  g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(a, "--clue_corners")) g_clue_mask |= CLUE_CORNERS;
         else if (!strcmp(a, "--max_nodes") && i+1 < argc) g_max_nodes = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--ties") && i+1 < argc) g_ties = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(a, "--only_complete")) g_only_complete = true;
-        else if (!strcmp(a, "--config_time_sec") && i+1 < argc) g_config_time_sec = atof(argv[++i]);
-        else if (!strcmp(a, "--max_wall_sec") && i+1 < argc) g_max_wall_sec = atof(argv[++i]);
-        else if (!strcmp(a, "--max_boards") && i+1 < argc) g_max_boards = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--time_limit") && i+1 < argc) g_config_time_sec = atof(argv[++i]);
+        else if (!strcmp(a, "--wall_time") && i+1 < argc) g_max_wall_sec = atof(argv[++i]);
+        else if (!strcmp(a, "--max_emitted") && i+1 < argc) g_max_boards = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--threads") && i+1 < argc) nthreads = atoi(argv[++i]);
         else if (!strcmp(a, "--selfcheck")) g_selfcheck = true;
-        else if (!strcmp(a, "--print-cmd")) g_print_cmd = true;
+        else if (!strcmp(a, "--print_cmd")) g_print_cmd = true;
         else if (!strcmp(a, "--verbose")) g_verbose = true;
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { fputs(k_usage, stdout); return 0; }
         else fatal("unknown option %s (try --help)", a);
@@ -2318,7 +2319,7 @@ int main(int argc, char **argv) {
     if (g_hold_band && g_stop_level >= 0)
         fatal("--hold_band and --stop_row both set where the strip ends: the held "
               "block already fixes it. Drop one.");
-    if (g_max_breaks < 0) fatal("--max_breaks must be >= 0");
+    if (g_max_breaks < 0) fatal("--breaks must be >= 0");
 
     if (nthreads > 0) { omp_set_num_threads(nthreads); g_nthreads = nthreads; }
     else g_nthreads = omp_get_max_threads();
@@ -2341,8 +2342,8 @@ int main(int argc, char **argv) {
              g_out_dir, g_rounds, g_rotate, rtag, wtag, g_max_breaks);
 
     uint32_t csv_lines = count_data_lines(csv_path);
-    /* --border_row_N 0 means "the rest of the file". Resolved here, before the
-       banner, so [cfg] and --print-cmd report the count the run will really use
+    /* --num_rows 0 means "the rest of the file". Resolved here, before the
+       banner, so [cfg] and --print_cmd report the count the run will really use
        rather than a sentinel -- and so a caller need not count the lines itself. */
     if (g_line_count == 0)
         g_line_count = (csv_lines > g_line_first) ? csv_lines - g_line_first : 0;
@@ -2360,10 +2361,10 @@ int main(int argc, char **argv) {
     printf("[cfg] rounds=%d rotate=%d reverse=%d strip_width=%s stop_row=%s ties=%u "
            "only_complete=%d hold_band=%d\n", g_rounds, g_rotate, g_reverse?1:0, wtag, sbuf,
            g_ties, g_only_complete?1:0, g_hold_band?1:0);
-    printf("[cfg] max_breaks=%d max_nodes=%" PRIu64 " config_time=%.0fs max_wall=%.0fs "
-           "max_boards=%" PRIu64 " threads=%d\n", g_max_breaks, g_max_nodes,
+    printf("[cfg] breaks=%d max_nodes=%" PRIu64 " time_limit=%.0fs wall_time=%.0fs "
+           "max_emitted=%" PRIu64 " threads=%d\n", g_max_breaks, g_max_nodes,
            g_config_time_sec, g_max_wall_sec, g_max_boards, g_nthreads);
-    printf("[cfg] border_row=%u border_row_N=%u of %u data line(s)  "
+    printf("[cfg] start_row=%u num_rows=%u of %u data line(s)  "
            "corners BL/BR/TL/TR=%d/%d/%d/%d\n", g_line_first, g_line_count, csv_lines,
            g_pin_corner[0], g_pin_corner[1], g_pin_corner[2], g_pin_corner[3]);
     if (g_clue_mask)
@@ -2381,7 +2382,7 @@ int main(int argc, char **argv) {
                "       bands and re-search them as usual\n",
                round_side(g_rounds), g_rounds, g_rounds-1);
     if (g_line_first >= csv_lines)
-        printf("[warn] --border_row %u is past the end of the CSV: nothing to do\n", g_line_first);
+        printf("[warn] --start_row %u is past the end of the CSV: nothing to do\n", g_line_first);
     fflush(stdout);
 
     g_free_edges = true;                 /* the roundhouse always re-chooses its border */
@@ -2485,7 +2486,7 @@ int main(int argc, char **argv) {
             restore_snap(g_best_n ? &g_best[0] : &core);
             int spent = greedy_fill();
             if (spent > g_max_breaks)
-                printf("[line %u] fill needs %d break(s), over --max_breaks %d: not written\n",
+                printf("[line %u] fill needs %d break(s), over --breaks %d: not written\n",
                        li, spent, g_max_breaks);
             else {
                 Snap filled; snapshot(&filled);

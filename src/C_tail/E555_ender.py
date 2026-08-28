@@ -29,7 +29,7 @@ WHAT IT DOES
     Either way the tool climbs an escalation ladder -- it re-solves from cheap,
     surgical openings (few pieces move, shallow reach) to broad ones, warm-
     starting each rung from the best board so far and stopping the instant
-    breaks reach zero. You set only the ceilings (--reach, --max-changes).
+    breaks reach zero. You set only the ceilings (--reach, --max_changes).
 
 EXAMPLE RUNS
 
@@ -38,7 +38,7 @@ EXAMPLE RUNS
 
     # Whole-border sweep -- best when breaks sit on/near the border ring.
     python3 E555_ender.py seed_Edge5.txt topped.csv solved.csv \
-            --mode ring --reach 2 --max-changes 16 --workers 8
+            --mode ring --reach 2 --max_changes 16 --threads 8
 
     # Patch only the cells named in a 16x16 0/1 mask (see data/holes_*.csv).
     python3 E555_ender.py seed_Edge5.txt board.csv out.csv \
@@ -76,7 +76,7 @@ INPUT / OUTPUT
 """
 
 from __future__ import annotations
-import argparse, csv, collections, itertools, signal, sys, threading, time
+import argparse, csv, collections, itertools, random, signal, sys, threading, time
 from dataclasses import dataclass
 from pathlib import Path
 try:
@@ -253,7 +253,7 @@ def clue_open_cells(CL, mask, orient, pos, rot):
     """Cells build_pool must open so the wrong clues of `orient` can be fixed.
 
     A clue already at its cell and spin contributes nothing: leaving it locked
-    keeps the model small and spends none of the --max-changes budget. The
+    keeps the model small and spends none of the --max_changes budget. The
     donor cell is only offered when it is an interior cell, which it always is
     on a well-formed board (every clue piece is an inner piece); the guard just
     stops a malformed input from pinning an inner piece into a border
@@ -550,17 +550,19 @@ def main():
                          "(overrides the automatic box)")
     ap.add_argument("--reach", type=int, default=2,
                     help="interior layers opened around the breaks (ladder ceiling)")
-    ap.add_argument("--max-changes", type=int, default=16,
+    ap.add_argument("--max_changes", type=int, default=16,
                     help="ceiling on pieces that may move per solve")
-    ap.add_argument("--max-time", type=float, default=120.0, help="seconds per stage solve")
-    ap.add_argument("--stall-time", type=float, default=40.0, help="no-improvement cutoff per stage")
-    ap.add_argument("--workers", type=int, default=8, help="CP-SAT workers")
-    ap.add_argument("--rng-seed", type=int, default=0, help="base seed; rung k uses seed+k")
-    ap.add_argument("--row", type=int, default=0,
+    ap.add_argument("--time_limit", type=float, default=120.0, help="seconds per stage solve")
+    ap.add_argument("--stall_time", type=float, default=40.0, help="no-improvement cutoff per stage")
+    ap.add_argument("--threads", type=int, default=8, help="CP-SAT workers")
+    ap.add_argument("--rng_seed", type=int, default=0,
+                    help="base seed; rung k uses seed+k (0 = auto-random)")
+    ap.add_argument("--start_row", type=int, default=0,
                     help="first input CSV row to process (0-indexed)")
-    ap.add_argument("--count", type=int, default=1000000,
-                    help="how many rows to process; with --row, splits a board "
-                         "list across array tasks")
+    ap.add_argument("--num_rows", type=int, default=0,
+                    help="how many rows to process (default 0 = every remaining "
+                         "row); with --start_row, splits a board list across "
+                         "array tasks")
     ap.add_argument("--clue_center", action="store_true",
                     help="Hold piece 138 at the board's centre clue cell and spin.")
     ap.add_argument("--clue_corners", action="store_true",
@@ -571,6 +573,11 @@ def main():
                          "auto (default) reads it off each input board.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    # 0 = auto-random, matching the rest of the toolkit; resolved here so the
+    # [cfg] dump below reports the seed the run actually used.
+    if args.rng_seed == 0:
+        args.rng_seed = random.randint(1_000_000, 9_999_999)
 
     if args.reach < 1:
         sys.exit("[ERROR] --reach must be >= 1.")
@@ -600,15 +607,17 @@ def main():
         # writer in the toolkit overrides.
         writer = csv.writer(out, lineterminator="\n")
         reader = csv.reader(src)
-        # --row/--count so a board list can be split across array tasks, exactly
-        # as E555_topper.py slices its input: BOARD rows, not raw CSV lines, so
-        # the '#' header bin/E555_backtracker writes neither breaks the parse nor
-        # eats a slot in the slice.
+        # --start_row/--num_rows so a board list can be split across array tasks,
+        # exactly as E555_topper.py slices its input: BOARD rows, not raw CSV
+        # lines, so the '#' header bin/E555_backtracker writes neither breaks
+        # the parse nor eats a slot in the slice. --num_rows 0 means every
+        # remaining row from --start_row.
         boards = (row for row in reader
                   if row and row[0].strip()
                   and not row[0].lstrip().startswith(("#", "%")))
-        rows = itertools.islice(boards, args.row, args.row + args.count)
-        for i, row in enumerate(rows, args.row + 1):
+        stop = None if args.num_rows == 0 else args.start_row + args.num_rows
+        rows = itertools.islice(boards, args.start_row, stop)
+        for i, row in enumerate(rows, args.start_row + 1):
             if _STOP: break
             partial = parse_partial_line(row)
             bin_ = len(broken_junctions(partial.pos, partial.rot, tiles))
@@ -627,7 +636,7 @@ def main():
 
             pos, rot, breaks, reason, stage, sec = solve_board(
                 args.mode, partial, tiles, ladder, args.reach, holes,
-                args.max_time, args.stall_time, args.workers, args.rng_seed, args.verbose,
+                args.time_limit, args.stall_time, args.threads, args.rng_seed, args.verbose,
                 CL, clue_mask, orient)
 
             score = NUM_EDGES - breaks

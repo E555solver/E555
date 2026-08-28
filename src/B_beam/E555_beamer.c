@@ -48,7 +48,7 @@
  *   random selection band does NOT taper -- --frac_rand is flat across rows.
  *
  * RANDOMNESS
- *   Runs are intentionally NOT reproducible unless --seed is given: by default
+ *   Runs are intentionally NOT reproducible unless --rng_seed is given: by default
  *   the master seed comes from the clock and the process id (and is printed),
  *   so repeated runs sample uncorrelated regions of the search space.
  *
@@ -121,8 +121,10 @@ static const char *g_out_dir      = "beam_out";
 static const char *g_db_file      = NULL;
 static bool     g_random_edges    = false;
 
-static uint32_t g_border_row_index = 0;
-static uint32_t g_border_row_N     = 1;
+static uint32_t g_start_row        = 0;
+static uint32_t g_num_rows         = 0;   /* rows to sweep; 0 = every remaining row of rotation.csv */
+static uint32_t g_samples          = 1;   /* --samples: random borders to try under --random_edges;
+                                              0 = uncapped, run until --wall_time/--max_emitted stops you */
 static double   g_config_time_sec  = 600.0;
 static double   g_max_wall_sec     = 0.0;
 static uint64_t g_max_partials     = 0;   /* reported-board budget; 0 = unlimited */
@@ -135,7 +137,7 @@ static double   g_tau_columns      = 0.0;
 /* Abandon a bottom after this many consecutive columns that emitted nothing
    (0 = never bail, run all --top_columns). */
 static uint32_t g_bail_columns     = 0;
-static bool     g_seed_given       = false;  /* --seed passed explicitly */
+static bool     g_seed_given       = false;  /* --rng_seed passed explicitly */
 static uint64_t g_resume_sol_idx   = 0;
 static uint32_t g_resume_bi = 0, g_resume_li = 0;
 static bool     g_resume_active = false;
@@ -175,7 +177,7 @@ static struct {
     double   t_expand, t_select, t_mat, t_emit;
 } g_stats;
 
-/* --max_partials budget: stop-row completions plus --incomplete_top A+B partials,
+/* --max_emitted budget: stop-row completions plus --incomplete_top A+B partials,
    i.e. every board written to disk. Checked after each stop-row emission and at
    each config boundary, so the beam in flight is always reported in full and the
    final count may exceed N by up to one beam's worth. Called from serial code
@@ -193,7 +195,7 @@ static bool partials_budget_spent(void) {
 static void partials_budget_announce(void) {
     if (!g_budget_hit) return;
     g_budget_hit = false;
-    printf("[sweep] max_partials reached (%" PRIu64 " boards reported).\n",
+    printf("[sweep] max_emitted reached (%" PRIu64 " boards reported).\n",
            g_stats.emitted_total + (uint64_t)g_partial_total);
     fflush(stdout);
 }
@@ -2043,13 +2045,13 @@ static void read_checkpoint(const char *path) {
     int nf = fscanf(ck, "%u %u %u %llu", &br, &bi, &li, &sol);
     fclose(ck);
     if (nf < 3) { printf("[resume] checkpoint %s unreadable; starting fresh\n", path); return; }
-    g_border_row_index = br;
+    g_start_row = br;
     g_resume_bi = bi;
     g_resume_li = li;
     if (nf >= 4) g_resume_sol_idx = (uint64_t)sol;
     g_resume_active = true;
-    printf("[resume] border_row=%u bi=%u li=%u sol_idx=%" PRIu64 "\n",
-           g_border_row_index, g_resume_bi, g_resume_li, g_resume_sol_idx);
+    printf("[resume] start_row=%u bi=%u li=%u sol_idx=%" PRIu64 "\n",
+           g_start_row, g_resume_bi, g_resume_li, g_resume_sol_idx);
 }
 
 /* -- Summary ------------------------------------------------------------------ */
@@ -2241,8 +2243,9 @@ static void usage(const char *a0) {
 "\n"
 "Input / output:\n"
 "  --out_dir DIR          output directory: completions + checkpoint (default beam_out)\n"
-"  --border_row N         first data row of rotation.csv to use (default 0)\n"
-"  --border_row_N N       number of consecutive border rows to sweep (default 1)\n"
+"  --start_row N          first data row of rotation.csv to use (default 0)\n"
+"  --num_rows N           number of consecutive border rows to sweep\n"
+"                         (default 0 = every remaining row of rotation.csv)\n"
 "  --db_file PATH         on-disk cache of the seed-only inner database: built and\n"
 "                         written on first run, mmapped in seconds on later runs\n"
 "  --free_edges           any edge piece may terminate a row on the right (relaxed\n"
@@ -2250,10 +2253,12 @@ static void usage(const char *a0) {
 "  --random_edges         sample random borders from the seed's edge pieces instead\n"
 "                         of reading a Stage A arrangement (implies --free_edges;\n"
 "                         rotation.csv may be omitted and is ignored if given).\n"
-"                         --border_row_N = number of random bottoms, --top_columns =\n"
-"                         random left columns per bottom; each border is the best of\n"
-"                         32 fan-out-ranked samples. --border_row/--top_bottoms and\n"
-"                         --resume do not apply\n"
+"                         --samples = number of random bottoms to try (default 1;\n"
+"                         0 = uncapped, run until --wall_time/--max_emitted stops\n"
+"                         you), --top_columns = random left columns per bottom;\n"
+"                         each border is the best of 32 fan-out-ranked samples.\n"
+"                         --start_row/--num_rows, --top_bottoms and --resume do\n"
+"                         not apply\n"
 "  --BL N / --BR N        pin a seed piece index (0..255) to the Bottom-Left /\n"
 "  --TL N / --TR N        Bottom-Right / Top-Left / Top-Right corner (--random_edges\n"
 "                         only); unpinned corners are sampled, and with 3 pinned the\n"
@@ -2264,7 +2269,7 @@ static void usage(const char *a0) {
 "                         kept: A+B (cols 11-15 unplaced), A+C (cols 6-10) and B+C\n"
 "                         (cols 1-5). The two segments that lost their left-hand\n"
 "                         neighbour are searched over all 17 inner colors, so expect\n"
-"                         roughly 10x the partials of A+B alone; --max_partials caps it.\n"
+"                         roughly 10x the partials of A+B alone; --max_emitted caps it.\n"
 "                         Both CSVs are APPENDED to, never truncated: a fresh run\n"
 "                         adds to whatever the out_dir already holds\n"
 "\n"
@@ -2333,24 +2338,24 @@ static void usage(const char *a0) {
 "  --top_bottoms N        bottom-row orderings tried per border row, best-ranked\n"
 "                         first (<1 = all; default 10). A bottom on a NEW border is\n"
 "                         worth more than another bottom on one already tried, so\n"
-"                         spend the budget on --border_row_N before raising this\n"
+"                         spend the budget on --num_rows before raising this\n"
 "  --top_columns N        left-column orderings tried per bottom (<1 = all; default 12).\n"
 "                         Ranked SEPARATELY FOR EACH BOTTOM, since a column's rank is\n"
 "                         conditional on the bottom it shares the board with, so l0\n"
 "                         means the best column for THIS bottom. Columns that cannot\n"
 "                         complete row 1 with it are dropped, which is why the [rank]\n"
 "                         line can show fewer run than asked for\n"
-"  --gumbel_tau_bottoms T selection temperature for the bottom ranking: above 0 the\n"
+"  --tau_bottoms T        selection temperature for the bottom ranking: above 0 the\n"
 "                         --top_bottoms tried are a sample without replacement with\n"
 "                         probability proportional to exp(rank/tau) rather than the\n"
 "                         greedy head. 0 = off, exact legacy (default 0; ~2 buys\n"
 "                         variety at no measured yield cost)\n"
-"  --gumbel_tau_columns T the same for the left-column ranking. EVERY MEASUREMENT OF\n"
+"  --tau_columns T        the same for the left-column ranking. EVERY MEASUREMENT OF\n"
 "                         THIS FLAG BEFORE THE COLUMN RANK WAS REWRITTEN IS VOID: the\n"
 "                         old rank was one constant across all columns of a border\n"
 "                         row (see left_rank_of), so rank/tau cancelled and tau chose\n"
 "                         nothing -- tau 2 and tau 4 picked identical columns run for\n"
-"                         run, while the same test on --gumbel_tau_bottoms did not.\n"
+"                         run, while the same test on --tau_bottoms did not.\n"
 "                         There is now a real rank to perturb. 0 = off (default 0);\n"
 "                         re-measure before raising it\n"
 "  --bail_columns N       abandon a bottom after N consecutive columns that emitted\n"
@@ -2359,11 +2364,11 @@ static void usage(const char *a0) {
 "                         completions alone at a high --stop_row emissions are rare\n"
 "                         enough that this acts as a cap of N columns per bottom.\n"
 "                         0 = never bail (default 0)\n"
-"  --config_time_sec S    wall-time slice per (bottom x left) config; a per-row\n"
+"  --time_limit S         wall-time slice per (bottom x left) config; a per-row\n"
 "                         deadline, so it only fires on a config that runs long\n"
 "                         (default 600)\n"
-"  --max_wall_sec S       total wall-time budget; 0 = unlimited (default 0)\n"
-"  --max_partials N       stop once N boards have been reported, counting both\n"
+"  --wall_time S          total wall-time budget; 0 = unlimited (default 0)\n"
+"  --max_emitted N        stop once N boards have been reported, counting both\n"
 "                         completions and --incomplete_top partials; the stop-row\n"
 "                         beam in flight is always reported in full, so the final\n"
 "                         count can overshoot N by up to one beam width\n"
@@ -2372,13 +2377,13 @@ static void usage(const char *a0) {
 "\n"
 "Misc:\n"
 "  --threads N            OpenMP threads (default: all cores)\n"
-"  --seed S               RNG seed; omitted or 0 = randomized from clock+pid and\n"
+"  --rng_seed S           RNG seed; omitted or 0 = randomized from clock+pid and\n"
 "                         printed, so repeated runs are uncorrelated\n"
 "  --verbose              per-row beam progress lines\n"
 "  --help                 this text\n", a0);
 }
 
-/* -- --print-cmd ----------------------------------------------------------
+/* -- --print_cmd ----------------------------------------------------------
  * The whole invocation, every flag carrying the value the run will actually
  * use, whether that came from the command line or from a default. Copy the
  * line and you have the run: no scrolling back through a log, no guessing
@@ -2400,14 +2405,15 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_incomplete_top) printf(" --incomplete_top");
     if (resume)           printf(" --resume");
     if (g_verbose)        printf(" --verbose");
-    if (g_print_cmd)      printf(" --print-cmd");
+    if (g_print_cmd)      printf(" --print_cmd");
     if (g_clue_mask & CLUE_CENTER)  printf(" --clue_center");
     if (g_clue_mask & CLUE_CORNERS) printf(" --clue_corners");
     if (!g_free_demand)   printf(" --no_free_demand");
     for (int k = 0; k < 4; k++)
         if (g_fixed_corner_pid[k] >= 0) printf(" %s %d", corner[k], g_fixed_corner_pid[k]);
     printf(" --out_dir %s", g_out_dir);
-    printf(" --border_row %u --border_row_N %u", g_border_row_index, g_border_row_N);
+    if (g_random_edges) printf(" --samples %u", g_samples);
+    else                 printf(" --start_row %u --num_rows %u", g_start_row, g_num_rows);
     if (g_db_file) printf(" --db_file %s", g_db_file);
     printf(" --beam_width %u --stop_row %u", g_beam_width, g_stop_row);
     printf(" --beam_expand %u --beam_expand_row %u", g_beam_expand, g_beam_expand_row);
@@ -2416,10 +2422,10 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
            g_frac_rand, g_parent_cap, g_pool_factor);
     printf(" --bc_window %u,%u", g_bc_nB, g_bc_nC);
     printf(" --top_bottoms %ld --top_columns %ld", g_top_bottoms, g_top_columns);
-    printf(" --gumbel_tau_bottoms %g --gumbel_tau_columns %g", g_tau_bottoms, g_tau_columns);
+    printf(" --tau_bottoms %g --tau_columns %g", g_tau_bottoms, g_tau_columns);
     printf(" --bail_columns %u", g_bail_columns);
-    printf(" --threads %d --seed %" PRIu64, g_nthreads, g_master_seed);
-    printf(" --config_time_sec %g --max_wall_sec %g --max_partials %" PRIu64 "\n",
+    printf(" --threads %d --rng_seed %" PRIu64, g_nthreads, g_master_seed);
+    printf(" --time_limit %g --wall_time %g --max_emitted %" PRIu64 "\n",
            g_config_time_sec, g_max_wall_sec, g_max_partials);
 }
 
@@ -2516,6 +2522,27 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
     fflush(stdout);
 }
 
+/* Data lines in a rotations CSV, counted with the same blank/comment convention
+   read_one_border_row uses, but in one pass and without validating any field.
+   Only called for --num_rows 0, so an ordinary run with an explicit count opens
+   the CSV exactly as before. */
+static uint32_t count_border_rows(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) fatal("cannot open rotation CSV %s: %s", path, strerror(errno));
+    char *line = NULL; size_t sz = 0; uint32_t n = 0; ssize_t len;
+    while ((len = getline(&line, &sz, f)) >= 0) {
+        bool nonempty = false;
+        for (ssize_t i = 0; i < len; i++) {
+            char ch = line[i];
+            if (ch == '#' || ch == '%') break;
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') { nonempty = true; break; }
+        }
+        if (nonempty) n++;
+    }
+    free(line); fclose(f);
+    return n;
+}
+
 int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
@@ -2541,8 +2568,9 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--TR")          && i+1 < argc) g_fixed_corner_pid[3] = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--incomplete_top"))            g_incomplete_top = true;
         else if (!strcmp(argv[i], "--out_dir")     && i+1 < argc) g_out_dir = argv[++i];
-        else if (!strcmp(argv[i], "--border_row")  && i+1 < argc) g_border_row_index = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--border_row_N")&& i+1 < argc) g_border_row_N = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--start_row")   && i+1 < argc) g_start_row = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--num_rows")    && i+1 < argc) g_num_rows = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--samples")     && i+1 < argc) g_samples = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--db_file")     && i+1 < argc) g_db_file = argv[++i];
         else if (!strcmp(argv[i], "--free_edges"))                g_free_edges = true;
         else if (!strcmp(argv[i], "--beam_width")  && i+1 < argc) g_beam_width = (uint32_t)atoi(argv[++i]);
@@ -2569,23 +2597,23 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--pool_factor") && i+1 < argc) g_pool_factor = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--top_bottoms") && i+1 < argc) g_top_bottoms = atol(argv[++i]);
         else if (!strcmp(argv[i], "--top_columns") && i+1 < argc) g_top_columns = atol(argv[++i]);
-        else if (!strcmp(argv[i], "--gumbel_tau_bottoms") && i+1 < argc) g_tau_bottoms = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--gumbel_tau_columns") && i+1 < argc) g_tau_columns = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--tau_bottoms") && i+1 < argc) g_tau_bottoms = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--tau_columns") && i+1 < argc) g_tau_columns = atof(argv[++i]);
         else if (!strcmp(argv[i], "--bail_columns") && i+1 < argc) g_bail_columns = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--threads")     && i+1 < argc) g_nthreads = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--seed")        && i+1 < argc) { unsigned long long s; if (!parse_u64_token(argv[++i], &s)) fatal("--seed needs an integer"); g_master_seed = (uint64_t)s; g_seed_given = true; }
-        else if (!strcmp(argv[i], "--config_time_sec") && i+1 < argc) g_config_time_sec = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--max_wall_sec")    && i+1 < argc) g_max_wall_sec = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--max_partials")    && i+1 < argc) g_max_partials = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--rng_seed")    && i+1 < argc) { unsigned long long s; if (!parse_u64_token(argv[++i], &s)) fatal("--rng_seed needs an integer"); g_master_seed = (uint64_t)s; g_seed_given = true; }
+        else if (!strcmp(argv[i], "--time_limit")  && i+1 < argc) g_config_time_sec = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--wall_time")       && i+1 < argc) g_max_wall_sec = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--max_emitted")     && i+1 < argc) g_max_partials = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--resume"))          resume = true;
-        else if (!strcmp(argv[i], "--print-cmd"))       g_print_cmd = true;
+        else if (!strcmp(argv[i], "--print_cmd"))       g_print_cmd = true;
         else if (!strcmp(argv[i], "--verbose"))         g_verbose = true;
         else { fprintf(stderr, "Unknown argument: %s\n\n", argv[i]); usage(argv[0]); return 1; }
     }
 
     if (g_nthreads <= 0) g_nthreads = omp_get_max_threads();
-    /* An explicit --seed 0 is a SUPPLIED seed, not an absent one. Keying the
-       clock fallback off the value meant `--seed 0` set g_seed_given and then
+    /* An explicit --rng_seed 0 is a SUPPLIED seed, not an absent one. Keying the
+       clock fallback off the value meant `--rng_seed 0` set g_seed_given and then
        got a clock/PID seed anyway -- which passes the --resume guard below
        while the border ranking it indexes is different on every run. */
     if (!g_seed_given) {
@@ -2606,8 +2634,8 @@ int main(int argc, char *argv[]) {
        and the attach in format_board_tail now yields to whatever the search
        placed -- so searching row 13 simply builds it from other pieces and the
        clues are left off, rather than being written on top of them. */
-    if (!(g_tau_bottoms >= 0.0 && g_tau_bottoms <= 1e6)) fatal("--gumbel_tau_bottoms in [0,1e6]");
-    if (!(g_tau_columns >= 0.0 && g_tau_columns <= 1e6)) fatal("--gumbel_tau_columns in [0,1e6]");
+    if (!(g_tau_bottoms >= 0.0 && g_tau_bottoms <= 1e6)) fatal("--tau_bottoms in [0,1e6]");
+    if (!(g_tau_columns >= 0.0 && g_tau_columns <= 1e6)) fatal("--tau_columns in [0,1e6]");
     if (g_frac_rand < 0.0 || g_frac_rand > 1.0) fatal("--frac_rand must be in [0,1]");
     if (g_pool_factor == 0) g_pool_factor = 1;
     bool any_fixed_corner = false;
@@ -2629,16 +2657,30 @@ int main(int argc, char *argv[]) {
        without pinning the seed would silently land on a different permutation,
        re-running some configs and skipping others. */
     if (resume && (g_tau_bottoms > 0.0 || g_tau_columns > 0.0) && !g_seed_given)
-        fatal("--resume with --gumbel_tau_bottoms/--gumbel_tau_columns needs the "
-              "original --seed (the checkpoint indexes a seed-dependent ordering)");
+        fatal("--resume with --tau_bottoms/--tau_columns needs the "
+              "original --rng_seed (the checkpoint indexes a seed-dependent ordering)");
+
+    /* --num_rows 0 means "the rest of the file" (fixed/rotation mode only; under
+       --random_edges there is no file to exhaust, and --samples governs that
+       mode's count instead). Resolved before the banner so [cfg] and --print_cmd
+       report the count the run will really use. */
+    if (!g_random_edges && g_num_rows == 0) {
+        uint32_t rot_lines = count_border_rows(csv_path);
+        g_num_rows = (rot_lines > g_start_row) ? rot_lines - g_start_row : 0;
+    }
 
     printf("\n=== E555 beamer ===\n\n");
     if (g_print_cmd) print_cmd(argv[0], seed_path, csv_path, resume);
     printf("[cfg] seed_file=%s rotations_file=%s out_dir=%s\n",
            seed_path, csv_path ? csv_path : "(none: --random_edges)", g_out_dir);
-    printf("[cfg] seed=%" PRIu64 " threads=%d verbose=%d random_edges=%d free_edges=%d border_row=%u border_row_N=%u\n",
-           g_master_seed, g_nthreads, g_verbose?1:0, g_random_edges?1:0, g_free_edges?1:0,
-           g_border_row_index, g_border_row_N);
+    if (g_random_edges)
+        printf("[cfg] rng_seed=%" PRIu64 " threads=%d verbose=%d random_edges=%d free_edges=%d samples=%u\n",
+               g_master_seed, g_nthreads, g_verbose?1:0, g_random_edges?1:0, g_free_edges?1:0,
+               g_samples);
+    else
+        printf("[cfg] rng_seed=%" PRIu64 " threads=%d verbose=%d random_edges=%d free_edges=%d start_row=%u num_rows=%u\n",
+               g_master_seed, g_nthreads, g_verbose?1:0, g_random_edges?1:0, g_free_edges?1:0,
+               g_start_row, g_num_rows);
     printf("[cfg] incomplete_top=%d resume=%d corners BL/BR/TL/TR=%d/%d/%d/%d\n",
            g_incomplete_top?1:0, resume?1:0, g_fixed_corner_pid[0], g_fixed_corner_pid[1],
            g_fixed_corner_pid[2], g_fixed_corner_pid[3]);
@@ -2660,10 +2702,10 @@ int main(int argc, char *argv[]) {
     }
     printf("[cfg] lambda_J=%.3f lambda_Maha=%.3f free_demand=%d bc_window=%u,%u\n",
            g_lambda_J, g_lambda_maha, g_free_demand?1:0, g_bc_nB, g_bc_nC);
-    printf("[cfg] top_bottoms=%ld top_columns=%ld config_time=%.0fs max_wall=%.0fs max_partials=%" PRIu64 " db_file=%s\n",
+    printf("[cfg] top_bottoms=%ld top_columns=%ld time_limit=%.0fs wall_time=%.0fs max_emitted=%" PRIu64 " db_file=%s\n",
            g_top_bottoms, g_top_columns, g_config_time_sec, g_max_wall_sec, g_max_partials,
            g_db_file ? g_db_file : "(none)");
-    printf("[cfg] gumbel_tau_bottoms=%.2f gumbel_tau_columns=%.2f bail_columns=%u\n",
+    printf("[cfg] tau_bottoms=%.2f tau_columns=%.2f bail_columns=%u\n",
            g_tau_bottoms, g_tau_columns, g_bail_columns);
     fflush(stdout);
 
@@ -2731,13 +2773,13 @@ int main(int argc, char *argv[]) {
     double init_s = t_sweep0 - t_start;
 
     if (g_random_edges) {
-        /* Random-border sweep: no rotation CSV. --border_row_N random bottoms,
+        /* Random-border sweep: no rotation CSV. --samples random bottoms,
            --top_columns random left columns per bottom, each border the best of
            RANDOM_SIDE_SAMPLES fan-out-ranked samples (--top_bottoms is moot:
            every sampled bottom is used). No checkpoint: borders are not
            re-derivable, so a run is continued simply by starting another. */
         printf("\n========== random borders ==========\n");
-        size_t run_b = g_border_row_N >= 1 ? g_border_row_N : 1;
+        size_t run_b = (g_samples == 0) ? SIZE_MAX : g_samples;
         size_t run_l = g_top_columns  >= 1 ? (size_t)g_top_columns : 1;
         printf("[sweep] random mode: %zu bottoms x %zu lefts (best of %d samples each)\n",
                run_b, run_l, RANDOM_SIDE_SAMPLES); fflush(stdout);
@@ -2810,7 +2852,7 @@ int main(int argc, char *argv[]) {
             sweep_flush();      /* never straddle a bottom */
         }
     } else
-    for (uint32_t cur_row = g_border_row_index; cur_row < g_border_row_index + g_border_row_N; cur_row++) {
+    for (uint32_t cur_row = g_start_row; cur_row < g_start_row + g_num_rows; cur_row++) {
         if (g_stop) break;
         printf("\n========== border row %u ==========\n", cur_row); fflush(stdout);
 
@@ -2860,7 +2902,7 @@ int main(int argc, char *argv[]) {
         fflush(stdout);
 
         size_t start_bi = 0, start_li = 0;
-        if (g_resume_active && cur_row == g_border_row_index) { start_bi = g_resume_bi; start_li = g_resume_li; g_solution_idx = g_resume_sol_idx; }
+        if (g_resume_active && cur_row == g_start_row) { start_bi = g_resume_bi; start_li = g_resume_li; g_solution_idx = g_resume_sol_idx; }
         else g_solution_idx = 0;
 
         for (size_t bi = start_bi; bi < run_b && !g_stop; bi++) {

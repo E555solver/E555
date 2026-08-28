@@ -31,7 +31,7 @@ NUM_ROWS=500            # how many rows
 WORKERS=12              # CP-SAT threads
 MAX_TIME=50             # seconds per board per pass
 STALL_TIME=20           # give up after this long with no gain
-BEAM=1                  # --report_best per board
+BEAM=1                  # --top per board
 BEAM_DIFF=4             # cells by which beam ranks must differ
 BEAM_SLACK=1            # extra breaks a lower rank may cost
 CLUES=0                 # 1 = hold the Eternity II clue pieces in place
@@ -70,15 +70,15 @@ run_pass() {  # SIDE WINDOW LOCKED
     local side=$1 window=$2 locked=$3
     STEP=$((STEP + 1)); LAST_LOCKED=$locked
     local out="$OUT_DIR/p${STEP}.csv" in="$CUR"
-    local slice=(--row 0 --count "$BEAM_WIDTH")
+    local slice=(--start_row 0 --num_rows "$BEAM_WIDTH")
     [ -z "$in" ] && { in="$ENTRY"; }
 
     echo
     echo ">> pass $STEP: --side $side, $window deep, $locked outermost unset"
     python3 "$TOPPER" "$SEED" "$in" "$out" \
-        --side "$side" --work-rows "$window" --unused_rows "$locked" \
-        --workers "$WORKERS" --max-time "$MAX_TIME" --stall-time "$STALL_TIME" \
-        --report_best "$BEAM" --beam_diff "$BEAM_DIFF" --beam_slack "$BEAM_SLACK" \
+        --side "$side" --band_depth "$window" --locked_rows "$locked" \
+        --threads "$WORKERS" --time_limit "$MAX_TIME" --stall_time "$STALL_TIME" \
+        --top "$BEAM" --beam_diff "$BEAM_DIFF" --beam_slack "$BEAM_SLACK" \
         "${CLUE_ARG[@]}" "${slice[@]}" | tee "$OUT_DIR/p${STEP}.log"
     CUR="$out"
 
@@ -99,8 +99,8 @@ run_pass() {  # SIDE WINDOW LOCKED
     if [ "$locked" -eq 0 ]; then
         local pruned="$OUT_DIR/g${STEP}.csv"
         echo "  [prune] group in + group out -> best $BEAM_WIDTH by breaks, then compactness"
-        python3 "$RANK" "$GROUP_IN" "$CUR" --seed "$SEED" \
-            --sort breaks,break_rows --top "$BEAM_WIDTH" --emit "$pruned" | tail -2
+        python3 "$RANK" "$GROUP_IN" "$CUR" --seed_file "$SEED" \
+            --sort breaks,break_rows --top "$BEAM_WIDTH" --out "$pruned" | tail -2
         CUR="$pruned"; GROUP_IN="$pruned"
     fi
     return 0
@@ -129,8 +129,8 @@ declare -F "plan_$PRESET" > /dev/null ||
 # against the group's output, and that is the whole of what makes a group
 # monotone. For the FIRST group that board is this run's slice of INPUT, so
 # materialize it: rank.py takes files, not row ranges. The range is the one the
-# topper's own --row/--count takes -- BOARD rows, skipping comment and blank
-# lines -- so both tools cut the file at the same place.
+# topper's own --start_row/--num_rows takes -- BOARD rows, skipping comment and
+# blank lines -- so both tools cut the file at the same place.
 ENTRY="$OUT_DIR/entry.csv"
 awk -v a="$FIRST_ROW" -v n="$NUM_ROWS" \
     '!/^[ \t]*[#%]/ && NF { if (++b > a && b <= a + n) print }' "$INPUT" > "$ENTRY"
@@ -152,5 +152,5 @@ echo "=== run summary ==="
     "boards. The documented next step is a plan that spends breaks to reach into"\
     "the core -- PRESET=deep."
 echo "[sum] $STEP pass(es) -> $OUT"
-python3 "$RANK" "$OUT" --seed "$SEED" --top 5
+python3 "$RANK" "$OUT" --seed_file "$SEED" --top 5
 date

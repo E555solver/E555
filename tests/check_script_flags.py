@@ -17,12 +17,12 @@ these scripts also drive the Python tools, whose flags are none of this
 check's business. A missed flag is a check that did not fire; a false alarm is
 a gate nobody can get past.
 
-It also checks that each tool's --print-cmd printer covers every flag its own
+It also checks that each tool's --print_cmd printer covers every flag its own
 parser accepts. That printer is hand-written, so it falls behind the parser
 within a couple of commits and starts emitting a command line that does not
 reproduce the run -- a silent lie, and worse than no feature. The check is
 static: it reads the "--x" literals out of the print_cmd() function body rather
-than running the binary, so mutually exclusive flags (--dedup/--no-dedup) and
+than running the binary, so mutually exclusive flags (--dedup/--no_dedup) and
 conditional ones (--clue_center) count as covered by being mentioned.
 
 It also refuses a comment placed between two backslash-continued lines. That
@@ -219,7 +219,7 @@ PRINTCMD_RE = re.compile(r'static void print_cmd\([^)]*\)[^{]*\{(.*?)\n\}', re.S
 
 
 def printcmd_gaps(accepts):
-    """Flags a parser accepts that its --print-cmd printer never mentions."""
+    """Flags a parser accepts that its --print_cmd printer never mentions."""
     gaps = {}
     for tool, sources in TOOL_SOURCES.items():
         body = None
@@ -260,7 +260,7 @@ def main():
     total = 0
     for tool, missing in sorted(printcmd_gaps(accepts).items()):
         for flag in missing:
-            print("%s: --print-cmd never prints %s" % (tool, flag))
+            print("%s: --print_cmd never prints %s" % (tool, flag))
             total += 1
 
     for path in scripts:
@@ -277,7 +277,7 @@ def main():
         print("%d problem(s) across %d scripts" % (total, len(scripts)))
         return 1
     print("ok: %d scripts pass only flags their binaries accept, no comment "
-          "breaks a continued command, and every --print-cmd covers its parser"
+          "breaks a continued command, and every --print_cmd covers its parser"
           % len(scripts))
     return 0
 

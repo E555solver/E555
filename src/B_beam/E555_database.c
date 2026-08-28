@@ -87,7 +87,7 @@ LeftOrder   *g_lefts   = NULL;  size_t g_left_n   = 0;
 
 int  g_nthreads        = 0;
 bool g_verbose         = false;
-bool g_print_cmd       = false;   /* --print-cmd: echo the full invocation, then run */
+bool g_print_cmd       = false;   /* --print_cmd: echo the full invocation, then run */
 bool g_free_edges      = false;
 
 /* Pieces barred from the database: excluded pieces never enter a chain record
@@ -1306,8 +1306,8 @@ void rank_bottoms(double tau, RNG *rng) {
  * exposes the SAME multiset. The measure was therefore one constant: at tau = 0
  * cmp_left_rank fell through to memcmp and ordered columns lexicographically by
  * exposed colour, and at tau > 0 the constant cancelled out of rank/tau and
- * left the Gumbel noise alone -- which is why --gumbel_tau_columns 2 and 4 were
- * observed to pick identical columns run for run while --gumbel_tau_bottoms 2
+ * left the Gumbel noise alone -- which is why --tau_columns 2 and 4 were
+ * observed to pick identical columns run for run while --tau_bottoms 2
  * and 4 differed. The same argument voids every supply/demand variant of it,
  * closure_raw on the initial board included: any functional of that multiset is
  * constant across columns. Only POSITIONAL information distinguishes them, and

@@ -44,19 +44,19 @@ cd "$REPO"
 [ -x bin/E555_backtracker ] || make backtracker
 
 echo "=== before ==="
-python3 tools/E555_rank.py "$BOARDS" --seed "$SEED" --top 3
+python3 tools/E555_rank.py "$BOARDS" --seed_file "$SEED" --top 3
 
 HOLE_ARG=(); [ -n "$HOLES" ] && HOLE_ARG=(--holes "$HOLES")
 
 bin/E555_backtracker "$SEED" "$BOARDS" "$OUT" "${HOLE_ARG[@]}" \
-    --row "$FIRST_LINE" --count "$N_LINES" --threads "$THREADS" \
-    --order "$ORDER" --break-mode "$MODE" \
-    --max-mismatch "$MAX_MISMATCH" --stuck_restarts "$RESTARTS" \
-    --time-limit "$TIME_LIMIT" --print-cmd --verbose
+    --start_row "$FIRST_LINE" --num_rows "$N_LINES" --threads "$THREADS" \
+    --order "$ORDER" --break_mode "$MODE" \
+    --breaks "$MAX_MISMATCH" --restarts "$RESTARTS" \
+    --time_limit "$TIME_LIMIT" --print_cmd --verbose
 
 echo
 echo "=== after ==="
-python3 tools/E555_rank.py "$OUT" --seed "$SEED" --top 3
+python3 tools/E555_rank.py "$OUT" --seed_file "$SEED" --top 3
 echo
 echo "Files written:"
 sed 's/^/  /' "$OUT.outputs.txt"

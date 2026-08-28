@@ -21,16 +21,16 @@ EXAMPLE RUNS
     # The final push of a top sliding window (see the STRATEGY GUIDE below):
     #   open the top 4 rows, herd breaks up into the top corners.
     python3 E555_topper.py seed_Edge5.txt board.csv topped.csv \
-            --side T --work-rows 4 --workers 8 --verbose
+            --side T --band_depth 4 --threads 8 --verbose
 
     # Clean-up pass: fold whatever is left into the top-right corner, and ask
     # for the 3 best genuinely-different boards to carry into the next step.
     python3 E555_topper.py seed_Edge5.txt topped.csv corner.csv \
-            --side TR --work-rows 4 --report_best 3
+            --side TR --band_depth 4 --top 3
 
     # Recover breaks stranded on a side the top window never opened.
     python3 E555_topper.py seed_Edge5.txt corner.csv left.csv \
-            --side L --work-rows 4
+            --side L --band_depth 4
 
 THE MODEL
 
@@ -45,19 +45,19 @@ THE MODEL
            (right for the right half, left for the left half).
       Together, (2) then (3) mean "go to the closest corner".
     - Iterative solving: the outermost rows/cols of the open band can be
-      locked empty (--unused_rows) while the rest mutates (--work-rows),
+      locked empty (--locked_rows) while the rest mutates (--band_depth),
       enabling the sliding-window strategy below.
-    - Beam search: --report_best N emits N genuinely DIFFERENT near-optimal
+    - Beam search: --top N emits N genuinely DIFFERENT near-optimal
       boards (see --beam_diff / --beam_slack), not N successive incumbents.
-    - Smart scoring: --allow_break_increase trades a slightly worse total
+    - Smart scoring: --relax_breaks trades a slightly worse total
       for a longer push (useful in the middle window steps).
-    - Chunked CSV reading (--row / --count) for Slurm array jobs; writes
+    - Chunked CSV reading (--start_row / --num_rows) for Slurm array jobs; writes
       are retried once on transient network-filesystem errors.
 
 WHAT IS OPEN FOR MUTATION
 
-    band   = the --side bands, each --work-rows deep
-    unused = the outermost --unused_rows rows/cols of those same bands
+    band   = the --side bands, each --band_depth deep
+    unused = the outermost --locked_rows rows/cols of those same bands
     free   = band + break cells orthogonally adjacent to the band - unused
 
     Two rules keep a --side run confined to that side:
@@ -68,7 +68,7 @@ WHAT IS OPEN FOR MUTATION
       * An empty cell outside the band stays empty. Only the band, and the
         breaks touching it, are opened; the rest of the board is frozen.
 
-    --unused_rows N actively UNSETS those cells: any piece sitting there is
+    --locked_rows N actively UNSETS those cells: any piece sitting there is
     lifted to 999 before the model is built, and the cells stay empty for
     this run. Note the lifted pieces do rejoin the free pool -- the solver
     may re-use them elsewhere in the band. The output therefore shows those
@@ -77,11 +77,11 @@ WHAT IS OPEN FOR MUTATION
 
     --holes FILE replaces all of that with an explicit 16x16 0/1 mask (the
     same dialect the ender and the backtracker read, see data/holes_*.csv):
-    free = exactly the cells marked 1. --side, --work-rows and the
+    free = exactly the cells marked 1. --side, --band_depth and the
     break-adjacency rule no longer apply, because the mask already says
     precisely which cells may move. Use it when the region you want is not a
     border band -- an L round a corner, a ragged patch round a cluster of
-    breaks, or the interior a band can never reach. --unused_rows is defined
+    breaks, or the interior a band can never reach. --locked_rows is defined
     in terms of the bands, so it cannot be combined with a mask.
 
 CLUE PIECES
@@ -113,7 +113,7 @@ OUTPUT
     unplaced cell counted as breaks, so a plain sort -k2,2nr pruning ranks
     these boards. The input row index is appended to the id as `#<row>` when
     not already tagged, and
-    `_r<rank>` distinguishes the ranks of a --report_best beam. --tag_id
+    `_r<rank>` distinguishes the ranks of a --top beam. --tag_id
     additionally appends `_<score>` to the id (older naming style).
 
     The break count alone hides what matters between window steps: eighteen
@@ -132,17 +132,17 @@ a constant computation size (e.g., a 4-row budget).
 Assuming row 0 is the bottom and row 15 is the top, here is how you bring pieces
 up from row 9 all the way to the top using overlapping steps (--side T):
 
-Step 1: --work-rows 7 --unused_rows 3
+Step 1: --band_depth 7 --locked_rows 3
         (Opens rows 9, 10, 11, 12. Rows 13-15 are locked empty)
-Step 2: --work-rows 6 --unused_rows 2
+Step 2: --band_depth 6 --locked_rows 2
         (Opens rows 10, 11, 12, 13. Notice it can still mutate 11-12 to fix mistakes!)
-Step 3: --work-rows 5 --unused_rows 1
+Step 3: --band_depth 5 --locked_rows 1
         (Opens rows 11, 12, 13, 14. Row 15 is locked empty)
-Step 4: --work-rows 4 --unused_rows 0
+Step 4: --band_depth 4 --locked_rows 0
         (Opens rows 12, 13, 14, 15. The final push!)
 
 Then, if breaks remain stuck on a side the window never opened, run a clean-up
-pass there: --side L (or R, or B) with --work-rows 4 --unused_rows 0. --side TR
+pass there: --side L (or R, or B) with --band_depth 4 --locked_rows 0. --side TR
 and --side TL open an L-shaped band and drive breaks into that one corner;
 --side TB opens both horizontal borders at once, which is the cheapest way to
 find out whether the two opposite sides can be re-cut against each other.
@@ -410,7 +410,7 @@ def solve_frontier(pos, rot, tiles, free_cells, args, verbose, pins=()):
     # objective one to two orders of magnitude smaller, which is a materially
     # easier LP relaxation for CP-SAT.
     n = max(1, len(breaks))
-    if args.allow_break_increase:
+    if args.relax_breaks:
         # Smart Scoring: deliberately NOT lexicographic -- 1 break is tradeable
         # for 5 units of row cost (2.5 rows of push), as in the topper. In this
         # mode decode_obj's split is indicative only.
@@ -462,11 +462,11 @@ def solve_frontier(pos, rot, tiles, free_cells, args, verbose, pins=()):
     def run_solve(budget):
         """Solves the current model for at most `budget` seconds."""
         solver = cp_model.CpSolver()
-        solver.parameters.num_search_workers = args.workers
+        solver.parameters.num_search_workers = args.threads
         solver.parameters.linearization_level = 1
         solver.parameters.symmetry_level = 0
         solver.parameters.random_seed = (args.rng_seed & 0x7fffffff
-                                         if args.rng_seed >= 0 else random.randrange(1 << 31))
+                                         if args.rng_seed != 0 else random.randrange(1 << 31))
         solver.parameters.max_time_in_seconds = float(budget)
 
         tracker = _Tracker()
@@ -524,8 +524,8 @@ def solve_frontier(pos, rot, tiles, free_cells, args, verbose, pins=()):
     # --beam_slack extra breaks. Successive incumbents of a single search are
     # near-duplicates of the optimum, so they are NOT used as ranks.
     # ---------------------------------------------------------
-    ranks = max(1, args.report_best)
-    budget = float(args.max_time) if ranks == 1 else float(args.max_time) / ranks
+    ranks = max(1, args.top)
+    budget = float(args.time_limit) if ranks == 1 else float(args.time_limit) / ranks
     results, wall, rsn = [], 0.0, "no-sol"
 
     for rank in range(ranks):
@@ -565,9 +565,9 @@ def build_free(pos, rot, tiles, side, work_rows, unused_rows, holes=None):
     Determines which cells the solver is allowed to mutate, and which are held
     empty. Returns (free, unused).
 
-    free   = the --side bands, --work-rows deep, plus any break cell that lies
+    free   = the --side bands, --band_depth deep, plus any break cell that lies
              in or touches those bands, minus the unused region.
-    unused = the outermost --unused_rows rows/cols of the same bands: locked
+    unused = the outermost --locked_rows rows/cols of the same bands: locked
              empty for this run (main() lifts any piece sitting there to 999).
 
     This does NOT free every break cell on the board, nor every empty cell: a
@@ -615,27 +615,27 @@ def main():
     ap.add_argument("output", help="Output CSV for topped-out results")
 
     # Processing Options
-    ap.add_argument("--row",        type=int,   default=0, help="First row of the CSV to process (0-indexed)")
-    ap.add_argument("--count",      type=int,   default=1, help="Number of rows to process before exiting")
+    ap.add_argument("--start_row",  type=int,   default=0, help="First row of the CSV to process (0-indexed)")
+    ap.add_argument("--num_rows",   type=int,   default=0, help="Number of rows to process (default 0 = every remaining row)")
 
     # Spatial Options
     ap.add_argument("--side",       default="T", choices=sorted(SIDES),
                     help="Which border band(s) to open: T B R L (one side), "
                          "TR TL BR BL (L-shaped corner), TB (both horizontal "
                          "borders), LR (both vertical borders).")
-    ap.add_argument("--work-rows",  type=int,   default=4, help="Depth of EACH open band, in rows (T/B) or columns (R/L).")
+    ap.add_argument("--band_depth", type=int,   default=4, help="Depth of EACH open band, in rows (T/B) or columns (R/L).")
     ap.add_argument("--holes", default=None,
                     help="16x16 0/1 mask of movable cells (see data/holes_*.csv). "
-                         "Replaces --side / --work-rows and is taken literally; "
-                         "cannot be combined with --unused_rows.")
-    ap.add_argument("--unused_rows", "--unused_top_rows", type=int, default=0, dest="unused_rows",
+                         "Replaces --side / --band_depth and is taken literally; "
+                         "cannot be combined with --locked_rows.")
+    ap.add_argument("--locked_rows", type=int, default=0,
                     help="Outermost rows/cols of each band to unset (999) and lock empty.")
 
     # Heuristic & Output Options
-    ap.add_argument("--report_best", type=int, default=1, help="Beam Search: Output N distinct near-optimal boards per input board.")
+    ap.add_argument("--top",        type=int, default=1, help="Beam Search: Output N distinct near-optimal boards per input board.")
     ap.add_argument("--beam_diff",  type=int,   default=4, help="Beam Search: minimum cells by which ranks must differ.")
     ap.add_argument("--beam_slack", type=int,   default=1, help="Beam Search: extra breaks a lower rank may cost.")
-    ap.add_argument("--allow_break_increase", action="store_true", help="Smart Scoring: Allows more total breaks if pushed further.")
+    ap.add_argument("--relax_breaks", action="store_true", help="Smart Scoring: Allows more total breaks if pushed further.")
 
     # Clue Options: hold the published Eternity II hint pieces in place.
     ap.add_argument("--clue_center", action="store_true",
@@ -651,25 +651,25 @@ def main():
     ap.add_argument("--tag_id", action="store_true", help="Also append _<score> to each output config_id (legacy naming).")
 
     # Solver Options
-    ap.add_argument("--max-time",   type=float, default=300.0, help="Absolute max time allowed per board (seconds)")
-    ap.add_argument("--stall-time", type=float, default=120.0, help="Stop solver if no improvements seen in X seconds")
-    ap.add_argument("--workers",    type=int,   default=8, help="CP-SAT thread count")
-    ap.add_argument("--rng-seed",   type=int,   default=-1, help="Random seed (default: OS entropy)")
+    ap.add_argument("--time_limit", type=float, default=300.0, help="Absolute max time allowed per board (seconds)")
+    ap.add_argument("--stall_time", type=float, default=120.0, help="Stop solver if no improvements seen in X seconds")
+    ap.add_argument("--threads",    type=int,   default=8, help="CP-SAT thread count")
+    ap.add_argument("--rng_seed",   type=int,   default=0, help="Random seed (0 = OS entropy)")
     ap.add_argument("--verbose",    action="store_true", help="Print detailed solver telemetry")
     args = ap.parse_args()
-    
-    if not (1 <= args.work_rows <= SIDE): sys.exit(f"[ERROR] --work-rows must be in 1..{SIDE}.")
-    if not (0 <= args.unused_rows < args.work_rows):
-        sys.exit(f"[ERROR] --unused_rows must be in 0..{args.work_rows - 1} (below --work-rows).")
+
+    if not (1 <= args.band_depth <= SIDE): sys.exit(f"[ERROR] --band_depth must be in 1..{SIDE}.")
+    if not (0 <= args.locked_rows < args.band_depth):
+        sys.exit(f"[ERROR] --locked_rows must be in 0..{args.band_depth - 1} (below --band_depth).")
     holes = None
     if args.holes:
-        if args.unused_rows:
-            sys.exit("[ERROR] --unused_rows locks the outer part of a --side band; "
+        if args.locked_rows:
+            sys.exit("[ERROR] --locked_rows locks the outer part of a --side band; "
                      "with --holes there is no band. Draw the mask you want instead.")
         holes = read_holes_file(args.holes)
         if not holes:
             sys.exit(f"[ERROR] --holes {args.holes} marks no cell as movable.")
-    if args.report_best < 1: sys.exit("[ERROR] --report_best must be >= 1.")
+    if args.top < 1: sys.exit("[ERROR] --top must be >= 1.")
     if args.beam_diff < 1: sys.exit("[ERROR] --beam_diff must be >= 1.")
     if args.beam_slack < 0: sys.exit("[ERROR] --beam_slack must be >= 0.")
 
@@ -679,7 +679,7 @@ def main():
         clue_mask = ((CL.CLUE_CENTER if args.clue_center else 0)
                      | (CL.CLUE_CORNERS if args.clue_corners else 0))
 
-    master = args.rng_seed if args.rng_seed >= 0 else int.from_bytes(os.urandom(4), "little")
+    master = args.rng_seed if args.rng_seed != 0 else int.from_bytes(os.urandom(4), "little")
     random.seed(master)
     tiles = read_seed(args.seed)
     signal.signal(signal.SIGINT, _request_stop)
@@ -689,10 +689,10 @@ def main():
         print(f"[cfg] {arg} = {value}")
     if holes is not None:
         print(f"[cfg] open cells: {len(holes)} from the --holes mask "
-              "(--side / --work-rows do not apply)")
+              "(--side / --band_depth do not apply)")
     else:
-        print(f"[cfg] open bands: {' + '.join(SIDES[args.side])}, {args.work_rows} deep"
-              + (f", outermost {args.unused_rows} locked empty" if args.unused_rows else ""))
+        print(f"[cfg] open bands: {' + '.join(SIDES[args.side])}, {args.band_depth} deep"
+              + (f", outermost {args.locked_rows} locked empty" if args.locked_rows else ""))
     print("[init] starting process loop...", flush=True)
 
     script_start_time = time.time()
@@ -704,7 +704,7 @@ def main():
     # outside the deliberately-emptied region. The CSV score keeps counting all
     # 480 (unplaced cells count as breaks, as everywhere in Stage C); this is
     # only the honest denominator for the printed telemetry.
-    unused_all = side_cells(args.side, args.unused_rows) if args.unused_rows else set()
+    unused_all = side_cells(args.side, args.locked_rows) if args.locked_rows else set()
     max_score = sum(1 for a, b, _da, _db in ALL_JUNCTIONS
                     if a not in unused_all and b not in unused_all)
 
@@ -713,22 +713,24 @@ def main():
         # writer in the toolkit overrides.
         writer = csv.writer(out, lineterminator="\n")
         reader = csv.reader(src)
-        # --row/--count count BOARD rows, not raw CSV lines. bin/E555_backtracker
-        # prefixes its output with two '#' header lines, and counting those made
-        # the default `--row 0 --count 1` select a comment and process nothing --
-        # the same defect as parsing one, one step later. Skipping them here also
-        # keeps the promise the whole pipeline rests on: any tool's output feeds
-        # any tool's input.
+        # --start_row/--num_rows count BOARD rows, not raw CSV lines.
+        # bin/E555_backtracker prefixes its output with two '#' header lines,
+        # and counting those made the default `--start_row 0 --num_rows 1`
+        # select a comment and process nothing -- the same defect as parsing
+        # one, one step later. Skipping them here also keeps the promise the
+        # whole pipeline rests on: any tool's output feeds any tool's input.
+        # --num_rows 0 means every remaining row from --start_row.
         boards = (row for row in reader
                   if row and row[0].strip()
                   and not row[0].lstrip().startswith(("#", "%")))
-        iterator = itertools.islice(boards, args.row, args.row + args.count)
+        stop = None if args.num_rows == 0 else args.start_row + args.num_rows
+        iterator = itertools.islice(boards, args.start_row, stop)
 
-        for i, row in enumerate(iterator, args.row):
+        for i, row in enumerate(iterator, args.start_row):
             if _STOP: break
             partial = parse_partial_line(row)
             free, unused = build_free(partial.pos, partial.rot, tiles,
-                                      args.side, args.work_rows, args.unused_rows,
+                                      args.side, args.band_depth, args.locked_rows,
                                       holes)
 
             # Lift every piece sitting in the locked-empty region: those cells
@@ -780,7 +782,7 @@ def main():
                 skipped_count += 1
             else:
                 results, reason, sec = solve_frontier(partial.pos, partial.rot, tiles, free, args, args.verbose, pins)
-                if len(results) < args.report_best:
+                if len(results) < args.top:
                     short_beams += 1
 
             # Output the top N configurations found
@@ -801,7 +803,7 @@ def main():
                 # ranks of a beam, and --tag_id restores the legacy `_<score>`.
                 cid = partial.config_id if '#' in partial.config_id \
                     else f"{partial.config_id}#{i}"
-                if args.report_best > 1:
+                if args.top > 1:
                     cid += f"_r{rank}"
                 if args.tag_id:
                     cid += f"_{score}"
@@ -825,7 +827,7 @@ def main():
     print(f"[sum] {processed_count} boards processed in {total_time:.1f}s"
           + (f" ({skipped_count} already clean, no solve)" if skipped_count else ""))
     if short_beams:
-        print(f"[sum] {short_beams} board(s) emitted fewer than {args.report_best} ranks: "
+        print(f"[sum] {short_beams} board(s) emitted fewer than {args.top} ranks: "
               f"no board >= {args.beam_diff} cells different stayed within "
               f"{args.beam_slack} extra break(s). Raise --beam_slack for a wider beam.")
 

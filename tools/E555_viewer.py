@@ -43,9 +43,9 @@ USAGE
   python3 E555_viewer.py SOLUTIONS.csv --diff 3 7      # compare rows 3 and 7
   python3 E555_viewer.py SOLUTIONS.csv --name my_try   # label in board + URL
   python3 E555_viewer.py SOLUTIONS.csv --all           # just a URL per row
-  python3 E555_viewer.py SOLUTIONS.csv --no-url        # ASCII board only
+  python3 E555_viewer.py SOLUTIONS.csv --no_url        # ASCII board only
 
-The seed is taken from --seed PATH; without the option the viewer tries
+The seed is taken from --seed_file PATH; without the option the viewer tries
 ./seed_Edge5.txt in the current directory, then data/seed_Edge5.txt next to
 this repository's tools/ directory.
 """
@@ -61,7 +61,7 @@ N_TRAILING = 2 * N_PIECES       # 512 = pos[256] + rot[256]
 N_EDGES = 2 * SIDE * (SIDE - 1) # 480 internal edges (240 H + 240 V)
 UNPLACED = 999
 
-# Fallback seed locations tried in order when --seed is not given: the
+# Fallback seed locations tried in order when --seed_file is not given: the
 # current directory first (old behaviour), then the repository's data/ file
 # resolved relative to this script, so the tool works from any cwd.
 SEED_FALLBACKS = (
@@ -73,7 +73,7 @@ SEED_FALLBACKS = (
 # -- seed ----------------------------------------------------------------
 
 def find_seed(explicit):
-    """Resolve the seed path: --seed wins, else the first existing fallback."""
+    """Resolve the seed path: --seed_file wins, else the first existing fallback."""
     if explicit:
         p = Path(explicit)
         if not p.exists():
@@ -82,7 +82,7 @@ def find_seed(explicit):
     for p in SEED_FALLBACKS:
         if p.exists():
             return p
-    raise SystemExit("No seed file found: pass --seed PATH "
+    raise SystemExit("No seed file found: pass --seed_file PATH "
                      f"(tried {', '.join(str(p) for p in SEED_FALLBACKS)})")
 
 
@@ -552,7 +552,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", help="solutions/partials CSV (tailsolver stack)")
-    ap.add_argument("--seed", default=None, metavar="PATH",
+    ap.add_argument("--seed_file", default=None, metavar="PATH",
                     help="piece seed file (default: ./seed_Edge5.txt, then the "
                          "repository's data/seed_Edge5.txt)")
     ap.add_argument("--row", type=int, default=0,
@@ -563,11 +563,11 @@ def main(argv=None):
                     help="label for the board title and URL (default: from CSV)")
     ap.add_argument("--all", action="store_true",
                     help="print one URL per row and exit (no ASCII board)")
-    ap.add_argument("--no-board", action="store_true", help="skip the ASCII board")
-    ap.add_argument("--no-url", action="store_true", help="skip the bucas URL")
+    ap.add_argument("--no_board", action="store_true", help="skip the ASCII board")
+    ap.add_argument("--no_url", action="store_true", help="skip the bucas URL")
     args = ap.parse_args(argv)
 
-    seed = load_seed(find_seed(args.seed))
+    seed = load_seed(find_seed(args.seed_file))
 
     if args.diff:
         ia, ib = args.diff

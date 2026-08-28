@@ -26,16 +26,16 @@
  *     --hall controls the policy.  With --jump on, or with an exact side-growth
  *     order, an impossible cell is deferred so independent gaps can keep
  *     growing and completion-only prunes are disabled.
- *   - --max-mismatch K allows up to K broken internal edges in the finished
+ *   - --breaks K allows up to K broken internal edges in the finished
  *     board (default 0 = exact).  K is an ABSOLUTE ceiling: breaks already in
  *     the input count against it, and an input that already exceeds K is
  *     dropped.  Iterative deepening over the budget finds the fewest breaks
- *     when each level is exhaustive (break-mode any, or uncapped lds); stuck
- *     is a faster heuristic.  With --all-solutions, retained ties prefer fewer
- *     distinct pieces touched.  --break-mode selects where breaks may be
+ *     when each level is exhaustive (break_mode any, or uncapped lds); stuck
+ *     is a faster heuristic.  With --max_emitted 0, retained ties prefer fewer
+ *     distinct pieces touched.  --break_mode selects where breaks may be
  *     spent: stuck (dead-end cells only), any (everywhere; complete but
  *     exponential), or lds (discrepancy-limited widening from stuck toward
- *     any, --lds-max caps the allowance).
+ *     any, --lds_max caps the allowance).
  *
  * OUTPUT
  *   - The mandatory output.csv gets ONE line per processed record: the best
@@ -49,14 +49,14 @@
  *     (>=10 s throttle per record).  Removed on clean completion.
  *   - ~30 s heartbeat progress lines per in-flight record (k, D, nodes, best).
  *   - --status optionally writes <output>.status.csv with one diagnostic row
- *     per parsed input record.  --best-output N additionally writes global
+ *     per parsed input record.  --best_n N additionally writes global
  *     top-N pure and mismatch partial-board CSVs.
  *
  * PARALLELISM (OpenMP)
  *   - Automatic, resolved once the input window is known: with no more records
  *     than threads, every worker attacks one record's search together; otherwise
- *     each worker takes its own record.  --all-for-one forces the former.
- *   - stuck mode ignores all of that: --stuck_restarts dives share nothing, so
+ *     each worker takes its own record.  --all_for_one forces the former.
+ *   - stuck mode ignores all of that: --restarts dives share nothing, so
  *     they are simply split across threads.
  *   - There is no knob for the frontier split.  It was measured and it does not
  *     matter: see the note on SPLIT_TASKS_PER_THREAD, where an independent-process
@@ -114,7 +114,7 @@
  * deliberately no CLI knob for it, because it was measured and it does not matter.
  *
  * MEASUREMENT (2026-07-21, 4 physical / 8 logical cores, 48-cell tail,
- * --break-mode lds --lds-max 0 --max-mismatch 12, 3 reps):
+ * --break_mode lds --lds_max 0 --breaks 12, 3 reps):
  *   tasks/thread    16      64     128     512    2048
  *   wall @4 thr   5.88s   5.78s  5.76s   5.96s  11.19s
  *   wall @8 thr   4.92s   5.05s  4.99s   5.57s  23.95s
@@ -206,8 +206,8 @@ static bool g_holes_active = false;
 /* -- Global configuration ----------------------------------------------------- */
 
 static int         g_nthreads           = 0;
-static long long   g_row_start          = -1;   /* -1 = no --row (start at record 0) */
-static long long   g_count              = -1;   /* -1 = unset; resolved in main() */
+static long long   g_row_start          = 0;    /* --start_row: 0-based first record */
+static long long   g_count              = 0;    /* --num_rows: 0 = every remaining record */
 static bool        g_verbose            = false;
 static int         g_best_output        = 0;    /* 0 = off: no global top-N partial tracks */
 
@@ -249,11 +249,11 @@ static uint64_t    g_solution_limit     = 1;    /* per record; 0 = enumerate all
  * Iterative deepening runs k = input_breaks .. g_max_mismatch.  With an
  * exhaustive break policy and no cutoff, the first completed level has the
  * minimum number of breaks.  Exhaustive ranking within that level (including
- * the clustering tie-break) additionally requires --all-solutions.
+ * the clustering tie-break) additionally requires --max_emitted 0.
  */
 static int      g_max_mismatch     = 0;
 /* Per-record wall-clock budget for the mismatch search (seconds).  -1 -> unset:
- * defaults to TIME_LIMIT_DEFAULT when --max-mismatch>0, else unlimited.  An
+ * defaults to TIME_LIMIT_DEFAULT when --breaks>0, else unlimited.  An
  * explicit 0 means unlimited.  When the budget elapses the search stops and the
  * best board found so far (complete if any, else deepest partial) is reported.
  * Proving a board cannot be completed within K breaks can be exponential, so a
@@ -268,27 +268,27 @@ static double   g_time_limit_sec   = -1.0;
  *   stuck (default): GREEDY DESCENT, no backtracking - see greedy_dive().
  *     Takes an exact fit where one exists, spends a minimal break where none
  *     does, never reconsiders, and therefore always reaches 256 pieces in one
- *     pass over the empty cells.  Cost is O(cells) per dive, so --stuck_restarts
+ *     pass over the empty cells.  Cost is O(cells) per dive, so --restarts
  *     runs many randomized dives and keeps the best.  This is a fast filter for
  *     ranking candidate partials, NOT a proof: it never establishes that a
  *     board cannot be completed with fewer breaks.
  *
  *   any: breaks are tried at every cell (in addition to exact fits) - complete
  *     within the budget but exponentially wide, so it must be paired with
- *     --time-limit.
+ *     --time_limit.
  *
  *   lds (E555): limited discrepancy on VOLUNTARY breaks.  At a cell with no
  *     exact fit, all break classes within the budget are tried.  Taking a break
  *     candidate where an exact fit also exists costs one discrepancy; a search
  *     pass with allowance D permits at most D such choices per path.  D iterates
- *     0,1,2,... inside each budget level's time window (capped by --lds-max),
+ *     0,1,2,... inside each budget level's time window (capped by --lds_max),
  *     and each D+1 widens toward any-mode completeness.
  *
  * any and lds keep the iterative-deepening ladder (k = input_breaks .. budget),
  * so an exhausted level is a theorem: no completion exists with <= k broken
  * edges.  Use them for overnight runs.  stuck never enters that loop.
  *
- * Exact search (--max-mismatch 0) is independent of all three: with a zero
+ * Exact search (--breaks 0) is independent of all three: with a zero
  * budget collect_candidates() never gathers break placements, so the mode
  * cannot influence it. */
 typedef enum { BREAK_STUCK = 0, BREAK_ANY, BREAK_LDS } BreakMode;
@@ -414,7 +414,7 @@ static const char *order_name(OrderMode m) {
     }
 }
 
-/* -- --print-cmd ----------------------------------------------------------
+/* -- --print_cmd ----------------------------------------------------------
  * The whole invocation with every flag carrying the value the run will really
  * use, from the command line or from a default. Copy the line and you have the
  * run. Prints and then continues, so a script can pass it on every run.
@@ -426,31 +426,29 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
                       const char *out_path, const char *holes_path, int nt) {
     printf("[cmd] %s %s %s %s", a0, seed_path, csv_path, out_path);
     if (g_verbose)      printf(" --verbose");
-    if (g_print_cmd)    printf(" --print-cmd");
+    if (g_print_cmd)    printf(" --print_cmd");
     if (g_reverse)      printf(" --reverse");
     if (g_jump)         printf(" --jump");
     if (g_with_frame)   printf(" --with_frame");
     if (g_write_status) printf(" --status");
-    printf(g_dedup ? " --dedup" : " --no-dedup");
-    if (g_parallel_mode == PAR_SEARCH) printf(" --all-for-one");
+    printf(g_dedup ? " --dedup" : " --no_dedup");
+    if (g_parallel_mode == PAR_SEARCH) printf(" --all_for_one");
     if (holes_path)     printf(" --holes %s", holes_path);
-    if (g_row_start >= 0) printf(" --row %lld", g_row_start);
-    if (g_count >= 1)     printf(" --count %lld", g_count);
-    if (g_best_output > 0) printf(" --best-output %d", g_best_output);
+    printf(" --start_row %lld --num_rows %lld", g_row_start, g_count);
+    if (g_best_output > 0) printf(" --best_n %d", g_best_output);
     if (g_stop_active)
         printf(" %s %d", g_stop_isrow ? "--stop_row" : "--stop_column", g_stop_n);
     printf(" --rotate %d", g_rotation);
-    printf(" --order %s --break-mode %s", order_name(g_order_mode),
+    printf(" --order %s --break_mode %s", order_name(g_order_mode),
            break_mode_name(g_break_mode));
-    printf(" --max-mismatch %d", g_max_mismatch);
-    if (g_lds_max >= 0) printf(" --lds-max %d", g_lds_max);
-    if (g_solution_limit == 0) printf(" --all-solutions");
-    else                       printf(" --solution-limit %" PRIu64, g_solution_limit);
-    printf(" --stuck_restarts %lld", (long long)g_stuck_restarts);
-    if (g_hall_mode == HALL_OFF) printf(" --no-hall");
+    printf(" --breaks %d", g_max_mismatch);
+    if (g_lds_max >= 0) printf(" --lds_max %d", g_lds_max);
+    printf(" --max_emitted %" PRIu64, g_solution_limit);
+    printf(" --restarts %lld", (long long)g_stuck_restarts);
+    if (g_hall_mode == HALL_OFF) printf(" --no_hall");
     else                         printf(" --hall %s", hall_mode_name(g_hall_mode));
-    printf(" --hall-stride %d --hall-small %d", g_hall_stride, g_hall_small);
-    if (g_time_limit_sec >= 0) printf(" --time-limit %g", g_time_limit_sec);
+    printf(" --hall_stride %d --hall_min %d", g_hall_stride, g_hall_small);
+    if (g_time_limit_sec >= 0) printf(" --time_limit %g", g_time_limit_sec);
     printf(" --threads %d\n", nt);
 }
 
@@ -477,7 +475,7 @@ static const char *effective_hall_name(void) {
 static uint64_t g_total_solutions    = 0;
 static uint64_t g_records_processed  = 0;
 static uint64_t g_cnt_invalid        = 0;
-static uint64_t g_cnt_dropped        = 0;   /* input_breaks already exceed --max-mismatch */
+static uint64_t g_cnt_dropped        = 0;   /* input_breaks already exceed --breaks */
 static uint64_t g_cnt_duplicate      = 0;   /* post-holes board repeats an earlier row */
 static uint64_t g_cnt_infeasible     = 0;
 static uint64_t g_cnt_hall_infeasible= 0;
@@ -2568,7 +2566,7 @@ static void write_stream_best(const Board *b,
  * Two failure modes, treated differently on purpose.  A structural defect (an
  * unfilled band cell, a frame-zero violation) is an internal error and aborts,
  * exactly as write_solution does for a full board.  A BROKEN EDGE only drops
- * the board: --break-mode stuck takes a minimal break wherever no exact fit
+ * the board: --break_mode stuck takes a minimal break wherever no exact fit
  * exists, so it produces such bands legitimately, and they are useless
  * downstream because the finalizer validates every color match inside its
  * locked region.  Rejections are counted so a run that emits nothing is
@@ -2805,7 +2803,7 @@ static bool partial_better(int a_tot, int a_conn, int a_brk, int a_bpieces,
  *
  * pure_track_ok is true only at the budget-0 deepening level.  A 0-break board
  * found while a break budget is active is NOT added to the pure track, so the
- * pure result is exactly what a --max-mismatch 0 run produces -- independent of
+ * pure result is exactly what a --breaks 0 run produces -- independent of
  * the requested budget.  rstat (the streamed overall best) is always updated.
  */
 static void try_update_best(const Board *cur_board,
@@ -2912,7 +2910,7 @@ typedef struct {
 } MismatchSolution;
 
 /* In mismatch mode, complete leaves are not written immediately.  The solver
- * keeps the top --best-output complete boards at the first budget level that
+ * keeps the top --best_n complete boards at the first budget level that
  * succeeds.  Ranking is exact: fewer broken edges, then fewer break-touched
  * pieces, then deterministic board order for ties. */
 typedef struct {
@@ -3001,7 +2999,7 @@ static void mres_merge(MismatchResult *dst, const MismatchResult *src) {
  * better than row-major, but it still selected cells with hundreds of legal
  * rotations in mismatch-any mode.  v8 keeps v7 candidate-aware MRV: it counts the actual candidate placements
  * that fit the current board and remaining break budget, then chooses the cell
- * with the fewest viable continuations.  This is the main reason --break-mode
+ * with the fewest viable continuations.  This is the main reason --break_mode
  * any becomes usable for small mismatch budgets.
  */
 #define MAX_CANDIDATES (NUM_PIECES * 4)
@@ -3356,7 +3354,7 @@ typedef struct {
 } DiveStats;
 
 /*
- * Run --stuck_restarts independent greedy dives and keep the best boards.
+ * Run --restarts independent greedy dives and keep the best boards.
  *
  * Parallelism here is the safe kind: dives share nothing.  Each thread owns its
  * Board, FcState, RNG and MismatchResult, and the per-thread results are merged
@@ -4291,7 +4289,7 @@ static void process_line(const char *config_id_str, long long sol_id,
     }
 
     /* -- Drop records whose input already exceeds the TOTAL break budget --
-     * --max-mismatch is the absolute ceiling on broken edges in the finished
+     * --breaks is the absolute ceiling on broken edges in the finished
      * board; input breaks count against it.  If the input alone already has more
      * breaks than allowed, no completion can satisfy the budget, so skip it
      * without searching (its own status/counter, never a silent no_solution). */
@@ -4300,7 +4298,7 @@ static void process_line(const char *config_id_str, long long sol_id,
         g_cnt_dropped++;
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
                 "[cfg=%s sol=%lld] DROPPED: input has %d broken edge(s) > "
-                "--max-mismatch %d (total budget); not searched.\n",
+                "--breaks %d (total budget); not searched.\n",
                 config_id_str, sol_id, input_breaks, g_max_mismatch);
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); }
@@ -4400,7 +4398,7 @@ static void process_line(const char *config_id_str, long long sol_id,
      * All levels share the one per-record deadline.  A timed-out lower level may
      * still widen to a higher mismatch budget only while that same deadline has
      * time remaining. */
-    /* E555 interprets --time-limit as one total per-record budget, not one fresh
+    /* E555 interprets --time_limit as one total per-record budget, not one fresh
      * window per mismatch level.  Unset means unlimited for exact search and the
      * conservative default only for mismatch search. */
     double eff_limit = g_time_limit_sec;
@@ -4754,7 +4752,7 @@ typedef struct {
  * aggressive --holes file removes; after the holes they are the SAME initial
  * board, and searching the later copies would exactly repeat the earlier
  * search.  Before processing, every record with row index < proc_end (i.e.
- * rows that will be processed PLUS rows skipped because they lie below --row,
+ * rows that will be processed PLUS rows skipped because they lie below --start_row,
  * which belong to an earlier block of a split run) is hashed on its
  * post-holes initial board.  Records whose board exactly matches an earlier
  * row are marked as duplicates and skipped with a message naming that row.
@@ -4877,19 +4875,20 @@ static void usage(const char *prog) {
         "Core options:\n"
         "  --version              Print the exact build tag and exit.\n"
         "  --threads N            OpenMP worker count (default: all available).\n"
-        "  --all-for-one          Put every thread on one record's search at a time,\n"
+        "  --all_for_one          Put every thread on one record's search at a time,\n"
         "                         instead of one record per thread.  Chosen\n"
         "                         automatically when there are no more records than\n"
         "                         threads; use this to force it.\n"
-        "  --row N                First data-record index (0 based).\n"
-        "  --count N              Number of records; default 1 with --row, else all.\n"
+        "  --start_row N          First data-record index (0 based, default 0).\n"
+        "  --num_rows N           Number of records to process (default 0 = every\n"
+        "                         remaining record from --start_row).\n"
         "  --holes PATH           256 position-indexed 0/1 entries; matrix CSV accepted.\n"
         "  --rotate K             Rotate K quarter turns CCW before search (0..3).\n"
         "  --verbose              Print every initial board and detailed statistics.\n"
-        "  --best-output N        Also retain global top-N pure/mismatch partials.\n"
+        "  --best_n N             Also retain global top-N pure/mismatch partials.\n"
         "  --status               Write output.csv.status.csv (off by default).\n"
         "  --dedup                Enable exact post-hole duplicate skipping (default).\n"
-        "  --no-dedup             Search every selected input row independently.\n\n",
+        "  --no_dedup             Search every selected input row independently.\n\n",
         stderr);
     fputs(
         "Search order and pruning:\n"
@@ -4902,7 +4901,7 @@ static void usage(const char *prog) {
         "                         side of every row before moving inward.\n"
         "                         4sides: exact left/right/bottom/top ring layers.\n"
         "                         Side modes defer dead cells and optimize a large\n"
-        "                         zero-mismatch partial; they require --max-mismatch 0.\n"
+        "                         zero-mismatch partial; they require --breaks 0.\n"
         "  --reverse              Reverse the --order traversal: rowmajor right-to-left,\n"
         "                         colmajor top-to-bottom, spiral/centerout/spiralout\n"
         "                         opposite chirality (border-first preserved); mrv uses\n"
@@ -4910,31 +4909,31 @@ static void usage(const char *prog) {
         "                         effect on 2sides/4sides.\n"
         "  --jump                 Best-partial mode: skip a dead cell and continue.\n"
         "  --hall MODE            off, root, adaptive (default), or always.\n"
-        "  --no-hall              Alias for --hall off.\n"
-        "  --hall-stride N        Adaptive Hall period in placements (default 8; 0=off).\n"
-        "  --hall-small N         Adaptive Hall always-on threshold (default 32 cells).\n\n",
+        "  --no_hall              Alias for --hall off.\n"
+        "  --hall_stride N        Adaptive Hall period in placements (default 8; 0=off).\n"
+        "  --hall_min N           Adaptive Hall always-on threshold (default 32 cells).\n\n",
         stderr);
     fputs(
         "Mismatch search:\n"
-        "  --max-mismatch K       Absolute completed-board broken-edge ceiling (0..480).\n"
+        "  --breaks K             Absolute completed-board broken-edge ceiling (0..480).\n"
         "                         0 = exact search.  In stuck mode every dive completes\n"
         "                         regardless, so K only filters what counts as a result.\n"
-        "  --break-mode MODE      stuck (default), any, or lds.\n"
+        "  --break_mode MODE      stuck (default), any, or lds.\n"
         "                         stuck: greedy dives, no backtracking, always completes.\n"
         "                           Fast triage for ranking partials; proves nothing.\n"
         "                         any/lds: exhaustive, iterative deepening.  An exhausted\n"
         "                           level proves no completion exists at that break count.\n"
-        "  --stuck_restarts N     Independent randomized dives per record (default 100000,\n"
+        "  --restarts N           Independent randomized dives per record (default 100000,\n"
         "                         roughly 5-10 s on four cores).\n"
         "                         Dives are sub-millisecond; N in the millions is fine.\n"
-        "  --lds-max N            With --break-mode lds, cap voluntary mismatch\n"
+        "  --lds_max N            With --break_mode lds, cap voluntary mismatch\n"
         "                         placements per root-to-leaf path.  Forced repairs\n"
         "                         at cells with no exact fit do not consume this count.\n"
-        "  --time-limit SEC       Total wall-clock budget per input record; 0=unlimited.\n"
+        "  --time_limit SEC       Total wall-clock budget per input record; 0=unlimited.\n"
         "                         Unset: unlimited for exact search, 30 s for mismatch.\n\n"
-        "  --solution-limit N     Stop after N completions per record (default 1; 0=all).\n"
-        "                         Ignored in stuck mode (--stuck_restarts governs).\n"
-        "  --all-solutions        Alias for --solution-limit 0.\n\n"
+        "  --max_emitted N        Stop after N completions per record (default 1; 0=all).\n"
+        "                         Ignored in stuck mode (--restarts governs).\n"
+        "                         Use --max_emitted 0 to enumerate every completion.\n\n"
         "Stop band (emit partials for the finalizer):\n"
         "  --stop_row N           Search ONLY rows 0..N and emit every way to fill\n"
         "                         them, as the beamer's --stop_row does.  Cells above\n"
@@ -4945,9 +4944,9 @@ static void usage(const char *prog) {
         "                         --reverse anchors either band at the far side\n"
         "                         instead (rows 15-N..15, columns 15-N..15) as well as\n"
         "                         flipping static traversal.  A band completion IS the\n"
-        "                         solution here, so --solution-limit caps how many are\n"
-        "                         emitted -- it defaults to 1, use --all-solutions to\n"
-        "                         enumerate.  Requires --max-mismatch 0 and --jump off.\n"
+        "                         solution here, so --max_emitted caps how many are\n"
+        "                         emitted -- it defaults to 1, use --max_emitted 0 to\n"
+        "                         enumerate.  Requires --breaks 0 and --jump off.\n"
         "  --with_frame           Widen the band to rows 0..N PLUS all 60 outer frame\n"
         "                         cells, so a fixed border survives the cut instead of\n"
         "                         being cleared with everything else outside the band.\n"
@@ -4965,8 +4964,8 @@ static void usage(const char *prog) {
         "  output.csv.checkpoint.csv      Crash recovery; removed on clean completion.\n"
         "  output.csv.stop_row<N>.csv     Every completed band, with --stop_row\n"
         "                                 (stop_col<N> for columns, _rev when reversed).\n"
-        "  output.csv.best_pure.csv       With --best-output.\n"
-        "  output.csv.best_mismatch.csv   With --best-output.\n\n",
+        "  output.csv.best_pure.csv       With --best_n.\n"
+        "  output.csv.best_mismatch.csv   With --best_n.\n\n",
         stderr);
 }
 
@@ -5042,7 +5041,7 @@ int main(int argc, char **argv) {
     const char *out_path   = argv[3];
     const char *holes_path = NULL;
     for (int i = 4; i < argc; i++) {
-        if (strcmp(argv[i], "--print-cmd") == 0) {
+        if (strcmp(argv[i], "--print_cmd") == 0) {
             g_print_cmd = true;
         } else if (strcmp(argv[i], "--verbose") == 0) {
             g_verbose = true;
@@ -5052,41 +5051,41 @@ int main(int argc, char **argv) {
             if (errno || end == argv[i] || *end || v <= 0 || v > INT_MAX)
                 fatal("--threads expects a positive integer, got '%s'", argv[i]);
             g_nthreads = (int)v;
-        } else if (strcmp(argv[i], "--all-for-one") == 0) {
+        } else if (strcmp(argv[i], "--all_for_one") == 0) {
             g_parallel_mode = PAR_SEARCH;
         } else if (strcmp(argv[i], "--reverse") == 0) {
             g_reverse = true;
         } else if (strcmp(argv[i], "--jump") == 0) {
             g_jump = true;
-        } else if (strcmp(argv[i], "--stuck_restarts") == 0 && i+1 < argc) {
+        } else if (strcmp(argv[i], "--restarts") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long long v = strtoll(argv[++i], &end, 10);
             if (errno || end == argv[i] || *end || v < 1)
-                fatal("--stuck_restarts expects a positive integer, got '%s'", argv[i]);
+                fatal("--restarts expects a positive integer, got '%s'", argv[i]);
             g_stuck_restarts = v;
-        } else if (strcmp(argv[i], "--row") == 0 && i+1 < argc) {
+        } else if (strcmp(argv[i], "--start_row") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long long v = strtoll(argv[++i], &end, 10);
             if (errno || end == argv[i] || *end || v < 0)
-                fatal("--row expects a non-negative integer (0-based record index), got '%s'", argv[i]);
+                fatal("--start_row expects a non-negative integer (0-based record index), got '%s'", argv[i]);
             g_row_start = v;
-        } else if (strcmp(argv[i], "--count") == 0 && i+1 < argc) {
+        } else if (strcmp(argv[i], "--num_rows") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long long v = strtoll(argv[++i], &end, 10);
-            if (errno || end == argv[i] || *end || v < 1)
-                fatal("--count expects a positive integer, got '%s'", argv[i]);
+            if (errno || end == argv[i] || *end || v < 0)
+                fatal("--num_rows expects a non-negative integer (0 = every remaining record), got '%s'", argv[i]);
             g_count = v;
         } else if (strcmp(argv[i], "--holes") == 0 && i+1 < argc) {
             holes_path = argv[++i];
-        } else if (strcmp(argv[i], "--best-output") == 0 && i+1 < argc) {
+        } else if (strcmp(argv[i], "--best_n") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
             if (errno || end == argv[i] || *end || v <= 0 || v > INT_MAX)
-                fatal("--best-output expects a positive integer, got '%s'", argv[i]);
+                fatal("--best_n expects a positive integer, got '%s'", argv[i]);
             g_best_output = (int)v;
         } else if (strcmp(argv[i], "--dedup") == 0) {
             g_dedup = true;
-        } else if (strcmp(argv[i], "--no-dedup") == 0) {
+        } else if (strcmp(argv[i], "--no_dedup") == 0) {
             g_dedup = false;
         } else if (strcmp(argv[i], "--status") == 0) {
             g_write_status = true;
@@ -5116,30 +5115,28 @@ int main(int argc, char **argv) {
             g_stop_n = (int)v; g_stop_isrow = false; g_stop_active = true;
         } else if (strcmp(argv[i], "--with_frame") == 0) {
             g_with_frame = true;
-        } else if (strcmp(argv[i], "--max-mismatch") == 0 && i+1 < argc) {
+        } else if (strcmp(argv[i], "--breaks") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
             /* 480 = 2*16*15 internal edges on the board (theoretical maximum). */
             if (errno || end == argv[i] || *end || v < 0 || v > 480)
-                fatal("--max-mismatch expects an integer in [0,480], got '%s'", argv[i]);
+                fatal("--breaks expects an integer in [0,480], got '%s'", argv[i]);
             g_max_mismatch = (int)v;
-        } else if (strcmp(argv[i], "--time-limit") == 0 && i+1 < argc) {
+        } else if (strcmp(argv[i], "--time_limit") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             double v = strtod(argv[++i], &end);
             if (errno || end == argv[i] || *end || v < 0.0)
-                fatal("--time-limit expects a non-negative number of seconds, got '%s'", argv[i]);
+                fatal("--time_limit expects a non-negative number of seconds, got '%s'", argv[i]);
             g_time_limit_sec = v;
-        } else if (strcmp(argv[i], "--solution-limit") == 0 && i+1 < argc) {
+        } else if (strcmp(argv[i], "--max_emitted") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             const char *arg = argv[++i];
             if (arg[0] == '-')
-                fatal("--solution-limit expects a non-negative integer, got '%s'", arg);
+                fatal("--max_emitted expects a non-negative integer, got '%s'", arg);
             unsigned long long v = strtoull(arg, &end, 10);
             if (errno || end == arg || *end)
-                fatal("--solution-limit expects a non-negative integer, got '%s'", arg);
+                fatal("--max_emitted expects a non-negative integer, got '%s'", arg);
             g_solution_limit = (uint64_t)v;
-        } else if (strcmp(argv[i], "--all-solutions") == 0) {
-            g_solution_limit = 0;
         } else if (strcmp(argv[i], "--order") == 0 && i+1 < argc) {
             const char *m = argv[++i];
             if      (!strcmp(m, "rowmajor"))  g_order_mode = ORD_ROWMAJOR;
@@ -5152,17 +5149,17 @@ int main(int argc, char **argv) {
             else if (!strcmp(m, "2sides"))    g_order_mode = ORD_2SIDES;
             else if (!strcmp(m, "4sides"))    g_order_mode = ORD_4SIDES;
             else fatal("--order expects mrv|rowmajor|colmajor|snake|spiral|centerout|spiralout|2sides|4sides, got '%s'", m);
-        } else if (strcmp(argv[i], "--break-mode") == 0 && i+1 < argc) {
+        } else if (strcmp(argv[i], "--break_mode") == 0 && i+1 < argc) {
             const char *m = argv[++i];
             if      (!strcmp(m, "stuck")) g_break_mode = BREAK_STUCK;
             else if (!strcmp(m, "any"))   g_break_mode = BREAK_ANY;
             else if (!strcmp(m, "lds"))   g_break_mode = BREAK_LDS;
-            else fatal("--break-mode expects stuck|any|lds, got '%s'", m);
-        } else if (strcmp(argv[i], "--lds-max") == 0 && i+1 < argc) {
+            else fatal("--break_mode expects stuck|any|lds, got '%s'", m);
+        } else if (strcmp(argv[i], "--lds_max") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
             if (errno || end == argv[i] || *end || v < 0 || v > 480)
-                fatal("--lds-max expects an integer in [0,480], got '%s'", argv[i]);
+                fatal("--lds_max expects an integer in [0,480], got '%s'", argv[i]);
             g_lds_max = (int)v;
         } else if (strcmp(argv[i], "--hall") == 0 && i+1 < argc) {
             const char *m = argv[++i];
@@ -5171,19 +5168,19 @@ int main(int argc, char **argv) {
             else if (!strcmp(m, "adaptive")) g_hall_mode = HALL_ADAPTIVE;
             else if (!strcmp(m, "always"))   g_hall_mode = HALL_ALWAYS;
             else fatal("--hall expects off|root|adaptive|always, got '%s'", m);
-        } else if (strcmp(argv[i], "--no-hall") == 0) {
+        } else if (strcmp(argv[i], "--no_hall") == 0) {
             g_hall_mode = HALL_OFF;
-        } else if (strcmp(argv[i], "--hall-stride") == 0 && i+1 < argc) {
+        } else if (strcmp(argv[i], "--hall_stride") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
             if (errno || end == argv[i] || *end || v < 0 || v > MAX_SEQ_LEN)
-                fatal("--hall-stride expects an integer in [0,%d], got '%s'", MAX_SEQ_LEN, argv[i]);
+                fatal("--hall_stride expects an integer in [0,%d], got '%s'", MAX_SEQ_LEN, argv[i]);
             g_hall_stride = (int)v;
-        } else if (strcmp(argv[i], "--hall-small") == 0 && i+1 < argc) {
+        } else if (strcmp(argv[i], "--hall_min") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
             if (errno || end == argv[i] || *end || v < 0 || v > MAX_SEQ_LEN)
-                fatal("--hall-small expects an integer in [0,%d], got '%s'", MAX_SEQ_LEN, argv[i]);
+                fatal("--hall_min expects an integer in [0,%d], got '%s'", MAX_SEQ_LEN, argv[i]);
             g_hall_small = (int)v;
         } else {
             fprintf(stderr, "Unknown option: %s\n\n", argv[i]);
@@ -5199,7 +5196,7 @@ int main(int argc, char **argv) {
      * the band would never be complete and the run could only ever emit nothing. */
     if (g_stop_active) {
         if (g_max_mismatch != 0)
-            fatal("--stop_%s requires --max-mismatch 0: an emitted band must be "
+            fatal("--stop_%s requires --breaks 0: an emitted band must be "
                   "exactly matched or the finalizer will reject it",
                   g_stop_isrow ? "row" : "column");
         if (g_jump)
@@ -5217,14 +5214,14 @@ int main(int argc, char **argv) {
         if (g_jump)
             fatal("--order %s requires --jump off", order_name(g_order_mode));
         if (g_max_mismatch != 0)
-            fatal("--order %s requires --max-mismatch 0", order_name(g_order_mode));
+            fatal("--order %s requires --breaks 0", order_name(g_order_mode));
         /* Side growth maximizes an exact partial.  Hall/color/FC completion
          * proofs are intentionally irrelevant here and must never stop the
          * sweep, even when the caller supplied --hall adaptive/always. */
         g_hall_mode = HALL_OFF;
     }
     if (g_lds_max >= 0 && g_break_mode != BREAK_LDS)
-        fprintf(stderr, "[warn] --lds-max has no effect unless --break-mode lds is selected.\n");
+        fprintf(stderr, "[warn] --lds_max has no effect unless --break_mode lds is selected.\n");
 
     /* mrv is the default order (see g_order_mode).  It is the right default
      * across the board: once breaks are allowed a static order lands on cells
@@ -5239,12 +5236,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[warn] --jump has no effect in stuck mode: a greedy dive "
                             "never leaves a cell empty.\n");
         if (g_solution_limit != 1)
-            fprintf(stderr, "[warn] --solution-limit has no effect in stuck mode; "
-                            "--stuck_restarts governs how many boards are produced.\n");
+            fprintf(stderr, "[warn] --max_emitted has no effect in stuck mode; "
+                            "--restarts governs how many boards are produced.\n");
     }
 
     /* Dive randomness is seeded from system noise only - there is deliberately no
-     * --rng-seed, so runs are not reproducible by design. */
+     * --rng_seed, so runs are not reproducible by design. */
     {
         struct timespec ts_m, ts_r;
         clock_gettime(CLOCK_MONOTONIC, &ts_m);
@@ -5275,12 +5272,12 @@ int main(int argc, char **argv) {
     printf("  board_size=%dx%d  pieces=%d\n", PUZZLE_SIDE, PUZZLE_SIDE, NUM_PIECES);
     printf("  rotate=%d CCW  (output_frame=%s)\n",
            g_rotation * 90, g_rotation > 0 ? "original" : "unchanged");
-    if (g_row_start >= 0)
-        printf("  start: row=%lld (0-based record index)\n", g_row_start);
+    printf("  start_row=%lld num_rows=%lld%s\n", g_row_start, g_count,
+           g_count == 0 ? " (0 = all remaining)" : "");
     if (holes_path)
         printf("  holes=%s (interpreted in rotated frame)\n", holes_path);
-    if (g_best_output > 0) printf("  best_output=%d\n", g_best_output);
-    else                   printf("  best_output=off\n");
+    if (g_best_output > 0) printf("  best_n=%d\n", g_best_output);
+    else                   printf("  best_n=off\n");
     printf("  parallel_requested=%s", parallel_mode_name(g_parallel_mode));
     if (g_parallel_mode != PAR_RECORDS)
         printf("  target_frontier=%d (auto)", nt * SPLIT_TASKS_PER_THREAD);
@@ -5307,7 +5304,7 @@ int main(int argc, char **argv) {
     if (!order_uses_soft_completion(g_order_mode) && g_hall_mode == HALL_ADAPTIVE)
         printf("  stride=%d  small=%d", g_hall_stride, g_hall_small);
     printf("\n");
-    printf("  max_mismatch=%d (total break ceiling)", g_max_mismatch);
+    printf("  breaks=%d (total break ceiling)", g_max_mismatch);
     if (g_max_mismatch > 0) {
         printf("  break_mode=%s", break_mode_name(g_break_mode));
         if (g_break_mode == BREAK_LDS) {
@@ -5330,7 +5327,7 @@ int main(int argc, char **argv) {
         if (el > 0.0) printf("%.0fs/record", el); else printf("unlimited");
     }
     printf("\n");
-    printf("  solution_limit=");
+    printf("  max_emitted=");
     if (g_solution_limit > 0) printf("%" PRIu64 " per record\n", g_solution_limit);
     else                      printf("all\n");
     printf("  dedup=%s  status_report=%s\n",
@@ -5501,28 +5498,24 @@ int main(int argc, char **argv) {
     g_total_records = n_records;
 
     /* -- Select the processing window [proc_start, proc_start+proc_count) --
-     * --row N is the 0-based index of the first data record to process (comment
-     * and blank lines do not count); default 0.  --count caps how many records
-     * (file order).  Default (no --count): one record when --row is given,
-     * otherwise all records from the start.  Blocks for parallel machines:
-     * --row 0 --count 100, --row 100 --count 100, ... */
-    int proc_start = 0;
-    if (g_row_start >= 0) {
-        if (g_row_start >= n_records) {
-            printf("[done] --row %lld is past the last record (%d loaded).\n",
-                   g_row_start, n_records);
-            checked_fclose(g_stream_csv, out_path);
-            if (g_status_csv) checked_fclose(g_status_csv, status_csv_path);
-            if (g_ckpt_csv) { checked_fclose(g_ckpt_csv, ckpt_csv_path); remove(ckpt_csv_path); }
-            free(records);
-            omp_destroy_lock(&g_best_lock);
-            return EXIT_SUCCESS;
-        }
-        proc_start = (int)g_row_start;
+     * --start_row N is the 0-based index of the first data record to process
+     * (comment and blank lines do not count); default 0.  --num_rows caps how
+     * many records (file order); default 0 = every remaining record from
+     * --start_row.  Blocks for parallel machines:
+     * --start_row 0 --num_rows 100, --start_row 100 --num_rows 100, ... */
+    if (g_row_start >= n_records) {
+        printf("[done] --start_row %lld is past the last record (%d loaded).\n",
+               g_row_start, n_records);
+        checked_fclose(g_stream_csv, out_path);
+        if (g_status_csv) checked_fclose(g_status_csv, status_csv_path);
+        if (g_ckpt_csv) { checked_fclose(g_ckpt_csv, ckpt_csv_path); remove(ckpt_csv_path); }
+        free(records);
+        omp_destroy_lock(&g_best_lock);
+        return EXIT_SUCCESS;
     }
+    int proc_start = (int)g_row_start;
     int avail = n_records - proc_start;
-    long long want = (g_count >= 1) ? g_count
-                   : (g_row_start >= 0 ? 1 : (long long)avail);
+    long long want = (g_count > 0) ? g_count : (long long)avail;
     int proc_count = (want < avail) ? (int)want : avail;
     int proc_end = proc_start + proc_count;        /* exclusive */
 
@@ -5539,14 +5532,14 @@ int main(int argc, char **argv) {
            proc_count, nt);
 
     /* -- E555: mark records whose post-holes initial board repeats an earlier
-     *    row (processed here or skipped below --row); they would exactly
+     *    row (processed here or skipped below --start_row); they would exactly
      *    repeat that row's search. -- */
     int *dup_of = xmalloc((size_t)n_records * sizeof(int));
     for (int i = 0; i < n_records; i++) dup_of[i] = -1;
     if (g_dedup)
         build_duplicate_map(records, proc_end, proc_start, dup_of);
     else
-        printf("[dedup] off by --no-dedup; every selected input row will be searched\n");
+        printf("[dedup] off by --no_dedup; every selected input row will be searched\n");
 
     /* [5/5] Search */
     printf("\n[5/5] Searching %d of %d record(s) (window [%d,%d))...\n",
@@ -5598,7 +5591,7 @@ int main(int argc, char **argv) {
     printf("    cutoff               = %" PRIu64 "\n", g_cnt_cutoff);
     printf("    full_solutions       = %" PRIu64 "\n", g_total_solutions);
     if (g_stop_active) {
-        /* The accept rate is the diagnostic that matters under --break-mode
+        /* The accept rate is the diagnostic that matters under --break_mode
          * stuck, whose dives take a minimal break when no exact fit exists and
          * so can reject every band they produce.  Without it a run that emitted
          * nothing looks like a bug rather than the mode working as designed. */
@@ -5621,7 +5614,7 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* -- Best partial boards (only with --best-output): PURE and MISMATCH -- */
+    /* -- Best partial boards (only with --best_n): PURE and MISMATCH -- */
     if (g_best_output > 0) {
         printf("\n  Best partial boards reached (top-%d per track):\n", g_best_output);
         if (g_best_pure_count == 0 && g_best_mm_count == 0)

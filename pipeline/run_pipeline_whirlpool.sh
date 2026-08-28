@@ -43,7 +43,7 @@ BC_WINDOW=3,3           # score up to nB x nC completions per segment-A record
 WHIRL_ROWS="10 10 10 10"
 BAND_ROW=5              # backtracker --stop_row: rows 0..BAND_ROW rebuilt exactly
 FIXED_BORDER=1          # 1 = --with_frame, so the band carries all 60 frame cells
-BT_LIMIT=200            # bands ENUMERATED per turned board (--solution-limit)
+BT_LIMIT=200            # bands ENUMERATED per turned board (--max_emitted)
 BT_PICK=6               # bands actually GROWN, chosen farthest-first
 BT_ORDER=rowmajor
 BT_TIME=60              # seconds per turned board
@@ -92,15 +92,15 @@ done
 banner() { echo; echo "==============================================================="
            echo "  $*"; echo "==============================================================="; echo; }
 rows()   { python3 "$TOOLS/E555_rank.py" "$1" --count; }
-best()   { python3 "$TOOLS/E555_rank.py" "$1" --seed "$SEED" --field score; }
-show_board() { echo; python3 "$TOOLS/E555_viewer.py" "$1" --seed "$SEED" --no-url --row 0; echo; }
+best()   { python3 "$TOOLS/E555_rank.py" "$1" --seed_file "$SEED" --field score; }
+show_board() { echo; python3 "$TOOLS/E555_viewer.py" "$1" --seed_file "$SEED" --no_url --row 0; echo; }
 
 # rank FILE -- rewrite a board CSV in place, best board first, field 2 rescored
 # to the true matched-edge count so "best so far" is comparable across stages.
 rank() {
     [ -s "$1" ] || return 0
-    python3 "$TOOLS/E555_rank.py" "$1" --seed "$SEED" \
-        --sort breaks,break_rows --emit "$1.tmp" --rescore > /dev/null
+    python3 "$TOOLS/E555_rank.py" "$1" --seed_file "$SEED" \
+        --sort breaks,break_rows --out "$1.tmp" --rescore > /dev/null
     mv "$1.tmp" "$1"
 }
 
@@ -140,13 +140,13 @@ echo
 BEAM_CMD=("$BIN/E555_beamer" "$SEED" --random_edges
     --out_dir beam --threads "$THREADS"
     --beam_width "$BEAM_WIDTH" --stop_row "$BEAM_STOP"
-    --border_row_N "$BEAM_BOARDS" --top_columns "$BEAM_COLUMNS"
-    --gumbel_tau_bottoms "$BEAM_TAU_BOTTOMS" --gumbel_tau_columns "$BEAM_TAU_COLUMNS"
+    --samples "$BEAM_BOARDS" --top_columns "$BEAM_COLUMNS"
+    --tau_bottoms "$BEAM_TAU_BOTTOMS" --tau_columns "$BEAM_TAU_COLUMNS"
     --frac_rand "$BEAM_FRAC_RAND"
     --bc_window "$BC_WINDOW"
-    --max_partials "$BEAM_BOARDS" --max_wall_sec "$BEAM_WALL" --verbose "${CLUE_ARG[@]}")
+    --max_emitted "$BEAM_BOARDS" --wall_time "$BEAM_WALL" --verbose "${CLUE_ARG[@]}")
 [ -n "$DB_FILE" ] && BEAM_CMD+=(--db_file "$DB_FILE")
-[ "$RNG_SEED" != "0" ] && BEAM_CMD+=(--seed "$RNG_SEED")
+[ "$RNG_SEED" != "0" ] && BEAM_CMD+=(--rng_seed "$RNG_SEED")
 "${BEAM_CMD[@]}"
 
 xargs -r cat < beam/outputs.txt > 0_beam.csv
@@ -181,8 +181,8 @@ lap() {
     # the filled region on columns 0..T; 3 (CCW) takes the old LEFT column down
     # instead and fills columns 15-T..15. The two keep different halves of the
     # board, so this genuinely doubles the field rather than mirroring it.
-    python3 "$TOOLS/E555_rotate.py" "$CURRENT" 1 --out "${k}_cw.csv"  --seed "$SEED" > /dev/null
-    python3 "$TOOLS/E555_rotate.py" "$CURRENT" 3 --out "${k}_ccw.csv" --seed "$SEED" > /dev/null
+    python3 "$TOOLS/E555_rotate.py" "$CURRENT" 1 --out "${k}_cw.csv"  --seed_file "$SEED" > /dev/null
+    python3 "$TOOLS/E555_rotate.py" "$CURRENT" 3 --out "${k}_ccw.csv" --seed_file "$SEED" > /dev/null
     cat "${k}_cw.csv" "${k}_ccw.csv" > "${k}_rot.csv"
     rm -f "${k}_cw.csv" "${k}_ccw.csv"
     nrot=$(rows "${k}_rot.csv")
@@ -191,14 +191,14 @@ lap() {
     # --- re-cut rows 0..BAND_ROW exactly -------------------------------------
     # $BT_ORDER (rowmajor) because the empty cells are whole COLUMNS of rows
     # 0..BAND_ROW: rowmajor walks them row by row and closes the border row 0
-    # first, which is exactly the shape the finalizer's lock needs. --break-mode
+    # first, which is exactly the shape the finalizer's lock needs. --break_mode
     # any because the default (stuck) takes a minimal break where no exact fit
     # exists, and a broken band is dropped at emission.
     "$BIN/E555_backtracker" "$SEED" "${k}_rot.csv" "${k}_bt.csv" \
-        --stop_row "$BAND_ROW" --order "$BT_ORDER" --break-mode any \
+        --stop_row "$BAND_ROW" --order "$BT_ORDER" --break_mode any \
         "${frame_arg[@]}" \
-        --max-mismatch 0 --solution-limit "$BT_LIMIT" \
-        --time-limit "$BT_TIME" --threads "$THREADS" > "${k}_bt.log" 2>&1 ||
+        --breaks 0 --max_emitted "$BT_LIMIT" \
+        --time_limit "$BT_TIME" --threads "$THREADS" > "${k}_bt.log" 2>&1 ||
         echo "[warn] lap $k: the backtracker exited non-zero, see ${k}_bt.log"
     if [ -s "${k}_bt.csv.stop_row${BAND_ROW}.csv" ]; then
         mv "${k}_bt.csv.stop_row${BAND_ROW}.csv" "${k}_band.csv"
@@ -208,8 +208,8 @@ lap() {
     # K sharing a long prefix and exact bands are all the same score -- there is
     # nothing else to choose on. Skipped when the cut returned few enough anyway.
     if [ -s "${k}_band.csv" ] && [ "$(rows "${k}_band.csv")" -gt "$BT_PICK" ]; then
-        python3 "$TOOLS/E555_rank.py" "${k}_band.csv" --seed "$SEED" \
-            --diverse "$BT_PICK" --emit "${k}_band.tmp" > /dev/null 2>&1 \
+        python3 "$TOOLS/E555_rank.py" "${k}_band.csv" --seed_file "$SEED" \
+            --diverse "$BT_PICK" --out "${k}_band.tmp" > /dev/null 2>&1 \
             && mv "${k}_band.tmp" "${k}_band.csv"
         rm -f "${k}_band.tmp"
     fi
@@ -233,10 +233,10 @@ lap() {
         --out_dir "lap$k" --threads "$THREADS" \
         --finalize_from "$BAND_ROW" --finalize_repeats 1 \
         --beam_width "$FIN_WIDTH" --stop_row "$target" \
-        --border_row_N "$nband" --top_columns "$FIN_COLUMNS" \
+        --num_rows "$nband" --top_columns "$FIN_COLUMNS" \
         --lambda_Mahalanobis 0 --frac_rand 0.0 \
-        --max_partials "$FIN_BOARDS" --max_wall_sec "$FIN_WALL" \
-        --print-cmd --verbose "${inc[@]}" "${CLUE_ARG[@]}" > "${k}_fin.log" 2>&1 ||
+        --max_emitted "$FIN_BOARDS" --wall_time "$FIN_WALL" \
+        --print_cmd --verbose "${inc[@]}" "${CLUE_ARG[@]}" > "${k}_fin.log" 2>&1 ||
         echo "[warn] lap $k: the finalizer exited non-zero, see ${k}_fin.log"
 
     xargs -r cat < "lap$k/outputs.txt" > "${k}_final.csv"
@@ -289,7 +289,7 @@ echo
 "$BIN/E555_roundhouse" "$SEED" "$CURRENT" \
     --out_dir strip --threads "$THREADS" \
     --rounds "$RH_ROUNDS" --strip_width "$RH_WIDTH" --rotate "$RH_ROTATE" \
-    --border_row_N "$RH_LINES" --max_wall_sec "$RH_WALL" --print-cmd --verbose "${CLUE_ARG[@]}"
+    --num_rows "$RH_LINES" --wall_time "$RH_WALL" --print_cmd --verbose "${CLUE_ARG[@]}"
 
 # First existing match, or empty. NOT `$(ls GLOB | head -1)`: an unmatched glob
 # makes ls exit 2, pipefail promotes it, and set -e kills the run -- which is
@@ -321,18 +321,18 @@ echo "which the ranking means anything."
 echo
 
 "$BIN/E555_backtracker" "$SEED" C2_in.csv C2_dived.csv \
-    --row 0 --count 1 --threads "$THREADS" \
-    --holes "$HOLES" --order mrv --break-mode stuck \
-    --max-mismatch "$BT_MISMATCH" --stuck_restarts "$BT_RESTARTS" \
-    --time-limit "$BT_FINAL_TIME" --print-cmd --verbose
+    --start_row 0 --num_rows 1 --threads "$THREADS" \
+    --holes "$HOLES" --order mrv --break_mode stuck \
+    --breaks "$BT_MISMATCH" --restarts "$BT_RESTARTS" \
+    --time_limit "$BT_FINAL_TIME" --print_cmd --verbose
 
 # -----------------------------------------------------------------------------
 banner "PIPELINE COMPLETE  ($(( (SECONDS-START)/60 )) min $(( (SECONDS-START)%60 )) s)"
 # -----------------------------------------------------------------------------
 cat C2_in.csv C2_dived.csv "$CURRENT" > final_pool.csv 2>/dev/null || cp C2_in.csv final_pool.csv
 rank final_pool.csv
-python3 "$TOOLS/E555_rank.py" final_pool.csv --seed "$SEED" \
-    --sort breaks,break_rows --top "$TOP_N" --emit FINAL_top"$TOP_N".csv --rescore > /dev/null
+python3 "$TOOLS/E555_rank.py" final_pool.csv --seed_file "$SEED" \
+    --sort breaks,break_rows --top "$TOP_N" --out FINAL_top"$TOP_N".csv --rescore > /dev/null
 head -1 final_pool.csv > FINAL_best.csv
 rm -f final_pool.csv C2_in.csv
 
@@ -346,4 +346,4 @@ ls -1 [0-9]_*.csv C[0-9]_*.csv FINAL_*.csv 2>/dev/null | sed 's/^/  /'
 echo
 echo "Best board of the whole run: $(best FINAL_best.csv)/480 correct edges."
 show_board FINAL_best.csv
-python3 "$TOOLS/E555_rank.py" FINAL_top"$TOP_N".csv --seed "$SEED" --top 20 --no-id
+python3 "$TOOLS/E555_rank.py" FINAL_top"$TOP_N".csv --seed_file "$SEED" --top 20 --no_id

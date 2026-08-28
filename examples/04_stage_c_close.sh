@@ -59,7 +59,7 @@ RINGED="$OUT_DIR/2_ringed.csv"
 PATCHED="$OUT_DIR/3_patched.csv"
 
 echo "=== before ==="
-python3 tools/E555_rank.py "$BOARDS" --seed "$SEED" --top 3
+python3 tools/E555_rank.py "$BOARDS" --seed_file "$SEED" --top 3
 
 CUR="$BOARDS"
 if [ "$SKIP_TOPPER" != 1 ]; then
@@ -68,10 +68,10 @@ if [ "$SKIP_TOPPER" != 1 ]; then
     # HOLES and the band are alternatives, so only the differing arguments are
     # built conditionally -- the call itself is written once.
     if [ -n "$HOLES" ]; then REGION=(--holes "$HOLES")
-    else                     REGION=(--side "$SIDE" --work-rows "$WORK_ROWS"); fi
+    else                     REGION=(--side "$SIDE" --band_depth "$WORK_ROWS"); fi
     python3 src/C_tail/E555_topper.py "$SEED" "$CUR" "$TOPPED" "${CLUE_ARG[@]}" \
-        --row "$FIRST_LINE" --count "$N_LINES" "${REGION[@]}" \
-        --workers "$WORKERS" --max-time "$MAX_TIME" --stall-time "$STALL_TIME" \
+        --start_row "$FIRST_LINE" --num_rows "$N_LINES" "${REGION[@]}" \
+        --threads "$WORKERS" --time_limit "$MAX_TIME" --stall_time "$STALL_TIME" \
         --verbose
     CUR="$TOPPED"
 fi
@@ -79,20 +79,20 @@ fi
 echo
 echo "=== pass 2: ender, ring sweep ==="
 python3 src/C_tail/E555_ender.py "$SEED" "$CUR" "$RINGED" "${CLUE_ARG[@]}" \
-    --mode ring --reach "$REACH" --max-changes "$MAX_CHANGES" \
-    --workers "$WORKERS" --max-time "$MAX_TIME" --stall-time "$STALL_TIME" \
+    --mode ring --reach "$REACH" --max_changes "$MAX_CHANGES" \
+    --threads "$WORKERS" --time_limit "$MAX_TIME" --stall_time "$STALL_TIME" \
     --verbose
 
 echo
 echo "=== pass 3: ender, patch ==="
 python3 src/C_tail/E555_ender.py "$SEED" "$RINGED" "$PATCHED" "${CLUE_ARG[@]}" \
-    --mode patch --reach "$REACH" --max-changes "$MAX_CHANGES" \
-    --workers "$WORKERS" --max-time "$MAX_TIME" --stall-time "$STALL_TIME" \
+    --mode patch --reach "$REACH" --max_changes "$MAX_CHANGES" \
+    --threads "$WORKERS" --time_limit "$MAX_TIME" --stall_time "$STALL_TIME" \
     --verbose
 
 echo
 echo "=== after ==="
-python3 tools/E555_rank.py "$PATCHED" --seed "$SEED" --top 3
+python3 tools/E555_rank.py "$PATCHED" --seed_file "$SEED" --top 3
 echo
 echo "Boards -> $PATCHED"
 echo "Still short? 05 proves whether the remaining breaks can be removed at all."
