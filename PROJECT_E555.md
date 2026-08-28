@@ -211,7 +211,7 @@ result**, and the parent replays the restarts -- stdout and the rotations CSV
 alike -- in restart order however the workers finish. The pool is capped at one
 worker per restart. Measured on an 8-thread laptop the gain is ~3x (8 restarts x
 50k steps: 24.5s serial, 7.9s parallel -- the workers share cores, so it is not
-8x), which takes the `run_pipeline_annealed.sh` Stage A of 50 restarts x 300k
+8x), which takes the `run_pipeline.sh` Stage A of 50 restarts x 500k
 steps from ~14 min to ~5.
 
 Key options: `--restarts`, `--steps`, `--seed`, `--threads`, `--verbose`,
@@ -961,9 +961,10 @@ stripped the calibration every later one would have scored against; and the
 as "no correction needed" rather than "the correction never ran". It now prints
 the sample count behind each figure and says so explicitly when there is none.
 
-**Locking.** `--border_row/--border_row_N` select the CSV lines; each line is
-structurally validated (piece types per cell, frame orientation, every color
-match inside the locked region). Pieces at or below `--finalize_from`
+**Locking.** `--border_row/--border_row_N` select the CSV lines, and
+`--border_row_N 0` reads to the end of the file. Each line is structurally
+validated (piece types per cell, frame orientation, every color match inside
+the locked region). Pieces at or below `--finalize_from`
 (default 5) are locked; pieces placed above return to the pool. That default is
 low on purpose: the beam grows from a single locked board, so it needs rows to
 widen in before selection means anything -- see below.
@@ -1426,7 +1427,7 @@ feeds any stage unchanged.
 | option | default | meaning |
 |---|---|---|
 | `--out_dir DIR` | `round_out` | output directory; names carry the geometry, and break-free boards are filed apart from break-bought ones |
-| `--border_row N` / `--border_row_N N` | 0 / 1 | first input CSV data line, and how many |
+| `--border_row N` / `--border_row_N N` | 0 / 1 | first input CSV data line, and how many (0 = to the end of the file) |
 | `--strip_width W` | 5 | 2..5; chain length, and hence the core. 0 = narrowest usable |
 | `--rounds N` | 3 | 1..3; bands freed and refilled (right, top, left) |
 | `--rotate K` | 1 | quarter-turns before the cut, -3..3; negative turns anticlockwise |
@@ -1994,11 +1995,13 @@ pip install ortools         # only for topper / ender
 # no Stage A needed -- the 5-minute demo:
 bash examples/01_beamer_quickstart.sh
 
-# the full pipeline:
-ANNEAL=1 bash examples/01_beamer_quickstart.sh   # Stage A then Stage B
-PARTIALS=beam_out/beam_completions_0_10.csv bash examples/02_finalizer_regrow.sh
-BOARDS=final_out/beam_completions_finalized_12.csv \
-    bash examples/04_stage_c_close.sh
+# the whole chain in five calls, no arguments, output in the current directory:
+cd ~/runs && bash ~/E555/examples/07_barebones_chain.sh
+
+# stage by stage. Settings are NAME=value ARGUMENTS, not environment variables:
+bash examples/01_beamer_quickstart.sh ANNEAL=1          # Stage A then Stage B
+bash examples/02_finalizer_regrow.sh BOARDS=beam_out/beam_completions_0_10.csv
+bash examples/04_stage_c_close.sh BOARDS=final_out/beam_completions_finalized_12.csv
 
 # validate everything (includes the synthetic-solution regression):
 bash tests/run_tests.sh
@@ -2034,7 +2037,7 @@ survive several rows.
   With an INCOMPLETE border the finalizer falls back to `--free_edges`, and
   `--top_columns 0` then enumerates every legal left column; that enumeration
   grows explosively as rows are freed, so the same board wants `7` (see the
-  measured table in `examples/02_finalizer_regrow.sh`).
+  measured table in `examples/README.md`).
 
 **Practical default:** breadth first (`--random_edges` or many border rows,
 moderate K), finalize the survivors from row 4-5 with repeats, topper the

@@ -1,116 +1,101 @@
 #!/bin/bash
-##SBATCH --job-name=E555_quickstart
-##SBATCH --ntasks=1 --cpus-per-task=8 --mem=10G --time=00:30:00
-##SBATCH --output=logs/quickstart_%j.out
+# 01_beamer_quickstart.sh -- start here. Grow boards row by row from a border.
 #
-# =============================================================================
-# 01_beamer_quickstart.sh -- start here. One command, one board, ~5 minutes.
-# =============================================================================
-# WHAT IT DOES
-#   Runs the Stage B beamer. By default with --random_edges: it samples border
-#   arrangements straight from the seed, so nothing has to be prepared first.
-#   It grows boards row by row and writes every board that survives to STOP_ROW.
+#   bash examples/01_beamer_quickstart.sh                    # random borders
+#   bash examples/01_beamer_quickstart.sh ANNEAL=1           # searched borders
+#   bash examples/01_beamer_quickstart.sh OUT_DIR=run1 THREADS=16
 #
-#   ANNEAL=1 runs Stage A first instead. The annealer searches for GOOD borders
-#   -- ones whose sides have many ways to be continued -- and the beamer then
-#   grows boards from those rather than from random ones. Slower to start, much
-#   better material. Everything below the settings block is shared; the only
-#   difference is where the borders come from.
+# Writes every board that survives to STOP_ROW; the files it wrote are listed
+# in $OUT_DIR/outputs.txt. Needs ~8 GB RAM and a few quiet minutes on the first
+# run, which builds the 6.4 GB chain database in memory.
 #
-#       bash examples/01_beamer_quickstart.sh              # random borders
-#       ANNEAL=1 bash examples/01_beamer_quickstart.sh     # annealed borders
-#
-# WHAT TO EXPECT
-#   The first run builds the 6.4 GB chain database in memory (a few quiet
-#   minutes, ~8 GB RAM). Then rows scroll past. Some border configurations go
-#   extinct with no board emitted -- that is normal and is the search working,
-#   not failing.
-#
-#   The beam is reproducible only at --threads 1; runs at higher thread counts
-#   will vary in row count and boards emitted from run to run.
-#
-# THE OUTPUT FEEDS EVERYTHING ELSE
-#   The result is a canonical board CSV. Every other script in this folder
-#   accepts it as input. Try 02 next.
-# =============================================================================
+# Border configurations that go extinct with no board are the search working,
+# not failing. What every setting does: examples/README.md
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# ---- settings: edit here, or pass NAME=value on the command line ------------
+REPO=$(cd "$(dirname "$0")/.." && pwd)  # E555 checkout. Set this if you copied
+                                        # this script somewhere else.
+SEED=data/seed_Edge5.txt                # paths below are relative to REPO
+OUT_DIR=beam_out
+THREADS=8
+BEAM_WIDTH=50000        # boards kept per row; the tool's own default is 250000
+STOP_ROW=10             # last row filled. Higher = harder = slower
+MAX_WALL=0              # seconds for the whole run, 0 = unlimited
+DB_FILE=                # cache the 6.4 GB chain database here (~6.5 GB on
+                        # disk) so later runs start in seconds; empty =
+                        # build it in memory every time
+RNG_SEED=1              # fixed so the run repeats; see the note in the README
+CLUES=0                 # 1 = hold the published Eternity II clue pieces
 
-# ---- settings: edit here, or override from the environment ------------------
-SEED="${SEED:-$REPO/data/seed_Edge5.txt}"
-OUT_DIR="${OUT_DIR:-beam_out}"
-BEAM_WIDTH="${BEAM_WIDTH:-50000}"   # boards kept per row. Production: 250000
-STOP_ROW="${STOP_ROW:-10}"          # last row filled. Higher = harder = slower
-MAX_WALL="${MAX_WALL:-0}"           # seconds for the whole run, 0 = unlimited
-CLUES="${CLUES:-0}"                # 1 = hold the published Eternity II clue
-                                  # pieces on their cells and spins
-
-ANNEAL="${ANNEAL:-0}"               # 1 = anneal the borders first (Stage A)
-N_BOTTOMS="${N_BOTTOMS:-2}"         # bottom rows tried per border
-N_COLUMNS="${N_COLUMNS:-2}"         # left columns tried per bottom row
-
-# ANNEAL=1 only:
-ROTATIONS="${ROTATIONS:-rotations.csv}"   # Stage A writes here, Stage B reads it
-RESTARTS="${RESTARTS:-4}"                 # independent annealing runs = borders
-STEPS="${STEPS:-60000}"                   # annealing steps per restart
-TARGET="${TARGET:-250}"                   # per-side trail target scale
-THREADS="${THREADS:-8}"                   # 0 = all cores
+ANNEAL=0                # 1 = search for good borders with Stage A first
+BORDERS=4               # border rows handed to the beamer (ANNEAL=1)
+STEPS=500000            # annealing steps per restart; 250000 is the floor
+ROTATIONS=rotations.csv # Stage A writes here, Stage B reads it (ANNEAL=1)
+N_BOTTOMS=2             # bottom rows tried per border
+N_COLUMNS=2             # left columns tried per bottom row
 # -----------------------------------------------------------------------------
+for arg in "$@"; do
+    case "$arg" in
+        [A-Za-z_]*=*) declare "$arg" ;;
+        *) echo "expected NAME=value, got: $arg" >&2; exit 1 ;;
+    esac
+done
+cd "$REPO"
+[ -d bin ] && [ -d tools ] ||
+    { echo "REPO=$REPO is not an E555 checkout -- set REPO at the top" >&2; exit 1; }
+[ -x bin/E555_beamer ] || make beamer
 
-[ -x "$REPO/bin/E555_beamer" ] || make -C "$REPO" beamer
-
-# The beamer call is the same either way apart from where the borders come
-# from, so build the differing part as an array rather than writing the whole
-# invocation out twice.
-if [ "$ANNEAL" = 1 ]; then
-    echo "=== Stage A: annealing $RESTARTS borders ==="
-    python3 -u "$REPO/src/A_border/E555_edge_annealer.py" "$SEED" \
-        --restarts "$RESTARTS" \
-        --steps "$STEPS" \
-        --target_scale "$TARGET" \
-        --threads "$THREADS" \
-        --w-bottom 60 --w-left 20 --w-right 20 --w-top 1 \
-        --out "$ROTATIONS" \
-        --verbose
-    echo
-    echo "=== Stage B: beaming from those borders ==="
-    BORDERS=("$ROTATIONS" --border_row 0 --border_row_N "$RESTARTS"
-             --top_bottoms "$N_BOTTOMS" --top_columns "$N_COLUMNS")
-    RESULT="$OUT_DIR/beam_completions_0_$STOP_ROW.csv"
-else
-    BORDERS=(--random_edges --border_row_N "$N_BOTTOMS" --top_columns "$N_COLUMNS")
-    RESULT="$OUT_DIR/beam_completions_random_$STOP_ROW.csv"
-fi
+# The annealer needs at least 250000 steps to do its job. Below that it is not
+# merely weaker -- it often fails to place a legal border at all: measured on
+# the real seed, 8 restarts x 3000 steps found 2 feasible borders and 2 x 2000
+# returned 1 on one run and 0 on the next, while every restart at 250000 steps
+# succeeded (2/2, 4/4, 8/8). Warn rather than refuse: a deliberately tiny smoke
+# run is a legitimate thing to ask for.
+[ "$STEPS" -ge 250000 ] || echo "[warn] STEPS=$STEPS is below 250000, the point where"\
+    " the annealer reliably finds a legal border at all. Expect few or none."
 
 CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 
-"$REPO/bin/E555_beamer" "$SEED" "${BORDERS[@]}" "${CLUE_ARG[@]}" \
-    --beam_width "$BEAM_WIDTH" \
-    --stop_row "$STOP_ROW" \
-    --max_wall_sec "$MAX_WALL" \
-    --seed 1 \
-    --out_dir "$OUT_DIR" \
-    --verbose
-
-# Repeated runs: add  --db_file /some/path.db  to cache the chain database on
-# disk (~6.5 GB) so later runs start in seconds instead of minutes.
-
-echo
-if [ -s "$RESULT" ]; then
-    echo "Boards written to $RESULT. Look at the best one:"
-    echo "  python3 $REPO/tools/E555_viewer.py $RESULT --seed $SEED"
-    echo "  python3 $REPO/tools/E555_rank.py   $RESULT --seed $SEED --top 5"
-    echo
-    echo "Then push it further:"
-    echo "  PARTIALS=$RESULT bash $REPO/examples/02_finalizer_regrow.sh"
-    if [ "$ANNEAL" = 1 ]; then
-        echo
-        echo "Keep $ROTATIONS: the finalizer reads it too, and will then re-impose"
-        echo "this side assignment instead of freeing all 56 edges to every side:"
-        echo "  PARTIALS=$RESULT ROTATIONS=$ROTATIONS bash $REPO/examples/02_finalizer_regrow.sh"
-    fi
+if [ "$ANNEAL" = 1 ]; then
+    # Anneal four times as many borders as we need, then keep the best quarter.
+    # Stage A is cheap and the beamer's time is not, so it pays to be picky.
+    echo "=== Stage A: annealing $((BORDERS * 4)) borders, keeping the best $BORDERS ==="
+    rm -f "$ROTATIONS"          # the annealer APPENDS; start clean
+    python3 src/A_border/E555_edge_annealer.py "$SEED" \
+        --restarts $((BORDERS * 4)) --steps "$STEPS" --threads "$THREADS" \
+        --w-bottom 0 --w-left 1 --w-right 3 --w-top 2 \
+        --out "$ROTATIONS" --verbose
+    python3 tools/E555_sort_rotations.py "$ROTATIONS" --top "$BORDERS" -o "$ROTATIONS.sorted"
+    mv "$ROTATIONS.sorted" "$ROTATIONS"
+    # An infeasible restart produces no border, so ask the beamer for the number
+    # that actually survived rather than the number requested.
+    BORDERS=$(grep -v '^ *#' "$ROTATIONS" | wc -l)
+    [ "$BORDERS" -gt 0 ] || { echo "Stage A found no feasible border. Raise STEPS."; exit 1; }
+    echo "=== Stage B: beaming from $BORDERS border(s) ==="
+    BORDER_ARG=("$ROTATIONS" --border_row 0 --border_row_N "$BORDERS"
+                --top_bottoms "$N_BOTTOMS" --top_columns "$N_COLUMNS")
 else
-    echo "No board survived to row $STOP_ROW. That is a normal outcome for a"
-    echo "short run: raise BEAM_WIDTH, raise N_BOTTOMS, or lower STOP_ROW."
+    BORDER_ARG=(--random_edges --border_row_N "$N_BOTTOMS" --top_columns "$N_COLUMNS")
+fi
+
+DB_ARG=(); [ -n "$DB_FILE" ] && DB_ARG=(--db_file "$DB_FILE")
+
+bin/E555_beamer "$SEED" "${BORDER_ARG[@]}" "${CLUE_ARG[@]}" "${DB_ARG[@]}" \
+    --beam_width "$BEAM_WIDTH" --stop_row "$STOP_ROW" \
+    --max_wall_sec "$MAX_WALL" --threads "$THREADS" --seed "$RNG_SEED" \
+    --out_dir "$OUT_DIR" --print-cmd --verbose
+
+# The beamer lists what it wrote; no need to rebuild the filenames here.
+echo
+if [ -s "$OUT_DIR/outputs.txt" ]; then
+    echo "Boards written:"
+    sed 's/^/  /' "$OUT_DIR/outputs.txt"
+    echo
+    echo "Look at the best one, then push it further:"
+    echo "  python3 tools/E555_rank.py \$(head -1 $OUT_DIR/outputs.txt) --seed $SEED --top 5"
+    echo "  bash examples/02_finalizer_regrow.sh BOARDS=\$(head -1 $OUT_DIR/outputs.txt)"
+else
+    echo "No board survived to row $STOP_ROW. Normal for a short run: raise"
+    echo "BEAM_WIDTH, raise N_BOTTOMS, or lower STOP_ROW."
 fi

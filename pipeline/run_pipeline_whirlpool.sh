@@ -1,289 +1,124 @@
 #!/bin/bash
-##SBATCH --job-name=E555_whirlpool
-##SBATCH --ntasks=1 --cpus-per-task=8 --mem=12G --time=24:00:00
-##SBATCH --output=logs/whirlpool_%j.out
+# run_pipeline_whirlpool.sh -- turn the board, re-cut its base exactly, re-grow.
 #
-# =============================================================================
-# run_pipeline_whirlpool.sh -- turn the board between every re-grow
-# =============================================================================
-# THIS IS NOT AN EXAMPLE. Like the other runners here it is meant to be started
-# and left alone. Read ../examples/ first if you have not used the tools singly.
+#   bash pipeline/run_pipeline_whirlpool.sh
+#   bash pipeline/run_pipeline_whirlpool.sh INPUT=boards.csv RUN_DIR=whirl1
+#   bash pipeline/run_pipeline_whirlpool.sh WHIRL_ROWS=10        # one lap only
 #
-# THE IDEA
-#   Stage B only ever grows ROWS UPWARD FROM THE BOTTOM. Every tool in it is
-#   built that way: the beam advances a row at a time, and the finalizer locks
-#   rows 0..N and frees everything above. So the rows a board is standing on
-#   were chosen early, by a beam that was guessing, and are then never revisited
-#   -- however many times you re-grow the top.
+# A lap turns every board a quarter turn, rebuilds rows 0..BAND_ROW EXACTLY with
+# the backtracker, and re-grows above them with the finalizer. Turning is what
+# makes it work: rows the beam fixed by sampling at row 0 and never revisited
+# become the rows a later lap re-cuts. WHIRL_ROWS lists one target row per lap,
+# so a single entry runs a single lap -- which is the way to try one by hand.
 #
-#   Turn the board 90 degrees and those buried rows become COLUMNS on one side,
-#   where a re-grow can reach them. The obstacle was that a turned board has
-#   complete columns and the finalizer can only start from complete ROWS, and
-#   nothing could convert one into the other. E555_backtracker --stop_row can:
-#   it searches rows 0..N only and emits every exact way to fill them.
-#
-#   That gives a lap:
-#
-#     rows 0..T full
-#       -> rotate +-90    T+1 complete COLUMNS (new row 0 is an old column,
-#                         so it is incomplete and no finalizer could start here)
-#       -> backtracker    --stop_row 5 --order rowmajor --with_frame: complete
-#                         rows 0..5 AND the outer frame, clear everything else
-#       -> finalizer      --finalize_from 5 --stop_row T: re-grow rows 6..T
-#                         at full width over a database rebuilt without the
-#                         locked pieces, with the border held fixed
-#
-#   --with_frame is what makes the border survive the cut. A plain --stop_row
-#   clears everything outside the band, frame included, so the band reaches the
-#   finalizer carrying 26 of 60 border cells and the finalizer has no choice but
-#   --free_edges. Widening the band to take in the frame retains the border cells
-#   the turned board already holds and SEARCHES the ones it does not, so the band
-#   arrives with all 60 -- and a band whose leftover border pool cannot chain is
-#   dropped, which is a filter the loop did not have before. Set FIXED_BORDER=0
-#   for the old free-border lap.
-#
-#   and the lap ends where it started -- rows 0..T full -- but rebuilt from a
-#   different direction. Four laps is one full turn of the board.
-#
-# WHY IT IS WORTH THE TIME
-#   The lap keeps rows 0..5 of the turned board, which is a six-deep slab
-#   against ONE side, and that side moves 90 degrees every lap. So 184 of the
-#   256 pieces are freed and re-searched each lap; the four slabs hug four
-#   different sides and their common intersection is empty, so no piece
-#   survives a full circle untouched. The centre is re-searched every lap, a
-#   corner twice in four. A board that comes out the far end is one that admits
-#   an exact rows-0..T partial cut from every direction -- much stronger
-#   evidence than surviving once from the bottom.
-#
-# WHAT THE LOOP DOES *NOT* DO
-#   It does not climb. The loop holds its depth and spends its time on coverage;
-#   Stage C runs once, at the end, on the survivors. That is not only a policy:
-#   from a five-row lock the beam reaches row 10 and row 11 and does not reach
-#   row 12 at all -- measured against a perfect board on its own frame, which is
-#   the friendliest input that exists. Climbing past 11 is Stage C's job.
-#
-#   Nothing here ranks: every stage in the loop emits EXACTLY MATCHED boards, so
-#   at equal depth they all score the same and there is nothing to sort on.
-#   What thins the field is attrition -- a board whose turned band admits no
-#   exact filling, or that will not re-grow to WHIRL_ROW, drops out. The
-#   per-lap counts printed below are therefore the real diagnostic, and a lap
-#   that returns what it was given means the neighbourhood is exhausted.
-#
-# Everything lands in $RUN_DIR. Override any setting from the environment:
-#
-#   RUN_DIR=my_whirl LAPS=4 THREADS=16 bash pipeline/run_pipeline_whirlpool.sh
-# =============================================================================
+# NEEDS ~8 GB RAM for stage 0, and `pip install ortools` for the CP-SAT stages.
+# Lap geometry, BAND_ROW, FIXED_BORDER and the measured evidence behind the
+# defaults: pipeline/README.md
 set -euo pipefail
 
-# Derived from this script's own location, so the runner works from anywhere.
-# Overridable because a copy of this file kept outside the tree -- a snapshot
-# pinned for a long run, say -- would otherwise resolve the repo to nonsense.
-REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-# Checked, because REPO is a common enough variable name that an unrelated one
-# already exported would otherwise fail ten stages later with a puzzling error.
-[ -d "$REPO/bin" ] && [ -d "$REPO/tools" ] || {
-    echo "!! REPO=$REPO does not look like the E555 tree (no bin/ and tools/)."
-    echo "   Unset REPO, or point it at the repository root."; exit 1; }
+# ---- settings: edit here, or pass NAME=value on the command line ------------
+REPO=$(cd "$(dirname "$0")/.." && pwd)  # E555 checkout. Set this if you copied
+                                        # this script somewhere else.
+SEED=data/seed_Edge5.txt                # paths below are relative to REPO
+RUN_DIR=whirlpool_out
+THREADS=8
+DB_FILE=                                # cache the 6.4 GB chain DB here
+INPUT=                                  # skip stage 0 and whirl these boards
+CLUES=0                                 # 1 = hold the Eternity II clue pieces
 
-# ---- what to run on ---------------------------------------------------------
-SEED="${SEED:-$REPO/data/seed_Edge5.txt}"
-RUN_DIR="${RUN_DIR:-$PWD/whirlpool_out}"
-THREADS="${THREADS:-$(nproc 2>/dev/null || echo 4)}"
-DB_FILE="${DB_FILE:-}"              # cache the 6.4 GB chain DB; empty = in memory
-CLUES="${CLUES:-0}"                 # 1 = hold the Eternity II centre clue
+# stage 0: beamer, one board supply
+BEAM_WIDTH=200000
+BEAM_STOP=10            # the whirlpool takes over here
+BEAM_BOARDS=60
+BEAM_WALL=900
+BEAM_COLUMNS=8
+BEAM_TAU_BOTTOMS=2      # sample the borders instead of taking the best-ranked:
+BEAM_TAU_COLUMNS=4      # yield is a property of the PAIR, so this costs nothing
+BEAM_FRAC_RAND=0.10     # and spreads the run over many more frames
+BC_WINDOW=3,3           # score up to nB x nC completions per segment-A record
 
-# Clues are rotation-covariant, which is what makes the loop legal: g_clue in
-# E555_database.c tabulates the published clues at ALL FOUR orientations (the
-# centre piece 138 at (7,7) (8,7) (8,8) (7,8), spins 0 3 2 1) and g_clue_orients
-# is 0xF, so a quarter-turn maps a satisfied configuration to another satisfied
-# one. Only --clue_center is passed: the centre-only record is the higher one.
-#
-# A band cut below row 7 carries no clue at all -- the centre clue sits on row 7
-# or 8 -- so the finalizer CHOOSES the orientation instead of reading it, and
-# searches the band once per candidate (--clue_orient, default auto). That is
-# four passes over one database per band, which is the cost of clueing a
-# shallow band; --clue_orient N pins it to one.
-CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center)
-# A clued chain database has different CONTENTS for the same seed, and the
-# beamer refuses a cache whose exclusion set does not match.
-[ "$CLUES" = 1 ] && [ -n "$DB_FILE" ] && DB_FILE="$DB_FILE.clue"
-RNG_SEED="${RNG_SEED:-0}"           # 0 = clock+pid
+# the whirlpool: one target row per lap. Ten, not twelve -- twelve is not
+# reachable from a five-row lock, measured against a perfect 480 board on its
+# own true frame: 7491 completions at row 10, ten at row 11, NONE at row 12.
+WHIRL_ROWS="10 10 10 10"
+BAND_ROW=5              # backtracker --stop_row: rows 0..BAND_ROW rebuilt exactly
+FIXED_BORDER=1          # 1 = --with_frame, so the band carries all 60 frame cells
+BT_LIMIT=200            # bands ENUMERATED per turned board (--solution-limit)
+BT_PICK=6               # bands actually GROWN, chosen farthest-first
+BT_ORDER=rowmajor
+BT_TIME=60              # seconds per turned board
+POP=40                  # boards carried into the next lap
+FIN_WIDTH=100000
+FIN_BOARDS=60           # boards the finalizer may write per lap
+FIN_WALL=900            # seconds per lap
+FIN_COLUMNS=4           # left columns sampled per partial (0 = enumerate all)
 
-# ---- stage 0: beamer, one board supply --------------------------------------
-# INPUT skips the beamer entirely and whirls boards you already have. They must
-# have whole rows 0..N filled -- the loop turns rows into columns, so a board
-# with a ragged top has nothing to turn.
-INPUT="${INPUT:-}"
-BEAM_WIDTH="${BEAM_WIDTH:-200000}"
-BEAM_STOP="${BEAM_STOP:-10}"        # last row the beamer fills; the whirlpool takes over here
-BEAM_BOARDS="${BEAM_BOARDS:-60}"
-BEAM_WALL="${BEAM_WALL:-900}"
-BEAM_COLUMNS="${BEAM_COLUMNS:-8}"
-BEAM_TAU_BOTTOMS="${BEAM_TAU_BOTTOMS:-2}"
-BEAM_TAU_COLUMNS="${BEAM_TAU_COLUMNS:-4}"
-# Replaced --gumbel_tau0/--gumbel_tau1, which are gone: the beam-row Gumbel
-# selection lost 0-for-20 paired configs to a plain random band.
-BEAM_FRAC_RAND="${BEAM_FRAC_RAND:-0.10}"
-# While the beam is FULL, score up to nB x nC (B, C) completions per segment-A
-# record and keep the best, instead of taking the first that fits; below capacity
-# the beamer keeps every child and the window does not apply. 3,3 is the repo
-# default now, so this line pins the setting rather than overriding it. Beamer
-# only -- the finalizer's rows already enumerate every conflict-free (B, C), so
-# it has no --bc_window.
-BC_WINDOW="${BC_WINDOW:-3,3}"
-
-# ---- the whirlpool ----------------------------------------------------------
-# One target row per lap. Row 12 used to sit at the end of this list, on the
-# theory that a board filling row 12 bar one 5-piece segment is the best thing
-# Stage C will be handed all day. It is -- but the lap cannot produce one from a
-# five-row lock, so asking costs a lap and returns nothing. See below.
-#
-# Below 10 is warned about, not refused. Depth is what bounds output: nothing
-# has gone extinct at a shallow row, so the stop-row beam is emitted in full and
-# --incomplete_top's siblings multiply it. Measured on the real seed, one
-# config: row 6 wrote 807 042 boards and 1.5 GB, row 10 wrote 1 136 and 2.2 MB
-# in the same 5 s. Worth knowing before you ask for it; not worth forbidding.
-#
-# Ten, not twelve, because twelve is not reachable from a five-row lock. Measured
-# against the one board that cannot be argued with -- a perfect 480 solution on
-# its own true frame, locked at rows 0..4 -- the beam found 7 491 completions at
-# row 10, ten at row 11 and NONE at row 12, fixed border or free. A default that
-# asks every lap for 12 is asking for something ground truth does not deliver.
-# Raise it if the run is free-bordered (FIXED_BORDER=0), where row 11 still had
-# 349 completions; row 12 needs Stage C, not another lap.
-WHIRL_ROWS="${WHIRL_ROWS:-10 10 10 10}"
-
-# Depth advice, not law -- and it has to sit HERE, after WHIRL_ROWS and
-# BEAM_STOP are defaulted: reading either one earlier is an unbound variable
-# under `set -u`, which kills the runner before it prints anything.
-#
-# Below row 10 the output floods and above 12 the beam is spent, but a shallow
-# stop row is a legitimate thing to ask a runner for -- seeing what the beam
-# holds early, say -- so this warns and carries on. What must never run shallow
-# is a TEST or an EXAMPLE, where nobody is watching the disk fill; those pass
-# their depth explicitly. Only a row the tools cannot accept is an error.
-for _t in $BEAM_STOP $WHIRL_ROWS; do
-    [ "$_t" -ge 1 ] && [ "$_t" -le 13 ] || {
-        echo "!! stop row $_t is outside 1..13, which is all the beamer accepts."; exit 1; }
+# stage C: once, at the end
+RH_WIDTH=4
+RH_ROUNDS=3
+RH_ROTATE=-1            # -1 cuts the bottom band first
+RH_LINES=20
+RH_WALL=600
+BT_MISMATCH=30
+BT_RESTARTS=200000
+BT_FINAL_TIME=300
+TOP_N=50                # boards kept in the final ranking
+HOLES=data/holes_open_border_TRL.csv
+# -----------------------------------------------------------------------------
+for arg in "$@"; do
+    case "$arg" in
+        [A-Za-z_]*=*) declare "$arg" ;;
+        *) echo "expected NAME=value, got: $arg" >&2; exit 1 ;;
+    esac
 done
-[ "$BEAM_STOP" -ge 10 ] || echo "[warn] BEAM_STOP $BEAM_STOP is below 10: nothing has gone
-       extinct that shallow, so the whole stop-row beam is emitted and the output
-       floods. Measured on the real seed: row 6 wrote 807 042 boards and 1.5 GB,
-       row 10 wrote 1 136 boards and 2.2 MB in the same 5 s. Continuing anyway."
-for _t in $WHIRL_ROWS; do
-    [ "$_t" -ge 10 ] || echo "[warn] WHIRL_ROWS entry $_t is below 10: same flood, per lap."
-    [ "$_t" -le 12 ] || echo "[warn] WHIRL_ROWS entry $_t is above 12: the beam is spent past
-       12 and the Stage C tools do better there. Continuing anyway."
+cd "$REPO"
+[ -d bin ] && [ -d tools ] ||
+    { echo "REPO=$REPO is not an E555 checkout -- set REPO at the top" >&2; exit 1; }
+[ -x bin/E555_beamer ] || make
+
+# The beamer already refuses a stop row outside 1..13, so there is nothing to
+# re-check here. What it cannot know is that a SHALLOW row floods the disk:
+# nothing has gone extinct that early, so the whole stop-row beam is emitted and
+# --incomplete_top multiplies it. Measured on the real seed, one config: row 6
+# wrote 807042 boards and 1.5 GB where row 10 wrote 1136 and 2.2 MB, in the same
+# 5 s. Worth warning about; not worth forbidding.
+for t in $BEAM_STOP $WHIRL_ROWS; do
+    [ "$t" -ge 10 ] || echo "[warn] stop row $t is below 10: nothing goes extinct that"\
+        "shallow, so the whole beam is emitted and the output floods."
+    [ "$t" -le 12 ] || echo "[warn] stop row $t is above 12: the beam is spent past 12"\
+        "and the Stage C tools do better there."
 done
-BAND_ROW="${BAND_ROW:-5}"           # backtracker --stop_row: rows 0..BAND_ROW are rebuilt exactly
-# FIXED_BORDER=1 adds --with_frame to the cut, so the band carries all 60 outer
-# frame cells instead of the 26 a plain --stop_row leaves: the frame is retained
-# where the input placed it and SEARCHED where it did not, and a band only counts
-# once its frame closes. That is what lets E555_finalizer run its fixed-sides
-# mode -- it needs all 60 border cells present or it falls back to --free_edges.
-#
-# Two things to know before turning it on. It is a much harder cut: many turned
-# boards admit an exact band but no exact frame to go with it, and those now drop
-# out, which is a real filter and a real loss of population. And fixed sides cost
-# yield -- every row must terminate on a piece the frame's own pool can supply,
-# where a free border may choose one that fits. Measured against ground truth (a
-# perfect board on its own frame, lock rows 0..4): 7 491 boards to row 10 fixed
-# against 95 540 free, and 10 against 349 at row 11.
-#
-# What it does NOT give you is a frame that is byte-identical from lap to lap.
-# Fixed mode pins the SET of pieces on each side, not their order: the finalizer
-# re-chooses which edge terminates which row from that pool, so the frame is
-# re-completed every lap rather than carried. Pinning it per cell would mean
-# constraining the terminals inside the beam, which this is not.
-FIXED_BORDER="${FIXED_BORDER:-1}"   # 1 = --with_frame; 0 = the old free-border lap
-# Bands per lap is 2 * POP * BT_LIMIT, and it is the setting that decides how
-# long a lap takes: every distinct band is a distinct locked set, so the
-# finalizer rebuilds its reduced database for each one. Measured at
-# --finalize_from 5 on the synthetic seed: 337 M records, 0.82 GB, ~9 s a band.
-# Locking only six rows is what makes that database big -- raise BAND_ROW and it
-# shrinks fast, at the cost of freeing less of the board per lap.
-BT_LIMIT="${BT_LIMIT:-200}"         # bands ENUMERATED per turned board (--solution-limit)
-BT_PICK="${BT_PICK:-6}"             # bands actually GROWN, chosen farthest-first
-# --solution-limit is load-bearing, not a safety net: the cut is effectively free
-# and the finalizer is the whole cost, so the loop consumes a vanishing fraction
-# of what is on offer. The trap is that the DFS returns its FIRST K, which share
-# a long prefix -- three near-identical bands re-searching one neighbourhood.
-# So enumerate a wide sample and let E555_rank.py --diverse pick BT_PICK of them
-# farthest-first on cell agreement. Exact bands all score the same, so agreement
-# is the only signal there is to choose on.
-#
-# How wide the sample can usefully be depends on how deep the board is, and the
-# spread is enormous: a turned rows-0..12 board admits 28 exact five-row bands
-# and is exhausted in under a second, while a turned rows-0..10 board runs past
-# a million in fifteen. Deeper input, smaller and more tractable band space.
-BT_ORDER="${BT_ORDER:-rowmajor}"
-BT_TIME="${BT_TIME:-60}"            # seconds per turned board
-POP="${POP:-40}"                    # boards carried into the next lap
-FIN_WIDTH="${FIN_WIDTH:-100000}"
-FIN_BOARDS="${FIN_BOARDS:-60}"      # boards the finalizer may write per lap
-FIN_WALL="${FIN_WALL:-900}"         # seconds per lap
-FIN_COLUMNS="${FIN_COLUMNS:-4}"     # left columns sampled per partial (0 = enumerate all)
 
-# ---- stage C: once, at the end ----------------------------------------------
-RH_WIDTH="${RH_WIDTH:-4}"
-RH_ROUNDS="${RH_ROUNDS:-3}"
-RH_ROTATE="${RH_ROTATE:--1}"        # -1 cuts the bottom band first
-RH_LINES="${RH_LINES:-20}"
-RH_WALL="${RH_WALL:-600}"
-# The backtracker is not clue-aware, so the mask matters when CLUES=1: this one
-# frees the right and top border, never the centre cell, so the centre clue
-# cannot be displaced by the close.
-HOLES="${HOLES:-$REPO/data/holes_open_border_TR.csv}"
-BT_MISMATCH="${BT_MISMATCH:-30}"
-BT_RESTARTS="${BT_RESTARTS:-200000}"
-BT_CLOSE_TIME="${BT_CLOSE_TIME:-300}"
-TOP_N="${TOP_N:-100}"               # rows in the delivered ranking
-# =============================================================================
+banner() { echo; echo "==============================================================="
+           echo "  $*"; echo "==============================================================="; echo; }
+rows()   { python3 "$TOOLS/E555_rank.py" "$1" --count; }
+best()   { python3 "$TOOLS/E555_rank.py" "$1" --seed "$SEED" --field score; }
+show_board() { echo; python3 "$TOOLS/E555_viewer.py" "$1" --seed "$SEED" --no-url --row 0; echo; }
 
-banner()     { echo; echo "==============================================================="; echo "  $*"; echo "==============================================================="; echo; }
-show_board() { echo; python3 "$REPO/tools/E555_viewer.py" "$1" --seed "$SEED" --no-url --row 0; echo; }
-# grep -c exits 1 on a zero count, so the usual `|| echo 0` idiom can print 0
-# TWICE -- once from grep, once from the fallback. The lap counts below are
-# compared numerically, so this one has to yield exactly one number.
-rows()       { local n; n=$(grep -cv '^ *#' "$1" 2>/dev/null) || n=0; echo "${n:-0}"; }
-best()       { cut -d, -f2 "$1" | head -1 | tr -d ' '; }
+# rank FILE -- rewrite a board CSV in place, best board first, field 2 rescored
+# to the true matched-edge count so "best so far" is comparable across stages.
 rank() {
     [ -s "$1" ] || return 0
-    python3 "$REPO/tools/E555_rank.py" "$1" --seed "$SEED" \
-        --sort breaks,break_rows --emit "$1.tmp" --rescore > /dev/null \
-        && mv "$1.tmp" "$1"
-    rm -f "$1.tmp"
+    python3 "$TOOLS/E555_rank.py" "$1" --seed "$SEED" \
+        --sort breaks,break_rows --emit "$1.tmp" --rescore > /dev/null
+    mv "$1.tmp" "$1"
 }
 
-[ -x "$REPO/bin/E555_beamer" ] || make -C "$REPO"
-# A binary that EXISTS is not a binary that RUNS here. CFLAGS carries
-# -march=native, so a bin/ built on another machine can hold instructions this
-# CPU lacks, and `make` will not rebuild it because the sources are not newer.
-# The failure mode is the nasty one: a mid-search SIGILL that still leaves a
-# checkpoint and a truncated CSV behind, so the lap looks like a short
-# successful run. Smoke-test the search itself, cheaply, and rebuild if it dies.
-if ! "$REPO/bin/E555_backtracker" "$SEED" "$REPO/data/board_partial_row12.csv" \
-        "$(mktemp -u)" --row 0 --count 1 --max-mismatch 480 --break-mode stuck \
-        --stuck_restarts 1 --time-limit 1 --threads 1 > /dev/null 2>&1; then
-    echo "[warn] bin/ does not run on this machine (a stale -march=native build?)."
-    echo "       Rebuilding from source before starting."
-    make -B -C "$REPO"
-fi
-# Everything below runs from inside $RUN_DIR, so any path handed in relative to
-# the invocation directory has to be resolved before the cd.
-abspath() { case "$1" in /*) printf '%s' "$1";; *) printf '%s' "$PWD/$1";; esac; }
-SEED="$(abspath "$SEED")"
-HOLES="$(abspath "$HOLES")"
-[ -n "$INPUT" ] && INPUT="$(abspath "$INPUT")"
-[ -n "$DB_FILE" ] && DB_FILE="$(abspath "$DB_FILE")"
-[ -r "$SEED" ] || { echo "!! seed not readable: $SEED"; exit 1; }
-mkdir -p "$RUN_DIR"
-cd "$RUN_DIR"
-echo "[cfg] repo=$REPO"
-echo "[cfg] seed=$SEED"
-echo "[cfg] run_dir=$RUN_DIR threads=$THREADS db_file=${DB_FILE:-<in memory>} clues=$CLUES"
+# Paths are resolved against the repo before the cd into RUN_DIR below.
+abs() { case "$1" in /*) printf '%s' "$1";; *) printf '%s' "$PWD/$1";; esac; }
+SEED=$(abs "$SEED"); HOLES=$(abs "$HOLES")
+[ -n "$INPUT" ] && INPUT=$(abs "$INPUT")
+[ -n "$DB_FILE" ] && DB_FILE=$(abs "$DB_FILE")
+TOOLS=$PWD/tools; SRC=$PWD/src; BIN=$PWD/bin
+mkdir -p "$RUN_DIR"; cd "$RUN_DIR"
+
+CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
+DB_ARG=();   [ -n "$DB_FILE" ] && DB_ARG=(--db_file "$DB_FILE")
+
+echo "[cfg] repo=$REPO  seed=$SEED"
+echo "[cfg] run_dir=$PWD threads=$THREADS db_file=${DB_FILE:-<in memory>} clues=$CLUES"
 echo "[cfg] whirlpool: laps=[$WHIRL_ROWS] band_row=$BAND_ROW bt_limit=$BT_LIMIT bt_pick=$BT_PICK pop=$POP"
-echo "[cfg] fixed_border=$FIXED_BORDER ($([ "$FIXED_BORDER" = 1 ] && echo "--with_frame: the cut carries all 60 frame cells, finalizer runs fixed sides" || echo "free border: the old lap"))"
+echo "[cfg] fixed_border=$FIXED_BORDER"
 START=$SECONDS
 
 # -----------------------------------------------------------------------------
@@ -302,7 +137,7 @@ echo "first run builds the 6.4 GB chain database: expect a few quiet minutes."
 echo "Completions only -- the whirlpool needs whole rows to turn."
 echo
 
-BEAM_CMD=("$REPO/bin/E555_beamer" "$SEED" --random_edges
+BEAM_CMD=("$BIN/E555_beamer" "$SEED" --random_edges
     --out_dir beam --threads "$THREADS"
     --beam_width "$BEAM_WIDTH" --stop_row "$BEAM_STOP"
     --border_row_N "$BEAM_BOARDS" --top_columns "$BEAM_COLUMNS"
@@ -314,7 +149,7 @@ BEAM_CMD=("$REPO/bin/E555_beamer" "$SEED" --random_edges
 [ "$RNG_SEED" != "0" ] && BEAM_CMD+=(--seed "$RNG_SEED")
 "${BEAM_CMD[@]}"
 
-cp beam/beam_completions_random_"$BEAM_STOP".csv 0_beam.csv 2>/dev/null || true
+xargs -r cat < beam/outputs.txt > 0_beam.csv
 rm -rf beam
 [ -s 0_beam.csv ] || { echo "!! no board reached row $BEAM_STOP -- raise BEAM_WALL or lower BEAM_STOP"; exit 1; }
 rank 0_beam.csv
@@ -346,8 +181,8 @@ lap() {
     # the filled region on columns 0..T; 3 (CCW) takes the old LEFT column down
     # instead and fills columns 15-T..15. The two keep different halves of the
     # board, so this genuinely doubles the field rather than mirroring it.
-    python3 "$REPO/tools/E555_rotate.py" "$CURRENT" 1 --out "${k}_cw.csv"  --seed "$SEED" > /dev/null
-    python3 "$REPO/tools/E555_rotate.py" "$CURRENT" 3 --out "${k}_ccw.csv" --seed "$SEED" > /dev/null
+    python3 "$TOOLS/E555_rotate.py" "$CURRENT" 1 --out "${k}_cw.csv"  --seed "$SEED" > /dev/null
+    python3 "$TOOLS/E555_rotate.py" "$CURRENT" 3 --out "${k}_ccw.csv" --seed "$SEED" > /dev/null
     cat "${k}_cw.csv" "${k}_ccw.csv" > "${k}_rot.csv"
     rm -f "${k}_cw.csv" "${k}_ccw.csv"
     nrot=$(rows "${k}_rot.csv")
@@ -359,11 +194,12 @@ lap() {
     # first, which is exactly the shape the finalizer's lock needs. --break-mode
     # any because the default (stuck) takes a minimal break where no exact fit
     # exists, and a broken band is dropped at emission.
-    "$REPO/bin/E555_backtracker" "$SEED" "${k}_rot.csv" "${k}_bt.csv" \
+    "$BIN/E555_backtracker" "$SEED" "${k}_rot.csv" "${k}_bt.csv" \
         --stop_row "$BAND_ROW" --order "$BT_ORDER" --break-mode any \
         "${frame_arg[@]}" \
         --max-mismatch 0 --solution-limit "$BT_LIMIT" \
-        --time-limit "$BT_TIME" --threads "$THREADS" > "${k}_bt.log" 2>&1 || true
+        --time-limit "$BT_TIME" --threads "$THREADS" > "${k}_bt.log" 2>&1 ||
+        echo "[warn] lap $k: the backtracker exited non-zero, see ${k}_bt.log"
     if [ -s "${k}_bt.csv.stop_row${BAND_ROW}.csv" ]; then
         mv "${k}_bt.csv.stop_row${BAND_ROW}.csv" "${k}_band.csv"
     fi
@@ -372,7 +208,7 @@ lap() {
     # K sharing a long prefix and exact bands are all the same score -- there is
     # nothing else to choose on. Skipped when the cut returned few enough anyway.
     if [ -s "${k}_band.csv" ] && [ "$(rows "${k}_band.csv")" -gt "$BT_PICK" ]; then
-        python3 "$REPO/tools/E555_rank.py" "${k}_band.csv" --seed "$SEED" \
+        python3 "$TOOLS/E555_rank.py" "${k}_band.csv" --seed "$SEED" \
             --diverse "$BT_PICK" --emit "${k}_band.tmp" > /dev/null 2>&1 \
             && mv "${k}_band.tmp" "${k}_band.csv"
         rm -f "${k}_band.tmp"
@@ -392,18 +228,18 @@ lap() {
     # below was rebuilt exactly by the backtracker, so the closure objective is
     # the only one with anything left to say about it. --frac_rand 0.0, though,
     # is the same unmeasured holdover as in the other two pipelines -- see the
-    # note above the finalizer call in run_pipeline_random.sh.
-    "$REPO/bin/E555_finalizer" "$SEED" "${k}_band.csv" \
+    # note in run_pipeline.sh.
+    "$BIN/E555_finalizer" "$SEED" "${k}_band.csv" \
         --out_dir "lap$k" --threads "$THREADS" \
         --finalize_from "$BAND_ROW" --finalize_repeats 1 \
         --beam_width "$FIN_WIDTH" --stop_row "$target" \
         --border_row_N "$nband" --top_columns "$FIN_COLUMNS" \
         --lambda_Mahalanobis 0 --frac_rand 0.0 \
         --max_partials "$FIN_BOARDS" --max_wall_sec "$FIN_WALL" \
-        --verbose "${inc[@]}" "${CLUE_ARG[@]}" > "${k}_fin.log" 2>&1 || true
+        --print-cmd --verbose "${inc[@]}" "${CLUE_ARG[@]}" > "${k}_fin.log" 2>&1 ||
+        echo "[warn] lap $k: the finalizer exited non-zero, see ${k}_fin.log"
 
-    cat "lap$k/beam_completions_finalized_$target.csv"          > "${k}_final.csv" 2>/dev/null || true
-    cat "lap$k/beam_completions_finalized_${target}_partial.csv" >> "${k}_final.csv" 2>/dev/null || true
+    xargs -r cat < "lap$k/outputs.txt" > "${k}_final.csv"
     rm -rf "lap$k"
 
     nout=$(rows "${k}_final.csv")
@@ -450,16 +286,15 @@ echo "rows on purpose. A completion here would be a solved puzzle; a refusal is"
 echo "a proof, delivered in milliseconds."
 echo
 
-"$REPO/bin/E555_roundhouse" "$SEED" "$CURRENT" \
+"$BIN/E555_roundhouse" "$SEED" "$CURRENT" \
     --out_dir strip --threads "$THREADS" \
     --rounds "$RH_ROUNDS" --strip_width "$RH_WIDTH" --rotate "$RH_ROTATE" \
-    --border_row_N "$RH_LINES" --max_wall_sec "$RH_WALL" --verbose "${CLUE_ARG[@]}" || true
+    --border_row_N "$RH_LINES" --max_wall_sec "$RH_WALL" --print-cmd --verbose "${CLUE_ARG[@]}"
 
 # First existing match, or empty. NOT `$(ls GLOB | head -1)`: an unmatched glob
 # makes ls exit 2, pipefail promotes it, and set -e kills the run -- which is
 # exactly the "emitted nothing" case the else branch exists to report.
-RH_OUT=""
-for f in strip/roundhouse_*_miss0.csv; do [ -e "$f" ] && { RH_OUT="$f"; break; }; done
+RH_OUT=$(head -1 strip/outputs.txt)
 if [ -n "$RH_OUT" ] && [ -s "$RH_OUT" ]; then
     cp "$RH_OUT" C1_strip.csv
     rank C1_strip.csv
@@ -485,18 +320,18 @@ echo "This is the first stage that may break an edge, and so the first point at"
 echo "which the ranking means anything."
 echo
 
-"$REPO/bin/E555_backtracker" "$SEED" C2_in.csv C2_dived.csv \
+"$BIN/E555_backtracker" "$SEED" C2_in.csv C2_dived.csv \
     --row 0 --count 1 --threads "$THREADS" \
     --holes "$HOLES" --order mrv --break-mode stuck \
     --max-mismatch "$BT_MISMATCH" --stuck_restarts "$BT_RESTARTS" \
-    --time-limit "$BT_CLOSE_TIME" --verbose || true
+    --time-limit "$BT_FINAL_TIME" --print-cmd --verbose
 
 # -----------------------------------------------------------------------------
 banner "PIPELINE COMPLETE  ($(( (SECONDS-START)/60 )) min $(( (SECONDS-START)%60 )) s)"
 # -----------------------------------------------------------------------------
 cat C2_in.csv C2_dived.csv "$CURRENT" > final_pool.csv 2>/dev/null || cp C2_in.csv final_pool.csv
 rank final_pool.csv
-python3 "$REPO/tools/E555_rank.py" final_pool.csv --seed "$SEED" \
+python3 "$TOOLS/E555_rank.py" final_pool.csv --seed "$SEED" \
     --sort breaks,break_rows --top "$TOP_N" --emit FINAL_top"$TOP_N".csv --rescore > /dev/null
 head -1 final_pool.csv > FINAL_best.csv
 rm -f final_pool.csv C2_in.csv
@@ -511,4 +346,4 @@ ls -1 [0-9]_*.csv C[0-9]_*.csv FINAL_*.csv 2>/dev/null | sed 's/^/  /'
 echo
 echo "Best board of the whole run: $(best FINAL_best.csv)/480 correct edges."
 show_board FINAL_best.csv
-python3 "$REPO/tools/E555_rank.py" FINAL_top"$TOP_N".csv --seed "$SEED" --top 20 --no-id
+python3 "$TOOLS/E555_rank.py" FINAL_top"$TOP_N".csv --seed "$SEED" --top 20 --no-id

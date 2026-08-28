@@ -75,8 +75,9 @@ src/B_beam/     Stage B beamer + finalizer + roundhouse + shared database (C)
 src/C_tail/     Stage C tail toolbox (C + Python/OR-Tools)
 tools/          board viewer, ranker, rotator, CSV cleaner, rotations sorter
 data/           seeds, example boards, masks (see data/README.md)
-examples/       five short scripts, one per stage: start here
-pipeline/       the full pipeline and the board farm, for long unattended runs
+examples/       seven short scripts: one per tool, plus the whole chain end to end
+pipeline/       the full pipeline, the whirlpool and the board farm, plus a
+                Slurm wrapper: long unattended runs
 tests/          run_tests.sh: the release gate
 agent/          an experimental self-driving optimisation mode: untested and just for fun
 ```

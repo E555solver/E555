@@ -2080,6 +2080,23 @@ static bool pdup_insert(uint64_t key) {
     return true;
 }
 
+/* Data lines in a partials CSV, counted with the same convention the loader
+   uses: blanks and # / % lines are not lines. Only called for
+   --border_row_N 0, so an ordinary run opens the CSV exactly as before. */
+static uint32_t fin_count_data_lines(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) fatal("cannot open partials CSV %s: %s", path, strerror(errno));
+    char *line = NULL; size_t sz = 0; uint32_t n = 0;
+    while (getline(&line, &sz, f) > 0) {
+        char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s=='\0'||*s=='\n'||*s=='\r'||*s=='#'||*s=='%') continue;
+        n++;
+    }
+    free(line); fclose(f);
+    return n;
+}
+
 /* Hash every data line BEFORE the selected window into the seen set (one
    pass, no validation), so a window line duplicating anything earlier in the
    file is skipped even when the file is processed in --border_row chunks. */
@@ -2935,7 +2952,8 @@ static void usage(const char *a0) {
 "Input / output:\n"
 "  --out_dir DIR          output directory for the completions CSV (default beam_out)\n"
 "  --border_row N         first data line of partials.csv to load (default 0)\n"
-"  --border_row_N N       number of consecutive lines to load (default 1)\n"
+"  --border_row_N N       number of consecutive lines to load (default 1; 0 = every\n"
+"                         line from --border_row to the end of the file)\n"
 "  --finalize_from N      lock rows 0..N and start the beam at row N+1 (default 5;\n"
 "                         a line with an unplaced cell at or below N is skipped).\n"
 "                         Low on purpose: the beam grows from ONE locked board, so it\n"
@@ -3071,6 +3089,46 @@ static void usage(const char *a0) {
 "  --help                 this text\n", a0);
 }
 
+/* -- --print-cmd ----------------------------------------------------------
+ * The whole invocation with every flag carrying the value the run will really
+ * use, from the command line or from a default. Copy the line and you have the
+ * run. Prints and then continues, so an example can pass it every time.
+ *
+ * Every flag the parser accepts must appear here; tests/check_script_flags.py
+ * enforces it, since a hand-written printer drifts from its parser fast. */
+static void print_cmd(const char *a0, const char *seed_path, const char *csv_path,
+                      const char *rot_path) {
+    printf("[cmd] %s %s %s", a0, seed_path, csv_path);
+    if (rot_path) printf(" %s", rot_path);
+    if (g_opt_free_edges) printf(" --free_edges");
+    if (g_incomplete_top) printf(" --incomplete_top");
+    if (g_verbose)        printf(" --verbose");
+    if (g_print_cmd)      printf(" --print-cmd");
+    if (!g_free_demand)   printf(" --no_free_demand");
+    if (g_clue_mask & CLUE_CENTER)  printf(" --clue_center");
+    if (g_clue_mask & CLUE_CORNERS) printf(" --clue_corners");
+    if (g_clue_orient_req != 0xF) {          /* 0xF is 'auto', the default */
+        char oz[16]; size_t on = 0;
+        for (int o = 0; o < 4; o++)
+            if (g_clue_orient_req & (1u << o))
+                on += (size_t)snprintf(oz + on, sizeof oz - on, "%s%d", on ? "," : "", o);
+        printf(" --clue_orient %s", on ? oz : "auto");
+    }
+    printf(" --out_dir %s", g_out_dir);
+    printf(" --border_row %u --border_row_N %u", g_border_row_index, g_border_row_N);
+    printf(" --finalize_from %u --finalize_repeats %u", g_finalize_from, g_finalize_repeats);
+    printf(" --beam_width %u --stop_row %u", g_beam_width, g_stop_row);
+    printf(" --beam_expand %u --beam_expand_row %u", g_beam_expand, g_beam_expand_row);
+    printf(" --lambda_J %g --lambda_Mahalanobis %g", g_lambda_J, g_lambda_maha);
+    printf(" --frac_rand %g --parent_cap %u --pool_factor %u",
+           g_frac_rand, g_parent_cap, g_pool_factor);
+    printf(" --top_columns %ld --gumbel_tau_columns %g --bail_columns %u",
+           g_top_columns, g_tau_columns, g_bail_columns);
+    printf(" --threads %d --seed %" PRIu64, g_nthreads, g_master_seed);
+    printf(" --config_time_sec %g --max_wall_sec %g --max_partials %" PRIu64 "\n",
+           g_config_time_sec, g_max_wall_sec, g_max_partials);
+}
+
 int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++)
         if (!strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
@@ -3108,6 +3166,7 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--config_time_sec") && i+1 < argc) g_config_time_sec = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_wall_sec")    && i+1 < argc) g_max_wall_sec = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_partials")    && i+1 < argc) g_max_partials = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--print-cmd"))       g_print_cmd = true;
         else if (!strcmp(argv[i], "--verbose"))         g_verbose = true;
         else { fprintf(stderr, "Unknown argument: %s\n\n", argv[i]); usage(argv[0]); return 1; }
     }
@@ -3142,7 +3201,17 @@ int main(int argc, char *argv[]) {
     if (g_frac_rand < 0.0 || g_frac_rand > 1.0) fatal("--frac_rand must be in [0,1]");
     if (g_pool_factor == 0) g_pool_factor = 1;
 
+    /* --border_row_N 0 means "the rest of the file". Resolved before the banner so
+       [cfg] and --print-cmd report the count the run will really use, and so a
+       caller feeding a whole stage's output need not count the lines itself. */
+    if (g_border_row_N == 0) {
+        uint32_t csv_lines = fin_count_data_lines(csv_path);
+        g_border_row_N = (csv_lines > g_border_row_index)
+                       ? csv_lines - g_border_row_index : 0;
+    }
+
     printf("\n=== E555 finalizer ===\n\n");
+    if (g_print_cmd) print_cmd(argv[0], seed_path, csv_path, rot_path);
     printf("[cfg] seed_file=%s partials_file=%s out_dir=%s\n",
            seed_path, csv_path, g_out_dir);
     printf("[cfg] seed=%" PRIu64 " threads=%d verbose=%d lines=%u+%u finalize_from=%u repeats=%u incomplete_top=%d\n",
@@ -3203,6 +3272,7 @@ int main(int argc, char *argv[]) {
     if (!g_completions_fp) fatal("cannot open %s: %s", comp_path, strerror(errno));
     setvbuf(g_completions_fp, NULL, _IOFBF, EMIT_FILE_BUF);
     printf("[out] completions -> %s (append)\n", comp_path);
+    manifest_add(comp_path);
     char part_path[1024] = "";
     if (g_incomplete_top) {
         snprintf(part_path, sizeof part_path, "%s/beam_completions_finalized_%u_partial.csv", g_out_dir, g_stop_row);
@@ -3210,6 +3280,7 @@ int main(int argc, char *argv[]) {
         if (!g_partial_fp) fatal("cannot open %s: %s", part_path, strerror(errno));
         setvbuf(g_partial_fp, NULL, _IOFBF, EMIT_FILE_BUF);
         printf("[out] incomplete-top partials -> %s (append)\n", part_path);
+        manifest_add(part_path);
     }
     fflush(stdout);
     g_solution_idx = 0;
@@ -3357,5 +3428,6 @@ int main(int argc, char *argv[]) {
     if (g_incomplete_top) printf("[sum] partials file: %s\n", part_path);
     if (g_completions_fp) fclose(g_completions_fp);
     if (g_partial_fp) fclose(g_partial_fp);
+    manifest_write(g_out_dir);          /* after the closes: it stats file sizes */
     return 0;
 }

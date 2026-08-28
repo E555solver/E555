@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -86,6 +87,7 @@ LeftOrder   *g_lefts   = NULL;  size_t g_left_n   = 0;
 
 int  g_nthreads        = 0;
 bool g_verbose         = false;
+bool g_print_cmd       = false;   /* --print-cmd: echo the full invocation, then run */
 bool g_free_edges      = false;
 
 /* Pieces barred from the database: excluded pieces never enter a chain record
@@ -142,6 +144,51 @@ void *arena_map(size_t bytes) {
 void ensure_dir(const char *path) {
     if (mkdir(path, 0775) != 0 && errno != EEXIST)
         fatal("cannot create directory %s: %s", path, strerror(errno));
+}
+
+/* -- Output manifest ------------------------------------------------------
+ * A script should not have to guess the name of the file a tool just wrote,
+ * and every one of them used to: rebuilding it from --stop_row, or globbing
+ * the output directory. Both are guesses, and a guess that misses reports a
+ * working search as a failure.
+ *
+ * Instead: every path a run MIGHT write is registered here as it is opened,
+ * and at exit the ones that actually GREW are listed in <out_dir>/outputs.txt,
+ * one per line. An empty file is the real answer "ran, emitted nothing".
+ *
+ * Growth, not existence: these files are opened in append mode, so a file left
+ * by an earlier run into the same directory is not this run's output. Recording
+ * the size at open and comparing at close is exact and needs no counter
+ * threaded through the emit path. */
+#define MANIFEST_MAX 64
+static struct { char path[1152]; off_t size0; } g_manifest[MANIFEST_MAX];
+static int g_manifest_n;
+
+void manifest_add(const char *path) {
+    if (g_manifest_n >= MANIFEST_MAX) return;
+    struct stat st;
+    snprintf(g_manifest[g_manifest_n].path, sizeof g_manifest[0].path, "%s", path);
+    g_manifest[g_manifest_n].size0 = (stat(path, &st) == 0) ? st.st_size : 0;
+    g_manifest_n++;
+}
+
+void manifest_write(const char *dir) {
+    char out[1200];
+    snprintf(out, sizeof out, "%s/outputs.txt", dir);
+    FILE *f = fopen(out, "w");
+    if (!f) return;                       /* never fail a finished run over this */
+    int listed = 0;
+    for (int i = 0; i < g_manifest_n; i++) {
+        struct stat st;
+        if (stat(g_manifest[i].path, &st) != 0 || st.st_size <= g_manifest[i].size0)
+            continue;
+        char abs[PATH_MAX];
+        const char *p = realpath(g_manifest[i].path, abs) ? abs : g_manifest[i].path;
+        fprintf(f, "%s\n", p);
+        listed++;
+    }
+    fclose(f);
+    printf("[out] %d file(s) written this run, listed in %s\n", listed, out);
 }
 
 uint64_t fnv1a_str(const char *s) {

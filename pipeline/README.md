@@ -6,20 +6,43 @@ have not run the tools individually yet, start with
 [`../examples/`](../examples/) instead; it takes about ten minutes and the
 settings here will make far more sense afterwards.
 
-## The four runners
+## The runners
 
 | script | what it is | typical run |
 |---|---|---|
-| `run_pipeline_random.sh` | the whole pipeline on fresh random borders, no Stage A. **Start here.** | 30-60 min per pass |
-| `run_pipeline_annealed.sh` | the same, but Stage A picks the borders first | +minutes for Stage A |
-| `run_pipeline_whirlpool.sh` | turns the board 90 degrees between every re-grow, so the buried bottom rows get re-searched too | hours |
+| `run_pipeline.sh` | the whole pipeline, borders to a finished board. `BORDERS=random` samples borders from the seed; `BORDERS=annealed` searches for them with Stage A first | 30-60 min per pass |
+| `run_pipeline_whirlpool.sh` | turns the board 90 degrees between every re-grow, so the buried bottom rows get re-searched too | hours, or one lap in minutes |
 | `run_board_farm.sh` | runs a pipeline pass in a loop forever, keeps only the best boards, and periodically re-attacks them | days |
+| `topper_sweep.sh` | one plan of topper passes over a slice of a board file | minutes |
+| `slurm_wrapper.sh` | runs any of the above as a batch job | -- |
 
 ```bash
-bash pipeline/run_pipeline_random.sh          # one pass, ~30-60 min
-bash pipeline/run_pipeline_whirlpool.sh       # four laps around the board
-MAX_HOURS=48 bash pipeline/run_board_farm.sh  # the farm, two days
+bash pipeline/run_pipeline.sh                       # annealed borders
+bash pipeline/run_pipeline.sh BORDERS=random        # sampled borders, start here
+bash pipeline/run_pipeline_whirlpool.sh             # four laps around the board
+bash pipeline/run_pipeline_whirlpool.sh WHIRL_ROWS=10   # just one lap
+bash pipeline/run_board_farm.sh MAX_HOURS=48        # the farm, two days
 ```
+
+## How every runner works
+
+The same shape as the examples: a settings block of plain assignments at the
+top, edited in place or overridden by optional `NAME=value` arguments.
+
+```bash
+bash pipeline/run_pipeline.sh RUN_DIR=run7 THREADS=16 BEAM_STOP_ROW=10
+```
+
+`REPO` defaults to the script's own parent; set it if you copy a runner
+somewhere else. Every stage reads the `outputs.txt` the previous tool wrote
+rather than guessing filenames, and passes `--print-cmd`, so the log carries the
+exact command each stage ran.
+
+**The annealer needs at least 250000 steps.** Below that it is not merely weaker
+-- it often fails to place a legal border at all. Measured on the real seed: 8
+restarts x 3000 steps found 2 feasible borders, 2 x 2000 found one on one run
+and none on the next, while every restart at 250000 succeeded (2/2, 4/4, 8/8).
+The runners warn below the floor rather than refusing.
 
 ## The whirlpool
 
@@ -72,10 +95,10 @@ the per-lap counts the script prints are the real diagnostic: a lap that returns
 what it was given means the neighbourhood is exhausted.
 
 ```bash
-bash pipeline/run_pipeline_whirlpool.sh                    # beamer, then four laps
-INPUT=champions.csv bash pipeline/run_pipeline_whirlpool.sh  # whirl boards you have
-WHIRL_ROWS="10 10 10 10" BAND_ROW=5 POP=40 bash pipeline/run_pipeline_whirlpool.sh
-FIXED_BORDER=0 bash pipeline/run_pipeline_whirlpool.sh        # the old free-border lap
+bash pipeline/run_pipeline_whirlpool.sh                  # beamer, then four laps
+bash pipeline/run_pipeline_whirlpool.sh INPUT=champions.csv   # whirl boards you have
+bash pipeline/run_pipeline_whirlpool.sh WHIRL_ROWS="10 10 10 10" BAND_ROW=5 POP=40
+bash pipeline/run_pipeline_whirlpool.sh FIXED_BORDER=0        # the old free-border lap
 ```
 
 `INPUT` skips the beamer and whirls boards you already have -- they need whole
@@ -111,23 +134,28 @@ spends 2-3 minutes rebuilding the same 6.4 GB chain database. It defaults to
 ## The topper sweep
 
 One script, `topper_sweep.sh`, drives `E555_topper.py` through a list of passes.
-A pass is written `SIDE:WINDOW:LOCKED` -- which border band opens, how deep it
-is, and how many of its outermost rows to **unset and hold empty**. A `PLAN` is
-a space-separated list of them, and `PRESET` names the four that used to be
-separate scripts:
+A pass is `run_pass SIDE WINDOW LOCKED` -- which border band opens, how deep it
+is, and how many of its outermost rows to **unset and hold empty**. `PRESET`
+names a plan; each plan is a handful of literal `run_pass` lines near the bottom
+of the script, so a new one is written by copying six lines rather than by
+learning a syntax:
 
 | `PRESET` | plan | when |
 |---|---|---|
-| `safe` | `T:5:0`, then `TR TL TB R L B` at `3:0` | a board filled to row 11. Nothing is ever unset, so no pass can make the board worse. Start here |
-| `window` | `T:8:3 T:6:2 T:5:1 T:4:0`, then `TR:4:0 L:4:0` | a window sliding up the board, then two clean-ups on borders it never reached; what `run_pipeline_annealed.sh` stage 5 runs |
+| `safe` | `T 5 0`, then `TR TL TB R L B` at `3 0` | a board filled to row 11. Nothing is ever unset, so no pass can make the board worse. Start here |
+| `window` | `T 8 3`, `T 6 2`, `T 5 1`, `T 4 0`, then `TR 4 0` and `L 4 0` | a window sliding up the board, then two clean-ups on borders it never reached; what `run_pipeline.sh` stage 5 runs |
 | `deep` | every side as a pair -- a wide pass with its outer band emptied, then a narrow pass that refills it | when the safe sweep has run out of moves and you will spend breaks to buy freedom |
-| `closeT` `closeB` `closeR` `closeL` | `X:6:2 X:4:0` on the named side | closing a hole that sits against one border -- an `E555_roundhouse` `miss0` board, or any partial whose breaks are all on one side. `close` on its own means `closeT` |
+| `closeT` `closeB` `closeR` `closeL` | `X 6 2` then `X 4 0` on the named side | closing a hole that sits against one border -- an `E555_roundhouse` `miss0` board, or any partial whose breaks are all on one side |
 
 ```bash
-INPUT=boards.csv PRESET=safe bash pipeline/topper_sweep.sh
-INPUT=boards.csv PRESET=closeT bash pipeline/topper_sweep.sh
-INPUT=boards.csv PLAN="T:8:3 T:5:1 T:4:0" MAX_TIME=3600 bash pipeline/topper_sweep.sh
+bash pipeline/topper_sweep.sh INPUT=boards.csv PRESET=safe
+bash pipeline/topper_sweep.sh INPUT=boards.csv PRESET=closeT OUT=closed.csv
+bash pipeline/topper_sweep.sh INPUT=boards.csv PRESET=deep MAX_TIME=3600
 ```
+
+`FIRST_ROW`/`NUM_ROWS` cut this run's slice of `INPUT`, so several runs can
+share one file. The script knows nothing about schedulers: under a Slurm array,
+pass `FIRST_ROW=$((SLURM_ARRAY_TASK_ID * NUM_ROWS))` from the submit script.
 
 `LOCKED > 0` is what makes the deep plans work, and it is worth being clear
 about: it does not merely freeze those cells, it **unsets** them, lifting their
@@ -156,7 +184,7 @@ roundhouse leaves it in the band of its LAST round:
 | `--rotate 0` | left | `closeL` |
 
 ```bash
-INPUT=round_out/roundhouse_round1_rot1_W5_miss0.csv PRESET=closeB bash pipeline/topper_sweep.sh
+bash pipeline/topper_sweep.sh INPUT=round_out/roundhouse_round1_rot1_W5_miss0.csv PRESET=closeB
 ```
 
 Read the DEPTH off the roundhouse's `[emit]` line
@@ -176,19 +204,19 @@ Open one side.
 
 ## Fixing the Eternity II clue pieces
 
-All four runners take **`CLUES=1`**, which passes `--clue_center --clue_corners`
+Every runner takes **`CLUES=1`**, which passes `--clue_center --clue_corners`
 to every stage that supports them. It is off by default and changes nothing when
 unset.
 
 ```bash
-CLUES=1 bash pipeline/run_pipeline_random.sh
-CLUES=1 INPUT=board.csv PRESET=window bash pipeline/topper_sweep.sh
+bash pipeline/run_pipeline.sh BORDERS=random CLUES=1
+bash pipeline/topper_sweep.sh INPUT=board.csv PRESET=window CLUES=1
 ```
 
 It is one switch per run, not per stage, on purpose: a clue held by the beamer
 and then dropped by the finalizer is no better than never holding it, and that
-is exactly what happened before -- `FIN_FROM` is `BEAM_STOP_ROW - 5`, so the
-finalizer frees the centre clue's row on every run. The farm passes `CLUES`
+is exactly what happened before -- `FIN_FROM` sits five rows below the beam's
+stop row, so the finalizer frees the centre clue's row on every run. The farm passes `CLUES`
 down to the production pipeline it drives.
 
 Two consequences worth knowing:
@@ -228,3 +256,19 @@ board, not failing: the beamer going extinct proves that border is dead below
 the current row, and the roundhouse refusing every strip start is a proof about
 that board delivered in milliseconds. The runners detect both, say so, and carry
 the previous stage's boards forward.
+
+## Slurm
+
+The runners are plain bash. One wrapper runs any of them as a batch job:
+
+```bash
+sbatch pipeline/slurm_wrapper.sh pipeline/run_pipeline.sh THREADS=8 RUN_DIR=run1
+sbatch --cpus-per-task=32 --mem=64G pipeline/slurm_wrapper.sh \
+       pipeline/run_pipeline_whirlpool.sh THREADS=32
+sbatch --array=0-9 pipeline/slurm_wrapper.sh \
+       pipeline/topper_sweep.sh INPUT=boards.csv NUM_ROWS=500
+```
+
+Anything passed to `sbatch` overrides the wrapper's own `#SBATCH` defaults. For
+the array case the sweep needs its slice, so give it one in the submit script
+rather than expecting it to read the scheduler's environment itself.

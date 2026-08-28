@@ -305,6 +305,7 @@ extern LeftOrder   *g_lefts;    extern size_t g_left_n;
 /* Shared run flags, set by the solver's main() before the builds run. */
 extern int  g_nthreads;
 extern bool g_verbose;
+extern bool g_print_cmd;
 extern bool g_free_edges;
 
 /* Pieces barred from the database: excluded pieces never enter a chain record
@@ -505,6 +506,13 @@ void *xmalloc(size_t n);
 void *xrealloc(void *ptr, size_t n);
 void *arena_map(size_t bytes);
 void  ensure_dir(const char *path);
+
+/* Output manifest: register each path as it is opened, then write
+ * <out_dir>/outputs.txt at exit listing the ones that actually grew, so a
+ * script can read where the boards went instead of guessing the name or
+ * globbing for it. An empty outputs.txt means "ran, emitted nothing". */
+void  manifest_add(const char *path);
+void  manifest_write(const char *dir);
 uint64_t fnv1a_str(const char *s);
 bool parse_u64_token(const char *s, unsigned long long *out);
 

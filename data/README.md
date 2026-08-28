@@ -14,7 +14,7 @@ CSVs), **borders** (Stage A output), and **holes** (movable-cell masks).
 | `board_partial_row12.csv` | A genuine **Stage B beam output** on `seed_Edge5` (id `r0c669`, from the low-B Mahalanobis campaign): rows 0-12 filled, rows 13-15 still open, the bottom 12 rows already clean. The realistic input for the Stage C tools, which expect a partial. Field 2 here is the beamer's solution **index**, not the edge score (see the convention below). |
 | `synth_solution_480.csv` | The known 480/480 solution of the synthetic set, as a canonical board row. Used by `tests/run_tests.sh` as the finalizer regression: the finalizer must rediscover it from a partial locked at row 10. |
 | **borders** (Stage A output, feed to the beamer as its rotations CSV) | |
-| `borders_annealed_fix12.csv` | A best-found Stage A annealer run with fixed corners (modes 1 and 2): border arrangements (`id, 256 spins`) with `#` comments carrying the per-side Euler-trail scores. The kind of file `ANNEAL=1 bash examples/01_beamer_quickstart.sh` produces and the beamer reads. |
+| `borders_annealed_fix12.csv` | A best-found Stage A annealer run with fixed corners (modes 1 and 2): border arrangements (`id, 256 spins`) with `#` comments carrying the per-side Euler-trail scores. The kind of file `bash examples/01_beamer_quickstart.sh ANNEAL=1` produces and the beamer reads. |
 | **holes** (16x16 0/1 masks; `1` marks cells `--holes` may reopen; `#` comments allowed; first data line is row 0, the bottom) | |
 | `holes_open_border_TBLR.csv` | Opens the whole border (Top, Bottom, Left, Right) and its adjacent ring. |
 | `holes_open_border_TRL.csv` | Opens the Top, Right and Left borders plus adjacent corners. |
