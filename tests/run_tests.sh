@@ -1217,7 +1217,7 @@ step_example_beamer() {
         || { tail -5 "$OUT/ex01.log"; fail "examples/01 exited non-zero"; }
     grep -q "run summary" "$OUT/ex01.log" || fail "examples/01 printed no run summary"
     bash examples/01_beamer_quickstart.sh ANNEAL=1 \
-        ROTATIONS="$OUT/ex01_rotations.csv" BORDERS=2 STEPS=2000 THREADS=4 \
+        ROTATIONS="$OUT/ex01_rotations.csv" BORDERS=2 THREADS=4 \
         OUT_DIR="$OUT/ex01a" BEAM_WIDTH=2000 STOP_ROW=10 N_BOTTOMS=2 \
         N_COLUMNS=1 DB_FILE="$GATE_DB" > "$OUT/ex01a.log" \
         || { tail -5 "$OUT/ex01a.log"; fail "examples/01 ANNEAL=1 exited non-zero"; }
