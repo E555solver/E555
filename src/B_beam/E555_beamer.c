@@ -2522,6 +2522,27 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
     fflush(stdout);
 }
 
+/* Data lines in a rotations CSV, counted with the same blank/comment convention
+   read_one_border_row uses, but in one pass and without validating any field.
+   Only called for --num_rows 0, so an ordinary run with an explicit count opens
+   the CSV exactly as before. */
+static uint32_t count_border_rows(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) fatal("cannot open rotation CSV %s: %s", path, strerror(errno));
+    char *line = NULL; size_t sz = 0; uint32_t n = 0; ssize_t len;
+    while ((len = getline(&line, &sz, f)) >= 0) {
+        bool nonempty = false;
+        for (ssize_t i = 0; i < len; i++) {
+            char ch = line[i];
+            if (ch == '#' || ch == '%') break;
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') { nonempty = true; break; }
+        }
+        if (nonempty) n++;
+    }
+    free(line); fclose(f);
+    return n;
+}
+
 int main(int argc, char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
@@ -2644,9 +2665,7 @@ int main(int argc, char *argv[]) {
        mode's count instead). Resolved before the banner so [cfg] and --print_cmd
        report the count the run will really use. */
     if (!g_random_edges && g_num_rows == 0) {
-        uint32_t rot_lines = 0;
-        uint8_t spins_tmp[NUM_PIECES];
-        while (read_one_border_row(csv_path, rot_lines, spins_tmp)) rot_lines++;
+        uint32_t rot_lines = count_border_rows(csv_path);
         g_num_rows = (rot_lines > g_start_row) ? rot_lines - g_start_row : 0;
     }
 

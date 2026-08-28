@@ -2205,7 +2205,7 @@ static const char *k_usage =
 "\n"
 "RETIRED, accepted with a warning so older scripts keep running: --beam_width,\n"
 "--mode, --frac_rand, --repeats, --finalize_repeats, --lambda_Mahalanobis,\n"
-"--top_bottoms, --emit_each_round, --emit_deepest, --rng_seed,\n"
+"--top_bottoms, --emit_each_round, --emit_deepest, --rng_seed, --max_partials,\n"
 "--free_edges. The search is exhaustive and deterministic, so none of them have\n"
 "anything left to do, and the deepest board is emitted by default.\n";
 
@@ -2224,6 +2224,7 @@ static bool retired_flag(const char *a, int *i, int argc) {
     static const char *takes_value[] = {
         "--beam_width", "--mode", "--frac_rand", "--repeats", "--finalize_repeats",
         "--lambda_Mahalanobis", "--top_bottoms", "--emit_deepest", "--rng_seed",
+        "--max_partials",
         NULL };
     static const char *no_value[] = { "--emit_each_round", "--free_edges", NULL };
     for (int k = 0; takes_value[k]; k++)

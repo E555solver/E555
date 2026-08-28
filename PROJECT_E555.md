@@ -1447,7 +1447,7 @@ feeds any stage unchanged.
 Retired in the exhaustive rewrite and now accepted with a warning, so older
 scripts keep running: `--beam_width`, `--mode`, `--frac_rand`, `--repeats`,
 `--finalize_repeats`, `--lambda_Mahalanobis`, `--top_bottoms`,
-`--emit_each_round`, `--emit_deepest`, `--rng_seed`,
+`--emit_each_round`, `--emit_deepest`, `--rng_seed`, `--max_partials`,
 `--free_edges`. The search is exhaustive and deterministic, so none of them
 have anything left to do, and the deepest board is emitted by default.
 
