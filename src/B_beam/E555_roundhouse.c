@@ -2187,7 +2187,8 @@ static const char *k_usage =
 "\n"
 "INPUT / OUTPUT\n"
 "  --border_row N         first data line of the boards CSV (default 0)\n"
-"  --border_row_N N       consecutive lines to process (default 1)\n"
+"  --border_row_N N       consecutive lines to process (default 1; 0 = every\n"
+"                         line from --border_row to the end of the file)\n"
 "  --out_dir DIR          output directory (default round_out). Names carry the\n"
 "                         geometry, and break-free boards are filed separately\n"
 "                         from break-bought ones: ..._W5_miss0.csv and _miss12.csv\n"
@@ -2244,6 +2245,35 @@ static bool retired_flag(const char *a, int *i, int argc) {
 /* Parse the CLI, set up the seed and catalog once, then for each input line:
    load and cut, skip duplicate cores, build the width-W database for what is
    left, search the spiral exhaustively, and report the furthest it got. */
+/* -- --print-cmd ----------------------------------------------------------
+ * The whole invocation with every flag carrying the value the run will really
+ * use. Copy the line and you have the run. Prints, then continues.
+ * Every accepted flag must appear here; tests/check_script_flags.py enforces it.
+ * Retired flags are deliberately absent: this prints what the tool will DO. */
+static void print_cmd(const char *a0, const char *seed_path, const char *csv_path,
+                      int nthreads) {
+    static const char *corner[4] = { "--BL", "--BR", "--TL", "--TR" };
+    printf("[cmd] %s %s %s", a0, seed_path, csv_path);
+    if (g_reverse)       printf(" --reverse");
+    if (g_hold_band)     printf(" --hold_band");
+    if (g_only_complete) printf(" --only_complete");
+    if (g_selfcheck)     printf(" --selfcheck");
+    if (g_verbose)       printf(" --verbose");
+    if (g_print_cmd)     printf(" --print-cmd");
+    if (g_clue_mask & CLUE_CENTER)  printf(" --clue_center");
+    if (g_clue_mask & CLUE_CORNERS) printf(" --clue_corners");
+    for (int k = 0; k < 4; k++)
+        if (g_pin_corner[k] >= 0) printf(" %s %d", corner[k], g_pin_corner[k]);
+    printf(" --out_dir %s", g_out_dir);
+    printf(" --border_row %u --border_row_N %u", g_line_first, g_line_count);
+    printf(" --rounds %d --rotate %d --strip_width %d", g_rounds, g_rotate, g_opt_W);
+    if (g_stop_level >= 0) printf(" --stop_row %d", g_stop_level);
+    printf(" --ties %u --max_breaks %d", g_ties, g_max_breaks);
+    printf(" --max_nodes %" PRIu64 " --max_boards %" PRIu64, g_max_nodes, g_max_boards);
+    printf(" --config_time_sec %g --max_wall_sec %g", g_config_time_sec, g_max_wall_sec);
+    printf(" --threads %d\n", nthreads > 0 ? nthreads : g_nthreads);
+}
+
 int main(int argc, char **argv) {
     if (argc < 3) { fputs(k_usage, stdout); return argc < 2 ? 1 : 0; }
     const char *seed_path = argv[1];
@@ -2275,6 +2305,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(a, "--max_boards") && i+1 < argc) g_max_boards = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(a, "--threads") && i+1 < argc) nthreads = atoi(argv[++i]);
         else if (!strcmp(a, "--selfcheck")) g_selfcheck = true;
+        else if (!strcmp(a, "--print-cmd")) g_print_cmd = true;
         else if (!strcmp(a, "--verbose")) g_verbose = true;
         else if (!strcmp(a, "--help") || !strcmp(a, "-h")) { fputs(k_usage, stdout); return 0; }
         else fatal("unknown option %s (try --help)", a);
@@ -2310,6 +2341,11 @@ int main(int argc, char **argv) {
              g_out_dir, g_rounds, g_rotate, rtag, wtag, g_max_breaks);
 
     uint32_t csv_lines = count_data_lines(csv_path);
+    /* --border_row_N 0 means "the rest of the file". Resolved here, before the
+       banner, so [cfg] and --print-cmd report the count the run will really use
+       rather than a sentinel -- and so a caller need not count the lines itself. */
+    if (g_line_count == 0)
+        g_line_count = (csv_lines > g_line_first) ? csv_lines - g_line_first : 0;
     char sbuf[24];
     if (g_stop_level >= 0) snprintf(sbuf, sizeof sbuf, "%d", g_stop_level);
     else                   snprintf(sbuf, sizeof sbuf, "last");
@@ -2319,6 +2355,7 @@ int main(int argc, char **argv) {
        echoed, in four lines rather than six -- and the one thing no reader can
        infer, which side of THEIR board each round tears up, is the [plan] line. */
     printf("\n=== E555 roundhouse ===\n\n");
+    if (g_print_cmd) print_cmd(argv[0], seed_path, csv_path, nthreads);
     printf("[cfg] seed=%s boards=%s out_dir=%s\n", seed_path, csv_path, g_out_dir);
     printf("[cfg] rounds=%d rotate=%d reverse=%d strip_width=%s stop_row=%s ties=%u "
            "only_complete=%d hold_band=%d\n", g_rounds, g_rotate, g_reverse?1:0, wtag, sbuf,
@@ -2363,7 +2400,9 @@ int main(int argc, char **argv) {
 
     ensure_dir(g_out_dir);
     printf("[out] break-free -> %s\n", g_out_path[OUT_CLEAN]);
+    manifest_add(g_out_path[OUT_CLEAN]);
     if (g_max_breaks > 0) printf("[out] with breaks -> %s\n", g_out_path[OUT_BROKEN]);
+    if (g_max_breaks > 0) manifest_add(g_out_path[OUT_BROKEN]);
     fflush(stdout);
 
     g_t_start = omp_get_wtime();
@@ -2457,5 +2496,6 @@ int main(int argc, char **argv) {
 
     print_summary(omp_get_wtime()-g_t_start);
     for (int k = 0; k < 2; k++) if (g_out_fp[k]) fclose(g_out_fp[k]);
+    manifest_write(g_out_dir);          /* after the closes: it stats file sizes */
     return 0;
 }

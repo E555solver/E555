@@ -22,18 +22,16 @@
 # (the roundhouse partials that four checks share are built on demand). Leaving
 # check 1 out of the selection uses whatever is already in bin/.
 #
-# RUNTIME  about 4 minutes with SKIP_BEAMER=1. The three checks that build the
-# real 6.4 GB chain database in memory -- beamer_micro, example_beamer and
-# pipeline_annealed -- add roughly 20 minutes and want ~8 GB of RAM.
+# RUNTIME  about 4 minutes with SKIP_BEAMER=1. The three checks that need the
+# real 6.4 GB chain database -- beamer_micro, example_beamer and pipeline_full
+# -- share one cache and want ~8 GB of RAM.
 #
 # Environment switches:
 #   SKIP_BEAMER=1   skip the three database checks (low-RAM machines)
-#   DB_FILE=path    beamer_micro uses/creates this database cache (~6.5 GB on
-#                   disk; leave unset to build it in memory). Nothing else
-#                   here ever writes the database to disk: no example script
-#                   reads DB_FILE at all, and pipeline_annealed -- the one
-#                   script that does -- is passed an empty value, so a cache
-#                   path set for beamer_micro cannot leak into it.
+#   DB_FILE=path    keep the 6.4 GB chain database here (~6.5 GB on disk)
+#                   instead of under tests/out, so it survives the wipe and
+#                   every later run loads it rather than building it. The
+#                   three real-seed checks share one cache either way.
 #
 # This gate proves the tools find the RIGHT answer.
 #
@@ -44,6 +42,19 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 OUT=tests/out
+
+# The three checks that use the real seed each rebuilt the 6.4 GB chain database
+# from scratch: 78 s of build apiece, four builds across the run, and most of
+# the gate's wall time. They now share one cache, written by whichever runs
+# first and mmapped by the rest. Only the beamer's full inner database is
+# shareable -- the finalizer's is rebuilt per configuration without the locked
+# pieces, and is cheap anyway (9 s).
+#
+# It lives under tests/out, so it is wiped with everything else and never
+# outlives a run; DB_FILE=path in the environment points them at a cache that
+# does, which turns the build into a load on every future run. SKIP_BEAMER=1
+# skips all three, so nothing is built at all.
+GATE_DB="${DB_FILE:-$OUT/chain.db}"
 
 # -----------------------------------------------------------------------------
 # The checks, in order. "name|one-line label"; the label is what gets printed.
@@ -79,7 +90,8 @@ ALL_STEPS=(
     "example_backtracker|examples/05 dives on the example board"
     "pipeline_topper_sweep|pipeline/topper_sweep.sh through a two-pass plan"
     "example_beamer|examples/01 both ways, random and annealed borders"
-    "pipeline_annealed|pipeline/run_pipeline_annealed.sh, all seven stages"
+    "pipeline_full|pipeline/run_pipeline.sh, all seven stages"
+    "pipeline_whirl_lap|pipeline/run_pipeline_whirlpool.sh, one lap end to end"
     "no_stray_output|no check left a file in the repository root"
 )
 TOTAL=${#ALL_STEPS[@]}
@@ -1017,7 +1029,7 @@ step_beamer_micro() {
     CMD=(bin/E555_beamer data/seed_Edge5.txt --random_edges
          --border_row_N 1 --top_columns 1 --beam_width 20000 --stop_row 10
          --seed 1 --out_dir "$OUT/beam")
-    [ -n "${DB_FILE:-}" ] && CMD+=(--db_file "$DB_FILE")
+    CMD+=(--db_file "$GATE_DB")
     # E555_COL_VERIFY needs a real database to build strips out of, and this is
     # the only check that has one. It asserts the left-column window score reads
     # the board the right way up -- a direction that fails silently, since a
@@ -1044,6 +1056,28 @@ step_beamer_micro() {
 # option, and the pipeline runner is handed an empty DB_FILE.
 # =============================================================================
 
+# WHIRL_ROWS with a single entry is one lap, which is the whole reason lap() no
+# longer talks to its caller through globals. It needs a board to whirl, so it
+# is handed the rows-0..10 fixture the roundhouse checks build, and stage 0 is
+# skipped -- the 6.4 GB beam is already covered by beamer_micro.
+step_pipeline_whirl_lap() {
+    if ! python3 -c "import ortools" 2>/dev/null; then
+        echo "SKIPPED: OR-Tools not installed (the closing stages would be skipped)"
+        return 0
+    fi
+    rh_fixtures
+    bash pipeline/run_pipeline_whirlpool.sh SEED=data/synth_seed.txt \
+        INPUT="$OUT/rh_rows12.csv" RUN_DIR="$PWD/$OUT/whirl" THREADS=4 \
+        WHIRL_ROWS=10 BAND_ROW=5 BT_LIMIT=20 BT_PICK=2 BT_TIME=15 POP=4 \
+        FIN_WIDTH=2000 FIN_BOARDS=4 FIN_WALL=120 FIN_COLUMNS=2 \
+        RH_WIDTH=3 RH_ROUNDS=1 RH_LINES=2 RH_WALL=60 \
+        BT_RESTARTS=2000 BT_FINAL_TIME=15 TOP_N=4 > "$OUT/whirl.log" \
+        || { tail -20 "$OUT/whirl.log"; fail "the whirlpool exited non-zero"; }
+    grep -q "LAP 1/1" "$OUT/whirl.log" || fail "the run never reached lap 1"
+    grep -q "WHIRLPOOL DONE" "$OUT/whirl.log" || fail "the lap never finished"
+    echo "ok: one whirlpool lap ran end to end"
+}
+
 step_scripts_parse() {
     n=0
     for s in examples/*.sh pipeline/*.sh tests/*.sh; do
@@ -1062,10 +1096,10 @@ step_scripts_parse() {
 # On the synthetic fixture, where the finalizer's chain database is 0.03 GB and
 # builds in half a second -- the real seed would want ~6 GB here.
 step_example_finalizer() {
-    SEED=data/synth_seed.txt PARTIALS=data/synth_solution_480.csv \
-    ROTATIONS= OUT_DIR="$OUT/ex03" FROM=10 STOP_ROW=12 REPEATS=1 \
-    BEAM_WIDTH=20000 FIRST_LINE=0 N_LINES=1 MAX_WALL=120 \
-        bash examples/02_finalizer_regrow.sh > "$OUT/ex03.log" \
+    bash examples/02_finalizer_regrow.sh SEED=data/synth_seed.txt \
+        BOARDS=data/synth_solution_480.csv OUT_DIR="$OUT/ex03" \
+        FROM=10 STOP_ROW=12 REPEATS=1 BEAM_WIDTH=20000 N_LINES=1 \
+        MAX_WALL=120 THREADS=4 > "$OUT/ex03.log" \
         || { tail -5 "$OUT/ex03.log"; fail "examples/02 exited non-zero"; }
     comp="$OUT/ex03/beam_completions_finalized_12.csv"
     [ -s "$comp" ] || { tail -5 "$OUT/ex03.log"; fail "examples/02 emitted nothing"; }
@@ -1076,10 +1110,10 @@ step_example_finalizer() {
 
 step_example_roundhouse() {
     rh_fixtures
-    SEED=data/synth_seed.txt PARTIALS="$OUT/rh_rows12.csv" OUT_DIR="$OUT/ex04" \
-    ROUNDS=1 WIDTH=3 ROTATE=1 TIES=1 BREAKS=0 FIRST_LINE=0 N_LINES=1 \
-    MAX_WALL=120 \
-        bash examples/03_roundhouse_strip.sh > "$OUT/ex04.log" \
+    bash examples/03_roundhouse_strip.sh SEED=data/synth_seed.txt \
+        BOARDS="$OUT/rh_rows12.csv" OUT_DIR="$OUT/ex04" \
+        ROUNDS=1 WIDTH=3 ROTATE=1 TIES=1 BREAKS=0 N_LINES=1 \
+        MAX_WALL=120 THREADS=4 > "$OUT/ex04.log" \
         || { tail -5 "$OUT/ex04.log"; fail "examples/03 exited non-zero"; }
     comp=$(first_match "$OUT/ex04"/roundhouse_*.csv)
     [ -s "$comp" ] || { tail -5 "$OUT/ex04.log"; fail "examples/03 emitted nothing"; }
@@ -1095,11 +1129,12 @@ step_example_roundhouse() {
 # the pass that wrote it.
 step_example_bothways() {
     rh_fixtures
-    SEED=data/synth_seed.txt PARTIALS="$OUT/rh_rows12.csv" OUT_DIR="$OUT/ex06" \
-    ROUNDS=1 WIDTH=3 ROTATE=1 N_LINES=1 HOLD=1 CLUES=0 MAX_WALL=120 \
-        bash examples/06_roundhouse_both_ways.sh > "$OUT/ex06.log" \
+    bash examples/06_roundhouse_both_ways.sh SEED=data/synth_seed.txt \
+        BOARDS="$OUT/rh_rows12.csv" OUT_DIR="$OUT/ex06" \
+        ROUNDS=1 WIDTH=3 ROTATE=1 N_LINES=1 HOLD=1 MAX_WALL=120 \
+        THREADS=4 > "$OUT/ex06.log" \
         || { tail -5 "$OUT/ex06.log"; fail "examples/06 exited non-zero"; }
-    grep -q "chains 480/480" "$OUT/ex06.log" || \
+    grep -q "a=480 *b=480" "$OUT/ex06.log" || \
         { tail -8 "$OUT/ex06.log"; fail "both chains should reach the known solution"; }
     comp=$(first_match "$OUT/ex06"/cfg0/a1/roundhouse_*_miss0.csv)
     [ -s "$comp" ] || { tail -5 "$OUT/ex06.log"; fail "examples/06 emitted nothing"; }
@@ -1121,10 +1156,9 @@ step_example_cpsat() {
     fi
     # One script now: topper -> ender ring -> ender patch, the documented
     # Stage C sequence, each pass fed by the previous one.
-    SEED=data/seed_Edge5.txt BOARDS=data/board_example_462.csv OUT_DIR="$OUT/ex04" \
-    SIDE=T WORK_ROWS=3 HOLES= FIRST_LINE=0 N_LINES=1 REACH=1 MAX_CHANGES=4 \
-    WORKERS=4 MAX_TIME=10 STALL_TIME=5 \
-        bash examples/04_stage_c_close.sh > "$OUT/ex04c.log" \
+    bash examples/04_stage_c_close.sh OUT_DIR="$OUT/ex04" \
+        SIDE=T WORK_ROWS=3 N_LINES=1 REACH=1 MAX_CHANGES=4 \
+        WORKERS=4 MAX_TIME=10 STALL_TIME=5 > "$OUT/ex04c.log" \
         || { tail -5 "$OUT/ex04c.log"; fail "examples/04 exited non-zero"; }
     for f in "$OUT/ex04/1_topped.csv" "$OUT/ex04/2_ringed.csv" "$OUT/ex04/3_patched.csv"; do
         [ -s "$f" ] || fail "$(basename "$f") was not written"
@@ -1135,10 +1169,9 @@ step_example_cpsat() {
 }
 
 step_example_backtracker() {
-    SEED=data/seed_Edge5.txt BOARDS=data/board_example_462.csv OUT="$OUT/ex07.csv" \
-    HOLES=data/holes_open_border_TR.csv MODE=stuck MAX_MISMATCH=60 RESTARTS=2000 \
-    FIRST_LINE=0 N_LINES=1 THREADS=4 TIME_LIMIT=15 \
-        bash examples/05_backtracker_dives.sh > "$OUT/ex07.log" \
+    bash examples/05_backtracker_dives.sh OUT="$OUT/ex07.csv" \
+        MODE=stuck MAX_MISMATCH=60 RESTARTS=2000 N_LINES=1 THREADS=4 \
+        TIME_LIMIT=15 > "$OUT/ex07.log" \
         || { tail -5 "$OUT/ex07.log"; fail "examples/05 exited non-zero"; }
     [ -s "$OUT/ex07.csv" ] || fail "examples/05 emitted nothing"
     nf=$(awk -F, '!/^ *[#%]/{print NF; exit}' "$OUT/ex07.csv")
@@ -1154,12 +1187,13 @@ step_pipeline_topper_sweep() {
         echo "SKIPPED: OR-Tools not installed (pip install ortools)"
         return 0
     fi
-    INPUT=data/board_example_462.csv PIECE_SEED=data/seed_Edge5.txt \
-    PLAN="T:5:2 T:3:0" OUT_DIR="$OUT/sweep" WORKERS=4 MAX_TIME=10 STALL_TIME=5 \
-    NUM_ROWS=1 BEAM=1 \
-        bash pipeline/topper_sweep.sh > "$OUT/sweep.log" \
+    # PRESET=closeT is the two-pass plan: a deep pass that may spend breaks,
+    # then a LOCKED=0 pass that closes the group and triggers the prune.
+    bash pipeline/topper_sweep.sh INPUT=data/board_example_462.csv \
+        PRESET=closeT OUT="$PWD/$OUT/sweep/topped.csv" OUT_DIR="$OUT/sweep" \
+        WORKERS=4 MAX_TIME=10 STALL_TIME=5 NUM_ROWS=1 BEAM=1 > "$OUT/sweep.log" \
         || { tail -5 "$OUT/sweep.log"; fail "topper_sweep.sh exited non-zero"; }
-    final=$(first_match "$OUT/sweep"/topped_*.csv)
+    final="$OUT/sweep/topped.csv"
     [ -s "$final" ] || { tail -5 "$OUT/sweep.log"; fail "topper_sweep.sh produced no final board"; }
     nf=$(awk -F, '!/^ *[#%]/{print NF; exit}' "$final")
     [ "$nf" = "514" ] || fail "topper_sweep.sh wrote $nf fields, want 514"
@@ -1177,15 +1211,15 @@ step_pipeline_topper_sweep() {
 # "no board survived" and exits 0), so depth costs the check nothing.
 step_example_beamer() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
-    SEED=data/seed_Edge5.txt OUT_DIR="$OUT/ex01" BEAM_WIDTH=2000 STOP_ROW=10 \
-    N_BOTTOMS=1 N_COLUMNS=1 \
-        bash examples/01_beamer_quickstart.sh > "$OUT/ex01.log" \
+    bash examples/01_beamer_quickstart.sh OUT_DIR="$OUT/ex01" BEAM_WIDTH=2000 \
+        STOP_ROW=10 N_BOTTOMS=1 N_COLUMNS=1 THREADS=4 DB_FILE="$GATE_DB" \
+        > "$OUT/ex01.log" \
         || { tail -5 "$OUT/ex01.log"; fail "examples/01 exited non-zero"; }
     grep -q "run summary" "$OUT/ex01.log" || fail "examples/01 printed no run summary"
-    ANNEAL=1 SEED=data/seed_Edge5.txt ROTATIONS="$OUT/ex01_rotations.csv" \
-    RESTARTS=2 STEPS=2000 TARGET=250 THREADS=4 OUT_DIR="$OUT/ex01a" \
-    BEAM_WIDTH=2000 STOP_ROW=10 N_BOTTOMS=2 N_COLUMNS=1 \
-        bash examples/01_beamer_quickstart.sh > "$OUT/ex01a.log" \
+    bash examples/01_beamer_quickstart.sh ANNEAL=1 \
+        ROTATIONS="$OUT/ex01_rotations.csv" BORDERS=2 STEPS=2000 THREADS=4 \
+        OUT_DIR="$OUT/ex01a" BEAM_WIDTH=2000 STOP_ROW=10 N_BOTTOMS=2 \
+        N_COLUMNS=1 DB_FILE="$GATE_DB" > "$OUT/ex01a.log" \
         || { tail -5 "$OUT/ex01a.log"; fail "examples/01 ANNEAL=1 exited non-zero"; }
     [ -s "$OUT/ex01_rotations.csv" ] || fail "examples/01 ANNEAL=1 wrote no rotations file"
     grep -q "run summary" "$OUT/ex01a.log" || fail "examples/01 ANNEAL=1 printed no run summary"
@@ -1205,20 +1239,28 @@ step_example_beamer() {
 # beam has thinned. Depth is what bounds this output, not width or --top_bottoms
 # (capping that to 2 changed nothing), and row 10 is also where the pipeline
 # really operates.
-step_pipeline_annealed() {
+step_pipeline_full() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
     if ! python3 -c "import ortools" 2>/dev/null; then
         echo "SKIPPED: OR-Tools not installed (stages 5 and 6 would be skipped)"
         return 0
     fi
-    SEED=data/seed_Edge5.txt RUN_DIR="$PWD/$OUT/pipeline" THREADS=4 DB_FILE= \
-    ROUNDS=2 BEAM_WIDTH=2000 BEAM_STOP_ROW=10 BEAM_MAX_PARTIALS=2 \
-    BEAM_MAX_WALL=300 BEAM_COLUMNS=2 FIN_WIDTH=2000 FIN_STOP_ROW=11 FIN_FROM=5 \
-    FIN_MAX_PARTIALS=2 FIN_MAX_WALL=300 RH_WIDTH=5 RH_LINES=2 RH_WALL=60 \
-    TOP_N=2 CPSAT_TIME=10 CPSAT_STALL=5 BT_MISMATCH=60 BT_RESTARTS=2000 \
-    BT_TIME=15 \
-        bash pipeline/run_pipeline_annealed.sh > "$OUT/pipeline.log" \
-        || { tail -20 "$OUT/pipeline.log"; fail "run_pipeline_annealed.sh exited non-zero"; }
+    bash pipeline/run_pipeline.sh RUN_DIR="$PWD/$OUT/pipeline" THREADS=4 \
+        BORDERS=annealed ROUNDS=2 STEPS=250000 \
+        `# 250000 is the annealer's floor, and it is where feasibility stops`\
+        `# being a coin flip: 2x2000 found a border on one run and none on`\
+        `# the next, while 250000 succeeded on every restart. 2 of them, 15 s` \
+        BEAM_WIDTH=2000 BEAM_STOP_ROW=10 BEAM_MAX_PARTIALS=2 \
+        BEAM_MAX_WALL=300 BEAM_COLUMNS=2 FIN_WIDTH=2000 FIN_STOP_ROW=11 \
+        FIN_FROM=5 FIN_MAX_PARTIALS=2 FIN_MAX_WALL=300 \
+        RH_WIDTH=5 RH_LINES=2 RH_WALL=60 \
+        DB_FILE="$GATE_DB" \
+        `# stage 6 was 474 s of a 620 s run: the ender solves once per break,`\
+        `# so --max-time is per solve and not per board. A small model and a`\
+        `# short budget still exercise both of its modes.` \
+        TOP_N=2 CPSAT_TIME=3 CPSAT_STALL=2 ENDER_REACH=1 ENDER_CHANGES=4 \
+        BT_MISMATCH=60 BT_RESTARTS=2000 BT_TIME=15 > "$OUT/pipeline.log" \
+        || { tail -20 "$OUT/pipeline.log"; fail "run_pipeline.sh exited non-zero"; }
     for stage in "STAGE 1/7" "STAGE 2/7" "STAGE 3/7" "STAGE 4/7" \
                  "STAGE 5/7" "STAGE 6/7" "STAGE 7/7"; do
         grep -q "$stage" "$OUT/pipeline.log" || fail "the run never reached $stage"

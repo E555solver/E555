@@ -414,6 +414,46 @@ static const char *order_name(OrderMode m) {
     }
 }
 
+/* -- --print-cmd ----------------------------------------------------------
+ * The whole invocation with every flag carrying the value the run will really
+ * use, from the command line or from a default. Copy the line and you have the
+ * run. Prints and then continues, so a script can pass it on every run.
+ * Every accepted flag must appear here; tests/check_script_flags.py enforces
+ * it, because a hand-written printer drifts from its parser fast. */
+static bool g_print_cmd = false;
+
+static void print_cmd(const char *a0, const char *seed_path, const char *csv_path,
+                      const char *out_path, const char *holes_path, int nt) {
+    printf("[cmd] %s %s %s %s", a0, seed_path, csv_path, out_path);
+    if (g_verbose)      printf(" --verbose");
+    if (g_print_cmd)    printf(" --print-cmd");
+    if (g_reverse)      printf(" --reverse");
+    if (g_jump)         printf(" --jump");
+    if (g_with_frame)   printf(" --with_frame");
+    if (g_write_status) printf(" --status");
+    printf(g_dedup ? " --dedup" : " --no-dedup");
+    if (g_parallel_mode == PAR_SEARCH) printf(" --all-for-one");
+    if (holes_path)     printf(" --holes %s", holes_path);
+    if (g_row_start >= 0) printf(" --row %lld", g_row_start);
+    if (g_count >= 1)     printf(" --count %lld", g_count);
+    if (g_best_output > 0) printf(" --best-output %d", g_best_output);
+    if (g_stop_active)
+        printf(" %s %d", g_stop_isrow ? "--stop_row" : "--stop_column", g_stop_n);
+    printf(" --rotate %d", g_rotation);
+    printf(" --order %s --break-mode %s", order_name(g_order_mode),
+           break_mode_name(g_break_mode));
+    printf(" --max-mismatch %d", g_max_mismatch);
+    if (g_lds_max >= 0) printf(" --lds-max %d", g_lds_max);
+    if (g_solution_limit == 0) printf(" --all-solutions");
+    else                       printf(" --solution-limit %" PRIu64, g_solution_limit);
+    printf(" --stuck_restarts %lld", (long long)g_stuck_restarts);
+    if (g_hall_mode == HALL_OFF) printf(" --no-hall");
+    else                         printf(" --hall %s", hall_mode_name(g_hall_mode));
+    printf(" --hall-stride %d --hall-small %d", g_hall_stride, g_hall_small);
+    if (g_time_limit_sec >= 0) printf(" --time-limit %g", g_time_limit_sec);
+    printf(" --threads %d\n", nt);
+}
+
 static inline bool order_is_side_growth(OrderMode m) {
     return m == ORD_2SIDES || m == ORD_4SIDES;
 }
@@ -5002,7 +5042,9 @@ int main(int argc, char **argv) {
     const char *out_path   = argv[3];
     const char *holes_path = NULL;
     for (int i = 4; i < argc; i++) {
-        if (strcmp(argv[i], "--verbose") == 0) {
+        if (strcmp(argv[i], "--print-cmd") == 0) {
+            g_print_cmd = true;
+        } else if (strcmp(argv[i], "--verbose") == 0) {
             g_verbose = true;
         } else if (strcmp(argv[i], "--threads") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
@@ -5223,6 +5265,8 @@ int main(int argc, char **argv) {
         g_best_mm   = xmalloc((size_t)g_best_output * sizeof(BestPartial));
     }
 
+    if (g_print_cmd)
+        print_cmd(argv[0], seed_path, csv_path, out_path, holes_path, nt);
     printf("=== E555 backtracker [build %s] ===\n",
            E555_BUILD_TAG);
     printf("  build=%s\n", E555_BUILD_TAG);
@@ -5615,6 +5659,27 @@ int main(int argc, char **argv) {
     if (g_best_pure_count > 0) printf("  best_partials_pure_csv   = %s\n", pure_csv_path);
     if (g_best_mm_count   > 0) printf("  best_partials_mm_csv     = %s\n", mm_csv_path);
     fflush(stdout);
+
+    /* The same list, in a file a script can read. This run writes up to five
+     * CSVs whose names it derives from out_path, and nothing downstream knew
+     * the four sidecars existed -- they had to be guessed or globbed for. The
+     * conditions here are the ones printed just above: a path is listed only
+     * when it actually holds boards. An empty file means the run emitted
+     * nothing, which is a real answer rather than an error. */
+    {
+        char man_path[PATH_MAX];
+        snprintf(man_path, sizeof(man_path), "%s.outputs.txt", out_path);
+        FILE *mf = fopen(man_path, "w");
+        if (mf) {
+            fprintf(mf, "%s\n", out_path);
+            if (g_band_csv)            fprintf(mf, "%s\n", band_csv_path);
+            if (g_status_csv)          fprintf(mf, "%s\n", status_csv_path);
+            if (g_best_pure_count > 0) fprintf(mf, "%s\n", pure_csv_path);
+            if (g_best_mm_count   > 0) fprintf(mf, "%s\n", mm_csv_path);
+            fclose(mf);
+            printf("  outputs_txt              = %s\n", man_path);
+        }
+    }
 
     checked_fclose(g_stream_csv, out_path);
     if (g_status_csv) checked_fclose(g_status_csv, status_csv_path);

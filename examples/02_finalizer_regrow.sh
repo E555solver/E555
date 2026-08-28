@@ -1,97 +1,70 @@
 #!/bin/bash
-##SBATCH --job-name=E555_finalizer
-##SBATCH --ntasks=1 --cpus-per-task=8 --mem=4G --time=12:00:00
-##SBATCH --output=logs/finalizer_%j.out
+# 02_finalizer_regrow.sh -- lock the bottom rows of a board and re-grow the top.
 #
-# =============================================================================
-# 02_finalizer_regrow.sh -- take a partial board and re-grow its top rows
-# =============================================================================
-# WHAT IT DOES
-#   Restarts the beam FROM a board instead of from the bottom border. Rows
-#   0..FROM stay locked; every piece above them goes back into the pool; a chain
-#   database rebuilt WITHOUT the locked pieces (tiny, seconds, low memory)
-#   searches the rows above at full beam width.
+#   bash examples/02_finalizer_regrow.sh
+#   bash examples/02_finalizer_regrow.sh BOARDS=beam_out/beam_completions_random_10.csv
+#   bash examples/02_finalizer_regrow.sh OUT_DIR=run7 THREADS=16 FROM=5
 #
-# WHY IT WORKS
-#   A beamer board is one lineage out of billions. Freeing four or five rows and
-#   re-searching them pulls pieces from deep in the board up to the frontier,
-#   which the original run never had the chance to do.
+# Rows 0..FROM stay put; every piece above them goes back in the pool and a
+# database rebuilt WITHOUT the locked pieces (small, seconds) re-searches the
+# rows above. Output is the same canonical CSV as the input, so this script can
+# be fed its own output with a different FROM or RNG_SEED.
 #
-# THE ONE KNOB THAT MATTERS: FROM
-#   Lower FROM = more rows re-searched = deeper resampling and much slower.
-#   Do NOT set it just below the input's top row: that asks the search to redo
-#   the exact row that already failed, with the same pieces. Leave four or five
-#   rows of daylight.
-#
-#   FROM=7 here, though the tool's own default is 5. That default is for the
-#   ordinary case, a beamer partial whose border is complete: the left column is
-#   fixed, --top_columns samples a handful of orderings, and freeing more rows
-#   buys a wider search. This script's board has an INCOMPLETE border, so the
-#   finalizer falls back to --free_edges and --top_columns 0 below enumerates
-#   every legal left column -- and that enumeration grows explosively as FROM
-#   drops. Measured on the shipped board_partial_row12.csv, MAX_WALL=600:
-#
-#       FROM=7    3512 columns    6 boards    6.2 s
-#       FROM=6   40098 columns    6 boards   50.2 s
-#       FROM=5    8606 columns    0 boards    budget exhausted
-#       FROM=4     127 columns    0 boards    budget exhausted
-#
-#   So on this board lower is emphatically not better, and 7 is not a stale
-#   value left behind by a default change. Raise MAX_WALL before lowering FROM.
-#
-# CHAINS WITH ITSELF
-#   Output is the same canonical CSV as the input, so you can feed this script
-#   its own output with a different FROM or SEED_RNG.
-#
-# Near-identical input lines are deduplicated automatically: once the top rows
-# are freed they would seed the same search.
-# =============================================================================
+# Emitting nothing is a real answer, not an error: no left column survived from
+# FROM to STOP_ROW. Why FROM=7 and not the tool's default of 5, and what the
+# other settings do: examples/README.md
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-
-# ---- settings ---------------------------------------------------------------
-SEED="${SEED:-$REPO/data/seed_Edge5.txt}"
-PARTIALS="${PARTIALS:-$REPO/data/board_partial_row12.csv}"
-ROTATIONS="${ROTATIONS:-}"        # optional Stage A borders CSV; see the note below
-OUT_DIR="${OUT_DIR:-final_out}"
-FROM="${FROM:-7}"                 # lock rows 0..FROM, re-search everything above
-STOP_ROW="${STOP_ROW:-12}"        # up to 14; the top border is Stage C's job.
-                                  # 12, not the tool default of 11: the input
-                                  # board already reaches row 12, and stopping
-                                  # below it would emit boards shallower than
-                                  # the ones handed in
-REPEATS="${REPEATS:-3}"           # re-runs per distinct input board
-BEAM_WIDTH="${BEAM_WIDTH:-150000}"
-FIRST_LINE="${FIRST_LINE:-0}"     # first input CSV line to use
-N_LINES="${N_LINES:-20}"          # how many input lines to process
-MAX_WALL="${MAX_WALL:-600}"       # seconds for the whole run, 0 = unlimited
-CLUES="${CLUES:-0}"                # 1 = hold the published Eternity II clue
-                                  # pieces on their cells and spins
+# ---- settings: edit here, or pass NAME=value on the command line ------------
+REPO=$(cd "$(dirname "$0")/.." && pwd)  # E555 checkout. Set this if you copied
+                                        # this script somewhere else.
+SEED=data/seed_Edge5.txt                # paths below are relative to REPO
+BOARDS=data/board_partial_row12.csv     # boards to re-grow
+ROTATIONS=                              # optional Stage A rotations CSV
+OUT_DIR=final_out
+THREADS=8
+FROM=7                  # lock rows 0..FROM, re-search everything above
+STOP_ROW=12             # up to 14; the top border is Stage C's job
+REPEATS=3               # stochastic re-runs per input board
+BEAM_WIDTH=150000
+FIRST_LINE=0            # first input CSV line to use
+N_LINES=20              # how many input lines to process
+MAX_WALL=600            # seconds for the whole run, 0 = unlimited
+COLUMNS=0               # left columns per board; 0 = enumerate every one
+CLUES=0                 # 1 = hold the published Eternity II clue pieces
 # -----------------------------------------------------------------------------
-
-[ -x "$REPO/bin/E555_finalizer" ] || make -C "$REPO" finalizer
+for arg in "$@"; do
+    case "$arg" in
+        [A-Za-z_]*=*) declare "$arg" ;;
+        *) echo "expected NAME=value, got: $arg" >&2; exit 1 ;;
+    esac
+done
+cd "$REPO"
+[ -d bin ] && [ -d tools ] ||
+    { echo "REPO=$REPO is not an E555 checkout -- set REPO at the top" >&2; exit 1; }
+[ -x bin/E555_finalizer ] || make finalizer
 
 # Passing the rotations CSV the boards came from is worth it: the finalizer
-# recognizes which border row each board used and keeps that side assignment,
+# recognizes which border row each board used and keeps that side assignment
 # instead of treating all 56 edge pieces as candidates for every side.
-# The rotations file is an optional third positional, so build just that part
-# conditionally rather than writing the whole call out twice.
 ROT_ARG=(); [ -n "$ROTATIONS" ] && ROT_ARG=("$ROTATIONS")
 CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 
-"$REPO/bin/E555_finalizer" "$SEED" "$PARTIALS" "${ROT_ARG[@]}" "${CLUE_ARG[@]}" \
+bin/E555_finalizer "$SEED" "$BOARDS" "${ROT_ARG[@]}" "${CLUE_ARG[@]}" \
     --border_row "$FIRST_LINE" --border_row_N "$N_LINES" \
     --finalize_from "$FROM" --finalize_repeats "$REPEATS" \
     --beam_width "$BEAM_WIDTH" --stop_row "$STOP_ROW" \
-    --top_columns 0 \
-    --max_wall_sec "$MAX_WALL" --out_dir "$OUT_DIR" --verbose
+    --top_columns "$COLUMNS" --threads "$THREADS" \
+    --max_wall_sec "$MAX_WALL" --out_dir "$OUT_DIR" --print-cmd --verbose
 
-RESULT="$OUT_DIR/beam_completions_finalized_$STOP_ROW.csv"
 echo
-echo "Boards -> $RESULT"
-echo "  python3 $REPO/tools/E555_rank.py $RESULT --seed $SEED --top 10"
-echo
-echo "Emitting nothing here is a real answer, not an error: it means no left"
-echo "column survived from row $FROM to row $STOP_ROW. Lower FROM, or take the"
-echo "input boards straight to Stage C (05, 06, 07)."
+if [ -s "$OUT_DIR/outputs.txt" ]; then
+    echo "Boards written:"
+    sed 's/^/  /' "$OUT_DIR/outputs.txt"
+    echo
+    echo "  python3 tools/E555_rank.py \$(head -1 $OUT_DIR/outputs.txt) --seed $SEED --top 10"
+else
+    echo "Nothing emitted: no left column survived from row $FROM to row $STOP_ROW."
+    echo "That is a real answer. Lower FROM, raise MAX_WALL, or take the input"
+    echo "boards straight to Stage C (03, 04, 05)."
+fi

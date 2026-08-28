@@ -17,6 +17,14 @@ these scripts also drive the Python tools, whose flags are none of this
 check's business. A missed flag is a check that did not fire; a false alarm is
 a gate nobody can get past.
 
+It also checks that each tool's --print-cmd printer covers every flag its own
+parser accepts. That printer is hand-written, so it falls behind the parser
+within a couple of commits and starts emitting a command line that does not
+reproduce the run -- a silent lie, and worse than no feature. The check is
+static: it reads the "--x" literals out of the print_cmd() function body rather
+than running the binary, so mutually exclusive flags (--dedup/--no-dedup) and
+conditional ones (--clue_center) count as covered by being mentioned.
+
 It also refuses a comment placed between two backslash-continued lines. That
 is valid shell and `bash -n` accepts it, but the comment swallows the rest of
 the line: the command is cut short at that point and every remaining argument
@@ -207,6 +215,34 @@ def broken_continuations(path):
     return bad
 
 
+PRINTCMD_RE = re.compile(r'static void print_cmd\([^)]*\)[^{]*\{(.*?)\n\}', re.S)
+
+
+def printcmd_gaps(accepts):
+    """Flags a parser accepts that its --print-cmd printer never mentions."""
+    gaps = {}
+    for tool, sources in TOOL_SOURCES.items():
+        body = None
+        for rel in sources:
+            with open(os.path.join(REPO, rel), encoding="utf-8", errors="replace") as fh:
+                m = PRINTCMD_RE.search(fh.read())
+            if m:
+                body = m.group(1)
+                break
+        if body is None:
+            gaps[tool] = ["(no print_cmd() found at all)"]
+            continue
+        # Flags live INSIDE format strings -- printf(" --out_dir %s", ...) --
+        # so match them anywhere in the body, not as standalone literals.
+        printed = set(re.findall(r'--[A-Za-z0-9_-]+', body))
+        # --help and --version print and exit, so they are never part of a
+        # command line that runs anything. Everything else must be covered.
+        missing = accepts[tool] - printed - {"--help", "--version"}
+        if missing:
+            gaps[tool] = sorted(missing)
+    return gaps
+
+
 def main():
     verbose = "--verbose" in sys.argv
     accepts = accepted_flags()
@@ -222,6 +258,11 @@ def main():
                         for f in sorted(os.listdir(full)) if f.endswith(".sh")]
 
     total = 0
+    for tool, missing in sorted(printcmd_gaps(accepts).items()):
+        for flag in missing:
+            print("%s: --print-cmd never prints %s" % (tool, flag))
+            total += 1
+
     for path in scripts:
         rel = os.path.relpath(path, REPO)
         for line_no, tool, flag in check_script(path, accepts):
@@ -235,8 +276,9 @@ def main():
     if total:
         print("%d problem(s) across %d scripts" % (total, len(scripts)))
         return 1
-    print("ok: %d scripts pass only flags their binaries accept, with no "
-          "comment breaking a continued command" % len(scripts))
+    print("ok: %d scripts pass only flags their binaries accept, no comment "
+          "breaks a continued command, and every --print-cmd covers its parser"
+          % len(scripts))
     return 0
 
 

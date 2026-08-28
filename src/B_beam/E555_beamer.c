@@ -2378,6 +2378,51 @@ static void usage(const char *a0) {
 "  --help                 this text\n", a0);
 }
 
+/* -- --print-cmd ----------------------------------------------------------
+ * The whole invocation, every flag carrying the value the run will actually
+ * use, whether that came from the command line or from a default. Copy the
+ * line and you have the run: no scrolling back through a log, no guessing
+ * which defaults were in force on the day.
+ *
+ * It prints and then the run continues, so an example can pass it on every run
+ * and teach while it works.
+ *
+ * Every flag the parser accepts must appear here. tests/check_script_flags.py
+ * enforces that, because a hand-written printer drifts from its parser within
+ * about two commits. */
+static void print_cmd(const char *a0, const char *seed_path, const char *csv_path,
+                      bool resume) {
+    static const char *corner[4] = { "--BL", "--BR", "--TL", "--TR" };
+    printf("[cmd] %s %s", a0, seed_path);
+    if (csv_path) printf(" %s", csv_path);
+    if (g_random_edges)   printf(" --random_edges");
+    if (g_free_edges)     printf(" --free_edges");
+    if (g_incomplete_top) printf(" --incomplete_top");
+    if (resume)           printf(" --resume");
+    if (g_verbose)        printf(" --verbose");
+    if (g_print_cmd)      printf(" --print-cmd");
+    if (g_clue_mask & CLUE_CENTER)  printf(" --clue_center");
+    if (g_clue_mask & CLUE_CORNERS) printf(" --clue_corners");
+    if (!g_free_demand)   printf(" --no_free_demand");
+    for (int k = 0; k < 4; k++)
+        if (g_fixed_corner_pid[k] >= 0) printf(" %s %d", corner[k], g_fixed_corner_pid[k]);
+    printf(" --out_dir %s", g_out_dir);
+    printf(" --border_row %u --border_row_N %u", g_border_row_index, g_border_row_N);
+    if (g_db_file) printf(" --db_file %s", g_db_file);
+    printf(" --beam_width %u --stop_row %u", g_beam_width, g_stop_row);
+    printf(" --beam_expand %u --beam_expand_row %u", g_beam_expand, g_beam_expand_row);
+    printf(" --lambda_J %g --lambda_Mahalanobis %g", g_lambda_J, g_lambda_maha);
+    printf(" --frac_rand %g --parent_cap %u --pool_factor %u",
+           g_frac_rand, g_parent_cap, g_pool_factor);
+    printf(" --bc_window %u,%u", g_bc_nB, g_bc_nC);
+    printf(" --top_bottoms %ld --top_columns %ld", g_top_bottoms, g_top_columns);
+    printf(" --gumbel_tau_bottoms %g --gumbel_tau_columns %g", g_tau_bottoms, g_tau_columns);
+    printf(" --bail_columns %u", g_bail_columns);
+    printf(" --threads %d --seed %" PRIu64, g_nthreads, g_master_seed);
+    printf(" --config_time_sec %g --max_wall_sec %g --max_partials %" PRIu64 "\n",
+           g_config_time_sec, g_max_wall_sec, g_max_partials);
+}
+
 /* -- The [sweep] line, and the run-length collapse behind it ----------------- */
 /* One configuration used to print 130 characters of mostly zeros whether or not
    it found anything, and a sweep that loses a whole CLASS of columns at one row
@@ -2533,6 +2578,7 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--max_wall_sec")    && i+1 < argc) g_max_wall_sec = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_partials")    && i+1 < argc) g_max_partials = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--resume"))          resume = true;
+        else if (!strcmp(argv[i], "--print-cmd"))       g_print_cmd = true;
         else if (!strcmp(argv[i], "--verbose"))         g_verbose = true;
         else { fprintf(stderr, "Unknown argument: %s\n\n", argv[i]); usage(argv[0]); return 1; }
     }
@@ -2587,6 +2633,7 @@ int main(int argc, char *argv[]) {
               "original --seed (the checkpoint indexes a seed-dependent ordering)");
 
     printf("\n=== E555 beamer ===\n\n");
+    if (g_print_cmd) print_cmd(argv[0], seed_path, csv_path, resume);
     printf("[cfg] seed_file=%s rotations_file=%s out_dir=%s\n",
            seed_path, csv_path ? csv_path : "(none: --random_edges)", g_out_dir);
     printf("[cfg] seed=%" PRIu64 " threads=%d verbose=%d random_edges=%d free_edges=%d border_row=%u border_row_N=%u\n",
@@ -2704,6 +2751,7 @@ int main(int argc, char *argv[]) {
         if (!g_completions_fp) fatal("cannot open %s: %s", comp_path, strerror(errno));
         setvbuf(g_completions_fp, NULL, _IOFBF, EMIT_FILE_BUF);
         printf("[out] completions -> %s (append)\n", comp_path);
+        manifest_add(comp_path);
         if (g_incomplete_top) {
             char part_path[1024];
             snprintf(part_path, sizeof part_path, "%s/beam_completions_random_%u_partial.csv", g_out_dir, g_stop_row);
@@ -2711,6 +2759,7 @@ int main(int argc, char *argv[]) {
             if (!g_partial_fp) fatal("cannot open %s: %s", part_path, strerror(errno));
             setvbuf(g_partial_fp, NULL, _IOFBF, EMIT_FILE_BUF);
             printf("[out] incomplete-top partials -> %s (append)\n", part_path);
+            manifest_add(part_path);
         }
         fflush(stdout);
         g_solution_idx = 0;
@@ -2798,6 +2847,7 @@ int main(int argc, char *argv[]) {
         if (!g_completions_fp) fatal("cannot open %s: %s", comp_path, strerror(errno));
         setvbuf(g_completions_fp, NULL, _IOFBF, EMIT_FILE_BUF);
         printf("[out] completions -> %s (append)\n", comp_path);
+        manifest_add(comp_path);
         if (g_incomplete_top) {
             char part_path[1024];
             snprintf(part_path, sizeof part_path, "%s/beam_completions_%u_%u_partial.csv", g_out_dir, cur_row, g_stop_row);
@@ -2805,6 +2855,7 @@ int main(int argc, char *argv[]) {
             if (!g_partial_fp) fatal("cannot open %s: %s", part_path, strerror(errno));
             setvbuf(g_partial_fp, NULL, _IOFBF, EMIT_FILE_BUF);
             printf("[out] incomplete-top partials -> %s (append)\n", part_path);
+            manifest_add(part_path);
         }
         fflush(stdout);
 
@@ -2875,5 +2926,8 @@ int main(int argc, char *argv[]) {
     print_summary(wall, init_s, omp_get_wtime() - t_sweep0);
     if (g_completions_fp) fclose(g_completions_fp);
     if (g_partial_fp) fclose(g_partial_fp);
+    /* After the closes: the manifest reports which files GREW, so their buffers
+       have to have reached the disk before it stats them. */
+    manifest_write(g_out_dir);
     return 0;
 }

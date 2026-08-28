@@ -619,6 +619,13 @@ def main():
                          "memory (default 8). Only applies without --top, which "
                          "streams in bounded memory whatever the file size")
     ap.add_argument("--seed", help="piece seed file (default: data/seed_Edge5.txt)")
+    ap.add_argument("--count", action="store_true",
+                    help="print just the number of board rows across the inputs "
+                         "and exit, one bare number. For scripts: "
+                         "N=$(E555_rank.py boards.csv --count). Comment and "
+                         "blank lines do not count, and neither the seed nor "
+                         "the boards are parsed, so it is instant on a large "
+                         "file and works on one no tool has scored yet.")
     ap.add_argument("--field", metavar="NAME",
                     help="print just this measure for the best board and exit, "
                          "one bare number, nothing else. For scripts: "
@@ -636,6 +643,15 @@ def main():
         raise SystemExit("[ERROR] --diverse wants a positive count")
     if args.max_agree is not None and not 0.0 <= args.max_agree <= 1.0:
         raise SystemExit("[ERROR] --max-agree is a fraction of placed cells, 0..1")
+
+    if args.count:
+        n = 0
+        for path in args.inputs:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                n += sum(1 for line in fh
+                         if line.strip() and not line.lstrip()[:1] in "#%")
+        print(n)
+        return 0
 
     check_memory(args.inputs, args)
     seed = V.load_seed(V.find_seed(args.seed))

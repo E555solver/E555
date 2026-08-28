@@ -90,7 +90,7 @@ solution index there, which is why you **always recompute** with the scorer.
 | C1 | `src/C_tail/E555_topper.py` | CP-SAT: **herd** breaks toward the nearest corner/side | `pipeline/topper_sweep.sh` (`PRESET=window`, `safe`, `deep`, `close`) |
 | C2 | `src/C_tail/E555_ender.py` | CP-SAT closer: `--mode ring` (re-thread whole border) or default patch (localized LNS) | `examples/04_stage_c_close.sh` |
 | C3 | `bin/E555_backtracker` | exact / bounded-mismatch DFS dives to **close** a small tail | `examples/05_backtracker_dives.sh` |
-| - | `pipeline/run_pipeline_annealed.sh` | **all six stages end to end** — the reference orchestration | `pipeline/run_pipeline_annealed.sh` |
+| - | `pipeline/run_pipeline.sh` | **all seven stages end to end** — the reference orchestration | `pipeline/run_pipeline.sh` |
 
 **The measure (single source of truth), used after every run:**
 ```bash
