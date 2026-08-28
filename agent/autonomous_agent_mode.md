@@ -94,25 +94,25 @@ solution index there, which is why you **always recompute** with the scorer.
 
 **The measure (single source of truth), used after every run:**
 ```bash
-python3 tools/E555_rank.py <FILE> --seed data/seed_Edge5.txt --top 5
+python3 tools/E555_rank.py <FILE> --seed_file data/seed_Edge5.txt --top 5
 ```
 Reads: `score` (=/480), `breaks`, and the *shape* — `break_rows`, `break_cols`,
 `span`, `clean_b/clean_t/clean_l/clean_r` (clean rows from each edge),
 `corner_d`. The top row is the best board. To pull the numeric best:
 ```bash
-python3 tools/E555_rank.py <FILE> --seed data/seed_Edge5.txt \
-    --emit /tmp/n.csv --rescore >/dev/null
+python3 tools/E555_rank.py <FILE> --seed_file data/seed_Edge5.txt \
+    --out /tmp/n.csv --rescore >/dev/null
 head -1 /tmp/n.csv | cut -d, -f2                     # -> best score /480
 ```
 
 **Visual check (occasional, for the journal):**
 ```bash
-python3 tools/E555_viewer.py <FILE> --seed data/seed_Edge5.txt --no-url --row 0
+python3 tools/E555_viewer.py <FILE> --seed_file data/seed_Edge5.txt --no_url --row 0
 ```
 
 **Key tool knobs worth sweeping** (see each `--help`):
-- annealer: `--w-top/-right/-bottom/-left`, `--target_scale`, `--restarts`,
-  `--fix-corners {0,1,2}`, `--steps`, `--seed`, `--threads` (restarts run in
+- annealer: `--w_top/right/bottom/left`, `--target_scale`, `--restarts`,
+  `--fix_corners {0,1,2}`, `--steps`, `--rng_seed`, `--threads` (restarts run in
   parallel; never changes the result), `--verbose` (per-step progress and the
   `BEST,` lines, off by default).
 - beamer: `--beam_width`, `--stop_row` (1..13), `--lambda_Mahalanobis` (the 463
@@ -121,12 +121,12 @@ python3 tools/E555_viewer.py <FILE> --seed data/seed_Edge5.txt --no-url --row 0
 - finalizer: `--finalize_from` (keep it **~3–4 rows BELOW the beamer stop row** —
   locking right under the frontier just re-runs the row that already failed),
   `--finalize_repeats`, `--beam_width`.
-- topper: `--side {T,B,L,R,TR,TL,TB}`, `--work-rows`, `--report_best` (real beam),
-  `--max_time`, `--stall_time`, `--workers`.
-- ender: `--mode {patch,ring}`, `--reach`, `--max-changes`, `--holes FILE`,
-  `--max-time`, `--stall-time`, `--workers`. Never returns a board worse than input.
+- topper: `--side {T,B,L,R,TR,TL,TB}`, `--band_depth`, `--top` (real beam),
+  `--time_limit`, `--stall_time`, `--threads`.
+- ender: `--mode {patch,ring}`, `--reach`, `--max_changes`, `--holes FILE`,
+  `--time_limit`, `--stall_time`, `--threads`. Never returns a board worse than input.
 - backtracker: `--holes FILE`, `--order {mrv,spiralout,2sides,4sides,...}`,
-  `--max-mismatch K` (0 = exact), `--stuck_restarts`, `--time-limit`, `--threads`.
+  `--breaks K` (0 = exact), `--restarts`, `--time_limit`, `--threads`.
 
 ---
 
@@ -153,7 +153,7 @@ the trap that makes a run *look* like it hit 16 while the board is still 17.
 - **10 ≤ breaks ≤ 30** → `topper` to herd breaks to the corner(s)/side(s) where they
   live (H1), then `ender` patch around them.
 - **breaks < 10, clustered** → `backtracker` with a `--holes` mask covering the
-  cluster + a slack ring, `--max-mismatch` small, `mrv` order. This is the endgame
+  cluster + a slack ring, `--breaks` small, `mrv` order. This is the endgame
   closer — the only exact engine that can actually *finish* a board.
 - **the board is a partial** (unplaced cells / rows not full) → grow it first with
   `beamer`/`finalizer`, or `backtracker` using the empty cells as holes.
@@ -196,7 +196,7 @@ printf 'unix,iso,stage,tool,params,input,output,score,breaks,runtime_s,note\n' >
 
 **Verify the scorer agrees with the baseline before trusting anything:**
 ```bash
-python3 tools/E555_rank.py frontier/frontier.csv --seed data/seed_Edge5.txt --top 1
+python3 tools/E555_rank.py frontier/frontier.csv --seed_file data/seed_Edge5.txt --top 1
 # must show score 463 / breaks 17. If not, STOP and fix setup — do not start the goal.
 ```
 
@@ -217,14 +217,14 @@ cd agent/lab
 # 1) same-seed sanity check on a sample: cleanest partials must have clean BOTTOM
 #    rows (a wrong-seed pool shows breaks scattered through every row).
 head -50 pool/*.csv > pool/_sample.csv
-python3 tools/E555_rank.py pool/_sample.csv --seed data/seed_Edge5.txt --top 10
+python3 tools/E555_rank.py pool/_sample.csv --seed_file data/seed_Edge5.txt --top 10
 
 # 2) curate a shortlist: most-placed first, then fewest breaks. Partials of
 #    equal depth => fewest breaks wins; do NOT sort by breaks alone (an emptier
 #    board trivially has fewer breaks). --rescore also rewrites field 2 as the
 #    true matched-edge count, so the emitted file is sortable by score too.
-python3 tools/E555_rank.py pool/<big>.csv --seed data/seed_Edge5.txt \
-    --sort placed,breaks --top 5000 --emit pool/curated.csv --rescore
+python3 tools/E555_rank.py pool/<big>.csv --seed_file data/seed_Edge5.txt \
+    --sort placed,breaks --top 5000 --out pool/curated.csv --rescore
 : > pool/consumed.txt          # ids the agent has already pulled
 ```
 (If a single file is too big to rank in one pass, split it, rank each chunk with
@@ -423,7 +423,7 @@ written.
   `column -s, -t agent/lab/run_log.csv | tail`.
 - The frontier board is always at `agent/lab/frontier/frontier.csv`; re-feed it to
   any Stage C tool by hand, or view it:
-  `python3 agent/lab/tools/E555_viewer.py agent/lab/frontier/frontier.csv --seed agent/lab/data/seed_Edge5.txt`.
+  `python3 agent/lab/tools/E555_viewer.py agent/lab/frontier/frontier.csv --seed_file agent/lab/data/seed_Edge5.txt`.
 - To resume a later day: the scoreboard, frontier, run_log, and STRATEGY.md are all
   the state you need — start a fresh session, point `/goal` at the same lab, and it
   picks up from the recorded frontier.

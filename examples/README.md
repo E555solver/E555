@@ -60,10 +60,10 @@ you:
 
 ```bash
 cat final_out/outputs.txt
-python3 tools/E555_rank.py $(head -1 final_out/outputs.txt) --seed data/seed_Edge5.txt --top 10
+python3 tools/E555_rank.py $(head -1 final_out/outputs.txt) --seed_file data/seed_Edge5.txt --top 10
 ```
 
-**They print the command they ran.** Every tool call passes `--print-cmd`, so
+**They print the command they ran.** Every tool call passes `--print_cmd`, so
 the log carries a `[cmd]` line with every flag populated from its effective
 value. Copy that line and you have the run, without this script in the middle.
 
@@ -95,14 +95,14 @@ bash examples/05_backtracker_dives.sh BOARDS=stage_c_out/3_patched.csv
 Between any two steps, look at what you have:
 
 ```bash
-python3 tools/E555_rank.py   FILE --seed data/seed_Edge5.txt --top 10
-python3 tools/E555_rank.py   FILE --seed data/seed_Edge5.txt --top 10 --no-id
+python3 tools/E555_rank.py   FILE --seed_file data/seed_Edge5.txt --top 10
+python3 tools/E555_rank.py   FILE --seed_file data/seed_Edge5.txt --top 10 --no_id
 python3 tools/E555_rank.py   FILE --count            # how many boards
 python3 tools/E555_rank.py   FILE --field score      # the best board's score
-python3 tools/E555_viewer.py FILE --seed data/seed_Edge5.txt
+python3 tools/E555_viewer.py FILE --seed_file data/seed_Edge5.txt
 ```
 
-`--no-id` drops the board-id column, which is the widest one and the usual
+`--no_id` drops the board-id column, which is the widest one and the usual
 reason the table wraps. `rank.py` is the one to trust: it recomputes the score
 from the seed -- **field 2 of a Stage B row is a solution index, not a score** --
 and it reports *where* the breaks are. Eighteen breaks spread over seven rows is
@@ -129,11 +129,11 @@ a deliberately tiny smoke run is a legitimate thing to ask for.
 
 The weights say what a good border is. Without `--target_scale` a weight is a
 maximize/minimize sign rather than a per-side target, which is what lets
-`--w-bottom 0` mean "ignore the bottom". The two settings are coupled: putting
+`--w_bottom 0` mean "ignore the bottom". The two settings are coupled: putting
 `--target_scale` back makes every weight a target that must be positive, and
-`--w-bottom 0` stops meaning anything.
+`--w_bottom 0` stops meaning anything.
 
-**Reproducibility.** The beam is reproducible from `--seed` together with
+**Reproducibility.** The beam is reproducible from `--rng_seed` together with
 `--threads`, not from the seed alone. The work partition follows the thread
 count, and a beam that keeps a bounded number of candidates keeps a different
 subset from a different partition. Record the thread count with the seed.
@@ -353,20 +353,19 @@ whole run stays there. `THREADS` and `PREFIX` are the only other variables.
 **Flags absent from the file are the tool's tuned defaults**, not oversights.
 `--beam_width` is the one to notice: the beamer and the finalizer both default
 to 250000, and writing that number into an example would pin a stale value the
-day it is retuned. `--print-cmd` reports every effective value at startup, so
+day it is retuned. `--print_cmd` reports every effective value at startup, so
 leaving a flag out hides nothing.
 
-**`--border_row_N 0` means "every line of the input".** Stages 2 and 3 read
-whatever the stage before them produced, and that count is not known when the
-script is written. The finalizer and the roundhouse both take 0 as "from
-`--border_row` to the end of the file" and resolve it before the banner, so
-`[cfg]` and `--print-cmd` report the real number rather than the sentinel. The
-default is 1, which is the trap worth knowing about: leave the flag out and the
-stage reads the first board of its input and discards the rest. The beamer's
-copy of the flag counts random bottoms rather than input lines, so it keeps a
-real number.
+**`--num_rows 0` means "every line of the input", and it is also the default.**
+Stages 2 and 3 read whatever the stage before them produced, and that count is
+not known when the script is written. The finalizer and the roundhouse both
+take 0 as "from `--start_row` to the end of the file" and resolve it before the
+banner, so `[cfg]` and `--print_cmd` report the real number rather than the
+sentinel -- so does the beamer, in its fixed-border mode. The beamer's
+`--random_edges` mode reads no file at all, so it counts random bottoms with a
+separate flag, `--samples`, instead.
 
-**`--max_partials 25` counts both files.** The beamer's help is explicit that
+**`--max_emitted 25` counts both files.** The beamer's help is explicit that
 the budget covers "both completions and `--incomplete_top` partials", so 25 is
 25 boards of either kind. It is a stop condition, not a quota: the beam in
 flight is always emitted in full, an overshoot of up to one beam width.
@@ -406,7 +405,7 @@ missing cells directly, and is untested.
 completions files are literally zero bytes when their stage emitted nothing --
 the CSV header is written with the first board, not at open -- so `[ -s ]` on
 their concatenation is an exact test rather than a heuristic. Give stage 1 a much
-longer `--max_wall_sec` and this stage starts working. `shopt -s nullglob` at the
+longer `--wall_time` and this stage starts working. `shopt -s nullglob` at the
 top of the script is what lets the final concatenation succeed when the
 roundhouse never created an output directory. `--clue_center` is *not* passed
 here, unlike the two stages above: the roundhouse never frees the centre cell,
@@ -416,11 +415,11 @@ how wide a band each round tears up, 2 to 5, and three rounds at width 5 keep
 only the 66-piece core.
 
 **Three limits bound stage 1, and the clock is the one that should win.**
-`--max_wall_sec 600`, `--max_partials 25` and `--border_row_N 50` are all live;
+`--wall_time 600`, `--max_emitted 25` and `--samples 50` are all live;
 whichever comes first stops the run. Yield is 0.7 to 1.2 boards per
 configuration at about 30 s each, so at these numbers the clock fires: one
 measured run stopped at 600.2 s with 21 boards from 18 bottoms, under both other
-limits. An earlier version set `--border_row_N 30` and the bottoms ran out
+limits. An earlier version set `--samples 30` and the bottoms ran out
 first, at 22 boards, with the board limit never firing at all -- a bound you
 cannot predict is not much of a bound.
 
@@ -437,14 +436,14 @@ A higher lock races through lines and returns nothing, because from row 7 the
 beam never widens enough to reach row 12 at all. A lower lock spends 75 s a line
 and sees 2 boards of 277.
 
-**`--max-mismatch 20` is a filter, not a promise.** Closing the gap in row 12
+**`--breaks 20` is a filter, not a promise.** Closing the gap in row 12
 plus rows 13..15 costs about 24-30 broken edges, so nothing passes a ceiling of
 20. In stuck mode that changes nothing about the output: every dive completes,
 the best board per input record is written regardless, and the ranking reads
 those.
 
 **Expect the yield to swing, and do not tune on one run.** Two runs of the
-finalizer differing only in `--seed` returned 15 partials and 1. That spread
+finalizer differing only in `--rng_seed` returned 15 partials and 1. That spread
 swamps every parameter effect, so settings were chosen at a *matched* seed,
 where `--finalize_repeats` earns its place:
 
@@ -472,8 +471,8 @@ the backtracker's CSVs are deleted once the ranking is written. Change `PREFIX`
 between runs -- the C tools append to their CSVs rather than truncating them.
 
 **Two dials set the run length**, since everything else is a default:
-`--max_wall_sec` on the beamer, which is two thirds of the total and decides
-how many boards the rest of the chain is handed, and `--time-limit` on the
+`--wall_time` on the beamer, which is two thirds of the total and decides
+how many boards the rest of the chain is handed, and `--time_limit` on the
 backtracker, which is spent once per board it receives. They are coupled --
 doubling the first roughly doubles the fourth stage too. One measured
 end-to-end run, four cores:
@@ -488,7 +487,7 @@ end-to-end run, four cores:
 | **total** | **914 s** | `bb1_ranked.csv`, 41 rows |
 
 Four idle cores; proportionally less on more threads. Stage 1 is two thirds of
-it and is capped by its own clock, so `--max_wall_sec` there is the dial that
+it and is capped by its own clock, so `--wall_time` there is the dial that
 moves the total. Measure on an idle machine: one stray solver left running from
 an earlier experiment doubled every figure in an earlier version of this table.
 
@@ -524,7 +523,7 @@ flag it frees the centre clue's cell and quietly refills it. The `clues` column
 of `E555_rank.py` counts how many of the five a board still has:
 
 ```bash
-python3 tools/E555_rank.py FILE --sort clues,score --no-id
+python3 tools/E555_rank.py FILE --sort clues,score --no_id
 ```
 
 ## When a stage stalls, turn the board
@@ -535,7 +534,7 @@ fixed corner -- so a quarter-turn gives the same breaks to a different one. The
 turn is lossless and re-scored to prove it:
 
 ```bash
-python3 tools/E555_rotate.py FILE 1 --seed data/seed_Edge5.txt   # -> FILE_rot1.csv
+python3 tools/E555_rotate.py FILE 1 --seed_file data/seed_Edge5.txt   # -> FILE_rot1.csv
 ```
 
 ## Three things that look like failures and are not

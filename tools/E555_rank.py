@@ -12,7 +12,7 @@ WHY
 
     This tool derives the missing measures from the board itself, so it works
     on any CSV in the stack -- including files produced long before it existed
-    -- and by default it never rewrites the format: --emit re-orders the input
+    -- and by default it never rewrites the format: --out re-orders the input
     rows byte for byte. Add --rescore when you want the file rewritten
     canonically instead; see CANONICAL OUTPUT below.
 
@@ -30,7 +30,7 @@ THE MEASURES  (a "break" is an internal junction whose two cells disagree;
     border      longest unbroken run of the external frame, walked from the
                 bottom-left corner counter-clockwise, stopping at the first frame
                 cell that is unplaced or touched by any break. 0..60; 60 = a fully
-                placed, break-free frame. Higher is better. `--border-only` keeps
+                placed, break-free frame. Higher is better. `--border_only` keeps
                 just the border==60 boards -- the clean start E555_finalizer needs
                 in fixed mode (a placed-but-broken seam would poison the search).
 
@@ -60,7 +60,7 @@ THE MEASURES  (a "break" is an internal junction whose two cells disagree;
                 of the board but of the selection, so it cannot be sorted on.
                 Lower means more independent; the first root always reads 0.
 
-CHOOSING INDEPENDENT ROOTS  (--diverse, --max-agree)
+CHOOSING INDEPENDENT ROOTS  (--diverse, --max_agree)
 
     A run that emits a thousand boards rarely emits a thousand ideas. The top
     of a ranking is usually one lineage -- the same board with three cells
@@ -77,7 +77,7 @@ CHOOSING INDEPENDENT ROOTS  (--diverse, --max-agree)
                       best board is the first root, and each next root is the
                       one whose CLOSEST already-chosen root is furthest away.
                       Costs K x M comparisons, not the M^2 of a full matrix.
-        --max-agree P drop any board agreeing with an already-kept board on
+        --max_agree P drop any board agreeing with an already-kept board on
                       more than fraction P of its placed cells -- a plain
                       near-duplicate filter. Runs before --diverse.
 
@@ -100,12 +100,12 @@ MEMORY
     peak memory does not depend on the file size at all (14 MB for the same
     input). Use it on anything large; it is the only mode that scales.
 
-    Without --top, an input projected to need more than `--max-mem` GB
+    Without --top, an input projected to need more than `--max_mem` GB
     (default 8) is refused before it starts, rather than being OOM-killed
-    half-way through. --diverse and --max-agree add a ~16 KB fingerprint per
+    half-way through. --diverse and --max_agree add a ~16 KB fingerprint per
     retained board, which the projection accounts for.
 
-CANONICAL OUTPUT  (--emit --rescore)
+CANONICAL OUTPUT  (--out --rescore)
 
     Field 2 of a board row is NOT reliably the score. Stage B writes its
     solution index there, and older files carry other dialects still -- all of
@@ -113,7 +113,7 @@ CANONICAL OUTPUT  (--emit --rescore)
     accepts them, but it means you cannot `sort -t, -k2,2nr` a mixed corpus and
     get anything meaningful.
 
-    `--emit FILE --rescore` rewrites each row in the one canonical form
+    `--out FILE --rescore` rewrites each row in the one canonical form
 
         config_id , score , pos[0..255] , rot[0..255]           (514 fields)
 
@@ -130,12 +130,12 @@ USAGE
 
     python3 tools/E555_rank.py boards.csv
     python3 tools/E555_rank.py step*.csv --sort breaks,break_rows --top 20
-    python3 tools/E555_rank.py boards.csv --sort solid --emit best.csv
-    python3 tools/E555_rank.py boards.csv --border-only --emit clean.csv
-    python3 tools/E555_rank.py mixed*.csv --emit pool.csv --rescore
+    python3 tools/E555_rank.py boards.csv --sort solid --out best.csv
+    python3 tools/E555_rank.py boards.csv --border_only --out clean.csv
+    python3 tools/E555_rank.py mixed*.csv --out pool.csv --rescore
     python3 tools/E555_rank.py boards.csv --csv > metrics.csv
-    python3 tools/E555_rank.py pool.csv --top 200 --diverse 5 --emit roots.csv
-    python3 tools/E555_rank.py huge.csv --top 100 --max-agree 0.9
+    python3 tools/E555_rank.py pool.csv --top 200 --diverse 5 --out roots.csv
+    python3 tools/E555_rank.py huge.csv --top 100 --max_agree 0.9
 
     --sort takes a comma-separated list of measure names, applied in order,
     and always puts the BEST board first -- `--sort solid` gives the most
@@ -144,7 +144,7 @@ USAGE
     with the '=' (a bare `--sort -solid` looks like a flag to argparse).
     The default, `breaks,break_rows`, is "fewest breaks first, then most
     compact". Several files can be ranked together; a `file` column then
-    appears and --emit merges them into one ranked CSV.
+    appears and --out merges them into one ranked CSV.
 """
 from __future__ import annotations
 import argparse, csv, heapq, sys
@@ -328,7 +328,7 @@ def fingerprint(line):
     Two boards agree on a cell when both put the same piece there at the same
     spin, so the agreement is just `len(a & b)` -- one C-speed set intersection
     instead of a 256-step Python loop. Built only for the records --diverse or
-    --max-agree actually compare, which is why the record keeps the line rather
+    --max_agree actually compare, which is why the record keeps the line rather
     than the parsed arrays: everything else in the file is measured once and
     never looked at again.
     """
@@ -533,7 +533,7 @@ def count_rows(paths):
 # What holding the whole input costs, measured: 51,000 boards of a 96 MB CSV
 # peaked at 165 MB, so the light record is about 1.8x its line on disk -- which
 # is the right shape for a projection, since a record's size follows its row's
-# width. A fingerprint set is another ~16 KB, and only --diverse/--max-agree
+# width. A fingerprint set is another ~16 KB, and only --diverse/--max_agree
 # build them.
 RECORD_OVERHEAD = 1.8
 BYTES_PER_PRINT = 16000
@@ -556,8 +556,8 @@ def check_memory(paths, args):
     if want > limit:
         raise SystemExit(
             f"[ERROR] {rows:,} boards would need about {want / (1<<30):.2g} GB, over "
-            f"the --max-mem limit of {args.max_mem:g} GB.\n"
-            f"        Add --top N to stream with bounded memory, or raise --max-mem.")
+            f"the --max_mem limit of {args.max_mem:g} GB.\n"
+            f"        Add --top N to stream with bounded memory, or raise --max_mem.")
 
 
 def _status(skipped):
@@ -588,20 +588,20 @@ def main():
                          "(default: breaks,break_rows). Use --sort=-KEY "
                          "(with the '=') to invert one to worst-first.")
     ap.add_argument("--top", type=int, default=0, help="show only the best N rows")
-    ap.add_argument("--emit", metavar="FILE",
+    ap.add_argument("--out", metavar="FILE",
                     help="write the input rows, re-ordered, verbatim to FILE")
     ap.add_argument("--rescore", action="store_true",
-                    help="with --emit: rewrite each row canonically as "
+                    help="with --out: rewrite each row canonically as "
                          "config_id,score,pos[256],rot[256] with the score "
                          "recomputed from the seed, instead of copying it "
                          "verbatim. Makes `sort -t, -k2,2nr` meaningful.")
     ap.add_argument("--csv", action="store_true",
                     help="print the measures as CSV instead of a table")
-    ap.add_argument("--no-id", action="store_true",
+    ap.add_argument("--no_id", action="store_true",
                     help="drop the board-id column from the table, which is the "
                          "widest one and the usual reason a row wraps; `row` "
                          "still identifies the board. Ignored by --csv.")
-    ap.add_argument("--border-only", action="store_true",
+    ap.add_argument("--border_only", action="store_true",
                     help="keep only boards with a fully clean, complete external "
                          "border (border == 60)")
     ap.add_argument("--diverse", type=int, default=0, metavar="K",
@@ -610,15 +610,15 @@ def main():
                          "instead of the K siblings the top of a ranking usually "
                          "holds. Adds an `agree` column: each root's highest "
                          "agreement with the roots before it")
-    ap.add_argument("--max-agree", type=float, default=None, metavar="P",
+    ap.add_argument("--max_agree", type=float, default=None, metavar="P",
                     help="drop any board agreeing with an already-kept board on "
                          "more than fraction P of its placed cells (0..1). A plain "
                          "near-duplicate filter; runs before --diverse")
-    ap.add_argument("--max-mem", type=float, default=8.0, metavar="GB",
+    ap.add_argument("--max_mem", type=float, default=8.0, metavar="GB",
                     help="refuse an input projected to need more than this much "
                          "memory (default 8). Only applies without --top, which "
                          "streams in bounded memory whatever the file size")
-    ap.add_argument("--seed", help="piece seed file (default: data/seed_Edge5.txt)")
+    ap.add_argument("--seed_file", help="piece seed file (default: data/seed_Edge5.txt)")
     ap.add_argument("--count", action="store_true",
                     help="print just the number of board rows across the inputs "
                          "and exit, one bare number. For scripts: "
@@ -633,8 +633,8 @@ def main():
                          "the real board instead of trusting field 2, which "
                          "Stage B writes its solution index into.")
     args = ap.parse_args()
-    if args.rescore and not args.emit:
-        raise SystemExit("[ERROR] --rescore only means something with --emit FILE")
+    if args.rescore and not args.out:
+        raise SystemExit("[ERROR] --rescore only means something with --out FILE")
     if args.field and args.field not in SORTABLE:
         raise SystemExit(f"[ERROR] unknown measure '{args.field}'; "
                          f"choose from: {', '.join(SORTABLE)}")
@@ -642,7 +642,7 @@ def main():
     if args.diverse < 0:
         raise SystemExit("[ERROR] --diverse wants a positive count")
     if args.max_agree is not None and not 0.0 <= args.max_agree <= 1.0:
-        raise SystemExit("[ERROR] --max-agree is a fraction of placed cells, 0..1")
+        raise SystemExit("[ERROR] --max_agree is a fraction of placed cells, 0..1")
 
     if args.count:
         n = 0
@@ -654,11 +654,11 @@ def main():
         return 0
 
     check_memory(args.inputs, args)
-    seed = V.load_seed(V.find_seed(args.seed))
+    seed = V.load_seed(V.find_seed(args.seed_file))
     skipped = []
     keys = parse_sort_spec(args.sort)
     stream = read_boards(args.inputs, seed, skipped, progress_every=50000)
-    # Counted as it streams, so --border-only can still report "N of M" without
+    # Counted as it streams, so --border_only can still report "N of M" without
     # a second pass and without holding the boards it rejects.
     seen = [0]
     def _count(it):
@@ -684,8 +684,8 @@ def main():
             return _status(skipped)
         if seen[0] == 0:
             raise SystemExit("[ERROR] no board rows found in the input")
-        if args.emit:
-            write_emit(args.emit, [], args.rescore)
+        if args.out:
+            write_emit(args.out, [], args.rescore)
         return _status(skipped)
     if args.field:
         print(records[0][args.field])
@@ -698,8 +698,8 @@ def main():
         records = select_diverse(records, args.diverse)
     shown = records
     if not shown:
-        if args.emit:
-            write_emit(args.emit, [], args.rescore)
+        if args.out:
+            write_emit(args.out, [], args.rescore)
         return _status(skipped)
 
     multi = len(args.inputs) > 1
@@ -718,7 +718,7 @@ def main():
     print(f"\n=== E555 rank ===  {len(records)} boards from "
           f"{len(args.inputs)} file(s), sorted by {order}\n")
 
-    # --no-id drops the widest column of all: board ids run to 44 characters and
+    # --no_id drops the widest column of all: board ids run to 44 characters and
     # are the main reason a row wraps. `row` still identifies the board, and it
     # is what --row of the other tools wants anyway.
     idw = 0 if args.no_id else min(44, max(len(r["id"]) for r in shown))
@@ -743,8 +743,8 @@ def main():
     print("[note] lower is better: breaks break_rows break_cols corner_d   |   "
           "higher is better: score solid placed border clues clean_*")
 
-    if args.emit:
-        write_emit(args.emit, shown, args.rescore)
+    if args.out:
+        write_emit(args.out, shown, args.rescore)
     return _status(skipped)
 
 

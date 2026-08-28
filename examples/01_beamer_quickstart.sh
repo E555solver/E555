@@ -64,7 +64,7 @@ if [ "$ANNEAL" = 1 ]; then
     rm -f "$ROTATIONS"          # the annealer APPENDS; start clean
     python3 src/A_border/E555_edge_annealer.py "$SEED" \
         --restarts $((BORDERS * 4)) --steps "$STEPS" --threads "$THREADS" \
-        --w-bottom 0 --w-left 1 --w-right 3 --w-top 2 \
+        --w_bottom 0 --w_left 1 --w_right 3 --w_top 2 \
         --out "$ROTATIONS" --verbose
     python3 tools/E555_sort_rotations.py "$ROTATIONS" --top "$BORDERS" -o "$ROTATIONS.sorted"
     mv "$ROTATIONS.sorted" "$ROTATIONS"
@@ -73,18 +73,18 @@ if [ "$ANNEAL" = 1 ]; then
     BORDERS=$(grep -v '^ *#' "$ROTATIONS" | wc -l)
     [ "$BORDERS" -gt 0 ] || { echo "Stage A found no feasible border. Raise STEPS."; exit 1; }
     echo "=== Stage B: beaming from $BORDERS border(s) ==="
-    BORDER_ARG=("$ROTATIONS" --border_row 0 --border_row_N "$BORDERS"
+    BORDER_ARG=("$ROTATIONS" --start_row 0 --num_rows "$BORDERS"
                 --top_bottoms "$N_BOTTOMS" --top_columns "$N_COLUMNS")
 else
-    BORDER_ARG=(--random_edges --border_row_N "$N_BOTTOMS" --top_columns "$N_COLUMNS")
+    BORDER_ARG=(--random_edges --samples "$N_BOTTOMS" --top_columns "$N_COLUMNS")
 fi
 
 DB_ARG=(); [ -n "$DB_FILE" ] && DB_ARG=(--db_file "$DB_FILE")
 
 bin/E555_beamer "$SEED" "${BORDER_ARG[@]}" "${CLUE_ARG[@]}" "${DB_ARG[@]}" \
     --beam_width "$BEAM_WIDTH" --stop_row "$STOP_ROW" \
-    --max_wall_sec "$MAX_WALL" --threads "$THREADS" --seed "$RNG_SEED" \
-    --out_dir "$OUT_DIR" --print-cmd --verbose
+    --wall_time "$MAX_WALL" --threads "$THREADS" --rng_seed "$RNG_SEED" \
+    --out_dir "$OUT_DIR" --print_cmd --verbose
 
 # The beamer lists what it wrote; no need to rebuild the filenames here.
 echo
@@ -93,7 +93,7 @@ if [ -s "$OUT_DIR/outputs.txt" ]; then
     sed 's/^/  /' "$OUT_DIR/outputs.txt"
     echo
     echo "Look at the best one, then push it further:"
-    echo "  python3 tools/E555_rank.py \$(head -1 $OUT_DIR/outputs.txt) --seed $SEED --top 5"
+    echo "  python3 tools/E555_rank.py \$(head -1 $OUT_DIR/outputs.txt) --seed_file $SEED --top 5"
     echo "  bash examples/02_finalizer_regrow.sh BOARDS=\$(head -1 $OUT_DIR/outputs.txt)"
 else
     echo "No board survived to row $STOP_ROW. Normal for a short run: raise"

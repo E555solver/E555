@@ -101,7 +101,7 @@ USAGE
 
     --all writes _rot0.._rot3 in one pass -- the "hand all four to the next
     stage" workflow above, without four commands. It takes no N, and no --out
-    or --holes-out, because it names four files.
+    or --holes_out, because it names four files.
 
     python3 E555_rotate.py board.csv 1 --holes data/holes_open_border_TR.csv
 
@@ -334,7 +334,7 @@ def main():
                          "2 = 180, 3 = 270. Omit it with --all.")
     ap.add_argument("--all", action="store_true",
                     help="write all four turns at once (_rot0 .. _rot3); takes "
-                         "no N, --out or --holes-out")
+                         "no N, --out or --holes_out")
     ap.add_argument("--out", metavar="FILE",
                     help="output path (default: the input with _rotN appended)")
     ap.add_argument("--rotations", action="store_true",
@@ -344,21 +344,21 @@ def main():
     ap.add_argument("--holes", metavar="FILE",
                     help="a 16x16 --holes mask to turn with the board, so the "
                          "next stage opens the same cells it did before")
-    ap.add_argument("--holes-out", metavar="FILE",
+    ap.add_argument("--holes_out", metavar="FILE",
                     help="output path for the turned mask (default: the input "
                          "with _rotN appended)")
-    ap.add_argument("--seed", help="piece seed file (default: data/seed_Edge5.txt)")
+    ap.add_argument("--seed_file", help="piece seed file (default: data/seed_Edge5.txt)")
     args = ap.parse_args()
 
     if args.all and args.n is not None:
         raise SystemExit("[ERROR] --all turns the board every way; drop the N")
     if args.all and (args.out or args.holes_out):
         raise SystemExit("[ERROR] --all writes four files and names them itself; "
-                         "drop --out / --holes-out")
+                         "drop --out / --holes_out")
     if args.n is None and not args.all:
         raise SystemExit("[ERROR] give N (0..4), or --all for every turn")
     if args.holes_out and not args.holes:
-        raise SystemExit("[ERROR] --holes-out only means something with --holes")
+        raise SystemExit("[ERROR] --holes_out only means something with --holes")
     if args.rotations and args.holes:
         raise SystemExit("[ERROR] --rotations turns a border's side assignment, "
                          "which has no cells for a --holes mask to name")
@@ -369,12 +369,12 @@ def main():
     holes = Path(args.holes) if args.holes else None
     if holes and not holes.exists():
         raise SystemExit(f"[ERROR] holes mask '{holes}' not found")
-    # checked before anything is written, so a bad --holes-out cannot leave a
+    # checked before anything is written, so a bad --holes_out cannot leave a
     # rotated board behind with no mask to go with it
     if args.holes_out and Path(args.holes_out).resolve() == holes.resolve():
         raise SystemExit(f"[ERROR] refusing to overwrite the mask '{holes}'")
 
-    seed = V.load_seed(V.find_seed(args.seed))
+    seed = V.load_seed(V.find_seed(args.seed_file))
     turns = [0, 1, 2, 3] if args.all else [args.n % 4]
     rc = 0
 

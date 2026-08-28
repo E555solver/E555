@@ -106,8 +106,8 @@ cd "$REPO"
 banner() { echo; echo "==============================================================="
            echo "  $*"; echo "==============================================================="; echo; }
 rows()   { python3 "$TOOLS/E555_rank.py" "$1" --count; }
-best()   { python3 "$TOOLS/E555_rank.py" "$1" --seed "$SEED" --field score; }
-show()   { echo; python3 "$TOOLS/E555_viewer.py" "$1" --seed "$SEED" --no-url --row 0; echo; }
+best()   { python3 "$TOOLS/E555_rank.py" "$1" --seed_file "$SEED" --field score; }
+show()   { echo; python3 "$TOOLS/E555_viewer.py" "$1" --seed_file "$SEED" --no_url --row 0; echo; }
 
 # rank FILE -- rewrite a board CSV in place, best board first. --rescore
 # recomputes field 2 as the number of matched edges (0..480) whatever tool wrote
@@ -116,8 +116,8 @@ show()   { echo; python3 "$TOOLS/E555_viewer.py" "$1" --seed "$SEED" --no-url --
 # breaks packed into fewer rows wins.
 rank() {
     [ -s "$1" ] || return 0
-    python3 "$TOOLS/E555_rank.py" "$1" --seed "$SEED" \
-        --sort breaks,break_rows --emit "$1.tmp" --rescore > /dev/null
+    python3 "$TOOLS/E555_rank.py" "$1" --seed_file "$SEED" \
+        --sort breaks,break_rows --out "$1.tmp" --rescore > /dev/null
     mv "$1.tmp" "$1"
 }
 
@@ -130,7 +130,7 @@ mkdir -p "$RUN_DIR"; cd "$RUN_DIR"
 
 CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 DB_ARG=();   [ -n "$DB_FILE" ] && DB_ARG=(--db_file "$DB_FILE")
-SEED_ARG=(); [ -n "$RNG_SEED" ] && SEED_ARG=(--seed "$RNG_SEED")
+SEED_ARG=(); [ -n "$RNG_SEED" ] && SEED_ARG=(--rng_seed "$RNG_SEED")
 
 [ "$BORDERS" = annealed ] && NSTAGE=7 || NSTAGE=6
 STAGE=0; STAGE_T0=0
@@ -156,7 +156,7 @@ if [ "$BORDERS" = annealed ]; then
     rm -f raw_rotations.csv         # the annealer APPENDS; start clean
     python3 -u "$SRC/A_border/E555_edge_annealer.py" "$SEED" \
         --restarts "$ROUNDS" --steps "$STEPS" --threads "$THREADS" \
-        --w-bottom 0 --w-left 1 --w-right 3 --w-top 2 \
+        --w_bottom 0 --w_left 1 --w_right 3 --w_top 2 \
         --out raw_rotations.csv
 
     # A restart that fails to place a legal border writes nothing, and whether
@@ -175,16 +175,16 @@ if [ "$BORDERS" = annealed ]; then
     NBORDER=$(grep -v '^ *#' 1_rotations.csv | wc -l)
     echo
     echo ">> $NBORDER border arrangements, best first -> 1_rotations.csv"
-    BORDER_ARG=(1_rotations.csv --border_row_N "$NBORDER" --top_columns "$BEAM_COLUMNS")
+    BORDER_ARG=(1_rotations.csv --num_rows "$NBORDER" --top_columns "$BEAM_COLUMNS")
 else
-    BORDER_ARG=(--random_edges --border_row_N "$BEAM_MAX_PARTIALS"
+    BORDER_ARG=(--random_edges --samples "$BEAM_MAX_PARTIALS"
                 --top_columns "$BEAM_COLUMNS" --frac_rand "$BEAM_FRAC_RAND")
 fi
 
 # -----------------------------------------------------------------------------
 next "beamer -- beam $BEAM_WIDTH up to row $BEAM_STOP_ROW"
 echo "Growing boards row by row. --incomplete_top also keeps boards that fill"
-echo "row $BEAM_STOP_ROW except for one of its three segments, and --max_partials"
+echo "row $BEAM_STOP_ROW except for one of its three segments, and --max_emitted"
 echo "$BEAM_MAX_PARTIALS ends the sweep once that many boards have been written."
 echo "The first run builds the 6.4 GB chain database: expect a few quiet minutes."
 echo
@@ -193,8 +193,8 @@ echo
     "${SEED_ARG[@]}" \
     --out_dir beam --threads "$THREADS" \
     --beam_width "$BEAM_WIDTH" --stop_row "$BEAM_STOP_ROW" \
-    --incomplete_top --max_partials "$BEAM_MAX_PARTIALS" \
-    --max_wall_sec "$BEAM_MAX_WALL" --print-cmd --verbose
+    --incomplete_top --max_emitted "$BEAM_MAX_PARTIALS" \
+    --wall_time "$BEAM_MAX_WALL" --print_cmd --verbose
 
 # One file pair per border row. The beamer lists what it filled, so this reads
 # that list instead of globbing for names it would have to know in advance.
@@ -219,9 +219,9 @@ echo
     --out_dir final --threads "$THREADS" \
     --finalize_repeats 1 --frac_rand "$FIN_FRAC_RAND" \
     --beam_width "$FIN_WIDTH" --stop_row "$FIN_STOP_ROW" --finalize_from "$FIN_FROM" \
-    --border_row_N "$BEAM_MAX_PARTIALS" --top_columns 0 \
-    --incomplete_top --max_partials "$FIN_MAX_PARTIALS" \
-    --max_wall_sec "$FIN_MAX_WALL" --print-cmd --verbose
+    --num_rows "$BEAM_MAX_PARTIALS" --top_columns 0 \
+    --incomplete_top --max_emitted "$FIN_MAX_PARTIALS" \
+    --wall_time "$FIN_MAX_WALL" --print_cmd --verbose
 
 FIN_OUT="3_final_row$FIN_STOP_ROW.csv"
 xargs -r cat < final/outputs.txt > "$FIN_OUT"
@@ -255,7 +255,7 @@ echo
 "$BIN/E555_roundhouse" "$SEED" "$FIN_OUT" "${CLUE_ARG[@]}" \
     --out_dir strip --threads "$THREADS" \
     --rounds 1 --strip_width "$RH_WIDTH" --rotate "$RH_ROTATE" \
-    --border_row_N "$RH_LINES" --max_wall_sec "$RH_WALL" --print-cmd --verbose
+    --num_rows "$RH_LINES" --wall_time "$RH_WALL" --print_cmd --verbose
 
 RH_OUT=$(head -1 strip/outputs.txt)
 if [ -n "$RH_OUT" ]; then
@@ -283,11 +283,11 @@ echo
 
 head -n "$TOP_N" "$FIN_OUT" > 5_in.csv
 python3 "$SRC/C_tail/E555_topper.py" "$SEED" 5_in.csv 5_deep.csv "${CLUE_ARG[@]}" \
-    --row 0 --count "$TOP_N" --side T --work-rows 6 --unused_rows 2 \
-    --workers "$THREADS" --max-time "$CPSAT_TIME" --stall-time "$CPSAT_STALL" --verbose
+    --start_row 0 --num_rows "$TOP_N" --side T --band_depth 6 --locked_rows 2 \
+    --threads "$THREADS" --time_limit "$CPSAT_TIME" --stall_time "$CPSAT_STALL" --verbose
 python3 "$SRC/C_tail/E555_topper.py" "$SEED" 5_deep.csv 5_corners.csv "${CLUE_ARG[@]}" \
-    --row 0 --count "$TOP_N" --side T --work-rows 4 --unused_rows 0 \
-    --workers "$THREADS" --max-time "$CPSAT_TIME" --stall-time "$CPSAT_STALL" --verbose
+    --start_row 0 --num_rows "$TOP_N" --side T --band_depth 4 --locked_rows 0 \
+    --threads "$THREADS" --time_limit "$CPSAT_TIME" --stall_time "$CPSAT_STALL" --verbose
 rm -f 5_in.csv 5_deep.csv
 rank 5_corners.csv
 echo
@@ -302,12 +302,12 @@ echo "localized LNS on whatever break the sweep left."
 echo
 
 python3 "$SRC/C_tail/E555_ender.py" "$SEED" 5_corners.csv 6_rung.csv "${CLUE_ARG[@]}" \
-    --mode ring --reach "$ENDER_REACH" --max-changes "$ENDER_CHANGES" \
-    --workers "$THREADS" \
-    --max-time "$((CPSAT_TIME*2))" --stall-time "$CPSAT_STALL" --verbose
+    --mode ring --reach "$ENDER_REACH" --max_changes "$ENDER_CHANGES" \
+    --threads "$THREADS" \
+    --time_limit "$((CPSAT_TIME*2))" --stall_time "$CPSAT_STALL" --verbose
 python3 "$SRC/C_tail/E555_ender.py" "$SEED" 6_rung.csv 6_patched.csv "${CLUE_ARG[@]}" \
-    --reach "$ENDER_REACH" --max-changes "$ENDER_CHANGES" --workers "$THREADS" \
-    --max-time "$((CPSAT_TIME*3))" --stall-time "$((CPSAT_STALL*2))" --verbose
+    --reach "$ENDER_REACH" --max_changes "$ENDER_CHANGES" --threads "$THREADS" \
+    --time_limit "$((CPSAT_TIME*3))" --stall_time "$((CPSAT_STALL*2))" --verbose
 rank 6_rung.csv; rank 6_patched.csv
 echo
 echo ">> ring sweep best $(best 6_rung.csv)/480, patch best $(best 6_patched.csv)/480"
@@ -326,10 +326,10 @@ echo "($BT_RESTARTS randomized greedy dives, keeping the best)."
 echo
 
 "$BIN/E555_backtracker" "$SEED" 7_best_input.csv 7_backtracker.csv \
-    --row 0 --count 1 --threads "$THREADS" \
-    --holes "$HOLES" --order mrv --break-mode stuck \
-    --max-mismatch "$BT_MISMATCH" --stuck_restarts "$BT_RESTARTS" \
-    --time-limit "$BT_TIME" --print-cmd --verbose
+    --start_row 0 --num_rows 1 --threads "$THREADS" \
+    --holes "$HOLES" --order mrv --break_mode stuck \
+    --breaks "$BT_MISMATCH" --restarts "$BT_RESTARTS" \
+    --time_limit "$BT_TIME" --print_cmd --verbose
 
 # -----------------------------------------------------------------------------
 echo "[time] stage $STAGE took $(( SECONDS - STAGE_T0 ))s"

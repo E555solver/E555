@@ -51,18 +51,18 @@ ROT_ARG=(); [ -n "$ROTATIONS" ] && ROT_ARG=("$ROTATIONS")
 CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 
 bin/E555_finalizer "$SEED" "$BOARDS" "${ROT_ARG[@]}" "${CLUE_ARG[@]}" \
-    --border_row "$FIRST_LINE" --border_row_N "$N_LINES" \
+    --start_row "$FIRST_LINE" --num_rows "$N_LINES" \
     --finalize_from "$FROM" --finalize_repeats "$REPEATS" \
     --beam_width "$BEAM_WIDTH" --stop_row "$STOP_ROW" \
     --top_columns "$COLUMNS" --threads "$THREADS" \
-    --max_wall_sec "$MAX_WALL" --out_dir "$OUT_DIR" --print-cmd --verbose
+    --wall_time "$MAX_WALL" --out_dir "$OUT_DIR" --print_cmd --verbose
 
 echo
 if [ -s "$OUT_DIR/outputs.txt" ]; then
     echo "Boards written:"
     sed 's/^/  /' "$OUT_DIR/outputs.txt"
     echo
-    echo "  python3 tools/E555_rank.py \$(head -1 $OUT_DIR/outputs.txt) --seed $SEED --top 10"
+    echo "  python3 tools/E555_rank.py \$(head -1 $OUT_DIR/outputs.txt) --seed_file $SEED --top 10"
 else
     echo "Nothing emitted: no left column survived from row $FROM to row $STOP_ROW."
     echo "That is a real answer. Lower FROM, raise MAX_WALL, or take the input"

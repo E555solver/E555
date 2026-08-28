@@ -35,5 +35,5 @@ config_id , score , pos[0..255] , rot[0..255]        (514 fields)
   and the older 515-field layout -- load everywhere.
 - Lines starting with `#` (or `%`) are comments.
 
-`python3 tools/E555_rank.py FILE --emit OUT.csv --rescore` rewrites any legacy
+`python3 tools/E555_rank.py FILE --out OUT.csv --rescore` rewrites any legacy
 file into this canonical form, recomputing the score from the seed.

@@ -66,7 +66,7 @@ CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 # beam stages write a solution index into.
 score() {
     [ -s "$1" ] || { echo 0; return; }
-    python3 tools/E555_rank.py "$1" --seed "$SEED" --field score
+    python3 tools/E555_rank.py "$1" --seed_file "$SEED" --field score
 }
 
 # harvest FILE... -- merge boards into champions.csv, best first, keep KEEP.
@@ -75,8 +75,8 @@ harvest() {
     [ -s "$FARM_DIR/merged.csv" ] || { rm -f "$FARM_DIR/merged.csv"; return; }
     # --rescore makes field 2 the true matched-edge count whatever tool wrote
     # the line, and ranks best first: fewest breaks, then most compact.
-    python3 tools/E555_rank.py "$FARM_DIR/merged.csv" --seed "$SEED" \
-        --sort breaks,break_rows --emit "$FARM_DIR/scored.csv" --rescore > /dev/null
+    python3 tools/E555_rank.py "$FARM_DIR/merged.csv" --seed_file "$SEED" \
+        --sort breaks,break_rows --out "$FARM_DIR/scored.csv" --rescore > /dev/null
     # drop exact duplicate boards (everything after the id), keep the best KEEP
     awk '!seen[substr($0, index($0, ","))]++' "$FARM_DIR/scored.csv" \
         | head -n "$KEEP" > "$CHAMPS"
@@ -97,8 +97,8 @@ resample() {  # RUN_DIR ITER
         --out_dir "$run/fin" --threads "$THREADS" \
         --finalize_from 7 --finalize_repeats 3 --stop_row 12 \
         --beam_width 150000 --top_columns 0 \
-        --border_row_N "$RESAMPLE_TOP" --incomplete_top \
-        --max_wall_sec "$PASS_FIN_WALL"
+        --num_rows "$RESAMPLE_TOP" --incomplete_top \
+        --wall_time "$PASS_FIN_WALL"
 
     # Rotate and refill a border strip. Alternate the direction between phases
     # so the retained core -- the one region a strip never touches -- moves
@@ -108,7 +108,7 @@ resample() {  # RUN_DIR ITER
     bin/E555_roundhouse "$SEED" "$run/in.csv" "${CLUE_ARG[@]}" \
         --out_dir "$run/rh" --threads "$THREADS" \
         --rounds 1 --strip_width 5 --rotate "$rot" \
-        --border_row_N "$RESAMPLE_TOP" --max_wall_sec 300
+        --num_rows "$RESAMPLE_TOP" --wall_time 300
 
     harvest $(cat "$run/fin/outputs.txt" "$run/rh/outputs.txt")
 }
@@ -167,4 +167,4 @@ done
 
 echo
 echo "[farm] $ITER iterations, best $BEST/480, champions in $CHAMPS"
-python3 tools/E555_rank.py "$CHAMPS" --seed "$SEED" --top 10
+python3 tools/E555_rank.py "$CHAMPS" --seed_file "$SEED" --top 10

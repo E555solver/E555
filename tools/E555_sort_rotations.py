@@ -11,7 +11,7 @@ WHAT IT DOES
         #  B=... L=... R=... T=...  Score=1234.5678
         r7, 0,3,1,2, ... (256 spins)
 
-    Stage B reads the rows in file order and, with --border_row_N, takes the
+    Stage B reads the rows in file order and, with --num_rows, takes the
     first N of them -- so the order of this file decides which borders get
     searched. This tool re-orders the pairs by score, best first, and writes
     them back out unchanged otherwise.

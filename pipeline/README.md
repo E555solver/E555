@@ -35,7 +35,7 @@ bash pipeline/run_pipeline.sh RUN_DIR=run7 THREADS=16 BEAM_STOP_ROW=10
 
 `REPO` defaults to the script's own parent; set it if you copy a runner
 somewhere else. Every stage reads the `outputs.txt` the previous tool wrote
-rather than guessing filenames, and passes `--print-cmd`, so the log carries the
+rather than guessing filenames, and passes `--print_cmd`, so the log carries the
 exact command each stage ran.
 
 **The annealer needs at least 250000 steps.** Below that it is not merely weaker
@@ -238,7 +238,7 @@ Two consequences worth knowing:
   column, which counts how many of the five a board still holds:
 
 ```bash
-python3 tools/E555_rank.py pipeline_out/FINAL_best.csv --sort clues,score --no-id
+python3 tools/E555_rank.py pipeline_out/FINAL_best.csv --sort clues,score --no_id
 ```
 
 ## Reading the output
@@ -247,8 +247,8 @@ Every stage writes the same canonical CSV, so any file here can be fed back into
 any tool -- including the one that produced it.
 
 ```bash
-python3 tools/E555_rank.py pipeline_out/FINAL_best.csv --seed data/seed_Edge5.txt
-python3 tools/E555_viewer.py pipeline_out/FINAL_best.csv --seed data/seed_Edge5.txt
+python3 tools/E555_rank.py pipeline_out/FINAL_best.csv --seed_file data/seed_Edge5.txt
+python3 tools/E555_viewer.py pipeline_out/FINAL_best.csv --seed_file data/seed_Edge5.txt
 ```
 
 A stage that emits nothing is usually telling you something true about the

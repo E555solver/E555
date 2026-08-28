@@ -62,7 +62,7 @@ GATE_DB="${DB_FILE:-$OUT/chain.db}"
 ALL_STEPS=(
     "compile|make all, zero compiler warnings tolerated"
     "viewer|the known synthetic solution scores 480/480"
-    "rank|measures agree with the viewer, --emit verbatim, --rescore canonical"
+    "rank|measures agree with the viewer, --out verbatim, --rescore canonical"
     "rotate|a quarter-turn preserves every measure, four turns are the identity"
     "annealer|Stage A short run: BEST lines and a beamer-format --out CSV"
     "finalizer_synth|REGRESSION: rediscovers the synthetic solution from row 10"
@@ -181,13 +181,13 @@ step_compile() {
 }
 
 step_viewer() {
-    python3 tools/E555_viewer.py data/synth_solution_480.csv --seed data/synth_seed.txt \
-        --no-board --no-url > /dev/null   # parse check
+    python3 tools/E555_viewer.py data/synth_solution_480.csv --seed_file data/synth_seed.txt \
+        --no_board --no_url > /dev/null   # parse check
     # Not piped into `grep -q`: the match is on line 5 of 43, so grep exits at
     # once, the viewer takes SIGPIPE on the rest of the board, and `pipefail`
     # turns that into a failed check -- a gate that goes red on a passing tool.
-    python3 tools/E555_viewer.py data/synth_solution_480.csv --seed data/synth_seed.txt \
-        --no-url > "$OUT/viewer.txt"
+    python3 tools/E555_viewer.py data/synth_solution_480.csv --seed_file data/synth_seed.txt \
+        --no_url > "$OUT/viewer.txt"
     grep -q "Correct edges : 480 / 480" "$OUT/viewer.txt" || fail "expected 480/480"
     echo "ok: 480/480"
 }
@@ -195,8 +195,8 @@ step_viewer() {
 # --rescore is the only writer in the repo that rewrites field 2 as the true
 # matched-edge count, which is what makes a mixed corpus sortable by score.
 step_rank() {
-    python3 tools/E555_rank.py data/board_example_462.csv --seed data/seed_Edge5.txt \
-        --emit "$OUT/norm.csv" --rescore | grep -q "1 canonical row" \
+    python3 tools/E555_rank.py data/board_example_462.csv --seed_file data/seed_Edge5.txt \
+        --out "$OUT/norm.csv" --rescore | grep -q "1 canonical row" \
         || fail "rank --rescore did not write 1 canonical row"
     fields=$(awk -F, 'NR==1{print NF}' "$OUT/norm.csv")
     [ "$fields" = "514" ] || fail "canonical row has $fields fields, want 514"
@@ -214,27 +214,27 @@ step_rank() {
     rbreak=$(awk -F, 'NR==2{print $3}' "$OUT/rank.csv")   # breaks
     [ "$rscore" = "229" ] || fail "rank solid=$rscore, viewer says 229"
     [ "$rbreak" = "18" ] || fail "rank breaks=$rbreak, want 18"
-    python3 tools/E555_rank.py data/board_example_462.csv --emit "$OUT/rank_emit.csv" > /dev/null
+    python3 tools/E555_rank.py data/board_example_462.csv --out "$OUT/rank_emit.csv" > /dev/null
     cmp -s data/board_example_462.csv "$OUT/rank_emit.csv" \
-        || fail "rank --emit did not reproduce the input row verbatim"
-    echo "ok: rank agrees with the viewer (18 breaks, 229 solid), --emit is verbatim"
+        || fail "rank --out did not reproduce the input row verbatim"
+    echo "ok: rank agrees with the viewer (18 breaks, 229 solid), --out is verbatim"
 }
 
 # A quarter-turn must move the board without changing it: same breaks, same
 # solid count, transposed span. Four turns must return the original bytes.
 step_rotate() {
     python3 tools/E555_rotate.py data/board_example_462.csv 0 \
-        --seed data/seed_Edge5.txt --out "$OUT/rot0.csv" > /dev/null
+        --seed_file data/seed_Edge5.txt --out "$OUT/rot0.csv" > /dev/null
     prev="$OUT/rot0.csv"
     for t in 1 2 3 4; do
-        python3 tools/E555_rotate.py "$prev" 1 --seed data/seed_Edge5.txt \
+        python3 tools/E555_rotate.py "$prev" 1 --seed_file data/seed_Edge5.txt \
             --out "$OUT/rot$t.csv" > /dev/null || fail "rotate failed at turn $t"
         prev="$OUT/rot$t.csv"
     done
     cmp -s "$OUT/rot0.csv" "$OUT/rot4.csv" \
         || fail "four quarter-turns did not return the original board"
     python3 tools/E555_rank.py "$OUT/rot0.csv" "$OUT/rot1.csv" "$OUT/rot2.csv" \
-        "$OUT/rot3.csv" --seed data/seed_Edge5.txt --csv > "$OUT/rot_rank.csv"
+        "$OUT/rot3.csv" --seed_file data/seed_Edge5.txt --csv > "$OUT/rot_rank.csv"
     # columns: file,row,id,breaks,score,solid,placed,border,break_rows,break_cols,span
     awk -F, 'NR>1{b[$4]=1; s[$6]=1; sp[$11]=1}
              END{ if (length(b)!=1) exit 1
@@ -250,10 +250,10 @@ step_rotate() {
     # Same identity law, and the spins it writes must be the ones the turned
     # board carries -- that equality is exactly what fin_rot_match compares.
     python3 tools/E555_rotate.py data/borders_annealed_fix12.csv 0 --rotations \
-        --seed data/seed_Edge5.txt --out "$OUT/br0.csv" > /dev/null
+        --seed_file data/seed_Edge5.txt --out "$OUT/br0.csv" > /dev/null
     prev="$OUT/br0.csv"
     for t in 1 2 3 4; do
-        python3 tools/E555_rotate.py "$prev" 1 --rotations --seed data/seed_Edge5.txt \
+        python3 tools/E555_rotate.py "$prev" 1 --rotations --seed_file data/seed_Edge5.txt \
             --out "$OUT/br$t.csv" > /dev/null || fail "--rotations failed at turn $t"
         prev="$OUT/br$t.csv"
     done
@@ -275,8 +275,8 @@ def frame_spins(path):                     # {piece: rotation} over the 60 frame
     return {p: rot[p] for p, v in enumerate(pos)
             if v != 999 and (v // 16 in (0, 15) or v % 16 in (0, 15))}
 subprocess.run(["python3", "tools/E555_rank.py", "data/best_463.csv",
-                "--seed", "data/seed_Edge5.txt", "--border-only",
-                "--emit", f"{out}/rr_full.csv"], check=True,
+                "--seed_file", "data/seed_Edge5.txt", "--border_only",
+                "--out", f"{out}/rr_full.csv"], check=True,
                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 open(f"{out}/rr_board.csv", "w").write(open(f"{out}/rr_full.csv").readline())
 sp = [0] * 256
@@ -287,7 +287,7 @@ for tool, src, dst, extra in (
         ("board", f"{out}/rr_board.csv", f"{out}/rr_board1.csv", []),
         ("row",   f"{out}/rr_row.csv",   f"{out}/rr_row1.csv",   ["--rotations"])):
     subprocess.run(["python3", "tools/E555_rotate.py", src, "1",
-                    "--seed", "data/seed_Edge5.txt", "--out", dst] + extra,
+                    "--seed_file", "data/seed_Edge5.txt", "--out", dst] + extra,
                    check=True, stdout=subprocess.DEVNULL)
 turned = frame_spins(f"{out}/rr_board1.csv")
 row = next(r for r in csv.reader(open(f"{out}/rr_row1.csv"))
@@ -307,7 +307,7 @@ EOF
 # one summary line per restart.
 step_annealer() {
     python3 -u src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
-        --restarts 2 --steps 3000 --seed 42 --verbose \
+        --restarts 2 --steps 3000 --rng_seed 42 --verbose \
         --out "$OUT/rotations.csv" > "$OUT/annealer.log"
     grep -c "^BEST," "$OUT/annealer.log" | grep -q "^2$" || fail "expected 2 BEST lines"
     python3 - "$OUT/rotations.csv" <<'EOF' || exit 1
@@ -329,7 +329,7 @@ EOF
 step_finalizer_synth() {
     bin/E555_finalizer data/synth_seed.txt data/synth_solution_480.csv \
         --finalize_from 10 --stop_row 14 --beam_width 20000 --frac_rand 0 \
-        --seed 1 --out_dir "$OUT/fin" > "$OUT/finalizer.log"
+        --rng_seed 1 --out_dir "$OUT/fin" > "$OUT/finalizer.log"
     comp="$OUT/fin/beam_completions_finalized_14.csv"
     [ -s "$comp" ] || { tail -5 "$OUT/finalizer.log"; fail "no boards emitted"; }
     python3 - "$comp" data/synth_solution_480.csv <<'EOF' || exit 1
@@ -380,7 +380,7 @@ EOF
             rotarg=""; [ "$mode" = rot ] && rotarg="$OUT/rot_row.csv"
             bin/E555_finalizer data/synth_seed.txt "$OUT/rot_partial.csv" $rotarg \
                 --finalize_from 10 --stop_row "$sr" --top_columns 0 --frac_rand 0 \
-                --beam_width 20000 --seed 1 --out_dir "$OUT/rot_${mode}_$sr" \
+                --beam_width 20000 --rng_seed 1 --out_dir "$OUT/rot_${mode}_$sr" \
                 > "$OUT/rot_${mode}_$sr.log"
         done
         nf=$(grep -oE 'enumerated [0-9]+' "$OUT/rot_free_$sr.log" | grep -oE '[0-9]+')
@@ -409,7 +409,7 @@ EOF
     # misapplied: the run falls back to free mode and behaves exactly as before.
     bin/E555_finalizer data/seed_Edge5.txt data/board_partial_row12.csv \
         data/borders_annealed_fix12.csv --finalize_from 10 --stop_row 11 \
-        --top_columns 2 --beam_width 2048 --seed 1 --max_wall_sec 60 \
+        --top_columns 2 --beam_width 2048 --rng_seed 1 --wall_time 60 \
         --out_dir "$OUT/rot_nomatch" > "$OUT/rot_nomatch.log" || true
     grep -q "no rotations row matches the locked border" "$OUT/rot_nomatch.log" \
         || fail "a non-matching rotations file was not rejected"
@@ -442,7 +442,7 @@ step_finalizer_determinism() {
     for arm in a b; do
         bin/E555_finalizer data/synth_seed.txt data/synth_solution_480.csv \
             --finalize_from 5 --stop_row 10 --beam_width 200 --frac_rand 0.30 \
-            --finalize_repeats 2 --threads 4 --seed 777 --verbose \
+            --finalize_repeats 2 --threads 4 --rng_seed 777 --verbose \
             --out_dir "$OUT/det_$arm" > "$OUT/det_$arm.log" \
             || { tail -5 "$OUT/det_$arm.log"; fail "the finalizer failed on arm $arm"; }
         # keep the lines that describe the SEARCH, drop every timing field
@@ -518,7 +518,7 @@ EOF
 step_roundhouse_two_rounds() {
     rh_fixtures
     bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_rows10.csv" --rounds 2 --strip_width 5 \
-        --ties 50 --max_wall_sec 300 --out_dir "$OUT/rh_r2" > "$OUT/roundhouse_r2.log"
+        --ties 50 --wall_time 300 --out_dir "$OUT/rh_r2" > "$OUT/roundhouse_r2.log"
     comp=$(first_match "$OUT/rh_r2"/roundhouse_*_miss0.csv)
     [ -s "$comp" ] || { tail -5 "$OUT/roundhouse_r2.log"; fail "two-round run emitted nothing"; }
     python3 - "$comp" data/synth_solution_480.csv <<'EOF' || exit 1
@@ -581,10 +581,10 @@ EOF
 
     # The spiral really turned round. --rotate names the side round 1 attacks and
     # keeps it for odd K, so it is rounds 2 and 3 that have to diverge. Nothing is
-    # searched here: --border_row is past the end of the one-line CSV.
+    # searched here: --start_row is past the end of the one-line CSV.
     plan() {
         bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_rows12.csv" --rounds 3 \
-            --strip_width 3 --rotate 1 --border_row 9 --out_dir "$OUT/rh_rev_plan" "$@" 2>&1 |
+            --strip_width 3 --rotate 1 --start_row 9 --out_dir "$OUT/rh_rev_plan" "$@" 2>&1 |
             sed -n 's/^\[plan\] rounds refill the input.s //p' | sed 's/ band;.*//'
     }
     [ "$(plan)" = "TOP -> LEFT -> BOTTOM" ] || fail "the forward spiral changed: $(plan)"
@@ -688,7 +688,7 @@ EOF
 step_roundhouse_legal() {
     rh_fixtures
     bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_rows10.csv" --rounds 3 --strip_width 5 \
-        --ties 4 --max_wall_sec 60 --out_dir "$OUT/rh_r3" > "$OUT/roundhouse_r3.log"
+        --ties 4 --wall_time 60 --out_dir "$OUT/rh_r3" > "$OUT/roundhouse_r3.log"
     python3 - data/synth_seed.txt "$(first_match "$OUT"/rh_r3/roundhouse_*_miss0.csv)" <<'EOF' || exit 1
 import sys
 seed = [list(map(int, l.split())) for l in open(sys.argv[1]) if l.strip()]
@@ -715,21 +715,21 @@ print("ok: %d board(s), every placed junction matched, frame intact" % n)
 EOF
 }
 
-# Default --break-mode stuck is the greedy dive engine: every dive fills all 256
+# Default --break_mode stuck is the greedy dive engine: every dive fills all 256
 # cells, so this run must always produce a complete board.
 step_backtracker_dives() {
     bin/E555_backtracker data/seed_Edge5.txt data/board_example_462.csv "$OUT/bt1.csv" \
-        --holes data/holes_open_border_TRL.csv --max-mismatch 60 \
-        --stuck_restarts 500 --time-limit 15 --threads 4 > "$OUT/bt1.log"
+        --holes data/holes_open_border_TRL.csv --breaks 60 \
+        --restarts 500 --time_limit 15 --threads 4 > "$OUT/bt1.log"
     nf=$(awk -F, '!/^#/{print NF; exit}' "$OUT/bt1.csv")
     [ "$nf" = "514" ] || fail "expected 514 fields, got $nf"
-    grep -q "\[dive\]" "$OUT/bt1.log" || fail "greedy engine did not run for --break-mode stuck"
+    grep -q "\[dive\]" "$OUT/bt1.log" || fail "greedy engine did not run for --break_mode stuck"
     # Every dive completes, so the streamed best board must have no unplaced cell.
     unplaced=$(awk -F, '!/^#/{n=0; for(i=3;i<=258;i++) if ($i==999) n++; print n; exit}' "$OUT/bt1.csv")
     [ "$unplaced" = "0" ] || fail "greedy dive left $unplaced cells unplaced"
     bin/E555_backtracker data/seed_Edge5.txt "$OUT/bt1.csv" "$OUT/bt2.csv" \
-        --holes data/holes_open_border_TRL.csv --max-mismatch 60 \
-        --stuck_restarts 500 --time-limit 5 --threads 4 > "$OUT/bt2.log"
+        --holes data/holes_open_border_TRL.csv --breaks 60 \
+        --restarts 500 --time_limit 5 --threads 4 > "$OUT/bt2.log"
     [ -s "$OUT/bt2.csv" ] || fail "round-trip run produced no output"
     echo "ok: greedy dives complete the board, canonical output, round-trip accepted"
 }
@@ -741,8 +741,8 @@ step_backtracker_dives() {
 step_backtracker_exhaustive() {
     for t in 1 4; do
         bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/ex$t.csv" \
-            --holes tests/fixtures/holes_top3.csv --order mrv --max-mismatch 0 \
-            --all-solutions --threads $t > "$OUT/ex$t.log"
+            --holes tests/fixtures/holes_top3.csv --order mrv --breaks 0 \
+            --max_emitted 0 --threads $t > "$OUT/ex$t.log"
     done
     s1=$(grep -oE 'full_solutions *= *[0-9]+' "$OUT/ex1.log" | grep -oE '[0-9]+$')
     s4=$(grep -oE 'full_solutions *= *[0-9]+' "$OUT/ex4.log" | grep -oE '[0-9]+$')
@@ -759,7 +759,7 @@ step_backtracker_exhaustive() {
 step_backtracker_stop_band() {
     bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sb.csv" \
         --holes tests/fixtures/holes_row0_x4.csv --stop_row 0 --order rowmajor \
-        --max-mismatch 0 --all-solutions --threads 4 > "$OUT/sb.log"
+        --breaks 0 --max_emitted 0 --threads 4 > "$OUT/sb.log"
     band="$OUT/sb.csv.stop_row0.csv"
     [ -s "$band" ] || fail "no stop-band file at $band"
     n=$(grep -vc '^#' "$band")
@@ -772,7 +772,7 @@ step_backtracker_stop_band() {
     for t in 1 4; do
         bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sb$t.csv" \
             --holes tests/fixtures/holes_row0_x4.csv --stop_row 0 --order rowmajor \
-            --max-mismatch 0 --all-solutions --threads $t > "$OUT/sb$t.log"
+            --breaks 0 --max_emitted 0 --threads $t > "$OUT/sb$t.log"
         grep -v '^#' "$OUT/sb$t.csv.stop_row0.csv" | cut -d, -f2- | sort > "$OUT/sbset$t.txt"
     done
     cmp -s "$OUT/sbset1.txt" "$OUT/sbset4.txt" \
@@ -780,7 +780,7 @@ step_backtracker_stop_band() {
 
     # --reverse anchors the band at the far side: rows 15..15 for --stop_row 0.
     bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sbr.csv" \
-        --stop_row 0 --reverse --max-mismatch 0 --solution-limit 1 --threads 1 > "$OUT/sbr.log"
+        --stop_row 0 --reverse --breaks 0 --max_emitted 1 --threads 1 > "$OUT/sbr.log"
     [ -s "$OUT/sbr.csv.stop_row0_rev.csv" ] || fail "no reversed stop-band file"
     top=$(awk -F, '!/^#/{for(i=3;i<=258;i++) if ($i!=999 && $i<240) bad++} END{print bad+0}' \
           "$OUT/sbr.csv.stop_row0_rev.csv")
@@ -789,9 +789,9 @@ step_backtracker_stop_band() {
     # A band must be refused where it could only mislead: a broken edge would be
     # rejected by the finalizer later, and --jump can never complete the band.
     bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv "$OUT/sbx.csv" \
-        --stop_row 3 --max-mismatch 5 > "$OUT/sbx.log" 2>&1 && \
-        fail "--stop_row accepted --max-mismatch 5"
-    grep -q "requires --max-mismatch 0" "$OUT/sbx.log" || fail "wrong error for --max-mismatch"
+        --stop_row 3 --breaks 5 > "$OUT/sbx.log" 2>&1 && \
+        fail "--stop_row accepted --breaks 5"
+    grep -q "requires --breaks 0" "$OUT/sbx.log" || fail "wrong error for --breaks"
 
     echo "ok: $n exact row-0 bands, thread-independent, --reverse and guards correct"
 }
@@ -818,7 +818,7 @@ EOF
     # A quarter-turn CW puts the filled region on columns 0..10 and leaves NO
     # complete row, so no finalizer could start from it.
     python3 tools/E555_rotate.py "$OUT/wp_row10.csv" 1 \
-        --out "$OUT/wp_rot.csv" --seed data/synth_seed.txt > /dev/null
+        --out "$OUT/wp_rot.csv" --seed_file data/synth_seed.txt > /dev/null
     read -r nc nr <<<"$(awk -F, '!/^#/{delete col; delete row;
         for(i=3;i<=258;i++) if($i!=999){col[$i%16]++; row[int($i/16)]++}
         nc=0; for(c=0;c<16;c++) if(col[c]==16)nc++
@@ -828,8 +828,8 @@ EOF
     [ "$nr" = 0 ]  || fail "a turned rows-0..10 board has $nr complete rows, expected 0"
 
     bin/E555_backtracker data/synth_seed.txt "$OUT/wp_rot.csv" "$OUT/wp_bt.csv" \
-        --stop_row 5 --order rowmajor --break-mode any --max-mismatch 0 \
-        --solution-limit 2 --time-limit 60 --threads 4 > "$OUT/wp_bt.log"
+        --stop_row 5 --order rowmajor --break_mode any --breaks 0 \
+        --max_emitted 2 --time_limit 60 --threads 4 > "$OUT/wp_bt.log"
     band="$OUT/wp_bt.csv.stop_row5.csv"
     [ -s "$band" ] || { tail -5 "$OUT/wp_bt.log"; fail "the band cut emitted nothing"; }
     bad=$(awk -F, '!/^#/{p=0; hi=0; for(i=3;i<=258;i++) if($i!=999){p++; if(int($i/16)>5)hi++}
@@ -839,14 +839,14 @@ EOF
     bin/E555_finalizer data/synth_seed.txt "$band" \
         --out_dir "$OUT/wp_fin" --threads 4 \
         --finalize_from 5 --stop_row 11 --beam_width 20000 --frac_rand 0 \
-        --border_row_N "$(grep -vc '^#' "$band")" --top_columns 0 \
-        --seed 1 --max_partials 8 --max_wall_sec 300 > "$OUT/wp_fin.log"
+        --num_rows "$(grep -vc '^#' "$band")" --top_columns 0 \
+        --rng_seed 1 --max_emitted 8 --wall_time 300 > "$OUT/wp_fin.log"
     comp="$OUT/wp_fin/beam_completions_finalized_11.csv"
     [ -s "$comp" ] || { tail -5 "$OUT/wp_fin.log"; fail "no board re-grew from row 5 to row 11"; }
     # Stage B writes its solution INDEX in field 2, so the score has to be
     # recomputed from the seed before it can be asserted on.
-    python3 tools/E555_rank.py "$comp" --seed data/synth_seed.txt \
-        --emit "$OUT/wp_final.csv" --rescore > /dev/null
+    python3 tools/E555_rank.py "$comp" --seed_file data/synth_seed.txt \
+        --out "$OUT/wp_final.csv" --rescore > /dev/null
     comp="$OUT/wp_final.csv"
     bad=$(awk -F, '!/^#/{p=0; hi=0; for(i=3;i<=258;i++) if($i!=999){p++; if(int($i/16)>11)hi++}
                           if (p!=192 || hi!=0 || $2!=356) n++} END{print n+0}' "$comp")
@@ -871,7 +871,7 @@ pos = ["999" if p != "999" and int(p) // 16 > 10 else p for p in pos]
 open(sys.argv[1], "w").write(",".join(meta + pos + rot) + "\n")
 EOF
     python3 tools/E555_rotate.py "$OUT/wf_row10.csv" 1 \
-        --out "$OUT/wf_rot.csv" --seed data/synth_seed.txt > /dev/null
+        --out "$OUT/wf_rot.csv" --seed_file data/synth_seed.txt > /dev/null
 
     # count_frame FILE -- placed cells and frame cells of the first board.
     count_frame='!/^#/{p=0; f=0
@@ -880,8 +880,8 @@ EOF
         print p, f; exit}'
 
     bin/E555_backtracker data/synth_seed.txt "$OUT/wf_rot.csv" "$OUT/wf_plain.csv" \
-        --stop_row 5 --order rowmajor --break-mode any --max-mismatch 0 \
-        --solution-limit 1 --time-limit 90 --threads 4 > "$OUT/wf_plain.log"
+        --stop_row 5 --order rowmajor --break_mode any --breaks 0 \
+        --max_emitted 1 --time_limit 90 --threads 4 > "$OUT/wf_plain.log"
     plain="$OUT/wf_plain.csv.stop_row5.csv"
     [ -s "$plain" ] || { tail -5 "$OUT/wf_plain.log"; fail "the plain band cut emitted nothing"; }
     read -r p f <<<"$(awk -F, "$count_frame" "$plain")"
@@ -889,8 +889,8 @@ EOF
     [ "$f" = 26 ] || fail "a plain rows-0..5 band carries $f frame cells, expected 26"
 
     bin/E555_backtracker data/synth_seed.txt "$OUT/wf_rot.csv" "$OUT/wf_frame.csv" \
-        --stop_row 5 --with_frame --order rowmajor --break-mode any --max-mismatch 0 \
-        --solution-limit 1 --time-limit 120 --threads 4 > "$OUT/wf_frame.log"
+        --stop_row 5 --with_frame --order rowmajor --break_mode any --breaks 0 \
+        --max_emitted 1 --time_limit 120 --threads 4 > "$OUT/wf_frame.log"
     band="$OUT/wf_frame.csv.stop_row5.csv"
     [ -s "$band" ] || { tail -5 "$OUT/wf_frame.log"; fail "--with_frame emitted no band"; }
     read -r p f <<<"$(awk -F, "$count_frame" "$band")"
@@ -903,8 +903,8 @@ EOF
     bin/E555_finalizer data/synth_seed.txt "$band" \
         --out_dir "$OUT/wf_fin" --threads 4 \
         --finalize_from 5 --stop_row 10 --beam_width 20000 --frac_rand 0 \
-        --border_row_N 1 --top_columns 0 \
-        --seed 1 --max_partials 8 --max_wall_sec 300 > "$OUT/wf_fin.log"
+        --num_rows 1 --top_columns 0 \
+        --rng_seed 1 --max_emitted 8 --wall_time 300 > "$OUT/wf_fin.log"
     grep -q "mode=fixed" "$OUT/wf_fin.log" \
         || { grep -m2 "mode=" "$OUT/wf_fin.log"; fail "a complete frame did not select fixed sides"; }
     comp="$OUT/wf_fin/beam_completions_finalized_10.csv"
@@ -913,14 +913,14 @@ EOF
     bin/E555_finalizer data/synth_seed.txt "$plain" \
         --out_dir "$OUT/wf_fin2" --threads 4 \
         --finalize_from 5 --stop_row 10 --beam_width 2000 --frac_rand 0 \
-        --border_row_N 1 --top_columns 1 \
-        --seed 1 --max_partials 1 --max_wall_sec 120 > "$OUT/wf_fin2.log"
+        --num_rows 1 --top_columns 1 \
+        --rng_seed 1 --max_emitted 1 --wall_time 120 > "$OUT/wf_fin2.log"
     grep -q "mode=free" "$OUT/wf_fin2.log" \
         || { grep -m2 "mode=" "$OUT/wf_fin2.log"; fail "an incomplete frame did not fall back to free sides"; }
 
     # --with_frame widens a band; without one there is nothing to widen.
     if bin/E555_backtracker data/synth_seed.txt "$OUT/wf_rot.csv" "$OUT/wf_bad.csv" \
-           --with_frame --max-mismatch 0 --threads 1 > "$OUT/wf_bad.log" 2>&1; then
+           --with_frame --breaks 0 --threads 1 > "$OUT/wf_bad.log" 2>&1; then
         fail "--with_frame without a stop band was accepted"
     fi
 
@@ -941,7 +941,7 @@ meta, pos, rot = f[:-512], [p.strip() for p in f[-512:-256]], [r.strip() for r i
 pos = ["999" if p != "999" and int(p) // 16 > 5 else p for p in pos]
 open(sys.argv[1], "w").write(",".join(meta + pos + rot) + "\n")
 EOF
-    n=$(python3 tools/E555_rank.py "$OUT/co_band.csv" --seed data/seed_Edge5.txt --field clues)
+    n=$(python3 tools/E555_rank.py "$OUT/co_band.csv" --seed_file data/seed_Edge5.txt --field clues)
     [ "$n" = 0 ] || fail "the rows-0..5 band carries $n clue(s), expected none"
 
     # stop_row 10, never lower: every orientation's centre cell (row 7 or 8) is
@@ -951,7 +951,7 @@ EOF
     bin/E555_finalizer data/seed_Edge5.txt "$OUT/co_band.csv" \
         --out_dir "$OUT/co_fin" --threads 4 --clue_center \
         --finalize_from 5 --stop_row 10 --beam_width 2000 --top_columns 1 \
-        --seed 3 --max_wall_sec 300 > "$OUT/co_fin.log"
+        --rng_seed 3 --wall_time 300 > "$OUT/co_fin.log"
     comp="$OUT/co_fin/beam_completions_finalized_10.csv"
     [ -s "$comp" ] || { tail -5 "$OUT/co_fin.log"; fail "the unclued band emitted nothing"; }
 
@@ -963,7 +963,7 @@ EOF
     [ "$n" = 1 ] || fail "expected 1 database build for the line, saw $n"
 
     # Every emitted board carries the centre clue, whichever orientation placed it.
-    bad=$(python3 tools/E555_rank.py "$comp" --seed data/seed_Edge5.txt --csv |
+    bad=$(python3 tools/E555_rank.py "$comp" --seed_file data/seed_Edge5.txt --csv |
           awk -F, 'NR>1 && $NF < 1 {n++} END{print n+0}')
     [ "$bad" = 0 ] || fail "$bad emitted boards lost the centre clue"
 
@@ -974,7 +974,7 @@ EOF
     bin/E555_finalizer data/seed_Edge5.txt "$OUT/co_band.csv" \
         --out_dir "$OUT/co_fin2" --threads 4 --clue_center --clue_orient 1 \
         --finalize_from 5 --stop_row 10 --beam_width 2000 --top_columns 1 \
-        --seed 3 --max_wall_sec 300 > "$OUT/co_fin2.log"
+        --rng_seed 3 --wall_time 300 > "$OUT/co_fin2.log"
     comp2="$OUT/co_fin2/beam_completions_finalized_10.csv"
     [ -s "$comp2" ] || { tail -5 "$OUT/co_fin2.log"; fail "--clue_orient 1 emitted nothing"; }
     # Piece 138 is field 3+138 of the pos block; orientation 1 puts it on cell 135.
@@ -992,19 +992,19 @@ step_cpsat_chain() {
     # topper: an L-shaped band plus a real 2-board beam (chain1 holds the beam)
     python3 src/C_tail/E555_topper.py data/seed_Edge5.txt \
         data/board_example_462.csv "$OUT/chain1.csv" \
-        --side TR --work-rows 4 --report_best 2 --beam_diff 4 \
-        --max-time 20 --stall-time 8 --workers 4 > "$OUT/topper.log"
+        --side TR --band_depth 4 --top 2 --beam_diff 4 \
+        --time_limit 20 --stall_time 8 --threads 4 > "$OUT/topper.log"
     # ender ring-sweep, then a localized patch pass, each feeding the next
     python3 src/C_tail/E555_ender.py data/seed_Edge5.txt \
         "$OUT/chain1.csv" "$OUT/chain2.csv" \
-        --mode ring --reach 1 --max-changes 4 --max-time 12 --stall-time 6 --workers 4 > "$OUT/ender_ring.log"
+        --mode ring --reach 1 --max_changes 4 --time_limit 12 --stall_time 6 --threads 4 > "$OUT/ender_ring.log"
     python3 src/C_tail/E555_ender.py data/seed_Edge5.txt \
         "$OUT/chain2.csv" "$OUT/chain3.csv" \
-        --reach 1 --max-changes 4 --max-time 12 --stall-time 6 --workers 4 > "$OUT/ender_patch.log"
+        --reach 1 --max_changes 4 --time_limit 12 --stall_time 6 --threads 4 > "$OUT/ender_patch.log"
     for f in chain1 chain2 chain3; do
         nf=$(awk -F, '{print NF; exit}' "$OUT/$f.csv")
         [ "$nf" = "514" ] || fail "$f.csv has $nf fields (want 514)"
-        python3 tools/E555_viewer.py "$OUT/$f.csv" --no-board --no-url
+        python3 tools/E555_viewer.py "$OUT/$f.csv" --no_board --no_url
     done
     # the topper beam ranks must be genuinely different boards, not near-duplicates
     diffs=$(awk -F, 'NR<=2{for(i=3;i<=258;i++)a[NR,i]=$i}
@@ -1027,8 +1027,8 @@ step_beamer_micro() {
     # value came out of the pipelines; leaving the flag off exercises the
     # shipped default, which is what a smoke test should be testing.
     CMD=(bin/E555_beamer data/seed_Edge5.txt --random_edges
-         --border_row_N 1 --top_columns 1 --beam_width 20000 --stop_row 10
-         --seed 1 --out_dir "$OUT/beam")
+         --samples 1 --top_columns 1 --beam_width 20000 --stop_row 10
+         --rng_seed 1 --out_dir "$OUT/beam")
     CMD+=(--db_file "$GATE_DB")
     # E555_COL_VERIFY needs a real database to build strips out of, and this is
     # the only check that has one. It asserts the left-column window score reads
@@ -1040,7 +1040,7 @@ step_beamer_micro() {
         || { grep "^\[colv\]" "$OUT/beamer.log"; fail "column rotation self-check did not pass"; }
     comp="$OUT/beam/beam_completions_random_10.csv"
     if [ -s "$comp" ]; then
-        python3 tools/E555_viewer.py "$comp" --no-board --no-url
+        python3 tools/E555_viewer.py "$comp" --no_board --no_url
         echo "ok: run complete, emissions parse"
     else
         echo "ok: run complete (this config went extinct -- normal for a micro-run)"
@@ -1256,7 +1256,7 @@ step_pipeline_full() {
         RH_WIDTH=5 RH_LINES=2 RH_WALL=60 \
         DB_FILE="$GATE_DB" \
         `# stage 6 was 474 s of a 620 s run: the ender solves once per break,`\
-        `# so --max-time is per solve and not per board. A small model and a`\
+        `# so --time_limit is per solve and not per board. A small model and a`\
         `# short budget still exercise both of its modes.` \
         TOP_N=2 CPSAT_TIME=3 CPSAT_STALL=2 ENDER_REACH=1 ENDER_CHANGES=4 \
         BT_MISMATCH=60 BT_RESTARTS=2000 BT_TIME=15 > "$OUT/pipeline.log" \

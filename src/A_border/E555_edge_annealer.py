@@ -53,18 +53,18 @@ PARALLELISM
     Restarts are independent, so --threads runs them in parallel, one worker
     process per restart (processes, not threads: the hot loop is pure Python
     and the GIL would serialize it anyway). --threads 0, the default, uses
-    every core. Each restart derives its own RNG seed from --seed and its own
-    index, so THE THREAD COUNT NEVER CHANGES THE RESULT, and the parent emits
-    every restart in restart order however the workers finish.
+    every core. Each restart derives its own RNG seed from --rng_seed and its
+    own index, so THE THREAD COUNT NEVER CHANGES THE RESULT, and the parent
+    emits every restart in restart order however the workers finish.
 
 USAGE
 
     python3 -u E555_edge_annealer.py seed_Edge5.txt --out rotations.csv \
-      --restarts 10 --steps 100000 --w-bottom -3 --w-left -1 --w-right 3 --w-top 5
+      --restarts 10 --steps 100000 --w_bottom -3 --w_left -1 --w_right 3 --w_top 5
 
     python3 -u E555_edge_annealer.py seed_Edge5.txt --out rotations.csv \
       --restarts 10 --steps 100000 --threads 8 --verbose \
-      --target_scale 250  --w-bottom 1 --w-left 20 --w-right 20 --w-top 60
+      --target_scale 250  --w_bottom 1 --w_left 20 --w_right 20 --w_top 60
 
 
       
@@ -112,7 +112,7 @@ def get_fixed_corner_mapping(option: int, sorted_c: List[int]) -> Dict[int, Corn
     elif option == 2:
         indices = {Corner.TL: 2, Corner.TR: 0, Corner.BR: 1, Corner.BL: 3}
     else:
-        raise ValueError(f"Invalid --fix-corners value: {option}")
+        raise ValueError(f"Invalid --fix_corners value: {option}")
     return {sorted_c[idx]: c for c, idx in indices.items()}
 
 # =============================================================================
@@ -781,7 +781,7 @@ def print_header(pieces: Sequence[Piece], corner_ids: List[int], edge_ids: List[
     print(f"[cfg] seed={config.random_seed}  "
           f"restarts={config.restarts} x {config.steps_per_restart} steps  "
           f"threads={config.threads}  T0={config.T0:g} Tf={config.Tf:g}  "
-          f"tabu={config.tabu_length}  fix-corners={config.fix_corners}")
+          f"tabu={config.tabu_length}  fix_corners={config.fix_corners}")
     if config.target_scale:
         targets = " ".join(f"{SIDE_NAMES[s]}={target_for(s, config):.0f}" for s in Side)
         print(f"[cfg] objective=target_scale({config.target_scale})  targets {targets}"
@@ -799,8 +799,8 @@ def print_header(pieces: Sequence[Piece], corner_ids: List[int], edge_ids: List[
 def restart_seed(master: int, restart: int) -> int:
     """The RNG seed for one restart, derived from the master seed rather than
     drawn from a stream shared with the other restarts. That is what makes a
-    restart's result depend only on --seed and its own index, never on how
-    many workers ran it or in what order they finished."""
+    restart's result depend only on --rng_seed and its own index, never on
+    how many workers ran it or in what order they finished."""
     return master * 1_000_003 + restart
 
 def anneal_one_restart(restart: int,
@@ -1044,7 +1044,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="E555 edge annealer -- Stage A Eternity II border optimizer",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("piece_file", help="4-integer-per-line piece file")
+    p.add_argument("seed_file", help="4-integer-per-line piece file")
     p.add_argument("--out", default=None, metavar="FILE",
                    help="append each restart's best border to this rotations "
                         "CSV in the format Stage B reads (id + 256 spins)")
@@ -1057,7 +1057,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--restarts", type=int, default=AnnealingConfig.restarts)
     g.add_argument("--steps",    type=int, default=AnnealingConfig.steps_per_restart,
                    dest="steps_per_restart")
-    g.add_argument("--seed",     type=int, default=0, dest="random_seed",
+    g.add_argument("--rng_seed", type=int, default=0, dest="random_seed",
                    help="Random seed (0 = auto-sample)")
     g.add_argument("--threads",  type=int, default=AnnealingConfig.threads,
                    help="Worker processes; the restarts run in parallel "
@@ -1070,15 +1070,15 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_argument_group(
         "objective weights (with --target_scale: side target = weight x scale, "
         "must be positive; without it: positive=maximize, negative=minimize)")
-    g.add_argument("--w-top",    type=float, default=AnnealingConfig.w_top)
-    g.add_argument("--w-right",  type=float, default=AnnealingConfig.w_right)
-    g.add_argument("--w-bottom", type=float, default=AnnealingConfig.w_bottom)
-    g.add_argument("--w-left",   type=float, default=AnnealingConfig.w_left)
+    g.add_argument("--w_top",    type=float, default=AnnealingConfig.w_top)
+    g.add_argument("--w_right",  type=float, default=AnnealingConfig.w_right)
+    g.add_argument("--w_bottom", type=float, default=AnnealingConfig.w_bottom)
+    g.add_argument("--w_left",   type=float, default=AnnealingConfig.w_left)
 
     g = p.add_argument_group("search control")
     g.add_argument("--tabu",       type=int,   default=AnnealingConfig.tabu_length,
                    dest="tabu_length", help="Tabu list length (0 = disabled)")
-    g.add_argument("--fix-corners", type=int, choices=[0, 1, 2],
+    g.add_argument("--fix_corners", type=int, choices=[0, 1, 2],
                    default=AnnealingConfig.fix_corners, dest="fix_corners",
                    help="0=random  1=edge-commutativity  2=corner-commutativity")
     g.add_argument("--target_scale",  type=int, default=AnnealingConfig.target_scale,
@@ -1124,7 +1124,7 @@ def main(argv=None) -> int:
                 f"got <= 0 for {', '.join(bad)}"
             )
 
-    pieces = read_pieces(args.piece_file)
+    pieces = read_pieces(args.seed_file)
 
     if args.out:
         # Fail now, not after the first restart has already been computed: a
