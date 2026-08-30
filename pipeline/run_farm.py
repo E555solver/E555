@@ -63,11 +63,43 @@ S = {
                                 # one: the other tools build a database around
                                 # the pieces each board locks.
     # Borders. Random costs nothing; annealed spends minutes in Stage A first.
-    "ANNEAL_EVERY": 0,          # 0 = always random, 4 = every fourth iteration
-    "ANNEAL_BORDERS": 25,       # borders kept, out of 4x that many restarts
+    "ANNEAL_EVERY": 0,          # 0 or less = never anneal, always random (the
+                                # default); 4 = every fourth production
+                                # iteration anneals its border instead
+    "ANNEAL_BORDERS": 40,       # borders kept, out of 4x that many restarts.
+                                # Size it to what the beam can actually consume
+                                # in BEAM_WALL, or the sweep starves and stops
+                                # early. Measured at BEAM_WALL=420 on 4 threads:
+                                # 36.1 s per (bottom x column) config, and
+                                # --top_columns 5 makes 5 configs per border --
+                                # about 1.8 borders, so ~4.5 in 900 s. That rate
+                                # scales with cores, so a 32-thread node gets
+                                # through roughly 20; 40 leaves headroom without
+                                # paying for borders nobody reaches. Spare
+                                # borders cost only annealer time, a starved
+                                # beam costs sweep time.
     "ANNEAL_STEPS": 500000,     # below 250000 the annealer often finds none
 
     # Per-stage budgets, seconds. These are what you raise for a long run.
+    #
+    # Two kinds of budget, and mixing them up is how an iteration turns into a
+    # day. The C tools take --wall_time: a total for the whole stage. The CP-SAT
+    # tools take --time_limit: a ceiling PER BOARD. So a CP-SAT stage costs its
+    # board cap times its time limit, and the defaults below are chosen to make
+    # a full iteration land near three hours at worst:
+    #
+    #   beamer    BEAM_WALL                      900
+    #   finalizer FIN_WALL                       600
+    #   focused   FOCUS_TOP x FOCUS_TIME    20 x 180 = 3600
+    #   roundhouse RH_WALL                       300
+    #   final     FINAL_TOP x TOPPER_TIME   20 x 180 = 3600
+    #   refine    REFINE_TOP x REFINE_TIME  10 x 180 = 1800
+    #
+    # In practice each solve usually stalls out well before its ceiling, so the
+    # real figure is far lower -- but the worst case is what has to be bounded.
+    # The harvest is deliberately not: HARVEST_TOP x HARVEST_TIME x 2 modes is
+    # hours, and it only fires every HARVEST_EVERY iterations, on the boards
+    # about to become champions.
     "BEAM_WALL": 900,
     "FIN_WALL": 600,
     "FOCUS_DEPTH": 8,           # rows (16-N)..12 open in the focused topper;
@@ -75,9 +107,18 @@ S = {
                                 # not close -- deeper reaches further into the
                                 # core for the pieces it needs, at a
                                 # superlinear CP-SAT cost. Must exceed 3.
-    "FOCUS_TIME": 600,
+    "FOCUS_TIME": 180,
     "RH_WALL": 300,
-    "TOPPER_TIME": 300,
+    "TOPPER_TIME": 180,
+    # Boards allowed into each CP-SAT stage, best first. These caps are not
+    # optional. The topper and the ender take only --time_limit, which is per
+    # SOLVE -- unlike the C tools there is no total --wall_time -- so a stage
+    # costs (boards in) x (time each). Measured: one 420s beam emitted 425
+    # boards and the focused topper was still on board 19 twenty minutes later,
+    # around 13 hours for that one stage. The beam is cheap and the solver is
+    # not, so the ranking picks who gets the solver's time.
+    "FOCUS_TOP": 20,
+    "FINAL_TOP": 20,
 
     "REFINE_TOP": 10,           # boards given one ender pass per iteration
     "REFINE_TIME": 300,
@@ -329,9 +370,14 @@ def produce(run, logfh, annealed):
     # range is therefore rows (16-D)..12. A shallow band could only draw on
     # pieces still unplaced -- the ones needed to close row 12 are usually
     # already sitting in the core, which is what the depth is for.
-    focus_in = os.path.join(run, "focus_in.csv")
-    write_boards(focus_in, read_boards(beam_all)
+    focus_all = os.path.join(run, "focus_all.csv")
+    write_boards(focus_all, read_boards(beam_all)
                  + [ln for p in manifest(fin_dir) for ln in read_boards(p)])
+    # Rank before the cap so the solver's time goes to the best material the
+    # beam found, not to whatever happened to be written first.
+    ranked = rank_boards([focus_all], os.path.join(run, "focus_ranked.csv"), logfh)
+    focus_in = os.path.join(run, "focus_in.csv")
+    write_boards(focus_in, (ranked or read_boards(focus_all))[:S["FOCUS_TOP"]])
     focus_out = os.path.join(run, "focus_out.csv")
     if read_boards(focus_in):
         worst = max(worst, run_tool(
@@ -382,8 +428,11 @@ def produce(run, logfh, annealed):
     rh_ids = {board_id(ln) for ln in rh_boards}
     survivors = [ln for ln in carried
                  if not any(r.startswith(board_id(ln) + "_") for r in rh_ids)]
+    final_all = os.path.join(run, "final_all.csv")
+    write_boards(final_all, rh_boards + survivors)
+    ranked = rank_boards([final_all], os.path.join(run, "final_ranked.csv"), logfh)
     final_in = os.path.join(run, "final_in.csv")
-    write_boards(final_in, rh_boards + survivors)
+    write_boards(final_in, (ranked or read_boards(final_all))[:S["FINAL_TOP"]])
     final_out = os.path.join(run, "final_out.csv")
     if read_boards(final_in):
         worst = max(worst, run_tool(
@@ -584,7 +633,12 @@ def main():
         logpath = os.path.join(run, "iter.log")
         with open(logpath, "w") as logfh:
             st["produced"] += 1
-            annealed = bool(S["ANNEAL_EVERY"]) and st["produced"] % S["ANNEAL_EVERY"] == 0
+            # Any value at or below zero means never. A bare `% ANNEAL_EVERY`
+            # would make -4 behave as "every fourth" -- Python's modulo of a
+            # negative divisor still hits zero every fourth step -- which is
+            # the opposite of what anyone typing a negative intends.
+            annealed = (S["ANNEAL_EVERY"] > 0
+                        and st["produced"] % S["ANNEAL_EVERY"] == 0)
             what = "produce " + ("annealed" if annealed else "random")
             rc, boards = produce(run, logfh, annealed)
             made = ingest(boards, run, logfh)

@@ -217,6 +217,23 @@ the input board's `config_id` and appends `_<line><tag><n>`, so a board that
 reached it is exactly one whose id prefixes some output's id. The final topper
 gets the roundhouse's boards plus every stage-4 board with no descendant.
 
+**The CP-SAT stages are capped by board count, and must be.** The topper and
+the ender take only `--time_limit`, which is per *solve* -- unlike the C tools
+there is no total `--wall_time` -- so a stage costs (boards in) x (time each).
+Measured: one 420 s beam emitted **425 boards**, and the focused topper was
+still on board 19 twenty minutes later, which is about **13 hours** for that one
+stage. `FOCUS_TOP` and `FINAL_TOP` rank first and take the best N, so the
+solver's time goes to the best material the beam found rather than to whatever
+was written first.
+
+**How much the beam actually consumes.** At `BEAM_WALL=420` on four threads the
+beamer spent 96 s on init and 325 s sweeping, and got through **9 configs at
+36.1 s each**. With `--top_columns 5` that is five configs per border, so about
+1.8 borders -- roughly **4.5 borders in 900 s** on four threads. The rate scales
+with cores, so a 32-thread node reaches perhaps 20. That is what `ANNEAL_BORDERS`
+is sized against: annealing borders the beam will never reach is wasted Stage A
+time, and running out of them stops the sweep early.
+
 **Budgets.** `--wall_time` covers the beamer's whole run, database build
 included, so `BEAM_WALL` under about four minutes with no `DB_FILE` is spent
 entirely on the build — the farm warns rather than letting you discover it from
