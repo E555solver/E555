@@ -293,6 +293,24 @@ the final score correlate at **r = −0.18** — focus 384 boards averaged a *be
 final board (442.0) than focus 385 ones (438.6). Stage 6 re-solves rows 10–15
 anyway.
 
+**The final topper is the opposite, and the same method says so.** Its
+improvements keep arriving — median gap 0.7–2.2 s — and all six boards were
+still improving when the 300 s cap cut them off, one as late as 298.4 s. Breaks
+fall from ~150 to ~37, and unlike stage 4 they land in the pool:
+
+| stall | 6 boards cost | breaks lost vs the cap |
+|---|---|---|
+| 10 s | 444 s | +16 |
+| 30 s | 951 s | +8 |
+| 45 s | 1351 s | +3 |
+| 60 s | 1411 s | +3 |
+| 100 s | 1800 s | 0 |
+
+`TOPPER_STALL=45` is the knee: the same result as 60 for 60 s less, while
+60 → 100 costs **130 s per break**. It also fixes an inert setting — no board
+had a gap over 96.7 s, so a stall of 100 never fired at all and `TOPPER_TIME`
+was silently doing all the work.
+
 **The CP-SAT stages are capped by board count, and must be.** The topper and
 the ender take only `--time_limit`, which is per *solve* -- unlike the C tools
 there is no total `--wall_time` -- so a stage costs (boards in) x (time each).

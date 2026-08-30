@@ -169,7 +169,27 @@ S = {
                                 # 0.5s. A ceiling for the pathological case,
                                 # not a working budget
     "TOPPER_TIME": 300,         # the stage that was being truncated
-    "TOPPER_STALL": 100,
+    "TOPPER_STALL": 45,         # priced the same way as FOCUS_STALL, and this
+                                # stage is its opposite. Improvements keep
+                                # arriving -- median gap 0.7-2.2s, and all six
+                                # boards were STILL improving when the 300s cap
+                                # cut them off, one as late as 298.4s. Breaks
+                                # fall from ~150 to ~37 here, and unlike stage
+                                # 4 they reach the pool, so the seconds are
+                                # worth paying:
+                                #
+                                #   stall   6 boards cost   breaks vs the cap
+                                #     10s          444s         +16
+                                #     30s          951s          +8
+                                #     45s         1351s          +3
+                                #     60s         1411s          +3
+                                #    100s         1800s           0
+                                #
+                                # 45 is the knee: the same result as 60 for 60s
+                                # less, while 60 -> 100 costs 130s per break.
+                                # 100 was also simply inert -- no board had a
+                                # gap over 96.7s, so nothing ever stalled and
+                                # TOPPER_TIME was doing all the work.
     # Boards allowed into each CP-SAT stage, best first. These caps are not
     # optional. The topper and the ender take only --time_limit, which is per
     # SOLVE -- unlike the C tools there is no total --wall_time -- so a stage
