@@ -119,7 +119,7 @@ for a targeted attack on one promising border, anneal first.
 ### The farm, in one paragraph
 
 Produce, then improve, then repeat. Four iterations grow brand-new boards from
-random borders; the fifth stops producing and *resamples* the current champions
+a fresh border; the fifth stops producing and *resamples* the current champions
 instead -- freeing five rows with the finalizer and refilling a border strip
 with the roundhouse, alternating the rotation so the region a strip never
 touches moves around the board. Everything worth keeping ends up in
@@ -127,9 +127,46 @@ touches moves around the board. Everything worth keeping ends up in
 is copied to `records/` and never deleted, and `farm.log` gets one line per
 iteration. Ctrl-C is safe at any point.
 
-The single most valuable setting is `DB_FILE`: without it, every iteration
-spends 2-3 minutes rebuilding the same 6.4 GB chain database. It defaults to
-`farm/chain.db` and needs about 6.5 GB of free disk.
+**Where the output goes.** Each iteration writes its whole output -- the tools'
+own logs, `--verbose` telemetry and all -- to a log inside its run directory,
+not to the farm's stdout. A record keeps that log next to the board, gzipped;
+a failure keeps it under `failed/`, up to `FAILED_KEEP` of them; every other
+iteration is deleted with its run directory. That is what makes a multi-day run
+survivable: 117 test iterations left 100 KB behind, where the same output on
+stdout runs to gigabytes a day. The farm's own stdout is one line per iteration,
+carrying how many boards the phase produced -- a run that quietly produces
+nothing, because every input contradicts the clue setting or a budget is too
+small to reach the stop row, says `0 boards` instead of looking healthy.
+
+**Borders.** `ANNEAL_EVERY` mixes the two sources: 0 runs every production
+iteration from random borders, 4 anneals every fourth one. Random costs nothing
+and gives the sweep more frames per hour; annealed spends minutes in Stage A
+first and starts from stronger material. `ANNEAL_ROUNDS` and `ANNEAL_STEPS`
+size those iterations only.
+
+**Clues.** `CLUES=none|center|all`. Centre-only is the middle setting worth
+having: the finalizer frees the centre cell on every resample, so holding it
+costs nothing, while `all` also pins the four corners and constrains the
+roundhouse's strips. Each setting gets its own database cache.
+
+**Running unattended.** Ten consecutive failures stop the farm (`GIVE_UP_AFTER`)
+rather than spin on a broken setup -- a dead iteration costs no time, so without
+that brake a bad setting burns a core for days. `ortools` is checked before the
+first iteration, since without it every production iteration would die in the
+CP-SAT stages. Stale `run_*` directories from a killed farm are cleared at
+startup.
+
+The single most valuable setting is `DB_FILE`: without it, every production
+iteration spends 2-3 minutes rebuilding the same 6.4 GB chain database. It
+defaults to `farm/chain.db` and needs about 6.5 GB of free disk. An absolute
+path puts it on a node-local disk, which is what you want on a cluster:
+`DB_FILE=/tmp/E555.db`. Only the beamer can use it -- the finalizer and the
+roundhouse build a database around the pieces each board locks, so there is
+nothing shareable to cache.
+
+**Settings the farm does not name** reach the pipeline through `PIPE_EXTRA`:
+`PIPE_EXTRA="BEAM_STOP_ROW=12 TOP_N=40 BT_TIME=600"` is passed verbatim to every
+production iteration.
 
 ## The topper sweep
 
@@ -206,10 +243,14 @@ Open one side.
 
 Every runner takes **`CLUES=1`**, which passes `--clue_center --clue_corners`
 to every stage that supports them. It is off by default and changes nothing when
-unset.
+unset. `run_pipeline.sh` and the farm also take **`CLUES=center`**, which holds
+the centre clue alone -- the corners are what constrain the border search
+hardest, so centre-only is the setting to reach for when `all` starves a run of
+borders. `none` and `all` spell out `0` and `1`; all four are accepted.
 
 ```bash
 bash pipeline/run_pipeline.sh BORDERS=random CLUES=1
+bash pipeline/run_pipeline.sh BORDERS=random CLUES=center
 bash pipeline/topper_sweep.sh INPUT=board.csv PRESET=window CLUES=1
 ```
 
@@ -223,9 +264,11 @@ Two consequences worth knowing:
 
 * **The chain database differs.** A clued run excludes the clue pieces from the
   chains, so its cache is not interchangeable with a normal one -- the beamer
-  refuses a cache whose exclusion set does not match. The runners therefore use
-  `$DB_FILE.clue` when `CLUES=1`, so the two coexist and neither is rebuilt on
-  every toggle.
+  reads the exclusion set out of the cache header and rebuilds when it does not
+  match, rather than returning wrong chains. The farm gives each setting its own
+  file, `$DB_FILE.center` and `$DB_FILE.all`, so switching `CLUES` between runs
+  does not throw the other cache away. The other runners take `DB_FILE` as you
+  give it, so name it yourself if you toggle clues with one of those.
 * **A clued whirlpool band costs up to 4x.** A band cut at `BAND_ROW=5` carries
   no clue -- the centre one sits on row 7 or 8 -- so the finalizer has no
   orientation to read and *chooses* instead, searching the band once per

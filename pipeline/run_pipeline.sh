@@ -26,7 +26,8 @@ THREADS=8
 DB_FILE=                                # cache the 6.4 GB chain DB here; empty
                                         # = build it in memory each run
 BORDERS=annealed                        # annealed | random
-CLUES=0                                 # 1 = hold the Eternity II clue pieces
+CLUES=none                              # none | center | all -- which Eternity
+                                        # II clues to hold (0 and 1 also accepted)
 HOLES=data/holes_open_border_TRL.csv    # cells the backtracker may reopen
 
 # stage 1: border annealer (BORDERS=annealed only)
@@ -128,7 +129,11 @@ SEED=$(abs "$SEED"); HOLES=$(abs "$HOLES")
 TOOLS=$PWD/tools; SRC=$PWD/src; BIN=$PWD/bin
 mkdir -p "$RUN_DIR"; cd "$RUN_DIR"
 
-CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
+CLUE_ARG=()
+case "$CLUES" in
+    center) CLUE_ARG=(--clue_center) ;;
+    all|1)  CLUE_ARG=(--clue_center --clue_corners) ;;
+esac
 DB_ARG=();   [ -n "$DB_FILE" ] && DB_ARG=(--db_file "$DB_FILE")
 SEED_ARG=(); [ -n "$RNG_SEED" ] && SEED_ARG=(--rng_seed "$RNG_SEED")
 
