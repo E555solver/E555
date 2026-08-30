@@ -92,7 +92,7 @@ ALL_STEPS=(
     "example_beamer|examples/01 both ways, random and annealed borders"
     "pipeline_full|pipeline/run_pipeline.sh, all seven stages"
     "pipeline_whirl_lap|pipeline/run_pipeline_whirlpool.sh, one lap end to end"
-    "farm_pools|run_farm.py: pool slicing, promotion, and roundhouse dedup"
+    "farm_pools|run_farm.py: pool slicing, the row-12 filter, and the spiral guard"
     "no_stray_output|no check left a file in the repository root"
 )
 TOTAL=${#ALL_STEPS[@]}
@@ -1306,21 +1306,44 @@ assert rf.take_top(os.path.join(d, "nope.csv"), 3) == []   # missing pool
 rf.write_boards(pool, ["x,1"])
 assert not os.path.exists(pool + ".tmp")
 
+# A canonical row: id, score, pos[256], rot[256], with 999 for unplaced.
+def board(ident, cells, spin=None):
+    pos = ["999"] * 256
+    for piece, cell in enumerate(cells):
+        pos[piece] = str(cell)
+    rot = ["0"] * 256
+    if spin is not None:
+        rot[spin] = "1"
+    return ",".join([ident, "0"] + pos + rot)
+
+# closed_to_row is what keeps a board that did not finish row 12 out of the
+# roundhouse, where the width-4 cut would make no sense.
+full12 = board("p1", range(208))                 # rows 0..12 complete
+row11 = board("p2", range(192))                  # the beam's usual shape
+assert rf.closed_to_row(full12, 12) and rf.closed_to_row(full12, 11)
+assert not rf.closed_to_row(row11, 12) and rf.closed_to_row(row11, 11)
+assert not rf.closed_to_row("junk,1,2", 12)      # unreadable, never raises
+
 # The roundhouse keeps its input's config_id and appends "_<line><tag><n>", so a
-# board that reached it is exactly one whose id prefixes an output's id. Getting
-# this wrong sends a parent and its own improved child through the final topper.
-rh = ["p1_0a1,480,...", "p3_2a1,470,..."]
-carried = ["p1,400,...", "p2,401,...", "p3,402,...", "p10,403,..."]
-rh_ids = {rf.board_id(x) for x in rh}
-kept = [c for c in carried
-        if not any(r.startswith(rf.board_id(c) + "_") for r in rh_ids)]
-assert [rf.board_id(k) for k in kept] == ["p2", "p10"], kept
+# spiral's parent is the board whose id is the longest prefix of its own. It
+# must never hand back something worse than it was given: a pass that could not
+# refill the bands it freed emits the deepest board it reached, and that one
+# used to displace its own parent in the next stage.
+spirals = [
+    board("p1_0d0", range(208)),                 # the refill already standing
+    board("p1_0d1", range(208), spin=3),         # a real rearrangement
+    board("p1_0d2", range(169)),                 # came back 39 pieces short
+    board("p1_0d1_0d0", range(208), spin=7),     # second pass, matched to p1
+    board("p10_0d0", range(208), spin=1),        # p10 is not p1: not ours
+]
+kept = [rf.board_id(x) for x in rf.spirals_worth_keeping(spirals, [full12, row11])]
+assert kept == ["p1_0d1", "p1_0d1_0d0", "p10_0d0"], kept
 
 # An unknown setting must stop the run, not be silently ignored for two days.
 r = subprocess.run([sys.executable, "pipeline/run_farm.py", "NO_SUCH=1"],
                    capture_output=True, text=True)
 assert r.returncode != 0 and "unknown setting" in r.stderr, r
-print("ok: pools slice, promote and dedup correctly")
+print("ok: pools slice and promote; row-12 filter and spiral guard hold")
 EOF
 }
 

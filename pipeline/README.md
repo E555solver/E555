@@ -182,9 +182,10 @@ it stops asking the beam for one and hands the job to CP-SAT.
     1 borders    random, or annealed every ANNEAL_EVERY-th iteration -- anneal
                  4x ANNEAL_BORDERS restarts, keep the best quarter
     2 beamer     to row 11, --top_columns 5, --max_emitted 0 (uncapped)
-    3 finalizer  to row 12 from row 5, exhaustive columns, --incomplete_top
+    3 clean      rank, then E555_clean_csv.py drops the frontier siblings
     4 topper     FOCUSED: rows (16-FOCUS_DEPTH)..12 open, to close row 12
-    5 roundhouse forward then reverse at --strip_width 3
+    5 roundhouse forward then reverse at --strip_width 4 --hold_band, on
+                 boards that really closed row 12
     6 topper     FINAL: the top band, filling rows 13..15
       refine     the best REFINE_TOP get one ender pass
       harvest    every HARVEST_EVERY iterations, the best HARVEST_TOP get a
@@ -198,6 +199,15 @@ anywhere. `champions.csv` is the deliverable: deeply refined, ranked, and never
 searched again, which is what makes it safe to hand to other tools while the
 farm keeps running.
 
+**Stage 3 is there because siblings are not diversity.** The beam emits in
+hundreds, but many of those boards are one board plus a different piece on the
+frontier: identical below row 11. Stage 4 frees rows 8–12 outright, so a sibling
+pair presents the *same* CP-SAT model — same locked floor, same free pool — and
+two `FOCUS_TOP` slots buy one search. Measured on a real sweep: **312 beamer
+boards carried only 126 distinct floors.** `E555_clean_csv.py` drops them
+structurally (one differing cell, its top face exposed), not on a similarity
+threshold, and ranking first is what decides which of a pair survives.
+
 **Stage 4 is the one to understand.** `--band_depth D` counts inward from the
 top edge, so the band is rows (16−D)…15, and `--locked_rows 3` locks 13–15
 empty; the solver's free range is rows **(16−D)…12**. `FOCUS_DEPTH=8` opens rows
@@ -207,15 +217,55 @@ pieces still unplaced. Measured on one row-11 board at depth 8, the topper
 closed row 12 completely, taking 15 pieces from the unplaced pool and **lifting
 one out of row 11**. `FOCUS_DEPTH` is the dial to turn if row 12 will not close.
 
-**Stage 5 filters itself.** `--strip_width 3` keeps *more* of the board than a
-wider strip, and `core_usable()` requires every kept cell to be placed,
-frame-legal and break-free — so a board that did not genuinely complete row 12
-is skipped by name. No filtering code of ours is involved.
+**Stage 5's width is forced by the geometry.** `--rounds 3 --rotate -1` frees
+the bottom, right and top bands and keeps rows W…(15−W) × columns 0…(15−2W);
+`core_usable()` then demands every kept cell be placed, frame-legal and
+break-free. Stage 4 hands over rows 0–11 break-free, row 12 closed but carrying
+the residue, 13–15 empty:
 
-**Deduplication after the roundhouse is by id prefix.** The roundhouse keeps
-the input board's `config_id` and appends `_<line><tag><n>`, so a board that
-reached it is exactly one whose id prefixes some output's id. The final topper
-gets the roundhouse's boards plus every stage-4 board with no descendant.
+| W | keeps | verdict |
+|---|---|---|
+| 3 | rows 3–12 | row 12's breaks make **every** board unusable — a width-3 pass here skipped its whole input and did no work |
+| 4 | rows 4–11 | exactly the part stage 4 proved |
+| 5 | rows 5–10 | proven too, but throws two more rows away |
+
+So W=4 is the widest core these boards can honestly offer. `--rotate -1` re-cuts
+the bottom band the beam fixed at row 0 and never revisited, which is how a
+border piece buried low can come back up.
+
+**Nothing comes back unset.** Three things see to it. Only boards that really
+closed row 12 go in (`closed_to_row`). `--hold_band` keeps the top band the cut
+would otherwise free — on a real row-12 board it reports *holding 12 piece(s) =
+3 chain level(s) in the TOP band*, so the row stage 4 worked for is not torn out
+to be searched again, and it says so in the log when it cannot. And
+`spirals_worth_keeping()` drops any output holding fewer pieces than the board
+it came from — the case `--hold_band` cannot cover, since the bottom and side
+bands must be freed for the search to happen at all. Measured before that guard
+existed: parents at 208 placed came back at **169** and took four of the six
+slots in the next stage.
+
+That function finds a spiral's parent by id: the roundhouse keeps its input's
+`config_id` and appends `_<line><tag><n>`, so the parent is the board whose id
+is the longest prefix of the spiral's. It also drops a spiral that is its input
+under a new name — measured on a real row-12 board, the forward pass returned it
+with **not one piece moved** (exhausting in 0.5 s and proving the standing
+refill is the only break-free one), while the reverse pass moved 2 pieces at
+(12,0). Both must run before any ranking: `E555_rank.py --rescore` rewrites the
+id to `<id>_<old field 2>`, and a parent would stop prefixing its own spirals.
+
+**The two topper stages behave nothing alike, and their budgets say so.**
+Measured over 24 solves of each across four production iterations, at
+`--time_limit 90 --stall_time 30`:
+
+| stage | time used | ended | mean gain |
+|---|---|---|---|
+| focused | 35.8 s, **never** reached the limit | 29% `optimal` at 17.5 s, 71% stalled having last improved ~13 s | +9.3 |
+| final | 89.1 s of 90 | **88% cut off by the clock** | +61.6 |
+
+`--time_limit` is not the focused stage's constraint, so raising `FOCUS_TIME`
+buys nothing — the stall is the only live dial, which is why `FOCUS_STALL` is
+its own setting. The final topper was the one stage genuinely truncated, so that
+is where the seconds go: `TOPPER_TIME=300`, `TOPPER_STALL=100`.
 
 **The CP-SAT stages are capped by board count, and must be.** The topper and
 the ender take only `--time_limit`, which is per *solve* -- unlike the C tools

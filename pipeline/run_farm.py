@@ -29,9 +29,11 @@ harvest runs after refinement and moves boards into champions.csv.
     1 borders    random, or annealed every ANNEAL_EVERY-th iteration: anneal
                  4x ANNEAL_BORDERS restarts and keep the best quarter
     2 beamer     to row 11, five columns per bottom, emissions uncapped
-    3 finalizer  to row 12 from row 5, exhaustive columns, --incomplete_top
+    3 clean      rank, then drop the frontier siblings -- boards the beam
+                 emits in hundreds that differ only in the piece on top
     4 topper     FOCUSED: rows (16-FOCUS_DEPTH)..12 open, to close row 12
-    5 roundhouse forward then reverse at width 3, which only row-12 boards pass
+    5 roundhouse forward then reverse at width 4, complete row 12 only, and
+                 never allowed to give back a board worse than it was handed
     6 topper     FINAL: the top band, to fill rows 13..15
     refine       the best REFINE_TOP get one ender pass  -> queue/refined.csv
     harvest      the best HARVEST_TOP get a deep ender   -> champions.csv
@@ -89,10 +91,25 @@ S = {
     # a full iteration land near three hours at worst:
     #
     #   beamer     BEAM_WALL                        900
-    #   finalizer  FIN_WALL                         600
-    #   focused    FOCUS_TOP x FOCUS_TIME      20 x 180 = 3600
-    #   roundhouse RH_WALL                          300
-    #   final      FINAL_TOP x TOPPER_TIME     20 x 180 = 3600
+    #   focused    FOCUS_TOP x FOCUS_TIME      20 x 120 = 2400
+    #   roundhouse RH_WALL, twice                    600
+    #   final      FINAL_TOP x TOPPER_TIME     20 x 300 = 6000
+    #
+    # WHERE THE TWO TOPPER BUDGETS COME FROM. Measured over 24 solves of each
+    # stage across four production iterations, at --time_limit 90 --stall_time
+    # 30 -- the two stages behave nothing alike:
+    #
+    #   focused  mean 35.8s and NOT ONE of the 24 reached the limit. 29% ended
+    #            `optimal` at 17.5s -- CP-SAT proving no arrangement of rows
+    #            8..12 on that locked floor has fewer breaks -- and the other
+    #            71% stopped on the stall watchdog, having last improved around
+    #            13s. --time_limit is therefore not this stage's constraint and
+    #            raising it buys nothing; the stall is the only live dial,
+    #            which is why FOCUS_STALL is its own setting. FOCUS_TIME just
+    #            has to stay clear of 13s + FOCUS_STALL.
+    #   final    mean 89.1s of the 90 allowed, 88% cut off BY THE CLOCK, mean
+    #            gain +61.6 edges. The one stage in the chain that was
+    #            genuinely truncated, so this is where the seconds go.
     #
     # The ender multiplies again, and this is the trap that matters. Ring and
     # patch mode both climb a LADDER per board -- [r1 m4], [r1 m8], [r1 m12],
@@ -109,22 +126,31 @@ S = {
     #
     #   refine     REFINE_TOP x 8 x REFINE_TIME     5 x 8 x 45 = 1800
     #   harvest    HARVEST_TOP x 18 x HARVEST_TIME x 2 modes
-    #                                            5 x 18 x 120 x 2 = 21600
+    #                                           10 x 18 x 120 x 2 = 43200
     #
     # A rung usually stalls well before its ceiling -- 34s against a 90s limit
     # in the measured run -- so the real figures run about a third of these.
     # The harvest is deliberately the expensive one: it fires only every
     # HARVEST_EVERY iterations, on the boards about to become champions.
     "BEAM_WALL": 900,
-    "FIN_WALL": 600,
     "FOCUS_DEPTH": 8,           # rows (16-N)..12 open in the focused topper;
                                 # 8 opens rows 8..12. THE dial if row 12 will
                                 # not close -- deeper reaches further into the
                                 # core for the pieces it needs, at a
                                 # superlinear CP-SAT cost. Must exceed 3.
-    "FOCUS_TIME": 180,
-    "RH_WALL": 300,
-    "TOPPER_TIME": 180,
+    "FOCUS_TIME": 120,          # a ceiling this stage has never reached
+    "FOCUS_STALL": 35,          # what actually stops it: seconds without an
+                                # improvement. This, not FOCUS_TIME, is the
+                                # dial to raise if you want the focused topper
+                                # to try harder -- and raise FOCUS_TIME with it
+                                # or the ceiling starts binding instead.
+    "RH_WALL": 300,             # generous on purpose: the width-4 cut keeps a
+                                # 96-piece core, 108 of them once --hold_band
+                                # pins row 12, and exhausted a real board in
+                                # 0.5s. A ceiling for the pathological case,
+                                # not a working budget
+    "TOPPER_TIME": 300,         # the stage that was being truncated
+    "TOPPER_STALL": 100,
     # Boards allowed into each CP-SAT stage, best first. These caps are not
     # optional. The topper and the ender take only --time_limit, which is per
     # SOLVE -- unlike the C tools there is no total --wall_time -- so a stage
@@ -141,7 +167,10 @@ S = {
     "REFINE_CHANGES": 16,
 
     "HARVEST_EVERY": 10,        # iterations between harvests
-    "HARVEST_TOP": 5,           # boards deep-endered and promoted per harvest
+    "HARVEST_TOP": 10,          # boards deep-endered and promoted per harvest.
+                                # This is what sets the champion rate: 10 every
+                                # HARVEST_EVERY iterations, so at ~2.4h an
+                                # iteration a harvest lands about once a day.
     "HARVEST_TIME": 120,
     "HARVEST_REACH": 3,         # a longer ladder than refine: 18 solves a board
     "HARVEST_CHANGES": 24,
@@ -212,6 +241,81 @@ def board_id(line):
     return line.split(",", 1)[0].strip()
 
 
+def placement(line):
+    """The board itself: where every piece sits and how it is turned.
+
+    A canonical row is id, score, pos[256], rot[256]. Read from the END --
+    every tool agrees on the last 512 fields and they do not all agree on what
+    sits in front of them. Two rows with different ids and the same placement
+    are the same board."""
+    return tuple(x.strip() for x in line.split(",")[-512:])
+
+
+def occupied(line):
+    """The cells this board has a piece in. 999 is the unplaced marker."""
+    cells = {int(x) for x in placement(line)[:256]}
+    cells.discard(999)
+    return cells
+
+
+def closed_to_row(line, row):
+    """True when every cell up to and including `row` holds a piece.
+
+    This is what keeps a board that did not really finish row 12 out of the
+    roundhouse. Never raises: one malformed line must not end a run that has
+    been going for days, and a board we cannot read is simply not eligible."""
+    try:
+        return occupied(line).issuperset(range(16 * (row + 1)))
+    except ValueError:
+        return False
+
+
+def spirals_worth_keeping(rh_boards, parents):
+    """The roundhouse outputs that earned a place beside the boards they
+    came from. Run this BEFORE any ranking: E555_rank.py --rescore renames
+    every board, and this reads provenance out of the ids.
+
+    The roundhouse KEEPS its input board's config_id and appends
+    "_<line><tag><n>" (E555_roundhouse.c:1243), so a spiral's parent is the
+    board whose id is the longest prefix of its own -- no tagging and no log
+    parsing needed to tell who came from whom. A second-pass spiral is matched
+    against the stage-4 board at the ROOT of its chain, since that is the board
+    we promise not to damage.
+
+    Two rules, both from watching it work:
+
+    NOTHING COMES BACK UNSET. A spiral has to free three bands to search them,
+    and when it cannot refill them break-free it emits the deepest board it
+    reached -- which can hold fewer pieces than the one it started from.
+    Measured: parents at 208 placed came back at 169 and took four of the six
+    slots in the next stage. A spiral that lost pieces is dropped.
+
+    AND NO COPIES. Often the only break-free refill is the one already
+    standing, and the output is its input under a new name. Measured on a real
+    row-12 board: the forward pass exhausted in 0.5s and gave it back with NOT
+    ONE PIECE MOVED, having proved the standing refill is the only break-free
+    one; the reverse pass, which frees the left band instead of the right,
+    moved 2 pieces at (12,0). The first is a slot spent on a search already
+    done, the second is a genuinely different board. Only the second is kept."""
+    roots = {board_id(ln): ln for ln in parents}
+    kept = []
+    for line in rh_boards:
+        ident = board_id(line)
+        root = max((k for k in roots if ident.startswith(k + "_")),
+                   key=len, default=None)
+        if root is None:            # no parent of ours: nothing to compare to
+            kept.append(line)
+            continue
+        try:
+            if len(occupied(line)) < len(occupied(roots[root])):
+                continue
+        except ValueError:
+            continue
+        if placement(line) != placement(roots[root]):
+            kept.append(line)
+    return kept
+
+
 def take_top(path, n):
     """Take the first n boards off a ranked pool, leaving the rest behind.
 
@@ -274,7 +378,11 @@ def rank_boards(inputs, out_path, logfh):
     --rescore makes field 2 the true matched-edge count whatever tool wrote the
     line, which is what makes scores comparable across stages; the tie-break is
     compactness, so of two equal boards the one with its breaks packed into
-    fewer rows wins."""
+    fewer rows wins.
+
+    Note --rescore also renames: the emitted id is "<id>_<old field 2>"
+    (E555_rank.py:370). Anything that reads provenance out of an id has to run
+    BEFORE a ranking, not after it."""
     inputs = [p for p in inputs if p and os.path.exists(p) and os.path.getsize(p)]
     if not inputs:
         write_boards(out_path, [])
@@ -368,20 +476,29 @@ def produce(run, logfh, annealed):
         logfh.write("!! the beamer emitted nothing; raise BEAM_WALL\n")
         return worst, []
 
-    # 3. Finalizer to row 12. --incomplete_top is NOT optional: complete row-12
-    # emission is essentially zero, and without it this stage contributes
-    # nothing. Its real output is the separate _12_partial.csv, boards holding
-    # 11 of row 12's 16 pieces.
+    # 3. Rank the beam's output, then drop its frontier siblings.
+    #
+    # The beam emits in hundreds, and many of those boards are one board plus a
+    # different piece on the frontier: identical below row 11, differing only in
+    # the cell on top. Stage 4 frees rows 8..12 outright, so a sibling pair
+    # collapses into the SAME CP-SAT model -- same locked floor, same free pool
+    # -- and two of the FOCUS_TOP slots buy one search. Measured on a real
+    # sweep: 312 beamer boards carried only 126 distinct floors.
+    #
+    # clean_csv drops them structurally -- one cell differs and its top face is
+    # exposed -- not on a similarity threshold. Ranking FIRST is what decides
+    # which of a pair survives.
     beam_all = os.path.join(run, "beam_all.csv")
     write_boards(beam_all, [ln for p in beam_out for ln in read_boards(p)])
-    fin_dir = os.path.join(run, "fin")
-    worst = max(worst, run_tool(
-        ["bin/E555_finalizer", SEED, beam_all]
-        + ([borders] if borders else [])   # enumerate only the annealer's edges
-        + ["--finalize_from", 5, "--top_columns", 0, "--stop_row", 12,
-           "--incomplete_top", "--num_rows", 0, "--wall_time", S["FIN_WALL"],
-           "--threads", S["THREADS"], "--out_dir", fin_dir, "--print_cmd"]
-        + clue, logfh))
+    ranked_path = os.path.join(run, "beam_ranked.csv")
+    candidates = rank_boards([beam_all], ranked_path, logfh)
+    if candidates:
+        cleaned = os.path.join(run, "beam_clean.csv")
+        if run_tool([sys.executable, os.path.join(TOOLS, "E555_clean_csv.py"),
+                     ranked_path, "--out", cleaned], logfh) == 0:
+            candidates = read_boards(cleaned) or candidates
+    else:
+        candidates = read_boards(beam_all)     # ranking died; press on unsorted
 
     # 4. Focused topper: close row 12, reaching deep for the pieces it needs.
     # --band_depth D counts inward from the top edge, so the band is rows
@@ -389,76 +506,88 @@ def produce(run, logfh, annealed):
     # range is therefore rows (16-D)..12. A shallow band could only draw on
     # pieces still unplaced -- the ones needed to close row 12 are usually
     # already sitting in the core, which is what the depth is for.
-    focus_all = os.path.join(run, "focus_all.csv")
-    write_boards(focus_all, read_boards(beam_all)
-                 + [ln for p in manifest(fin_dir) for ln in read_boards(p)])
-    # Rank before the cap so the solver's time goes to the best material the
-    # beam found, not to whatever happened to be written first.
-    ranked = rank_boards([focus_all], os.path.join(run, "focus_ranked.csv"), logfh)
     focus_in = os.path.join(run, "focus_in.csv")
-    write_boards(focus_in, (ranked or read_boards(focus_all))[:S["FOCUS_TOP"]])
+    write_boards(focus_in, candidates[:S["FOCUS_TOP"]])
     focus_out = os.path.join(run, "focus_out.csv")
     if read_boards(focus_in):
         worst = max(worst, run_tool(
             [sys.executable, TOPPER, SEED, focus_in, focus_out,
              "--side", "T", "--band_depth", S["FOCUS_DEPTH"], "--locked_rows", 3,
              "--num_rows", 0, "--time_limit", S["FOCUS_TIME"],
-             "--stall_time", max(10, S["FOCUS_TIME"] // 3),
+             "--stall_time", S["FOCUS_STALL"],
              "--threads", S["THREADS"]] + clue, logfh))
     carried = read_boards(focus_out) or read_boards(focus_in)
 
-    # 5. Double roundhouse at width 3, forward then reverse. Width 3 IS the
-    # row-12 filter and needs no code of ours: core_usable() requires every
-    # kept cell to be placed, frame-legal and break-free, and a narrower strip
-    # keeps MORE of the board, so anything short of a real row 12 is skipped
-    # with "--strip_width 3 is unusable -- it keeps cell (r,c), which is
-    # unplaced". --hold_band on the second pass keeps what the first left.
+    # 5. Double roundhouse at width 4, forward then reverse.
+    #
+    # WIDTH 4 IS FORCED BY THE GEOMETRY, not picked. --rounds 3 --rotate -1
+    # frees the bottom, right and top bands and keeps rows W..(15-W) x columns
+    # 0..(15-2W); core_usable() then demands every kept cell be placed,
+    # frame-legal and break-free. Stage 4 hands over boards with rows 0..11
+    # break-free, row 12 closed but carrying the residue, and 13..15 empty:
+    #
+    #     W=3 keeps rows 3..12 -- row 12's breaks make every board unusable,
+    #                             which is why an earlier width-3 pass here
+    #                             skipped its whole input and did no work
+    #     W=4 keeps rows 4..11 -- exactly the part stage 4 proved
+    #     W=5 keeps rows 5..10 -- proven too, but throws two more rows away
+    #
+    # So W=4 is the widest core these boards can honestly offer, and the spiral
+    # re-cuts the bottom band the beam fixed at row 0 and never revisited --
+    # which is the point of --rotate -1 and the reason border pieces buried low
+    # can come back up.
+    #
+    # NOTHING COMES BACK UNSET. Three things see to it. Only boards that really
+    # closed row 12 go in. --hold_band keeps the top band the cut would
+    # otherwise free -- on a real row-12 board it reports "holding 12 piece(s)
+    # = 3 chain level(s) in the TOP band", so the row stage 4 worked for is not
+    # torn out to be searched again; it says so in the log when it cannot.
+    # And spirals_worth_keeping() drops any output holding fewer pieces than
+    # the board it came from, which is the case --hold_band cannot cover: the
+    # bottom and side bands have to be freed for the search to happen at all.
     rh_boards = []
-    if carried:
-        write_boards(focus_out, carried)
-        geom = ["--rounds", 3, "--strip_width", 3, "--rotate", -1,
-                "--num_rows", 0, "--wall_time", S["RH_WALL"],
+    rh_in = [ln for ln in carried if closed_to_row(ln, 12)]
+    if rh_in:
+        rh_src = os.path.join(run, "rh_in.csv")
+        write_boards(rh_src, rh_in)
+        geom = ["--rounds", 3, "--strip_width", 4, "--rotate", -1,
+                "--hold_band", "--num_rows", 0, "--wall_time", S["RH_WALL"],
                 "--threads", S["THREADS"], "--print_cmd"] + clue
         rh1 = os.path.join(run, "rh1")
         worst = max(worst, run_tool(
-            ["bin/E555_roundhouse", SEED, focus_out, "--out_dir", rh1]
-            + geom, logfh))
-        first = [ln for p in manifest(rh1) for ln in read_boards(p)]
-        rh_boards = list(first)
-        if first:
+            ["bin/E555_roundhouse", SEED, rh_src, "--out_dir", rh1] + geom, logfh))
+        rh_boards = [ln for p in manifest(rh1) for ln in read_boards(p)]
+        if rh_boards:
+            # The reverse spiral runs on the forward one's output, and BOTH are
+            # carried forward -- pass 2 is not always an improvement on pass 1,
+            # and the lineage guard is what picks between them.
             rh1_all = os.path.join(run, "rh1_all.csv")
-            write_boards(rh1_all, first)
+            write_boards(rh1_all, rh_boards)
             rh2 = os.path.join(run, "rh2")
             worst = max(worst, run_tool(
                 ["bin/E555_roundhouse", SEED, rh1_all, "--out_dir", rh2,
-                 "--reverse", "--hold_band"] + geom, logfh))
-            second = [ln for p in manifest(rh2) for ln in read_boards(p)]
-            if second:
-                rh_boards = second
+                 "--reverse"] + geom, logfh))
+            rh_boards += [ln for p in manifest(rh2) for ln in read_boards(p)]
+    elif carried:
+        logfh.write("!! nothing closed row 12, so the roundhouse has nothing to"
+                    " spiral this iteration -- raise FOCUS_DEPTH or FOCUS_STALL\n")
 
     # 6. Final topper over everything, opening the top band to fill rows 13..15.
     # --locked_rows must be 0 here: the flag unsets what it locks, and with no
     # second pass to recover those rows a board would leave missing its top two.
-    #
-    # Dedup by id prefix. The roundhouse KEEPS the input board's config_id and
-    # appends "_<line><tag><n>", so a board that reached the roundhouse is
-    # exactly one whose id prefixes some roundhouse output's id -- no tagging,
-    # no log parsing.
-    rh_ids = {board_id(ln) for ln in rh_boards}
-    survivors = [ln for ln in carried
-                 if not any(r.startswith(board_id(ln) + "_") for r in rh_ids)]
+    keep = spirals_worth_keeping(rh_boards, carried) + carried
     final_all = os.path.join(run, "final_all.csv")
-    write_boards(final_all, rh_boards + survivors)
+    write_boards(final_all, keep)
     ranked = rank_boards([final_all], os.path.join(run, "final_ranked.csv"), logfh)
     final_in = os.path.join(run, "final_in.csv")
-    write_boards(final_in, (ranked or read_boards(final_all))[:S["FINAL_TOP"]])
+    write_boards(final_in, (ranked or keep)[:S["FINAL_TOP"]])
     final_out = os.path.join(run, "final_out.csv")
     if read_boards(final_in):
         worst = max(worst, run_tool(
             [sys.executable, TOPPER, SEED, final_in, final_out,
              "--side", "T", "--band_depth", 6, "--locked_rows", 0,
              "--num_rows", 0, "--time_limit", S["TOPPER_TIME"],
-             "--stall_time", max(10, S["TOPPER_TIME"] // 3),
+             "--stall_time", S["TOPPER_STALL"],
              "--threads", S["THREADS"]] + clue, logfh))
     return worst, (read_boards(final_out) or read_boards(final_in))
 
@@ -468,7 +597,13 @@ def ingest(boards, run, logfh):
     it to the produced queue. clean_csv drops a board repeating an earlier one
     with a single frontier piece swapped -- a structural rule, not a similarity
     threshold, which is what stops the pool filling with siblings of one lucky
-    board."""
+    board.
+
+    Stage 3 already ran it, on a different population and for a different
+    reason: there it thins the beam's row-11 output so the focused topper does
+    not solve the same model twice. Here the population is the whole queue,
+    where a near-complete board has almost no frontier left and what it mostly
+    removes is an exact repeat."""
     if not boards:
         return 0
     fresh = os.path.join(run, "fresh.csv")
