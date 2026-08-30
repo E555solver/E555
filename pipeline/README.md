@@ -13,6 +13,7 @@ settings here will make far more sense afterwards.
 | `run_pipeline.sh` | the whole pipeline, borders to a finished board. `BORDERS=random` samples borders from the seed; `BORDERS=annealed` searches for them with Stage A first | 30-60 min per pass |
 | `run_pipeline_whirlpool.sh` | turns the board 90 degrees between every re-grow, so the buried bottom rows get re-searched too | hours, or one lap in minutes |
 | `run_board_farm.sh` | runs a pipeline pass in a loop forever, keeps only the best boards, and periodically re-attacks them | days |
+| `run_farm.py` | the same idea with a different chain, and boards that graduate: produced, refined once, then deeply refined into `champions.csv` and never searched again | days |
 | `topper_sweep.sh` | one plan of topper passes over a slice of a board file | minutes |
 | `slurm_wrapper.sh` | runs any of the above as a batch job | -- |
 
@@ -22,6 +23,7 @@ bash pipeline/run_pipeline.sh BORDERS=random        # sampled borders, start her
 bash pipeline/run_pipeline_whirlpool.sh             # four laps around the board
 bash pipeline/run_pipeline_whirlpool.sh WHIRL_ROWS=10   # just one lap
 bash pipeline/run_board_farm.sh MAX_HOURS=48        # the farm, two days
+python3 pipeline/run_farm.py DB_FILE=/tmp/E555.db  # the graduating farm
 ```
 
 ## How every runner works
@@ -167,6 +169,67 @@ nothing shareable to cache.
 **Settings the farm does not name** reach the pipeline through `PIPE_EXTRA`:
 `PIPE_EXTRA="BEAM_STOP_ROW=12 TOP_N=40 BT_TIME=600"` is passed verbatim to every
 production iteration.
+
+### The other farm: `run_farm.py`
+
+Two runners now loop forever, and they answer different questions.
+`run_board_farm.sh` drives `run_pipeline.sh`, so it inherits that chain and
+re-attacks its champions indefinitely. `run_farm.py` runs **its own chain**,
+built around the one measured fact that shapes everything here: **no
+configuration of any tool in this repo has ever emitted a complete row 12**. So
+it stops asking the beam for one and hands the job to CP-SAT.
+
+    1 borders    random, or annealed every ANNEAL_EVERY-th iteration -- anneal
+                 4x ANNEAL_BORDERS restarts, keep the best quarter
+    2 beamer     to row 11, --top_columns 5, --max_emitted 0 (uncapped)
+    3 finalizer  to row 12 from row 5, exhaustive columns, --incomplete_top
+    4 topper     FOCUSED: rows (16-FOCUS_DEPTH)..12 open, to close row 12
+    5 roundhouse forward then reverse at --strip_width 3
+    6 topper     FINAL: the top band, filling rows 13..15
+      refine     the best REFINE_TOP get one ender pass
+      harvest    every HARVEST_EVERY iterations, the best HARVEST_TOP get a
+                 deep ender and graduate
+
+**Boards graduate rather than being re-attacked.** A board's search history is
+simply which file it is in — `queue/produced.csv`, then `queue/refined.csv`,
+then `champions.csv`. Because every stage takes the *top N* of a ranked file,
+"remove what we just took" is a slice, so no attempt counter is stored
+anywhere. `champions.csv` is the deliverable: deeply refined, ranked, and never
+searched again, which is what makes it safe to hand to other tools while the
+farm keeps running.
+
+**Stage 4 is the one to understand.** `--band_depth D` counts inward from the
+top edge, so the band is rows (16−D)…15, and `--locked_rows 3` locks 13–15
+empty; the solver's free range is rows **(16−D)…12**. `FOCUS_DEPTH=8` opens rows
+8–12. Depth is the whole point: the pieces needed to close row 12 are usually
+already placed somewhere in the core, and a shallow band could only draw on
+pieces still unplaced. Measured on one row-11 board at depth 8, the topper
+closed row 12 completely, taking 15 pieces from the unplaced pool and **lifting
+one out of row 11**. `FOCUS_DEPTH` is the dial to turn if row 12 will not close.
+
+**Stage 5 filters itself.** `--strip_width 3` keeps *more* of the board than a
+wider strip, and `core_usable()` requires every kept cell to be placed,
+frame-legal and break-free — so a board that did not genuinely complete row 12
+is skipped by name. No filtering code of ours is involved.
+
+**Deduplication after the roundhouse is by id prefix.** The roundhouse keeps
+the input board's `config_id` and appends `_<line><tag><n>`, so a board that
+reached it is exactly one whose id prefixes some output's id. The final topper
+gets the roundhouse's boards plus every stage-4 board with no descendant.
+
+**Budgets.** `--wall_time` covers the beamer's whole run, database build
+included, so `BEAM_WALL` under about four minutes with no `DB_FILE` is spent
+entirely on the build — the farm warns rather than letting you discover it from
+a day of `0 boards`. Set `DB_FILE` to an absolute path on node-local disk and
+the build happens once.
+
+**Unattended.** ortools is checked before iteration 1; each tool's exit code is
+checked separately, so a stage that dies does not discard what the stages
+before it made; `GIVE_UP_AFTER` consecutive failures end the run (`0` never
+gives up); pools are written atomically and `farm_state.json` lets a restart
+resume; `SIGINT`/`SIGTERM` finish the current iteration and exit 0. Per-iteration
+logs are kept only for records and failures, which is what keeps a multi-day run
+to kilobytes.
 
 ## The topper sweep
 

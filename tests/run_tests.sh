@@ -92,6 +92,7 @@ ALL_STEPS=(
     "example_beamer|examples/01 both ways, random and annealed borders"
     "pipeline_full|pipeline/run_pipeline.sh, all seven stages"
     "pipeline_whirl_lap|pipeline/run_pipeline_whirlpool.sh, one lap end to end"
+    "farm_pools|run_farm.py: pool slicing, promotion, and roundhouse dedup"
     "no_stray_output|no check left a file in the repository root"
 )
 TOTAL=${#ALL_STEPS[@]}
@@ -1084,6 +1085,10 @@ step_scripts_parse() {
         bash -n "$s" || fail "$s does not parse"
         n=$((n + 1))
     done
+    for s in pipeline/*.py; do
+        python3 -m py_compile "$s" || fail "$s does not compile"
+        n=$((n + 1))
+    done
     echo "ok: $n scripts parse"
     # Parsing is not running. When --gumbel_tau0/--gumbel_tau1 were removed
     # from the beamer, two pipelines went on passing them and went on parsing
@@ -1273,6 +1278,52 @@ step_pipeline_full() {
 # bin/ and logs/ are exempt: check 1 rebuilds bin/ from scratch, and both
 # topper_sweep.sh and the pipeline runners mkdir logs/ for their Slurm headers,
 # so on a fresh clone those two appear legitimately.
+# The farm's own bookkeeping. Every tool it drives is covered elsewhere; what is
+# only here is how boards move between the pools -- and a slip there is silent,
+# because a farm that loses or re-searches boards still looks like it is working.
+step_farm_pools() {
+    python3 - <<'EOF' || fail "run_farm.py pool mechanics are wrong"
+import importlib.util, os, subprocess, sys, tempfile
+spec = importlib.util.spec_from_file_location("rf", "pipeline/run_farm.py")
+rf = importlib.util.module_from_spec(spec); spec.loader.exec_module(rf)
+
+d = tempfile.mkdtemp()
+pool = os.path.join(d, "pool.csv")
+
+# Comments are not boards, and a round trip must not invent or drop rows.
+open(pool, "w").write("# a comment\n\nb1,1\nb2,2\nb3,3\n% another\n")
+assert rf.read_boards(pool) == ["b1,1", "b2,2", "b3,3"], rf.read_boards(pool)
+
+# take_top is the whole attempt-counting mechanism: what it takes must leave.
+taken = rf.take_top(pool, 2)
+assert taken == ["b1,1", "b2,2"], taken
+assert rf.read_boards(pool) == ["b3,3"], rf.read_boards(pool)
+assert rf.take_top(pool, 9) == ["b3,3"]          # asking for more than exists
+assert rf.read_boards(pool) == []
+assert rf.take_top(os.path.join(d, "nope.csv"), 3) == []   # missing pool
+
+# Writes are atomic: no .tmp may survive a completed write.
+rf.write_boards(pool, ["x,1"])
+assert not os.path.exists(pool + ".tmp")
+
+# The roundhouse keeps its input's config_id and appends "_<line><tag><n>", so a
+# board that reached it is exactly one whose id prefixes an output's id. Getting
+# this wrong sends a parent and its own improved child through the final topper.
+rh = ["p1_0a1,480,...", "p3_2a1,470,..."]
+carried = ["p1,400,...", "p2,401,...", "p3,402,...", "p10,403,..."]
+rh_ids = {rf.board_id(x) for x in rh}
+kept = [c for c in carried
+        if not any(r.startswith(rf.board_id(c) + "_") for r in rh_ids)]
+assert [rf.board_id(k) for k in kept] == ["p2", "p10"], kept
+
+# An unknown setting must stop the run, not be silently ignored for two days.
+r = subprocess.run([sys.executable, "pipeline/run_farm.py", "NO_SUCH=1"],
+                   capture_output=True, text=True)
+assert r.returncode != 0 and "unknown setting" in r.stderr, r
+print("ok: pools slice, promote and dedup correctly")
+EOF
+}
+
 step_no_stray_output() {
     ls -A | grep -vxE 'bin|logs' > "$OUT/root_after.txt"
     stray=$(comm -13 "$OUT/root_before.txt" "$OUT/root_after.txt" | tr '\n' ' ')
