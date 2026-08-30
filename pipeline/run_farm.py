@@ -139,11 +139,30 @@ S = {
                                 # core for the pieces it needs, at a
                                 # superlinear CP-SAT cost. Must exceed 3.
     "FOCUS_TIME": 120,          # a ceiling this stage has never reached
-    "FOCUS_STALL": 35,          # what actually stops it: seconds without an
-                                # improvement. This, not FOCUS_TIME, is the
-                                # dial to raise if you want the focused topper
-                                # to try harder -- and raise FOCUS_TIME with it
-                                # or the ceiling starts binding instead.
+    "FOCUS_STALL": 10,          # what actually stops it: seconds without an
+                                # improvement. Measured by running six real
+                                # stage-4 boards with the watchdog OFF and
+                                # replaying the incumbent trace -- the watchdog
+                                # only stops the search, it never changes it,
+                                # so one trace prices every setting exactly:
+                                #
+                                #   stall   6 boards cost   breaks vs 180s/board
+                                #      5s          100s         +12
+                                #     10s          148s          +8
+                                #     15s          178s          +8
+                                #     30s          337s          +4
+                                #     60s          633s          +2
+                                #
+                                # Improvements come in a burst -- median gap
+                                # between them 0.1s, all six boards' first at
+                                # ~4.5s -- and then stop. The late gains sit
+                                # behind gaps of 22 to 85s, so buying them
+                                # means waiting out the dead time on every
+                                # board. 10 buys the same result as 15 and 5x
+                                # the median gap of margin. It is not worth
+                                # more because a break won HERE does not
+                                # survive: over 15 boards the focused score
+                                # and the final score correlate at r=-0.18.
     "RH_WALL": 300,             # generous on purpose: the width-4 cut keeps a
                                 # 96-piece core, 108 of them once --hold_band
                                 # pins row 12, and exhausted a real board in

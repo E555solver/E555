@@ -267,6 +267,32 @@ buys nothing — the stall is the only live dial, which is why `FOCUS_STALL` is
 its own setting. The final topper was the one stage genuinely truncated, so that
 is where the seconds go: `TOPPER_TIME=300`, `TOPPER_STALL=100`.
 
+**`FOCUS_STALL` was then priced, not guessed.** Run six real stage-4 boards with
+the watchdog *off* and the incumbent trace tells you what every setting would
+have done — the watchdog only stops the search, it never changes it, so one run
+prices them all:
+
+| stall | 6 boards cost | breaks lost vs 180 s/board |
+|---|---|---|
+| 5 s | 100 s | +12 |
+| 10 s | 148 s | +8 |
+| 15 s | 178 s | +8 |
+| 30 s | 337 s | +4 |
+| 60 s | 633 s | +2 |
+
+Improvements arrive in a burst — median gap between them **0.1 s**, every
+board's first at ~4.5 s — and then stop; two of the six were finished by 11 s
+and sat idle for the next 170. The late gains that exist sit behind gaps of
+**22–85 s**, so buying them means waiting out dead time on every board. 8, 10,
+12 and 15 all give the same result, so `FOCUS_STALL=10` takes the cheapest of
+them with five times the median gap as margin.
+
+And those breaks are not worth more, because one won here does not survive the
+last stage. Over the 15 boards where both numbers exist, the focused score and
+the final score correlate at **r = −0.18** — focus 384 boards averaged a *better*
+final board (442.0) than focus 385 ones (438.6). Stage 6 re-solves rows 10–15
+anyway.
+
 **The CP-SAT stages are capped by board count, and must be.** The topper and
 the ender take only `--time_limit`, which is per *solve* -- unlike the C tools
 there is no total `--wall_time` -- so a stage costs (boards in) x (time each).
