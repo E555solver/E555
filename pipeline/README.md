@@ -234,6 +234,18 @@ with cores, so a 32-thread node reaches perhaps 20. That is what `ANNEAL_BORDERS
 is sized against: annealing borders the beam will never reach is wasted Stage A
 time, and running out of them stops the sweep early.
 
+**The ender climbs a ladder, and that is the budget trap worth knowing.** Both
+ring and patch mode run one solve per rung -- `[r1 m4]`, `[r1 m8]`, `[r1 m12]`,
+... -- and each rung gets the full `--time_limit`. The rung count is
+`reach x (max_changes / 4)`: **8 solves per board** for refine, **18** for the
+harvest. A stage costs boards x rungs x time, so the numbers move fast. Before
+this was measured the defaults read as half an hour and were really four hours
+an iteration, with a harvest of `10 x 30 x 900s x 2 modes` -- **six days for one
+harvest**. `REFINE_REACH`, `REFINE_CHANGES`, `HARVEST_REACH` and
+`HARVEST_CHANGES` set the ladder length, and the settings block carries the
+arithmetic. In practice a rung stalls well before its ceiling -- 34 s against a
+90 s limit in the measured run -- so real cost runs about a third of worst case.
+
 **Budgets.** `--wall_time` covers the beamer's whole run, database build
 included, so `BEAM_WALL` under about four minutes with no `DB_FILE` is spent
 entirely on the build — the farm warns rather than letting you discover it from

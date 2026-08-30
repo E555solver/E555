@@ -88,18 +88,33 @@ S = {
     # board cap times its time limit, and the defaults below are chosen to make
     # a full iteration land near three hours at worst:
     #
-    #   beamer    BEAM_WALL                      900
-    #   finalizer FIN_WALL                       600
-    #   focused   FOCUS_TOP x FOCUS_TIME    20 x 180 = 3600
-    #   roundhouse RH_WALL                       300
-    #   final     FINAL_TOP x TOPPER_TIME   20 x 180 = 3600
-    #   refine    REFINE_TOP x REFINE_TIME  10 x 180 = 1800
+    #   beamer     BEAM_WALL                        900
+    #   finalizer  FIN_WALL                         600
+    #   focused    FOCUS_TOP x FOCUS_TIME      20 x 180 = 3600
+    #   roundhouse RH_WALL                          300
+    #   final      FINAL_TOP x TOPPER_TIME     20 x 180 = 3600
     #
-    # In practice each solve usually stalls out well before its ceiling, so the
-    # real figure is far lower -- but the worst case is what has to be bounded.
-    # The harvest is deliberately not: HARVEST_TOP x HARVEST_TIME x 2 modes is
-    # hours, and it only fires every HARVEST_EVERY iterations, on the boards
-    # about to become champions.
+    # The ender multiplies again, and this is the trap that matters. Ring and
+    # patch mode both climb a LADDER per board -- [r1 m4], [r1 m8], [r1 m12],
+    # ... -- one solve per rung, each granted the full --time_limit. The rung
+    # count is
+    #
+    #       reach x (max_changes / 4)
+    #
+    # so refine is 2 x 4 = 8 solves a board and the harvest 3 x 6 = 18. A stage
+    # therefore costs boards x rungs x time. Measured, not guessed: one refine
+    # board climbed its 8 rungs in 290s. Before the ladder was understood these
+    # defaults read as 30 minutes and were really 4 hours an iteration, with a
+    # harvest of 10 x 30 x 900s x 2 modes -- SIX DAYS for one harvest.
+    #
+    #   refine     REFINE_TOP x 8 x REFINE_TIME     5 x 8 x 45 = 1800
+    #   harvest    HARVEST_TOP x 18 x HARVEST_TIME x 2 modes
+    #                                            5 x 18 x 120 x 2 = 21600
+    #
+    # A rung usually stalls well before its ceiling -- 34s against a 90s limit
+    # in the measured run -- so the real figures run about a third of these.
+    # The harvest is deliberately the expensive one: it fires only every
+    # HARVEST_EVERY iterations, on the boards about to become champions.
     "BEAM_WALL": 900,
     "FIN_WALL": 600,
     "FOCUS_DEPTH": 8,           # rows (16-N)..12 open in the focused topper;
@@ -120,12 +135,16 @@ S = {
     "FOCUS_TOP": 20,
     "FINAL_TOP": 20,
 
-    "REFINE_TOP": 10,           # boards given one ender pass per iteration
-    "REFINE_TIME": 300,
+    "REFINE_TOP": 5,            # boards given one ender pass per iteration
+    "REFINE_TIME": 45,
+    "REFINE_REACH": 2,          # ladder: reach x (changes/4) solves per board
+    "REFINE_CHANGES": 16,
 
     "HARVEST_EVERY": 10,        # iterations between harvests
-    "HARVEST_TOP": 10,          # boards deep-endered and promoted per harvest
-    "HARVEST_TIME": 900,
+    "HARVEST_TOP": 5,           # boards deep-endered and promoted per harvest
+    "HARVEST_TIME": 120,
+    "HARVEST_REACH": 3,         # a longer ladder than refine: 18 solves a board
+    "HARVEST_CHANGES": 24,
 
     "GIVE_UP_AFTER": 10,        # consecutive FAILED iterations that end the run;
                                 # 0 never gives up. A failure is a tool exiting
@@ -481,7 +500,8 @@ def ender(inputs, out_path, run, logfh, deep):
     src = os.path.join(run, "ender_in.csv")
     write_boards(src, inputs)
     budget = S["HARVEST_TIME"] if deep else S["REFINE_TIME"]
-    reach, changes = (3, 40) if deep else (2, 16)
+    reach = S["HARVEST_REACH"] if deep else S["REFINE_REACH"]
+    changes = S["HARVEST_CHANGES"] if deep else S["REFINE_CHANGES"]
     # Ring mode first: the topper leaves its damage on and near the border ring,
     # which is exactly what the ring sweep re-threads.
     modes = ["ring", "patch"] if deep else ["ring"]
