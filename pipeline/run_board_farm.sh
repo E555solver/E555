@@ -60,10 +60,12 @@ PASS_CPSAT=180          # per CP-SAT solve; the tail runs several of them
 DB_FILE=chain.db
 CLUES=none              # none | center | all -- which Eternity II clues to hold
 FAILED_KEEP=20          # failure logs kept before the farm stops saving them
-GIVE_UP_AFTER=10        # consecutive failures that end the run. A farm left for
-                        # days should not spin on a broken setup: iterations that
-                        # die take no time, so without this it burns a core and
-                        # writes farm.log at hundreds of lines a minute
+GIVE_UP_AFTER=10        # consecutive FAILED iterations that end the run; 0 never
+                        # gives up. A failed iteration is one whose tools exited
+                        # non-zero -- not one that merely found nothing, which is
+                        # an ordinary result and never counts here. Failures cost
+                        # no time, so without this brake a broken setup spins for
+                        # days; any single success resets the count to zero.
 
 # Anything else run_pipeline.sh accepts, passed straight through to every
 # production iteration. The settings above cover what a farm normally tunes;
@@ -261,7 +263,7 @@ while true; do
         fi
         echo "[farm] iter $ITER: $WHAT FAILED (exit $STATUS) after ${TOOK}s, best still $BEST/480"
         echo "[farm] $(date '+%F %T') iter=$ITER $WHAT exit=$STATUS score=$NEW" >> "$LOG"
-        if [ "$CONSEC" -ge "$GIVE_UP_AFTER" ]; then
+        if [ "$GIVE_UP_AFTER" != 0 ] && [ "$CONSEC" -ge "$GIVE_UP_AFTER" ]; then
             echo "[farm] $CONSEC iterations in a row failed -- stopping. The setup is"
             echo "[farm] broken, not unlucky: read $FARM_DIR/failed/ for the reason."
             echo "[farm] $(date '+%F %T') stop, $CONSEC consecutive failures" >> "$LOG"
