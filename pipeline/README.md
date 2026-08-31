@@ -13,7 +13,7 @@ settings here will make far more sense afterwards.
 | `run_pipeline.sh` | the whole pipeline, borders to a finished board. `BORDERS=random` samples borders from the seed; `BORDERS=annealed` searches for them with Stage A first | 30-60 min per pass |
 | `run_pipeline_whirlpool.sh` | turns the board 90 degrees between every re-grow, so the buried bottom rows get re-searched too | hours, or one lap in minutes |
 | `run_board_farm.sh` | runs a pipeline pass in a loop forever, keeps only the best boards, and periodically re-attacks them | days |
-| `run_farm.py` | the same idea with a different chain, and boards that graduate: produced, refined once, then deeply refined into `champions.csv` and never searched again | days |
+| `run_farm.py` | the same idea with a different chain, and boards that graduate: built, endered once, then deeply endered into `elite.csv` and never searched again | days |
 | `topper_sweep.sh` | one plan of topper passes over a slice of a board file | minutes |
 | `slurm_wrapper.sh` | runs any of the above as a batch job | -- |
 
@@ -23,7 +23,7 @@ bash pipeline/run_pipeline.sh BORDERS=random        # sampled borders, start her
 bash pipeline/run_pipeline_whirlpool.sh             # four laps around the board
 bash pipeline/run_pipeline_whirlpool.sh WHIRL_ROWS=10   # just one lap
 bash pipeline/run_board_farm.sh MAX_HOURS=48        # the farm, two days
-python3 pipeline/run_farm.py DB_FILE=/tmp/E555.db  # the graduating farm
+python3 pipeline/run_farm.py DB=/tmp/E555.db THREADS=10   # the graduating farm
 ```
 
 ## How every runner works
@@ -172,187 +172,153 @@ production iteration.
 
 ### The other farm: `run_farm.py`
 
-Two runners now loop forever, and they answer different questions.
-`run_board_farm.sh` drives `run_pipeline.sh`, so it inherits that chain and
-re-attacks its champions indefinitely. `run_farm.py` runs **its own chain**,
-built around the one measured fact that shapes everything here: **no
-configuration of any tool in this repo has ever emitted a complete row 12**. So
-it stops asking the beam for one and hands the job to CP-SAT.
+Two runners loop forever and answer different questions. `run_board_farm.sh`
+drives `run_pipeline.sh`, so it inherits that chain and re-attacks its champions
+indefinitely. `run_farm.py` runs **its own chain**, built around the measured
+fact that shapes everything here: **no configuration of any tool in this repo
+has ever emitted a complete row 12**. So it stops asking the beam for one and
+hands the job to CP-SAT.
 
-    1 borders    random, or annealed every ANNEAL_EVERY-th iteration -- anneal
-                 4x ANNEAL_BORDERS restarts, keep the best quarter
-    2 beamer     to row 11, --top_columns 5, --max_emitted 0 (uncapped)
-    3 clean      rank, then E555_clean_csv.py drops the frontier siblings
-    4 topper     FOCUSED: rows (16-FOCUS_DEPTH)..12 open, to close row 12
-    5 roundhouse forward then reverse at --strip_width 4 --hold_band, on
-                 boards that really closed row 12
-    6 topper     FINAL: the top band, filling rows 13..15
-      refine     the best REFINE_TOP get one ender pass
-      harvest    every HARVEST_EVERY iterations, the best HARVEST_TOP get a
-                 deep ender and graduate
+Eight stages, one tool call each, in `produce()` and `ender()`:
+
+    1 beamer      random borders, grow to row 11, emit everything
+    2 clean_csv   drop the near-duplicates the beam emits in hundreds
+    3 topper      open rows 8..12 and close row 12
+    4 roundhouse  width 4, forward then reverse, TIES refills each
+    5 clean_csv   again, over the spirals and the boards they came from
+    6 topper      open rows 10..15 and fill the top
+    7 ender       the best ENDER_TOP, one pass                 -> good.csv
+    8 ender       every ELITE_EVERY, the best of those, deep   -> elite.csv
 
 **Boards graduate rather than being re-attacked.** A board's search history is
-simply which file it is in — `queue/produced.csv`, then `queue/refined.csv`,
-then `champions.csv`. Because every stage takes the *top N* of a ranked file,
-"remove what we just took" is a slice, so no attempt counter is stored
-anywhere. `champions.csv` is the deliverable: deeply refined, ranked, and never
-searched again, which is what makes it safe to hand to other tools while the
-farm keeps running.
+which file it is in — `boards.csv`, then `good.csv`, then `elite.csv`. Every
+stage takes the top N of a ranked file, so "remove what we just took" is a
+slice and no attempt counter is stored anywhere. `elite.csv` is the deliverable:
+deeply searched, ranked, never touched again, safe to hand to other tools while
+the farm keeps running.
 
-**Stage 3 is there because siblings are not diversity.** The beam emits in
-hundreds, but many of those boards are one board plus a different piece on the
-frontier: identical below row 11. Stage 4 frees rows 8–12 outright, so a sibling
-pair presents the *same* CP-SAT model — same locked floor, same free pool — and
-two `FOCUS_TOP` slots buy one search. Measured on a real sweep: **312 beamer
-boards carried only 126 distinct floors.** `E555_clean_csv.py` drops them
-structurally (one differing cell, its top face exposed), not on a similarity
-threshold, and ranking first is what decides which of a pair survives.
+**Stage 2 is there because siblings are not diversity.** Many of the beam's
+boards are one board plus a different piece on the frontier: identical below
+row 11. Stage 3 frees rows 8–12 outright, so a sibling pair presents the *same*
+CP-SAT model — same locked floor, same free pool — and two slots buy one search.
+Measured on a real sweep: **312 beamer boards carried only 126 distinct floors**,
+and `clean_csv` dropped 79 of them as frontier twins.
 
-**Stage 4 is the one to understand.** `--band_depth D` counts inward from the
-top edge, so the band is rows (16−D)…15, and `--locked_rows 3` locks 13–15
-empty; the solver's free range is rows **(16−D)…12**. `FOCUS_DEPTH=8` opens rows
-8–12. Depth is the whole point: the pieces needed to close row 12 are usually
-already placed somewhere in the core, and a shallow band could only draw on
-pieces still unplaced. Measured on one row-11 board at depth 8, the topper
-closed row 12 completely, taking 15 pieces from the unplaced pool and **lifting
-one out of row 11**. `FOCUS_DEPTH` is the dial to turn if row 12 will not close.
+**`spread()` picks stage 3's input, because ranking cannot.** Every row-11 board
+scores *exactly* the same — 192 pieces, break-free, so 480 − 124 = 356 — and a
+312-way tie means "the top 20" is really "the first config's first 20". Measured:
 
-**Stage 5's width is forced by the geometry.** `--rounds 3 --rotate -1` frees
-the bottom, right and top bands and keeps rows W…(15−W) × columns 0…(15−2W);
+| picking 20 from the same 233 cleaned boards | configs | distinct floors |
+|---|---|---|
+| by rank, as a naive `[:20]` would | 1 | 13 |
+| round-robin by config, one per floor | 4 | 20 |
+
+Since rows 0–7 is the whole of stage 3's problem, that is 20 different searches
+instead of 13, for the same money.
+
+**Stage 3 is the one to understand.** `--band_depth D` counts inward from the top
+edge, so the band is rows (16−D)…15, and `--locked_rows 3` locks 13–15 empty;
+the solver's free range is rows **(16−D)…12**, and depth 8 opens rows 8–12.
+Depth is the point: the pieces needed to close row 12 are usually already placed
+in the core, and a shallow band could only draw on pieces still unplaced.
+Measured on one row-11 board at depth 8, the topper closed row 12 completely,
+taking 15 pieces from the unplaced pool and **lifting one out of row 11**.
+Depth 10 was tried and is worse — 36% slower, slightly lower scores, and zero
+optimal proofs where depth 8 gets 8 in 66.
+
+**Stage 4's width is forced by the geometry.** `--rounds 3 --rotate -1` frees the
+bottom, right and top bands and keeps rows W…(15−W) × columns 0…(15−2W);
 `core_usable()` then demands every kept cell be placed, frame-legal and
-break-free. Stage 4 hands over rows 0–11 break-free, row 12 closed but carrying
+break-free. Stage 3 hands over rows 0–11 break-free, row 12 closed but carrying
 the residue, 13–15 empty:
 
 | W | keeps | verdict |
 |---|---|---|
-| 3 | rows 3–12 | row 12's breaks make **every** board unusable — a width-3 pass here skipped its whole input and did no work |
-| 4 | rows 4–11 | exactly the part stage 4 proved |
+| 3 | rows 3–12 | row 12's breaks reject it — measured, **20 of 22** boards with a complete row 12 were still refused |
+| 4 | rows 4–11 | exactly the part stage 3 proved |
 | 5 | rows 5–10 | proven too, but throws two more rows away |
 
-So W=4 is the widest core these boards can honestly offer. `--rotate -1` re-cuts
-the bottom band the beam fixed at row 0 and never revisited, which is how a
-border piece buried low can come back up.
+`--rotate -1` re-cuts the bottom band the beam fixed at row 0 and never
+revisited, which is how a border piece buried low can come back up. `--ties N`
+keeps N distinct refills per board instead of one; the tool drops a tie that
+repeats another with a single frontier piece swapped, so they are real
+alternatives.
 
-**Nothing comes back unset.** Three things see to it. Only boards that really
-closed row 12 go in (`closed_to_row`). `--hold_band` keeps the top band the cut
-would otherwise free — on a real row-12 board it reports *holding 12 piece(s) =
-3 chain level(s) in the TOP band*, so the row stage 4 worked for is not torn out
-to be searched again, and it says so in the log when it cannot. And
-`spirals_worth_keeping()` drops any output holding fewer pieces than the board
-it came from — the case `--hold_band` cannot cover, since the bottom and side
-bands must be freed for the search to happen at all. Measured before that guard
-existed: parents at 208 placed came back at **169** and took four of the six
-slots in the next stage.
+**Nothing comes back unset.** Only boards that really closed row 12 go in
+(`closed_to`), and `kept_spirals()` drops any output holding fewer pieces than
+the board it came from — a pass that cannot refill the bands it freed emits the
+deepest board it reached, and measured before that guard existed, parents at 208
+placed came back at **169** and took four of six slots in the next stage. That
+function finds a spiral's parent by id prefix (the roundhouse appends
+`_<line><tag><n>`), so it must run **before** any ranking: `E555_rank.py
+--rescore` rewrites ids to `<id>_<old field 2>`.
 
-That function finds a spiral's parent by id: the roundhouse keeps its input's
-`config_id` and appends `_<line><tag><n>`, so the parent is the board whose id
-is the longest prefix of the spiral's. It also drops a spiral that is its input
-under a new name — measured on a real row-12 board, the forward pass returned it
-with **not one piece moved** (exhausting in 0.5 s and proving the standing
-refill is the only break-free one), while the reverse pass moved 2 pieces at
-(12,0). Both must run before any ranking: `E555_rank.py --rescore` rewrites the
-id to `<id>_<old field 2>`, and a parent would stop prefixing its own spirals.
+**Was the roundhouse worth moving earlier?** Measured, no. Run on all 312 row-11
+boards *before* stage 3 it costs **1309 s** (1007 forward + 302 reverse, all
+exhaustive proofs) and never loses a piece — but paired against the same boards
+unspiralled, 16 lineages gave **1 win, 10 ties, 5 losses**. Stage 3 frees rows
+8–12, so extra row-12 pieces go back in the pool and survive only as a hint.
+It stays after stage 3, where its output is inherited.
 
 **The two topper stages behave nothing alike, and their budgets say so.**
-Measured over 24 solves of each across four production iterations, at
-`--time_limit 90 --stall_time 30`:
+Measured over 24 solves of each at `--time_limit 90 --stall_time 30`:
 
 | stage | time used | ended | mean gain |
 |---|---|---|---|
-| focused | 35.8 s, **never** reached the limit | 29% `optimal` at 17.5 s, 71% stalled having last improved ~13 s | +9.3 |
-| final | 89.1 s of 90 | **88% cut off by the clock** | +61.6 |
+| 3 (focused) | 35.8 s, **never** reached the limit | 29% `optimal` at 17.5 s, 71% stalled having last improved ~13 s | +9.3 |
+| 6 (final) | 89.1 s of 90 | **88% cut off by the clock** | +61.6 |
 
-`--time_limit` is not the focused stage's constraint, so raising `FOCUS_TIME`
-buys nothing — the stall is the only live dial, which is why `FOCUS_STALL` is
-its own setting. The final topper was the one stage genuinely truncated, so that
-is where the seconds go: `TOPPER_TIME=300`, `TOPPER_STALL=100`.
+Both stalls were then priced exactly, by running six boards with the watchdog
+**off** and replaying the incumbent trace — the watchdog only stops the search,
+it never changes it, so one trace prices every setting:
 
-**`FOCUS_STALL` was then priced, not guessed.** Run six real stage-4 boards with
-the watchdog *off* and the incumbent trace tells you what every setting would
-have done — the watchdog only stops the search, it never changes it, so one run
-prices them all:
+| stall | stage 3, 6 boards | breaks lost | stage 6, 6 boards | breaks lost |
+|---|---|---|---|---|
+| 10 s | 148 s | +8 | 444 s | +16 |
+| 30 s | 337 s | +4 | 951 s | +8 |
+| 45 s | 495 s | +3 | 1351 s | +3 |
+| 60 s | 633 s | +2 | 1411 s | +3 |
 
-| stall | 6 boards cost | breaks lost vs 180 s/board |
-|---|---|---|
-| 5 s | 100 s | +12 |
-| 10 s | 148 s | +8 |
-| 15 s | 178 s | +8 |
-| 30 s | 337 s | +4 |
-| 60 s | 633 s | +2 |
+Stage 3's improvements arrive in a burst — median gap **0.1 s**, all six first
+incumbents at ~4.5 s — then stop; the late gains sit behind gaps of 22–85 s. So
+`T1_STALL=10` buys the same result as 15, and it is not worth more because a
+break won there does not survive: over 15 boards the stage-3 score and the final
+score correlate at **r = −0.18**. Stage 6 is the opposite — median gap 0.7–2.2 s,
+every board still improving when the 300 s cap cut it off, one at 298.4 s — so
+`T2_STALL=45` is its knee, the same result as 60 for 60 s less, while 60 → 100
+costs 130 s per break. (100 was also inert: no board had a gap over 96.7 s.)
 
-Improvements arrive in a burst — median gap between them **0.1 s**, every
-board's first at ~4.5 s — and then stop; two of the six were finished by 11 s
-and sat idle for the next 170. The late gains that exist sit behind gaps of
-**22–85 s**, so buying them means waiting out dead time on every board. 8, 10,
-12 and 15 all give the same result, so `FOCUS_STALL=10` takes the cheapest of
-them with five times the median gap as margin.
+**The CP-SAT stages are capped by board count, and must be.** The topper and the
+ender take only `--time_limit`, which is per *solve* — unlike the C tools there
+is no total `--wall_time` — so a stage costs (boards in) × (time each).
+Measured: one 420 s beam emitted **425 boards**, and stage 3 was still on board
+19 twenty minutes later, about **13 hours** for that one stage. The two caps cost
+very differently: `TOP1` is ~25 s a board, `TOP2` ~250 s. Widen stage 3 freely;
+widen stage 6 only if you have the hours.
 
-And those breaks are not worth more, because one won here does not survive the
-last stage. Over the 15 boards where both numbers exist, the focused score and
-the final score correlate at **r = −0.18** — focus 384 boards averaged a *better*
-final board (442.0) than focus 385 ones (438.6). Stage 6 re-solves rows 10–15
-anyway.
-
-**The final topper is the opposite, and the same method says so.** Its
-improvements keep arriving — median gap 0.7–2.2 s — and all six boards were
-still improving when the 300 s cap cut them off, one as late as 298.4 s. Breaks
-fall from ~150 to ~37, and unlike stage 4 they land in the pool:
-
-| stall | 6 boards cost | breaks lost vs the cap |
-|---|---|---|
-| 10 s | 444 s | +16 |
-| 30 s | 951 s | +8 |
-| 45 s | 1351 s | +3 |
-| 60 s | 1411 s | +3 |
-| 100 s | 1800 s | 0 |
-
-`TOPPER_STALL=45` is the knee: the same result as 60 for 60 s less, while
-60 → 100 costs **130 s per break**. It also fixes an inert setting — no board
-had a gap over 96.7 s, so a stall of 100 never fired at all and `TOPPER_TIME`
-was silently doing all the work.
-
-**The CP-SAT stages are capped by board count, and must be.** The topper and
-the ender take only `--time_limit`, which is per *solve* -- unlike the C tools
-there is no total `--wall_time` -- so a stage costs (boards in) x (time each).
-Measured: one 420 s beam emitted **425 boards**, and the focused topper was
-still on board 19 twenty minutes later, which is about **13 hours** for that one
-stage. `FOCUS_TOP` and `FINAL_TOP` rank first and take the best N, so the
-solver's time goes to the best material the beam found rather than to whatever
-was written first.
-
-**How much the beam actually consumes.** At `BEAM_WALL=420` on four threads the
-beamer spent 96 s on init and 325 s sweeping, and got through **9 configs at
-36.1 s each**. With `--top_columns 5` that is five configs per border, so about
-1.8 borders -- roughly **4.5 borders in 900 s** on four threads. The rate scales
-with cores, so a 32-thread node reaches perhaps 20. That is what `ANNEAL_BORDERS`
-is sized against: annealing borders the beam will never reach is wasted Stage A
-time, and running out of them stops the sweep early.
-
-**The ender climbs a ladder, and that is the budget trap worth knowing.** Both
-ring and patch mode run one solve per rung -- `[r1 m4]`, `[r1 m8]`, `[r1 m12]`,
-... -- and each rung gets the full `--time_limit`. The rung count is
-`reach x (max_changes / 4)`: **8 solves per board** for refine, **18** for the
-harvest. A stage costs boards x rungs x time, so the numbers move fast. Before
-this was measured the defaults read as half an hour and were really four hours
-an iteration, with a harvest of `10 x 30 x 900s x 2 modes` -- **six days for one
-harvest**. `REFINE_REACH`, `REFINE_CHANGES`, `HARVEST_REACH` and
-`HARVEST_CHANGES` set the ladder length, and the settings block carries the
-arithmetic. In practice a rung stalls well before its ceiling -- 34 s against a
-90 s limit in the measured run -- so real cost runs about a third of worst case.
+**The ender climbs a ladder, and that is the budget trap.** Both ring and patch
+mode run one solve per rung — `[r1 m4]`, `[r1 m8]`, … — each at the full
+`--time_limit`, and the rungs number `reach × (max_changes / 4)`: **8 solves a
+board** at stage 7, **18** at stage 8. A stage costs boards × rungs × time.
+Before this was measured the defaults read as half an hour and were really four
+hours an iteration, with a deep pass of `10 × 30 × 900 s × 2 modes` — **six days**.
+In practice a rung stalls well before its ceiling, so real cost is about a third
+of worst case.
 
 **Budgets.** `--wall_time` covers the beamer's whole run, database build
-included, so `BEAM_WALL` under about four minutes with no `DB_FILE` is spent
-entirely on the build — the farm warns rather than letting you discover it from
-a day of `0 boards`. Set `DB_FILE` to an absolute path on node-local disk and
-the build happens once.
+included, so `BEAM` under about four minutes with no `DB` is spent entirely on
+the build — the farm warns rather than letting you find out from a day of
+`0 boards`. Set `DB` to an absolute path on node-local disk and the build happens
+once. A slow disk is worse than none: measured at 5.9 MB/s the beamer sat in
+`D` state at 98.8% iowait and never finished a config, where an in-memory build
+ran fine.
 
-**Unattended.** ortools is checked before iteration 1; each tool's exit code is
-checked separately, so a stage that dies does not discard what the stages
-before it made; `GIVE_UP_AFTER` consecutive failures end the run (`0` never
-gives up); pools are written atomically and `farm_state.json` lets a restart
-resume; `SIGINT`/`SIGTERM` finish the current iteration and exit 0. Per-iteration
-logs are kept only for records and failures, which is what keeps a multi-day run
-to kilobytes.
+**Unattended.** ortools is checked before iteration 1; `sh()` records every
+tool's exit code, so a stage that dies does not discard what the stages before
+it made; `GIVE_UP_AFTER` consecutive failures end the run (`0` never gives up);
+files are written atomically; `SIGINT`/`SIGTERM` finish the current iteration and
+exit 0. Per-iteration logs are kept only for records and failures, which is what
+keeps a multi-day run to kilobytes.
 
 ## The topper sweep
 
@@ -452,9 +418,10 @@ Two consequences worth knowing:
   chains, so its cache is not interchangeable with a normal one -- the beamer
   reads the exclusion set out of the cache header and rebuilds when it does not
   match, rather than returning wrong chains. The farm gives each setting its own
-  file, `$DB_FILE.center` and `$DB_FILE.all`, so switching `CLUES` between runs
-  does not throw the other cache away. The other runners take `DB_FILE` as you
-  give it, so name it yourself if you toggle clues with one of those.
+  file, `$DB.center` and `$DB.all` (`run_farm.py`) or `$DB_FILE.center` and
+  `$DB_FILE.all` (the bash farm), so switching `CLUES` between runs does not
+  throw the other cache away. The other runners take the path as you give it,
+  so name it yourself if you toggle clues with one of those.
 * **A clued whirlpool band costs up to 4x.** A band cut at `BAND_ROW=5` carries
   no clue -- the centre one sits on row 7 or 8 -- so the finalizer has no
   orientation to read and *chooses* instead, searching the band once per
