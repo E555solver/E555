@@ -293,7 +293,7 @@ def build(d):
 
     closed = read(d + "/top1.csv") or read(d + "/top1_in.csv")
     ready = [b for b in closed if closed_to(b, 12)]
-    geom = ["--rounds", 3, "--strip_width", 4, "--rotate", -1,
+    geom = ["--rounds", 3, "--strip_width", 4, "--rotate", -1, "--hold_band",
             "--ties", TIES, "--num_rows", 0, "--wall_time", RH,
             "--threads", THREADS, "--print_cmd", *clue]
     spirals = []
