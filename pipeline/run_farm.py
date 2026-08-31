@@ -256,9 +256,9 @@ def kept_spirals(spirals, parents):
     return out
 
 
-# ---- one production pass ----------------------------------------------------
+# ---- stages 1 to 6: build boards ----------------------------------------------------
 
-def produce(d):
+def build(d):
     """Stages 1 to 6, one tool call each. Returns the boards that came out."""
     clue = CLUE[CLUES]
 
@@ -336,7 +336,7 @@ def produce(d):
     return read(d + "/top2.csv") or read(d + "/top2_in.csv")
 
 
-# ---- the ender: stages 7 and 8 ----------------------------------------------
+# ---- stages 7 and 8: refine the best, graduate the very best ---------------
 
 def ender(d, boards, out, deep):
     """7 and 8. One ender pass, or ring then patch for the deep one.
@@ -374,6 +374,29 @@ def ender(d, boards, out, deep):
     return read(src)
 
 
+def refine(d, n):
+    """Stages 7 and 8. Everything built joins the pool; the best of it is
+    endered once and moves to good.csv; every ELITE_EVERY iterations the best
+    of THOSE gets the deep pass and graduates to elite.csv, where nothing
+    searches it again. Returns (endered, promoted) for the log line."""
+    rank(d + "/pool.csv", d + "/made.csv", POOL)
+    clean(d + "/pool_clean.csv", d + "/pool.csv")
+    write(POOL, read(d + "/pool_clean.csv")[:KEEP])
+
+    # 7. One ender pass for the best few, which then leave the pool for good.
+    endered = ender(d, take(POOL, ENDER_TOP), d + "/good.csv", False)
+    rank(d + "/good_all.csv", d + "/good.csv", GOOD)
+    write(GOOD, read(d + "/good_all.csv"))
+
+    # 8. The deep pass, on a schedule because it costs 18 solves a board.
+    promoted = []
+    if not STOP and ELITE_EVERY and n % ELITE_EVERY == 0:
+        promoted = ender(d, take(GOOD, ELITE_TOP), d + "/elite.csv", True)
+        rank(d + "/elite_all.csv", d + "/elite.csv", ELITE)
+        write(ELITE, read(d + "/elite_all.csv"))
+    return endered, promoted
+
+
 def take(path, n):
     """Take the best n off a file, leaving the rest. Because every stage takes
     the top of a ranked file, "remove what we just took" is a slice -- which is
@@ -406,6 +429,12 @@ def note(msg):
 
 
 def preflight():
+    """Everything that must be true before iteration 1, checked once."""
+    for stale in os.listdir(FARM):           # whatever a killed farm left
+        if stale.startswith("run_"):
+            shutil.rmtree(FARM + "/" + stale, ignore_errors=True)
+    signal.signal(signal.SIGINT, stop)       # Ctrl-C finishes the iteration
+    signal.signal(signal.SIGTERM, stop)
     if not os.path.exists(BIN + "/E555_beamer"):
         subprocess.run(["make"], cwd=REPO)
     if not os.path.exists(SEED):
@@ -423,18 +452,21 @@ def preflight():
              " Set DB, or raise BEAM past ~420." % BEAM)
 
 
+def keep_log(d, name):
+    """Copy this iteration's log out before its directory is deleted. Only
+    three things are worth keeping: a record, a failure, and an iteration that
+    quietly produced nothing -- which is the one you most need to explain."""
+    dst = FARM + "/" + name
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy(d + "/iter.log", dst)
+
+
 def main():
     global LOG, FAILED
     settings(sys.argv[1:])
     globals().update(paths())
     os.makedirs(FARM, exist_ok=True)
     preflight()
-    for stale in os.listdir(FARM):           # whatever a killed farm left
-        if stale.startswith("run_"):
-            shutil.rmtree(FARM + "/" + stale, ignore_errors=True)
-
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
     note("%s, %d threads, clues=%s, db=%s"
          % (FARM, THREADS, CLUES, DB or "<in memory>"))
 
@@ -452,24 +484,8 @@ def main():
 
         with open(d + "/iter.log", "w") as LOG:
             FAILED = 0
-            write(d + "/made.csv", produce(d))
-
-            # Everything produced joins the pool, best first, capped at KEEP.
-            rank(d + "/pool.csv", d + "/made.csv", POOL)
-            write(POOL, clean(d + "/pool_clean.csv", d + "/pool.csv")[:KEEP])
-
-            # 7. The best few get one ender pass and move on.
-            refined = ender(d, take(POOL, ENDER_TOP), d + "/good.csv", False)
-            rank(d + "/good_all.csv", d + "/good.csv", GOOD)
-            write(GOOD, read(d + "/good_all.csv"))
-
-            # 8. Every ELITE_EVERY iterations, the best of those go deep.
-            promoted = []
-            if not STOP and ELITE_EVERY and it % ELITE_EVERY == 0:
-                promoted = ender(d, take(GOOD, ELITE_TOP),
-                                 d + "/elite.csv", True)
-                rank(d + "/elite_all.csv", d + "/elite.csv", ELITE)
-                write(ELITE, read(d + "/elite_all.csv"))
+            write(d + "/made.csv", build(d))        # stages 1 to 6
+            refined, promoted = refine(d, it)       # stages 7 and 8
 
         now = max(best(ELITE), best(GOOD), best(POOL))
         took = int(time.time() - t0)
@@ -477,13 +493,10 @@ def main():
         tail = "%d made, %d endered, %d to elite" % (made, len(refined),
                                                      len(promoted))
         if not made and not FAILED:
-            # Nothing failed and nothing came out. That is the case you most
-            # need the log for, so it is the one case that used to delete it.
-            shutil.copy(d + "/iter.log", "%s/empty_iter%d.log" % (FARM, it))
+            keep_log(d, "empty_iter%d.log" % it)
         if FAILED:
             failures += 1
-            os.makedirs(FARM + "/failed", exist_ok=True)
-            shutil.copy(d + "/iter.log", "%s/failed/iter%d.log" % (FARM, it))
+            keep_log(d, "failed/iter%d.log" % it)
             note("iter %d FAILED (exit %d) after %ds, best still %d/480"
                  % (it, FAILED, took, record))
             if GIVE_UP_AFTER and failures >= GIVE_UP_AFTER:
@@ -494,7 +507,7 @@ def main():
         else:
             failures = 0
             if now > record:
-                shutil.copy(d + "/iter.log", "%s/best_%d.log" % (FARM, now))
+                keep_log(d, "best_%d.log" % now)
                 note("iter %d -> NEW RECORD %d/480 (was %d), %s in %ds"
                      % (it, now, record, tail, took))
                 record = now
