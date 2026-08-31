@@ -416,9 +416,11 @@ def preflight():
                       capture_output=True).returncode:
         die("ortools is missing, so both toppers and the ender would fail in\n"
             "        every iteration. Install it with:  pip install ortools")
-    if not DB and BEAM < 240:
-        note("warning: BEAM=%d with no DB. The beamer's budget covers building"
-             " the chain database (90-180s) before it searches at all." % BEAM)
+    if not DB and BEAM < 420:
+        note("warning: BEAM=%d with no DB. --wall_time covers the whole run and"
+             " building the chain database takes 90-180s of it, so little is"
+             " left to search with and the iteration can yield nothing at all."
+             " Set DB, or raise BEAM past ~420." % BEAM)
 
 
 def main():
@@ -471,8 +473,13 @@ def main():
 
         now = max(best(ELITE), best(GOOD), best(POOL))
         took = int(time.time() - t0)
-        tail = "%d made, %d endered, %d to elite" % (
-            len(read(d + "/made.csv")), len(refined), len(promoted))
+        made = len(read(d + "/made.csv"))
+        tail = "%d made, %d endered, %d to elite" % (made, len(refined),
+                                                     len(promoted))
+        if not made and not FAILED:
+            # Nothing failed and nothing came out. That is the case you most
+            # need the log for, so it is the one case that used to delete it.
+            shutil.copy(d + "/iter.log", "%s/empty_iter%d.log" % (FARM, it))
         if FAILED:
             failures += 1
             os.makedirs(FARM + "/failed", exist_ok=True)
