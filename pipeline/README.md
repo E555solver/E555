@@ -184,7 +184,7 @@ Eight stages, one tool call each, in `produce()` and `ender()`:
     1 beamer      random borders, grow to row 11, emit everything
     2 clean_csv   drop the near-duplicates the beam emits in hundreds
     3 topper      open rows 8..12 and close row 12
-    4 roundhouse  width 4, forward then reverse, TIES refills each
+    4 roundhouse  width 3, forward then reverse, TIES refills each
     5 clean_csv   again, over the spirals and the boards they came from
     6 topper      open rows 10..15 and fill the top
     7 ender       the best ENDER_TOP, one pass                 -> good.csv
@@ -226,17 +226,16 @@ taking 15 pieces from the unplaced pool and **lifting one out of row 11**.
 Depth 10 was tried and is worse — 36% slower, slightly lower scores, and zero
 optimal proofs where depth 8 gets 8 in 66.
 
-**Stage 4's width is forced by the geometry.** `--rounds 3 --rotate -1` frees the
-bottom, right and top bands and keeps rows W…(15−W) × columns 0…(15−2W);
-`core_usable()` then demands every kept cell be placed, frame-legal and
-break-free. Stage 3 hands over rows 0–11 break-free, row 12 closed but carrying
-the residue, 13–15 empty:
+**Stage 4 runs at width 3, to keep the row stage 3 built.** `--rounds 3
+--rotate -1` keeps rows W…(15−W) × columns 0…(15−2W), so W=3 keeps rows 3–12 ×
+columns 0–12 and frees the bottom three rows, the right three columns and rows
+13–15. Wider cuts abandon row 12 entirely:
 
-| W | keeps | verdict |
+| W | keeps | row 12 |
 |---|---|---|
-| 3 | rows 3–12 | row 12's breaks reject it — measured, **20 of 22** boards with a complete row 12 were still refused |
-| 4 | rows 4–11 | exactly the part stage 3 proved |
-| 5 | rows 5–10 | proven too, but throws two more rows away |
+| 3 | rows 3–12 × cols 0–12 | kept, except columns 13–15 |
+| 4 | rows 4–11 × cols 0–11 | **freed** — the spiral tears out what stage 3 built |
+| 5 | rows 5–10 × cols 0–10 | freed, and keeps two rows fewer still |
 
 `--rotate -1` re-cuts the bottom band the beam fixed at row 0 and never
 revisited, which is how a border piece buried low can come back up. `--ties N`
@@ -244,14 +243,23 @@ keeps N distinct refills per board instead of one; the tool drops a tie that
 repeats another with a single frontier piece swapped, so they are real
 alternatives.
 
-**Nothing comes back unset.** Only boards that really closed row 12 go in
-(`closed_to`), and `kept_spirals()` drops any output holding fewer pieces than
-the board it came from — a pass that cannot refill the bands it freed emits the
-deepest board it reached, and measured before that guard existed, parents at 208
-placed came back at **169** and took four of six slots in the next stage. That
-function finds a spiral's parent by id prefix (the roundhouse appends
-`_<line><tag><n>`), so it must run **before** any ranking: `E555_rank.py
---rescore` rewrites ids to `<id>_<old field 2>`.
+**Two things about width 3 to know before reading its logs.** First, it keeps 13
+of row 12's 16 cells, not all 16 — the right band is a vertical strip and
+necessarily crosses row 12 at columns 13–15, and no width avoids that, since
+freeing three sides always means two vertical strips. Second, `core_usable()`
+requires the kept region to be placed **and break-free**, so a board is skipped
+unless rows 3–12 are perfect. Measured on 22 real stage-3 outputs, every one
+with a complete row 12: **20 were skipped**, the breaks sitting in row 12 (×17),
+row 11 (×2) and row 9 (×1). The two that passed returned 196 and 169 placed
+against parents of 208.
+
+That is not a defect, it is the filter: stage 3 lands at 384–386 of 387, so the
+stage only fires on a board that came out clean, and a skip costs a scan rather
+than a search. `kept_spirals()` then drops any spiral that came back short, so
+the pool only ever sees one that gained. Do **not** substitute
+`--strip_width 0`: it picks the narrowest *usable* width per board, which on
+these boards means W=4 or W=5, and two W=5 boards ran 600 s and 272 s
+TRUNCATED — eating a 900 s budget for a worse result.
 
 **Was the roundhouse worth moving earlier?** Measured, no. Run on all 312 row-11
 boards *before* stage 3 it costs **1309 s** (1007 forward + 302 reverse, all

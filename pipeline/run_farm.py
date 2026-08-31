@@ -9,7 +9,7 @@ ONE ITERATION, top to bottom. Every stage is one tool call in produce():
     1 beamer      random borders, grow to row 11, emit everything
     2 clean_csv   drop the near-duplicates the beam emits in hundreds
     3 topper      open rows 8..12 and close row 12
-    4 roundhouse  width 4, forward then reverse, TIES refills each
+    4 roundhouse  width 3, forward then reverse, TIES refills each
     5 clean_csv   again, over the spirals and the boards they came from
     6 topper      open rows 10..15 and fill the top
     7 ender       the best ENDER_TOP, one pass       -> good.csv
@@ -293,16 +293,33 @@ def build(d):
 
     closed = read(d + "/top1.csv") or read(d + "/top1_in.csv")
     ready = [b for b in closed if closed_to(b, 12)]
-    geom = ["--rounds", 3, "--strip_width", 4, "--rotate", -1, "--hold_band",
+    geom = ["--rounds", 3, "--strip_width", 3, "--rotate", -1, "--hold_band",
             "--ties", TIES, "--num_rows", 0, "--wall_time", RH,
             "--threads", THREADS, "--print_cmd", *clue]
     spirals = []
 
-    # 4. ROUNDHOUSE, forward then reverse. Width 4 keeps rows 4..11 -- the part
-    #    stage 3 proved -- and frees the bottom, right and top bands; width 3
-    #    would keep row 12 as well and reject every board on the breaks left
-    #    there. --rotate -1 re-cuts the bottom band the beam fixed at row 0 and
-    #    never revisited. Only a board that really closed row 12 is worth it.
+    # 4. ROUNDHOUSE, forward then reverse, at WIDTH 3 -- the width that keeps
+    #    the most of the row stage 3 just built.
+    #
+    #    --rounds 3 --rotate -1 keeps rows W..(15-W) x columns 0..(15-2W), so
+    #    W=3 keeps rows 3..12 x columns 0..12 and frees the bottom three rows,
+    #    the right three columns and rows 13..15. It rebuilds the sides around
+    #    row 12, pulling border pieces up from row 0 that the beam fixed by
+    #    random sampling and never revisited -- the point of --rotate -1.
+    #
+    #    It keeps 13 of row 12's 16 cells, not all 16: the right band is a
+    #    vertical strip and necessarily crosses row 12 at columns 13..15. No
+    #    width avoids that -- freeing three sides always means two vertical
+    #    strips -- so a spiral can still come back short, and measured it does:
+    #    the two boards that passed the W=3 filter returned 196 and 169 placed
+    #    against parents of 208. kept_spirals() drops those, so the pool only
+    #    ever sees a spiral that gained.
+    #
+    #    core_usable() demands the kept region be placed AND break-free, so a
+    #    board is skipped unless rows 3..12 are perfect. That is the filter, and
+    #    it is strict: stage 3 lands at 384-386 of 387, so 20 of 22 measured
+    #    boards were skipped. A skip costs a scan, not a search, and a long run
+    #    on real hardware is where the clean ones show up.
     if ready:
         write(d + "/rh_in.csv", ready)
         sh(BIN + "/E555_roundhouse", SEED, d + "/rh_in.csv",
