@@ -1342,6 +1342,19 @@ spirals = [board("rndb0l0_1_0d0", range(208), spin=3),   # held its ground
 kept = [rf.board_id(x) for x in rf.kept_spirals(spirals, [full12, row11])]
 assert kept == ["rndb0l0_1_0d0", "rndb0l0_9_0d0"], kept
 
+# The last ender pass has to write to the file the caller named. It did not:
+# with one mode the result went to a scratch file, "1 endered" was logged, and
+# good.csv stayed empty -- the boards were searched and then dropped.
+calls = []
+rf.sh = lambda *cmd: (calls.append(cmd[cmd.index("--mode") + 1]),
+                      rf.write(cmd[cmd.index("--mode") - 1], ["z,1"]))[0] is None or 0
+for deep, want in ((False, ["ring"]), (True, ["ring", "patch"])):
+    del calls[:]
+    out = os.path.join(d, "ender_out_%s.csv" % deep)
+    got = rf.ender(d, ["a,1"], out, deep)
+    assert calls == want, (deep, calls)
+    assert os.path.exists(out) and got, (deep, out)
+
 # An unknown setting must stop the run, not be ignored for two days.
 r = subprocess.run([sys.executable, "pipeline/run_farm.py", "NO_SUCH=1"],
                    capture_output=True, text=True)

@@ -77,6 +77,11 @@ SETTINGS = ("REPO SEED FARM DB THREADS HOURS CLUES KEEP BEAM TOP1 T1_TIME "
 
 CLUE = {"none": [], "center": ["--clue_center"],
         "all": ["--clue_center", "--clue_corners"]}
+
+# Everything below is filled in by paths() once REPO is known, and named here
+# so the module reads without having to run main() to find out what exists.
+BIN = TOOLS = TOPPER = ENDER = ""       # where the tools are
+POOL = GOOD = ELITE = ""                # the three files boards graduate through
 STOP = False                # set by Ctrl-C, checked between stages
 LOG = None                  # this iteration's log file
 FAILED = 0                  # worst exit code this iteration. sh() records it,
@@ -351,8 +356,12 @@ def ender(d, boards, out, deep):
 
     # Ring first: the topper leaves its damage on and near the border ring,
     # which is exactly what the ring sweep re-threads.
-    for i, mode in enumerate(["ring", "patch"] if deep else ["ring"]):
-        dst = out if i else d + "/ender_%s.csv" % mode
+    modes = ["ring", "patch"] if deep else ["ring"]
+    for i, mode in enumerate(modes):
+        # The LAST pass writes to `out`; the deep one's ring pass feeds patch
+        # from a scratch file. Getting this wrong sends the single-mode result
+        # to the scratch file, and the boards never reach good.csv at all.
+        dst = out if i == len(modes) - 1 else d + "/ender_%s.csv" % mode
         sh(sys.executable, ENDER, SEED, src, dst,
            "--mode", mode, "--reach", reach, "--max_changes", changes,
            "--num_rows", 0, "--time_limit", budget,
