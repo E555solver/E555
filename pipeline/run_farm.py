@@ -6,7 +6,8 @@
 
 ONE ITERATION, top to bottom. Every stage is one tool call in produce():
 
-    1 beamer      random borders, grow to row 11, emit everything
+    0 annealer    every ANNEAL_EVERY-th iteration only; 0 = never (default)
+    1 beamer      random or annealed borders, grow to row 11, emit all
     2 clean_csv   drop the near-duplicates the beam emits in hundreds
     3 topper      open rows 8..12 and close row 12
     4 roundhouse  width 3, forward then reverse, TIES refills each
@@ -45,6 +46,11 @@ HOURS     = 0               # 0 = run until you stop it
 CLUES     = "none"          # none | center | all
 KEEP      = 500             # boards kept in boards.csv
 
+ANNEAL_EVERY   = 0          # 0 = never anneal, always random borders. 4 =
+                            # every fourth iteration anneals its border first
+ANNEAL_BORDERS = 40         # borders kept, out of 4x that many restarts
+ANNEAL_STEPS   = 500000     # below 250000 the annealer often finds none
+
 BEAM      = 900             # 1 beamer, whole stage
 TOP1      = 24              # 3 boards into the first topper
 T1_TIME   = 120             #   per-board ceiling; it has never reached this
@@ -68,7 +74,8 @@ ELITE_CHANGES = 24
 
 GIVE_UP_AFTER = 10          # consecutive failed iterations that end the run
 
-SETTINGS = ("REPO SEED FARM DB THREADS HOURS CLUES KEEP BEAM TOP1 T1_TIME "
+SETTINGS = ("REPO SEED FARM DB THREADS HOURS CLUES KEEP "
+            "ANNEAL_EVERY ANNEAL_BORDERS ANNEAL_STEPS BEAM TOP1 T1_TIME "
             "T1_STALL TIES RH TOP2 T2_TIME T2_STALL ENDER_TOP ENDER_TIME "
             "ENDER_REACH ENDER_CHANGES ELITE_EVERY ELITE_TOP ELITE_TIME "
             "ELITE_REACH ELITE_CHANGES GIVE_UP_AFTER").split()
@@ -80,7 +87,7 @@ CLUE = {"none": [], "center": ["--clue_center"],
 
 # Everything below is filled in by paths() once REPO is known, and named here
 # so the module reads without having to run main() to find out what exists.
-BIN = TOOLS = TOPPER = ENDER = ""       # where the tools are
+BIN = TOOLS = SRC = TOPPER = ENDER = ""  # where the tools are
 POOL = GOOD = ELITE = ""                # the three files boards graduate through
 STOP = False                # set by Ctrl-C, checked between stages
 LOG = None                  # this iteration's log file
@@ -256,16 +263,40 @@ def kept_spirals(spirals, parents):
     return out
 
 
+def anneal(d):
+    """Stage 0, only on an ANNEAL_EVERY-th iteration. Anneal four times the
+    borders we need and keep the best quarter. Returns the file, or None to
+    fall back to random borders -- a failed annealer must not lose an
+    iteration."""
+    raw, out = d + "/raw_rotations.csv", d + "/borders.csv"
+    sh(sys.executable, SRC + "/A_border/E555_edge_annealer.py", SEED,
+       "--restarts", 4 * ANNEAL_BORDERS, "--steps", ANNEAL_STEPS,
+       "--threads", THREADS,
+       "--w_bottom", 0, "--w_left", 1, "--w_right", 3, "--w_top", 2,
+       "--out", raw)
+
+    if not read(raw):
+        LOG.write("!! the annealer produced no border; using random ones\n")
+        return None
+    sh(sys.executable, TOOLS + "/E555_sort_rotations.py", raw,
+       "--top", ANNEAL_BORDERS, "-o", out)
+
+    return out if read(out) else None
+
+
 # ---- stages 1 to 6: build boards ----------------------------------------------------
 
-def build(d):
-    """Stages 1 to 6, one tool call each. Returns the boards that came out."""
+def build(d, n):
+    """Stages 0 to 6, one tool call each. Returns the boards that came out."""
     clue = CLUE[CLUES]
+    borders = anneal(d) if ANNEAL_EVERY > 0 and n % ANNEAL_EVERY == 0 else None
 
-    # 1. BEAMER -- random borders up to row 11, nothing capped but the clock.
-    #    Random mode counts bottoms with --samples; --num_rows does not apply.
+    # 1. BEAMER -- borders up to row 11, nothing capped but the clock. Random
+    #    mode counts bottoms with --samples and --num_rows does not apply; an
+    #    annealed run reads the border file and --num_rows is the count.
     sh(BIN + "/E555_beamer", SEED,
-       "--random_edges", "--samples", 0,
+       *([borders, "--num_rows", ANNEAL_BORDERS] if borders
+         else ["--random_edges", "--samples", 0]),
        "--stop_row", 11, "--top_columns", 5, "--max_emitted", 0,
        "--wall_time", BEAM, "--threads", THREADS,
        "--out_dir", d + "/beam", "--print_cmd",
@@ -501,7 +532,7 @@ def main():
 
         with open(d + "/iter.log", "w") as LOG:
             FAILED = 0
-            write(d + "/made.csv", build(d))        # stages 1 to 6
+            write(d + "/made.csv", build(d, it))    # stages 0 to 6
             refined, promoted = refine(d, it)       # stages 7 and 8
 
         now = max(best(ELITE), best(GOOD), best(POOL))
@@ -555,6 +586,7 @@ def paths():
         if CLUES != "none":
             db += "." + CLUES
     return {"REPO": repo, "BIN": repo + "/bin", "TOOLS": repo + "/tools",
+            "SRC": repo + "/src",
             "TOPPER": repo + "/src/C_tail/E555_topper.py",
             "ENDER": repo + "/src/C_tail/E555_ender.py",
             "SEED": SEED if os.path.isabs(SEED) else repo + "/" + SEED,

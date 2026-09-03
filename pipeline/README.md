@@ -181,7 +181,8 @@ hands the job to CP-SAT.
 
 Eight stages, one tool call each, in `produce()` and `ender()`:
 
-    1 beamer      random borders, grow to row 11, emit everything
+    0 annealer    every ANNEAL_EVERY-th iteration only; 0 = never (default)
+    1 beamer      random or annealed borders, grow to row 11, emit all
     2 clean_csv   drop the near-duplicates the beam emits in hundreds
     3 topper      open rows 8..12 and close row 12
     4 roundhouse  width 3, forward then reverse, TIES refills each
