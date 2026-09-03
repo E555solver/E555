@@ -2,6 +2,11 @@
 """check_script_flags.py -- every --flag a shipped script passes to an E555
 binary must be one that binary's argument parser accepts.
 
+"Script" means any runner in pipeline/, examples/ or tests/, in shell or in
+Python. The two are read differently -- Python statements come from the
+tokenizer, and its flags are string literals where a shell script's are bare --
+but they drift from the binaries in exactly the same way.
+
 `bash -n` proves a script parses, not that it can run: when --gumbel_tau0 and
 --gumbel_tau1 were removed from the beamer, two pipelines kept passing them and
 went on parsing perfectly. The binaries reject an unknown flag at startup, so
@@ -34,9 +39,11 @@ was meant to explain.
     python3 tests/check_script_flags.py            # every shipped script
     python3 tests/check_script_flags.py --verbose  # plus per-tool tallies
 """
+import io
 import os
 import re
 import sys
+import tokenize
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -51,11 +58,18 @@ TOOL_SOURCES = {
 SCRIPT_DIRS = ["examples", "pipeline", "tests"]
 
 FLAG_RE = re.compile(r'(?<![\w"\'-])(--[A-Za-z][A-Za-z0-9_-]*)')
+# In shell a flag is bare, and a quoted one is prose to be skipped. In Python
+# it is the other way round: every flag IS a string literal, and bare text is
+# prose. Same job, opposite quoting -- so the two need different patterns.
+PY_FLAG_RE = re.compile(r'["\'](--[A-Za-z][A-Za-z0-9_-]*)["\']')
 PARSE_RE = re.compile(r'strn?cmp\s*\([^,]+,\s*"(--[A-Za-z0-9_-]+)"')
 # Only a path into bin/ is a binary. tools/E555_rank.py must not match.
 TOOL_RE = re.compile(r'bin/(E555_[A-Za-z_]+)')
 # NAME=( ... ) and NAME+=( ... ), the two ways these scripts build argument lists
 ARRAY_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\+?=\(')
+# The Python spelling of the same thing: geom = ["--rounds", 3, ...], built in
+# one statement and passed to a binary in another.
+PY_ARRAY_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\[')
 EXPAND_RE = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\[@\]\}')
 
 
@@ -153,12 +167,45 @@ def statement_blocks(lines):
             yield start + 1, block
 
 
+def python_blocks(lines):
+    """Yield (first_line_no, [(line_no, text)]) for each Python statement.
+
+    Logical lines come from the tokenizer, so a bracketed call spanning six
+    lines is one statement and the binary named on its first line owns the
+    flags on the rest. Comments are blanked: a comment naming a flag of some
+    OTHER tool sits inside these calls, and reading it would be a false alarm.
+    String literals are kept -- that is where the flags live.
+    """
+    src = "\n".join(lines)
+    text = list(lines)
+    spans, start = [], None
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if tok.type == tokenize.COMMENT:
+                text[tok.start[0] - 1] = text[tok.start[0] - 1][:tok.start[1]]
+            elif tok.type == tokenize.NEWLINE:
+                if start is not None:
+                    spans.append((start, tok.end[0]))
+                    start = None
+            elif tok.type in (tokenize.NL, tokenize.INDENT, tokenize.DEDENT,
+                              tokenize.ENDMARKER):
+                continue
+            elif start is None:
+                start = tok.start[0]
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return                           # unparseable: not ours to judge
+    for a, b in spans:
+        yield a, [(i, text[i - 1]) for i in range(a, min(b, len(text)) + 1)]
+
+
 def check_script(path, accepts):
     """Return sorted (line_no, tool, flag) triples the tool would reject."""
     with open(path, encoding="utf-8", errors="replace") as fh:
         lines = fh.read().split("\n")
 
-    blocks = list(statement_blocks(lines))
+    is_py = path.endswith(".py")
+    flag_re = PY_FLAG_RE if is_py else FLAG_RE
+    blocks = list(python_blocks(lines) if is_py else statement_blocks(lines))
 
     # Which single binary, if any, does each statement invoke? Two binaries in
     # one statement is ambiguous, so that statement is left unattributed.
@@ -170,21 +217,40 @@ def check_script(path, accepts):
 
     # An argument array is judged against the binary whose statement expands it.
     array_tool = {}
-    for (_, block), tool in zip(blocks, owners):
-        if tool:
-            for name in EXPAND_RE.findall("\n".join(t for _, t in block)):
-                array_tool.setdefault(name, tool)
+    if is_py:
+        # Names bound to a list literal, then mentioned in a tool's statement.
+        # A list used by two different binaries is dropped rather than guessed
+        # at: a false alarm is a gate nobody can get past.
+        named = set()
+        for _, block in blocks:
+            m = PY_ARRAY_RE.match(block[0][1])
+            if m:
+                named.add(m.group(1))
+        seen = {}
+        for (_, block), tool in zip(blocks, owners):
+            if not tool:
+                continue
+            text = "\n".join(t for _, t in block)
+            for name in named:
+                if re.search(r"\b%s\b" % re.escape(name), text):
+                    seen.setdefault(name, set()).add(tool)
+        array_tool = {n: next(iter(t)) for n, t in seen.items() if len(t) == 1}
+    else:
+        for (_, block), tool in zip(blocks, owners):
+            if tool:
+                for name in EXPAND_RE.findall("\n".join(t for _, t in block)):
+                    array_tool.setdefault(name, tool)
 
     problems = set()
     for (_, block), tool in zip(blocks, owners):
         owner = tool
         if owner is None and block:
-            m = ARRAY_RE.match(block[0][1])
+            m = (PY_ARRAY_RE if is_py else ARRAY_RE).match(block[0][1])
             owner = array_tool.get(m.group(1)) if m else None
         if owner is None:
             continue                     # not attributable -- not ours to judge
         for line_no, text in block:
-            for flag in FLAG_RE.findall(text):
+            for flag in flag_re.findall(text):
                 if flag not in accepts[owner]:
                     problems.add((line_no, owner, flag))
 
@@ -253,9 +319,13 @@ def main():
     scripts = []
     for d in SCRIPT_DIRS:
         full = os.path.join(REPO, d)
-        if os.path.isdir(full):
-            scripts += [os.path.join(full, f)
-                        for f in sorted(os.listdir(full)) if f.endswith(".sh")]
+        if not os.path.isdir(full):
+            continue
+        # Runners, whatever they are written in. A Python runner passes the same
+        # flags to the same binaries and drifts from them the same way.
+        exts = (".sh", ".py") if d == "pipeline" else (".sh",)
+        scripts += [os.path.join(full, f)
+                    for f in sorted(os.listdir(full)) if f.endswith(exts)]
 
     total = 0
     for tool, missing in sorted(printcmd_gaps(accepts).items()):
@@ -268,7 +338,7 @@ def main():
         for line_no, tool, flag in check_script(path, accepts):
             print("%s:%d: %s does not accept %s" % (rel, line_no, tool, flag))
             total += 1
-        for line_no in broken_continuations(path):
+        for line_no in ([] if path.endswith(".py") else broken_continuations(path)):
             print("%s:%d: a comment here truncates the continued command above it"
                   % (rel, line_no))
             total += 1

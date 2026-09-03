@@ -92,6 +92,7 @@ ALL_STEPS=(
     "example_beamer|examples/01 both ways, random and annealed borders"
     "pipeline_full|pipeline/run_pipeline.sh, all seven stages"
     "pipeline_whirl_lap|pipeline/run_pipeline_whirlpool.sh, one lap end to end"
+    "farm_pools|run_farm.py: file handling, spread(), and the spiral guard"
     "no_stray_output|no check left a file in the repository root"
 )
 TOTAL=${#ALL_STEPS[@]}
@@ -1084,6 +1085,10 @@ step_scripts_parse() {
         bash -n "$s" || fail "$s does not parse"
         n=$((n + 1))
     done
+    for s in pipeline/*.py; do
+        python3 -m py_compile "$s" || fail "$s does not compile"
+        n=$((n + 1))
+    done
     echo "ok: $n scripts parse"
     # Parsing is not running. When --gumbel_tau0/--gumbel_tau1 were removed
     # from the beamer, two pipelines went on passing them and went on parsing
@@ -1273,6 +1278,91 @@ step_pipeline_full() {
 # bin/ and logs/ are exempt: check 1 rebuilds bin/ from scratch, and both
 # topper_sweep.sh and the pipeline runners mkdir logs/ for their Slurm headers,
 # so on a fresh clone those two appear legitimately.
+# The farm's own bookkeeping. Every tool it drives is covered elsewhere; what is
+# only here is how boards move between the pools -- and a slip there is silent,
+# because a farm that loses or re-searches boards still looks like it is working.
+step_farm_pools() {
+    python3 - <<'EOF' || fail "run_farm.py board handling is wrong"
+import importlib.util, os, subprocess, sys, tempfile
+spec = importlib.util.spec_from_file_location("rf", "pipeline/run_farm.py")
+rf = importlib.util.module_from_spec(spec); spec.loader.exec_module(rf)
+
+d = tempfile.mkdtemp()
+pool = os.path.join(d, "pool.csv")
+
+# Comments are not boards, and a round trip must not invent or drop rows.
+open(pool, "w").write("# a comment\n\nb1,1\nb2,2\nb3,3\n% another\n")
+assert rf.read(pool) == ["b1,1", "b2,2", "b3,3"], rf.read(pool)
+
+# take() is the whole graduation mechanism: what it takes must leave.
+assert rf.take(pool, 2) == ["b1,1", "b2,2"]
+assert rf.read(pool) == ["b3,3"], rf.read(pool)
+assert rf.take(pool, 9) == ["b3,3"]              # asking for more than exists
+assert rf.read(pool) == []
+assert rf.take(os.path.join(d, "nope.csv"), 3) == []      # missing file
+
+# Writes are atomic: no .tmp may survive a completed write.
+rf.write(pool, ["x,1"])
+assert not os.path.exists(pool + ".tmp")
+
+# A canonical row: id, score, pos[256], rot[256], 999 for unplaced.
+def board(ident, cells, spin=None):
+    pos = ["999"] * 256
+    for piece, cell in enumerate(cells):
+        pos[piece] = str(cell)
+    rot = ["0"] * 256
+    if spin is not None:
+        rot[spin] = "1"
+    return ",".join([ident, "0"] + pos + rot)
+
+full12 = board("rndb0l0_1", range(208))          # rows 0..12 complete
+row11 = board("rndb0l0_2", range(192))           # the beam's usual shape
+assert rf.closed_to(full12, 12) and rf.closed_to(full12, 11)
+assert not rf.closed_to(row11, 12) and rf.closed_to(row11, 11)
+assert rf.placed(full12) == 208 and rf.placed(row11) == 192
+
+# spread() picks for variety, because every row-11 board scores the same and
+# ranking cannot choose between them. Round-robin across configs, one board
+# per distinct rows 0..7 floor -- the whole of the first topper's problem.
+same_floor = board("rndb0l0_3", range(192), spin=200)   # differs above row 7
+boards = [row11, same_floor, board("rndb0l1_1", range(1, 193)),
+          board("rndb0l2_1", range(2, 194)), board("rndb0l3_1", range(3, 195))]
+picked = rf.spread(boards, 4)
+assert len(picked) == 4, picked                  # the twin floor is skipped
+assert len({rf.board_id(b).rsplit("_", 1)[0] for b in picked}) == 4
+assert len({rf.floor(b) for b in picked}) == 4
+
+# The roundhouse appends _<line><tag><n>, so a spiral's parent is the board
+# whose id is the longest prefix of its own. One that came back with fewer
+# pieces than its parent must never displace it: measured, parents at 208
+# came back at 169 and took four of six slots in the next stage.
+spirals = [board("rndb0l0_1_0d0", range(208), spin=3),   # held its ground
+           board("rndb0l0_1_0d1", range(169)),           # 39 pieces short
+           board("rndb0l0_9_0d0", range(208))]           # not ours: no parent
+kept = [rf.board_id(x) for x in rf.kept_spirals(spirals, [full12, row11])]
+assert kept == ["rndb0l0_1_0d0", "rndb0l0_9_0d0"], kept
+
+# The last ender pass has to write to the file the caller named. It did not:
+# with one mode the result went to a scratch file, "1 endered" was logged, and
+# good.csv stayed empty -- the boards were searched and then dropped.
+calls = []
+rf.sh = lambda *cmd: (calls.append(cmd[cmd.index("--mode") + 1]),
+                      rf.write(cmd[cmd.index("--mode") - 1], ["z,1"]))[0] is None or 0
+for deep, want in ((False, ["ring"]), (True, ["ring", "patch"])):
+    del calls[:]
+    out = os.path.join(d, "ender_out_%s.csv" % deep)
+    got = rf.ender(d, ["a,1"], out, deep)
+    assert calls == want, (deep, calls)
+    assert os.path.exists(out) and got, (deep, out)
+
+# An unknown setting must stop the run, not be ignored for two days.
+r = subprocess.run([sys.executable, "pipeline/run_farm.py", "NO_SUCH=1"],
+                   capture_output=True, text=True)
+assert r.returncode != 0 and "unknown setting" in r.stderr, r
+print("ok: files round-trip, take() slices, spread() varies, spirals guarded")
+EOF
+}
+
 step_no_stray_output() {
     ls -A | grep -vxE 'bin|logs' > "$OUT/root_after.txt"
     stray=$(comm -13 "$OUT/root_before.txt" "$OUT/root_after.txt" | tr '\n' ' ')
