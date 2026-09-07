@@ -77,6 +77,7 @@ value. Copy that line and you have the run, without this script in the middle.
 | `04_stage_c_close.sh` | topper + ender | the whole CP-SAT tail in the documented order: herd the breaks onto a band, sweep the ring, then patch what is left | `pip install ortools` |
 | `05_backtracker_dives.sh` | backtracker | greedy dives to triage, exhaustive DFS to prove | minutes to overnight |
 | `06_roundhouse_both_ways.sh` | roundhouse | chain two roundhouse passes per board, once each way round, so the two spirals cover all four sides | seconds to minutes |
+| `08_distiller_quickstart.sh` | distiller (+ backtracker) | triage a corpus: rank thousands of >=450 boards by how much repair headroom is left, then write the Stage C commands to attack the best of them | seconds to minutes |
 | `07_barebones_chain.sh` | all four | the whole chain in six calls, no arguments and no indirection: what the tools are actually invoked with | 8 GB RAM, ~15 min |
 
 ## They all speak the same CSV

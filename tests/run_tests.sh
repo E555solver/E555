@@ -64,6 +64,7 @@ ALL_STEPS=(
     "viewer|the known synthetic solution scores 480/480"
     "rank|measures agree with the viewer, --out verbatim, --rescore canonical"
     "rotate|a quarter-turn preserves every measure, four turns are the identity"
+    "distiller|per-board windows differ, masks cover every break, --plan runs"
     "annealer|Stage A short run: BEST lines and a beamer-format --out CSV"
     "finalizer_synth|REGRESSION: rediscovers the synthetic solution from row 10"
     "finalizer_rotations|re-imposes a matching rotations row's side assignment"
@@ -223,6 +224,66 @@ step_rank() {
 
 # A quarter-turn must move the board without changing it: same breaks, same
 # solid count, transposed span. Four turns must return the original bytes.
+# The distiller ranks by what a board could BECOME, so the regression that
+# matters is that its board-DEPENDENT layer actually varies: b* of a fixed
+# window shape is the same for every board, so a build where the window search
+# has broken still prints a plausible table, just a useless one.
+step_distiller() {
+    python3 tools/E555_distiller.py data/best_463.csv --seed_file data/seed_Edge5.txt \
+        --top 7 > "$OUT/distil.txt" 2>"$OUT/distil.err" || fail "distiller exited nonzero"
+    rows=$(grep -cE '^ *[0-9]+ ' "$OUT/distil.txt")
+    [ "$rows" = "7" ] || fail "expected 7 ranked rows, got $rows"
+
+    # All seven boards score 463, so a ranking that works has to come from the
+    # structure. Distinct window names across the corpus is the cheapest proof
+    # that the per-board window search ran at all.
+    wins=$(awk '$1 ~ /^[0-9]+$/ {print $7}' "$OUT/distil.txt" | sort -u | wc -l)
+    [ "$wins" -ge 2 ] || fail "every board picked the same window: window search is dead"
+    echo "ok: 7 boards ranked, $wins distinct windows"
+
+    # --explain names the board's own geometry; row 2's breaks reach row 10, so
+    # no top band covers them cheaply and the hull has to win.
+    python3 tools/E555_distiller.py data/best_463.csv --seed_file data/seed_Edge5.txt \
+        --explain 2 > "$OUT/distil_explain.txt" 2>&1
+    grep -q "chosen window  hull" "$OUT/distil_explain.txt" \
+        || fail "--explain 2 should pick hull, not a band"
+
+    # --plan writes into the working directory, so run it somewhere disposable.
+    ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" "$REPO/data/best_463.csv" \
+        --seed_file "$REPO/data/seed_Edge5.txt" --top 3 --plan > plan.txt 2>&1 ) \
+        || fail "distiller --plan exited nonzero"
+    [ -f "$OUT/plan_best_463/run_plan.sh" ] || fail "--plan wrote no run_plan.sh"
+    bash -n "$OUT/plan_best_463/run_plan.sh" || fail "run_plan.sh does not parse"
+    masks=$(ls "$OUT"/plan_best_463/*.holes.csv | wc -l)
+    [ "$masks" = "3" ] || fail "expected 3 hole masks, got $masks"
+
+    # A mask that misses a break is worse than useless: Stage C would re-solve a
+    # region that cannot contain the fix.
+    python3 - "$REPO" "$OUT/plan_best_463" <<'PY' || fail "a hole mask does not cover its board's breaks"
+import csv, sys
+from pathlib import Path
+root, plan = Path(sys.argv[1]), Path(sys.argv[2])
+sys.path.insert(0, str(root / "tools"))
+import E555_viewer as V, E555_distiller as D
+seed = V.load_seed(root / "data" / "seed_Edge5.txt")
+rows = [r for r in csv.reader(open(root / "data" / "best_463.csv")) if V.parse_row(r)]
+for mask_file in sorted(plan.glob("*.holes.csv")):
+    idx = int(mask_file.name[1:5])
+    _, _, pos, rot = V.parse_row(rows[idx])
+    _, bad = D.board_colors(pos, rot, seed)
+    vals = []
+    for line in open(mask_file):
+        if not line.strip().startswith("#"):
+            vals.extend(line.replace(",", " ").split())
+    if len(vals) != 256:
+        sys.exit(f"{mask_file.name}: {len(vals)} values, want 256")
+    free = {i for i, v in enumerate(vals) if int(v) == 1}
+    if not bad <= free:
+        sys.exit(f"{mask_file.name}: misses {len(bad - free)} break cell(s)")
+PY
+    echo "ok: --explain picks hull, 3 masks cover every break, run_plan.sh parses"
+}
+
 step_rotate() {
     python3 tools/E555_rotate.py data/board_example_462.csv 0 \
         --seed_file data/seed_Edge5.txt --out "$OUT/rot0.csv" > /dev/null

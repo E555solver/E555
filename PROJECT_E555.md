@@ -1955,6 +1955,64 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   memory stops depending on file size at all (14 MB for the same input), and
   without `--top` an input projected past `--max_mem` (default 8 GB) is refused
   up front instead of being OOM-killed half way.
+- **`tools/E555_distiller.py`** -- distils a corpus of high-scoring boards down
+  to the few worth Stage C time, and writes the commands to attack them. Where
+  `E555_rank.py` sorts by what a board *is*, this ranks by what it could
+  *become*. Above ~450 that distinction is the whole game: every board sits
+  within a couple of breaks of the same entropy floor, so `score` stops
+  separating them and CP-SAT time gets spread evenly over a corpus that is
+  mostly finished.
+
+  Per board it derives the **cheapest repair window** covering that board's own
+  breaks -- a T/B/L/R band at its minimal covering depth, or `hull`, a
+  1-cell-padded outline -- choosing the candidate with fewest junctions `J`.
+  Boards whose breaks hug one border get a cheap band; sprawling ones get a
+  hull, which is exactly the region no `--side` can express. That choice is what
+  `--plan` turns into a command. Then **`fixers`**: piece-orientations that
+  could sit on a break cell and match strictly more of its junctions than the
+  incumbent -- single-swap escape routes, counted exactly by four big-int ANDs
+  against the same static (side, colour) orientation index
+  `E555_backtracker.c` builds. And **`dive_min`**: the best break count
+  randomized greedy dives reach inside the window, by shelling out to
+  `bin/E555_backtracker --break_mode stuck` (absent binary is a notice, not an
+  error). `floor` is the first-moment entropy floor of the window *shape*, which
+  is board-independent by construction and therefore printed for context only --
+  it can never rank boards, and a version that ranked on it would be sorting by
+  the score it was built to replace.
+
+  On the seven boards of `data/best_463.csv`, which all score 463, the
+  structural measures separate cleanly where the score cannot: minimal covering
+  top-band depth 4/4/6/4/5/4/5, `fixers` spanning 3..25 -- and the two disagree,
+  the board with the worst window holding the most escape routes, so they are
+  genuinely independent information.
+
+  Ranking is **rank-sum** (a Borda count) over `breaks`, `J`, `fixers` and
+  `dive_min`: each board's position in each measure's ordering, added. The
+  measures are in incompatible units, so adding them directly would need
+  weights and there is no data to fit weights with; positions are unitless, so
+  nothing has to be tuned or calibrated. It degrades to three measures when the
+  dive engine is missing. The cost is that it discards magnitude, acceptable
+  only because the corpus is clustered tightly near the floor. Work runs in two
+  passes -- cheap measures on everything, mobility and dives on a shortlist --
+  which is why there is no dive budget to set. Selection finishes with a greedy
+  max-min spread over the **repair signature** (the window plus the pieces
+  inside it), deliberately not `E555_rank.py`'s whole-board agreement: a cluster
+  of beam siblings shares rows 0..11 and differs only in rows 12..15, so
+  whole-board agreement keeps one and drops the rest -- but rows 12..15 *are*
+  the repair problem, and those siblings are several different Stage C jobs.
+
+  Five flags, none of them a quality or speed knob: `--top`, `--out` (verbatim
+  re-ordering, as the ranker), `--plan`, `--explain N` (one board's ASCII map,
+  chosen window and every measure) and `--seed_file`, plus `--root` for a
+  checkout the tool was copied out of. `--plan` writes `plan_<stem>/`: one
+  `--holes` mask per kept board, named by its input row, and a `run_plan.sh`
+  whose blocks target single rows via `--start_row N --num_rows 1`. Complete
+  boards route to `E555_ender.py` -- the purpose-built endgame tool -- in
+  `--mode ring` when the window is mostly border and `--mode patch` otherwise;
+  boards with empty cells route to `E555_topper.py`. `dive_min` is sampled and
+  the backtracker seeds its RNG from the clock, so it moves a break or two
+  between runs and close ranks can swap; the window and mobility columns are
+  exact.
 - **`tools/E555_rotate.py`** -- turns every board in a CSV by `N` quarter-turns
   clockwise, same convention as `E555_roundhouse --rotate`. Lossless: the frame
   rule is identical on all four sides, so a rotated board is the same board

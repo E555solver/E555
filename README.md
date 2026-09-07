@@ -26,7 +26,9 @@ python3 tools/E555_viewer.py beam_out/beam_completions_random_10.csv
 The viewer prints the board as ASCII (with `#` marking mismatched junctions)
 and a ready-to-open [e2.bucas.name](https://e2.bucas.name) URL. To compare many
 boards instead of one, `python3 tools/E555_rank.py *.csv` ranks them by how *compact* their breaks
-are, not just how many there are. And when a stage keeps stalling on the same
+are, not just how many there are. When a corpus grows past what you can hand to CP-SAT,
+`python3 tools/E555_distiller.py boards.csv --top 25 --plan` picks the few worth the time
+and writes the Stage C commands to attack them. And when a stage keeps stalling on the same
 region, `python3 tools/E555_rotate.py FILE 1` turns every board a quarter-turn
 so the next stage attacks it from a different side; the turn is lossless and the tool re-scores to prove it.
 
@@ -61,6 +63,7 @@ any stage's output feeds the next, or itself, for iterative improvement.
 | power tool | **`E555_roundhouse`** (C, OpenMP) | Turns the board 90 deg and grows a W-wide **strip** instead of a row, so each level is one chain lookup and the frontier is W colors wide. Small enough to solve the relaxed problem exactly: a backward dynamic program says which colorings can still finish the strip *before* any piece is tried, so a hopeless board is refuted in milliseconds. **Exhaustive and deterministic** -- finishing without a solution is a proof that none exists for that cut -- and it reports the furthest it got, one board per input. `--breaks B` then fills the rest greedily so Stage C gets a complete board rather than a hole. Uses only the edge half of the database (megabytes, seconds -- no 6.4 GB arena), and re-searches three sides of the border, which no other stage does. |
 | power tool | **`E555_topper.py`** (CP-SAT) | Break minimizer with a lexicographic objective that herds breaks to the *nearest* corner (a 7+7 trip instead of 15+15); `--side` opens the top, bottom, left, right or an L-shaped pair of bands, so breaks stranded on any border can be attacked where they are, and `--holes` takes an explicit mask for a region no band can express -- a ragged patch, or the interior. The sliding-window workflow is the workhorse of late-game improvement. |
 | strong, slower | **`E555_backtracker`** (C, OpenMP) | Two engines in one: greedy dives (`--break_mode stuck`, ~10k boards/s) to triage which partials are worth pursuing, and exhaustive DFS (`any`/`lds`) that *proves* no completion exists below a given break count. Thorough where CP-SAT is opportunistic. |
+| triage | **`E555_distiller.py`** (Python) | Distils thousands of >=450 boards down to the few worth Stage C time. Ranks by what a board could *become*, not what it is: the cheapest repair window covering its own breaks, the single-swap escape routes left inside it, and how good randomized dives get there. `--plan` writes the hole masks and a runnable `run_plan.sh`. Five flags, no tuning knobs. |
 | power tool | **`E555_ender.py`** (CP-SAT) | The closer. Opens a slice of a full board and re-solves it under a move budget to drive breaks toward zero, never returning a worse board. `--mode patch` (default) repairs and compacts a local neighborhood; `--mode ring` re-threads the whole border ring so a break can heal by cascading around it. |
 
 The endgame (turning a 46x/480 board into 480/480) is the open problem;
@@ -73,9 +76,9 @@ it, you know where to send the postcard.
 src/A_border/   Stage A border annealer (pure Python)
 src/B_beam/     Stage B beamer + finalizer + roundhouse + shared database (C)
 src/C_tail/     Stage C tail toolbox (C + Python/OR-Tools)
-tools/          board viewer, ranker, rotator, CSV cleaner, rotations sorter
+tools/          board viewer, ranker, distiller, rotator, CSV cleaner, rotations sorter
 data/           seeds, example boards, masks (see data/README.md)
-examples/       seven short scripts: one per tool, plus the whole chain end to end
+examples/       eight short scripts: one per tool, plus the whole chain end to end
 pipeline/       the full pipeline, the whirlpool and the board farm, plus a
                 Slurm wrapper: long unattended runs
 tests/          run_tests.sh: the release gate

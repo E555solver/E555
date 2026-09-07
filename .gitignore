@@ -12,6 +12,8 @@ bothways_out/
 final_out/
 stage_c_out/
 topper_out/
+distiller_out/
+plan_*/
 pipeline_out/
 farm/
 tests/out/
