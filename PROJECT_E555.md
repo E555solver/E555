@@ -2067,6 +2067,16 @@ make                        # bin/E555_beamer, bin/E555_finalizer,
                             # bin/E555_roundhouse, bin/E555_backtracker
 pip install ortools         # only for topper / ender
 
+# Portability: `make` compiles for THIS cpu (-march=native), which is fastest
+# and valid nowhere else. `make ARCH=v3` targets x86-64-v3 (AVX2, Haswell and
+# later) and is the setting for a cluster of mixed Intel nodes -- one binary
+# every node can run, still tuned for the one that built it; `ARCH=v2` drops to
+# SSE4.2 for anything older; `ARCH=generic` assumes nothing and is what CI,
+# containers and cloud sandboxes want. A binary meeting a CPU older than the one
+# that built it dies with `Illegal instruction` and no further explanation, so
+# when a tool that worked yesterday stops starting, suspect this first.
+# Changing ARCH or OPT rebuilds automatically; the Makefile header has the rest.
+
 # no Stage A needed -- the 5-minute demo:
 bash examples/01_beamer_quickstart.sh
 

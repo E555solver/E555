@@ -551,8 +551,10 @@ def run_dives(recs, seed_path, backtracker, tmpdir):
                 rc = exc.returncode
                 why = f"signal {-rc}" if rc < 0 else f"exit {rc}"
                 if rc in (-4, 132):
-                    why += " (illegal instruction: rebuild with `make bin/E555_backtracker`"\
-                           " -- the Makefile uses -march=native)"
+                    why += (" (illegal instruction: the binary was built for a"
+                            " different CPU. Rebuild -- `make backtracker`, or"
+                            " `make backtracker ARCH=generic` if the machine"
+                            " that runs it is not the one that builds it)")
                 tail = (exc.stderr or b"").decode(errors="replace").strip().splitlines()
                 if tail:
                     why += f": {tail[-1]}"

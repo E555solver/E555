@@ -88,6 +88,12 @@ agent/          an experimental self-driving optimisation mode: untested and jus
 ## Requirements
 
 - GCC or Clang with OpenMP, 64-bit POSIX (Linux, WSL2, macOS+libomp).
+- `make` builds for the machine that compiles it (`-march=native`). For a
+  cluster of mixed x86-64 nodes build once with `make ARCH=v3` (AVX2, Haswell
+  and later); for CI, containers or anywhere the CPU is not yours, `make
+  ARCH=generic`. A binary run on a CPU older than the one that built it dies
+  with `Illegal instruction` and no other explanation -- see the Makefile
+  header.
 - ~8 GB RAM for Stage B (6.4 GB database + workspace); everything else is tiny.
 - Python >= 3.9; `pip install ortools` for the two CP-SAT tail tools only.
 

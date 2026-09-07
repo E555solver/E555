@@ -27,6 +27,11 @@
 # -- share one cache and want ~8 GB of RAM.
 #
 # Environment switches:
+#   ARCH=generic    build binaries that run on any CPU rather than only on
+#                   this one. Set it for CI, containers and cloud sandboxes:
+#                   -march=native is the Makefile default, and a sandbox that
+#                   migrates to different silicon mid-session leaves binaries
+#                   that die with SIGILL. See the Makefile header for v2/v3.
 #   SKIP_BEAMER=1   skip the three database checks (low-RAM machines)
 #   DB_FILE=path    keep the 6.4 GB chain database here (~6.5 GB on disk)
 #                   instead of under tests/out, so it survives the wipe and
