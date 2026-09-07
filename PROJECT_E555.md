@@ -2042,6 +2042,25 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   of a board -- a border piece's spin *is* its side, so a turned board needs a
   turned rotations file or `fin_rot_match` stops recognising it and the
   finalizer drops to `--free_edges`.
+  `--sink M` is the one transform that is *not* lossless, deliberately: it moves
+  every piece `M` rows down, so the bottom `M` rows fall out of the board and
+  their pieces return to the pool. The turn is applied first and aims it --
+  `FILE 2 --sink 3` discards what were the input's top three rows and exposes a
+  fresh top. Two rules define it: a piece landing below row 0 is unset, and a
+  piece is unset unless its grey sides are exactly the sides of its new cell
+  that face out of the board. The second empties two further rows -- the new
+  row 0, which receives an interior row with no grey face for the frame, and the
+  input's old top frame row, now at row `15-M` with its grey pointing inward. So
+  `--sink M` opens row 0 and rows `15-M .. 15`, `16(M+2)` cells, and frees
+  exactly `16(M+2)` pieces, matching the opened cells by kind as well as in
+  total. Choose `M` by the breaks left among the surviving pieces, which the run
+  reports; on `data/best_463.csv` that falls from 3..12 at `--sink 1` to 0..1 at
+  `--sink 3`. The result is a partial with holes in its frame, row 0 among them,
+  so it is Stage C input and not Stage B input. `--clue_center` keeps only the
+  boards whose centre clue is in place *after* the transform. The clue fixes an
+  orientation as well as a cell, and a translation moves the cell while leaving
+  the spin alone, so any non-zero sink breaks a clue that was already right: the
+  filter selects boards the sink puts right, which are rare. Off by default.
 
 ---
 
@@ -2154,7 +2173,7 @@ tools to the same-seed-same-threads contract.
 | `src/C_tail/E555_ender.py` | CP-SAT closer: budgeted local re-solve, `--mode patch` (compacting LNS) or `ring` (border sweep). |
 | `tools/E555_viewer.py` | Board viewer/differ + bucas URL. |
 | `tools/E555_rank.py` | Ranks/sorts board CSVs by compactness, solidity, clean rows; `--rescore` rewrites them canonically; `--diverse K` picks independent roots. |
-| `tools/E555_rotate.py` | Turns every board in a CSV by a quarter-turn multiple, losslessly. |
+| `tools/E555_rotate.py` | Turns every board in a CSV by a quarter-turn multiple, losslessly; `--sink N` drops the board N rows so the bad rows fall out of it. |
 | `data/` | Seeds, known synthetic solution, example boards, masks (see `data/README.md`). |
 | `examples/` | One small script per tool: read these first. |
 | `pipeline/` | The full pipeline, the board farm and the topper sweeps -- long unattended runs. |

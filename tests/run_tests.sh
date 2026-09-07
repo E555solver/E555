@@ -66,6 +66,7 @@ ALL_STEPS=(
     "viewer|the known synthetic solution scores 480/480"
     "rank|measures agree with the viewer, --out verbatim, --rescore canonical"
     "rotate|a quarter-turn preserves every measure, four turns are the identity"
+    "sink|--sink drops N rows, frees the frame it broke, and keeps the core intact"
     "distiller|per-board windows differ, masks cover every break, --plan runs"
     "annealer|Stage A short run: BEST lines and a beamer-format --out CSV"
     "finalizer_synth|REGRESSION: rediscovers the synthetic solution from row 10"
@@ -365,6 +366,105 @@ if len(turned) != 60 or bad:
 EOF
     echo "ok: rotation is lossless, span transposes, 4 turns = identity;"
     echo "    --rotations agrees with the turned board on all 60 frame spins"
+}
+
+step_sink() {
+    # --sink 0 must leave the rotate path byte for byte where it was.
+    python3 tools/E555_rotate.py data/best_463.csv 1 --seed_file data/seed_Edge5.txt \
+        --out "$OUT/sink_none.csv" > /dev/null
+    python3 tools/E555_rotate.py data/best_463.csv 1 --sink 0 \
+        --seed_file data/seed_Edge5.txt --out "$OUT/sink_zero.csv" > /dev/null
+    cmp -s "$OUT/sink_none.csv" "$OUT/sink_zero.csv" \
+        || fail "--sink 0 is not the identity"
+
+    for d in 2 3; do
+        python3 tools/E555_rotate.py data/best_463.csv 2 --sink $d \
+            --seed_file data/seed_Edge5.txt --out "$OUT/sink$d.csv" \
+            > "$OUT/sink$d.log" || fail "--sink $d failed"
+    done
+    # the shipped boards carry their 17 breaks in the top rows, so a 180-degree
+    # turn puts them at the bottom and --sink 3 drops all but one of them.
+    grep -q "6 of 7 clean" "$OUT/sink3.log" \
+        || fail "--sink 3 no longer leaves 6 of 7 cores break-free"
+
+    python3 - "$OUT" <<'EOF' || exit 1
+import sys
+sys.path.insert(0, "tools")
+import E555_viewer as V, E555_rank as R
+out, seed = sys.argv[1], V.load_seed(V.find_seed("data/seed_Edge5.txt"))
+SIDE, UNP = V.SIDE, V.UNPLACED
+grey = [sum(1 for x in e if x == 0) for e in seed]
+for depth in (2, 3):
+    rows = list(V.iter_records(f"{out}/sink{depth}.csv"))
+    if len(rows) != 7:
+        raise SystemExit(f"!!! --sink {depth} wrote {len(rows)} rows, expected 7")
+    for idx, cid, sol, pos, rot in rows:
+        board = V.build_board(pos, rot)          # also proves no two pieces collide
+        empty = [r * SIDE + c for r in range(SIDE) for c in range(SIDE)
+                 if board[r][c] is None]
+        # --sink N opens row 0 and rows 15-N..15, and nothing else
+        want = [0] + list(range(SIDE - 1 - depth, SIDE))
+        if sorted({c // SIDE for c in empty}) != want or len(empty) != 16 * (depth + 2):
+            raise SystemExit(f"!!! --sink {depth} row {idx}: opened {len(empty)} "
+                             f"cell(s) in rows {sorted({c // SIDE for c in empty})}")
+        # every piece still placed is legal where it sits: its grey sides are
+        # exactly the sides of its cell that face out of the board
+        for p in range(256):
+            if pos[p] == UNP:
+                continue
+            shown = V.rotate_edges(seed[p], rot[p])
+            faces = R.FRAME_SIDES.get(pos[p], ())
+            if any((shown[d] == 0) != (d in faces) for d in range(4)):
+                raise SystemExit(f"!!! --sink {depth} row {idx}: piece {p} shows "
+                                 f"grey into the board at cell {pos[p]}")
+        # and the freed pieces are exactly what the holes need, kind for kind --
+        # 4 corners, borders for the ring, inner for the interior. Without this
+        # the board is short a corner and can never be completed.
+        need, have = {0: 0, 1: 0, 2: 0}, {0: 0, 1: 0, 2: 0}
+        for c in empty:
+            need[len(R.FRAME_SIDES.get(c, ()))] += 1
+        for p in range(256):
+            if pos[p] == UNP:
+                have[grey[p]] += 1
+        if need != have:
+            raise SystemExit(f"!!! --sink {depth} row {idx}: holes need {need}, "
+                             f"the sink freed {have}")
+EOF
+
+    # Sinks compose, which is what lets N be turned one notch at a time on a
+    # file that has already been sunk.
+    python3 tools/E555_rotate.py data/best_463.csv 2 --sink 1 \
+        --seed_file data/seed_Edge5.txt --out "$OUT/sink_1a.csv" > /dev/null
+    python3 tools/E555_rotate.py "$OUT/sink_1a.csv" 0 --sink 1 \
+        --seed_file data/seed_Edge5.txt --out "$OUT/sink_1b.csv" > /dev/null
+    cmp -s "$OUT/sink_1b.csv" "$OUT/sink2.csv" \
+        || fail "--sink 1 twice did not give what --sink 2 gives once"
+
+    # the centre clue moves with the board but its spin does not, so the filter
+    # keeps only a board already carrying the spin of the cell it lands on.
+    python3 tools/E555_rotate.py data/best_463.csv 0 --sink 4 --clue_center \
+        --seed_file data/seed_Edge5.txt --out "$OUT/sink_clue.csv" > /dev/null \
+        || fail "--clue_center dropped the one qualifying board"
+    n=$(python3 tools/E555_rank.py "$OUT/sink_clue.csv" --seed_file data/seed_Edge5.txt --count)
+    [ "$n" = 1 ] || fail "--clue_center kept $n of the 7 boards, expected 1"
+    if python3 tools/E555_rotate.py data/best_463.csv 2 --sink 2 --clue_center \
+            --seed_file data/seed_Edge5.txt --out "$OUT/sink_noclue.csv" \
+            > /dev/null 2>&1; then
+        fail "--clue_center kept a board at a setting where none qualifies"
+    fi
+
+    for bad in "--sink 15" "--sink 2 --rotations" \
+               "--sink 2 --holes data/holes_open_border_TR.csv"; do
+        if python3 tools/E555_rotate.py data/best_463.csv 0 $bad \
+                --seed_file data/seed_Edge5.txt --out "$OUT/sink_bad.csv" \
+                > /dev/null 2>&1; then
+            fail "'$bad' was accepted"
+        fi
+    done
+
+    echo "ok: --sink opens row 0 and the top N+1 rows and nothing else, every"
+    echo "    surviving piece is frame-legal, the freed pieces balance the holes"
+    echo "    kind for kind, sinks compose, and --clue_center keeps 1 of 7"
 }
 
 # --verbose: the BEST lines grepped below are verbose-only, the default being

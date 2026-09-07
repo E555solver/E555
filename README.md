@@ -31,6 +31,8 @@ are, not just how many there are. When a corpus grows past what you can hand to 
 and writes the Stage C commands to attack them. And when a stage keeps stalling on the same
 region, `python3 tools/E555_rotate.py FILE 1` turns every board a quarter-turn
 so the next stage attacks it from a different side; the turn is lossless and the tool re-scores to prove it.
+Adding `--sink N` goes further and drops the board N rows, so the bad rows fall out of it
+altogether and a fresh top comes free.
 
 To validate the whole toolkit on your machine (including a regression against
 a known solution): `bash tests/run_tests.sh`.
