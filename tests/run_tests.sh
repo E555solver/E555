@@ -431,6 +431,15 @@ for depth in (2, 3):
                              f"the sink freed {have}")
 EOF
 
+    # Sinks compose, which is what lets N be turned one notch at a time on a
+    # file that has already been sunk.
+    python3 tools/E555_rotate.py data/best_463.csv 2 --sink 1 \
+        --seed_file data/seed_Edge5.txt --out "$OUT/sink_1a.csv" > /dev/null
+    python3 tools/E555_rotate.py "$OUT/sink_1a.csv" 0 --sink 1 \
+        --seed_file data/seed_Edge5.txt --out "$OUT/sink_1b.csv" > /dev/null
+    cmp -s "$OUT/sink_1b.csv" "$OUT/sink2.csv" \
+        || fail "--sink 1 twice did not give what --sink 2 gives once"
+
     # the centre clue moves with the board but its spin does not, so the filter
     # keeps only a board already carrying the spin of the cell it lands on.
     python3 tools/E555_rotate.py data/best_463.csv 0 --sink 4 --clue_center \
@@ -455,7 +464,7 @@ EOF
 
     echo "ok: --sink opens row 0 and the top N+1 rows and nothing else, every"
     echo "    surviving piece is frame-legal, the freed pieces balance the holes"
-    echo "    kind for kind, and --clue_center keeps 1 of 7 where it should"
+    echo "    kind for kind, sinks compose, and --clue_center keeps 1 of 7"
 }
 
 # --verbose: the BEST lines grepped below are verbose-only, the default being
