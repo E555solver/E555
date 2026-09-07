@@ -71,7 +71,15 @@ THE MEASURES  (a "break" is an internal junction whose two cells disagree; a
                 best-of-N statistic is already extreme-value concentrated, so
                 repeated samples of it agree. Removed rather than left in.)
 
-    rsum        the ranking. See RANK-SUM below.
+    rsum        the rank-sum: lower is better. See RANK-SUM below.
+
+    agree       how much of its repair window this board shares with the boards
+                already picked, as a percentage. Not a property of the board but
+                of the selection, which is why `rank` is NOT sorted by `rsum`:
+                the spread deliberately reaches past a slightly better board for
+                a much more independent one, so a lower `rsum` further down the
+                table is the diversity pass doing its job. Blank for rank 1,
+                which had nothing to agree with.
 
     Every measure E555_rank.py already computes (score, solid, placed, border,
     break_rows, break_cols, span, clean_b/t/l/r, corner_d, clues) is imported
@@ -120,6 +128,75 @@ STRATEGY
     pid, so it moves by a break or two between runs and boards with close rsum
     can swap places. That is the measure being honest about being a sample; the
     window, fixers and subs columns are exact and do not move.
+
+THE DIVE ENGINE -- what E555_backtracker does here, and what it took to read it
+
+    dive_min is the only measure that samples the repair landscape instead of
+    describing it, and it is not computed here: it shells out to
+    `bin/E555_backtracker --break_mode stuck`, the project's tuned dive engine.
+    A dive takes an exact fit where one exists and a minimal break where none
+    does, never backtracks, and therefore always reaches 256 pieces in one pass
+    -- piece-type counts are exactly balanced, so the candidate set is never
+    empty. It runs at ~9k-18k dives/s on four cores. Re-implementing that in
+    Python would be both slower and a second thing to keep correct.
+
+    The invocation is
+
+        bin/E555_backtracker SEED BATCH.csv OUT.csv \
+            --break_mode stuck --restarts N --breaks B --holes MASK.csv
+
+    and five things about it are worth writing down, because none is obvious
+    from the outside and two of them cost real debugging time.
+
+    1. ONE MASK PER PROCESS. --holes applies a single mask to every record in
+       the input file, so boards can only be batched when their windows are
+       byte-identical. Grouping by the window NAME is a bug: two boards both
+       reading `hull` generally have different outlines. run_dives() groups on
+       the mask itself, and trades DIVE_RUNS against the number of groups
+       (DIVE_CALL_BUDGET) so a corpus of all-distinct hulls cannot turn into
+       thousands of subprocess calls.
+
+    2. THE RNG IS NOT SEEDABLE. g_rng_master comes from the clock and the pid,
+       and there is no --rng_seed: "runs are not reproducible by design"
+       (E555_backtracker.c). Two consequences. Good: separate invocations are
+       genuinely independent samples, which is the only way to get more than
+       one number out of a tool that reports one best per record -- so DIVE_RUNS
+       short runs beat one long one for robustness against an unlucky batch.
+       Bad: this tool's own dive_min moves a break or two between runs, and
+       boards with close rsum can swap places. Everything else it prints is
+       exact.
+
+    3. IT REWRITES THE RECORD ID. The output is a canonical board CSV
+       (`config_id,score,pos[256],rot[256]`), but each record comes back tagged
+       `<input id>_<score>` -- feed it `d7` and the row says `d7_463`. The first
+       implementation matched on the whole id, parsed nothing, and reported
+       blank dive columns after 20 s of CPU with no error anywhere. _read_dive_out
+       takes the first "_"-separated segment.
+
+    4. NEITHER OBVIOUS KEY WORKS FOR MAPPING RESULTS BACK. config_id repeats in
+       real corpora -- data/best_463.csv lines 1 and 4 share
+       `lowB_free_Maha10_68` while agreeing on ZERO of 256 cells -- and the row
+       index restarts at 0 in every input file. So the batch is written with a
+       synthetic `d<seq>` id, seq counting boards across the whole run.
+
+    5. --breaks IS A CEILING THE DIVE CAN HIT. stuck mode spends a break
+       wherever no exact fit exists, and a run whose budget is too small emits
+       nothing rather than something worse. DIVE_BREAK_CEILING is deliberately
+       far above anything a real window needs.
+
+    What the numbers are worth: dives land WELL above a CP-SAT incumbent --
+    26..30 against 17 on data/best_463.csv, matching the project's own measured
+    ~28 best-of-200k on a 74-cell region whose input carried 18. So dive_min is
+    a ranking signal between windows and never a bound on one.
+
+    A dead end worth not repeating: the first design ranked on median-minus-min
+    across runs, meaning to measure the landscape's tail thickness. Measured, it
+    spread 0..2 over seven boards and separated nothing -- a best-of-N statistic
+    is already extreme-value concentrated, so repeated samples of it agree.
+    dive_min has real spread; the gap did not, and was removed.
+
+    None of this is required: without the binary the tool prints one notice and
+    ranks on the three exact measures instead.
 
 PATHS
 
@@ -306,7 +383,11 @@ def mobility(colors, cells, idx, placed_bits):
     outward frame side -- which also enforces the piece TYPE for free, since
     only a corner shows two greys. `masks` are the interior sides that have a
     placed neighbour to agree with. The incumbent matches `cur` of them, so the
-    escape routes are the candidates matching more."""
+    escape routes are the candidates matching more.
+
+    The incumbent is itself legal and matches exactly `cur`, so it falls inside
+    the "no worse" set and outside the "strictly better" one. It is subtracted,
+    so both numbers count ALTERNATIVES to what is already there."""
     better = worse = 0
     for cell in cells:
         cols = colors.get(cell)
@@ -333,7 +414,7 @@ def mobility(colors, cells, idx, placed_bits):
                 cur += 1
 
         better += popcount(_at_least(legal, masks, cur + 1))
-        worse += popcount(_at_least(legal, masks, cur))
+        worse += popcount(_at_least(legal, masks, cur)) - 1
     return better, worse
 
 
@@ -343,7 +424,8 @@ def rank_sum(recs, keys):
     """Add each board's position in each measure's ordering. Lowest wins.
 
     `keys` is (name, high_is_better) pairs. Boards missing a measure share the
-    worst position for it, so a corpus where dives did not run still ranks."""
+    worst position for it, so a corpus where dives did not run still ranks.
+    Sorts `recs` in place and returns it; ties break on breaks, then J."""
     for rec in recs:
         rec["rsum"] = 0
     for name, high_is_better in keys:
@@ -377,17 +459,21 @@ def select_spread(recs, k):
     for rec in recs:
         rec["_sig"] = repair_signature(rec)
 
+    # Each candidate carries its distance to the CLOSEST chosen board, updated
+    # against the one board just added rather than recomputed against all of
+    # them: K x M comparisons, not K x M x K. Same shape as R.select_diverse.
     chosen = [recs[0]]
     rest = recs[1:]
+    dmin = [_sig_distance(rec, chosen[0]) for rec in rest]
     while len(chosen) < k and rest:
-        best_i, best_d = 0, -1.0
-        for i, rec in enumerate(rest):
-            d = min(_sig_distance(rec, c) for c in chosen)
-            if d > best_d:
-                best_i, best_d = i, d
+        best_i = max(range(len(rest)), key=lambda i: dmin[i])
         rec = rest.pop(best_i)
-        rec["agree"] = round((1.0 - best_d) * 100)
+        rec["agree"] = round((1.0 - dmin.pop(best_i)) * 100)
         chosen.append(rec)
+        for i, cand in enumerate(rest):
+            d = _sig_distance(cand, rec)
+            if d < dmin[i]:
+                dmin[i] = d
     for rec in recs:
         rec.pop("_sig", None)
     return chosen
@@ -443,6 +529,7 @@ def run_dives(recs, seed_path, backtracker, tmpdir):
         write_mask(mask_path, mask, f"distiller window {group[0]['win']}")
 
         samples = {rec["seq"]: [] for rec in group}
+        warned = set()
         for run in range(runs):
             out = tmpdir / f"dive_{gi}_{run}.csv"
             cmd = [str(backtracker), str(seed_path), str(batch), str(out),
@@ -452,9 +539,24 @@ def run_dives(recs, seed_path, backtracker, tmpdir):
             try:
                 subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
                                stderr=subprocess.PIPE, timeout=1800)
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                print(f"[dive] group {gi} run {run} failed ({exc.__class__.__name__}); "
-                      "continuing without it", file=sys.stderr)
+            except subprocess.TimeoutExpired:
+                _dive_warn(warned, gi, "timed out")
+                continue
+            except subprocess.CalledProcessError as exc:
+                # A negative code is a signal. SIGILL (-4) here almost always
+                # means the binary was built with the Makefile's -march=native
+                # on a different machine (or a migrated VM) from the one running
+                # it -- rebuilding in place fixes it. Say so rather than making
+                # the reader guess from "CalledProcessError".
+                rc = exc.returncode
+                why = f"signal {-rc}" if rc < 0 else f"exit {rc}"
+                if rc in (-4, 132):
+                    why += " (illegal instruction: rebuild with `make bin/E555_backtracker`"\
+                           " -- the Makefile uses -march=native)"
+                tail = (exc.stderr or b"").decode(errors="replace").strip().splitlines()
+                if tail:
+                    why += f": {tail[-1]}"
+                _dive_warn(warned, gi, why)
                 continue
             for cid, breaks in _read_dive_out(out):
                 if cid in samples:
@@ -464,6 +566,17 @@ def run_dives(recs, seed_path, backtracker, tmpdir):
             got = samples[rec["seq"]]
             if got:
                 rec["dive_min"] = min(got)
+
+
+def _dive_warn(warned, gi, why):
+    """One line per failing group, not per failing run: a broken binary fails
+    every run of every group, and DIVE_RUNS x groups lines of it buries the
+    ranking that still came out fine."""
+    if gi in warned:
+        return
+    warned.add(gi)
+    print(f"[dive] window group {gi} failed -- {why}; ranking without its dives",
+          file=sys.stderr)
 
 
 def _read_dive_out(path):
@@ -493,7 +606,7 @@ def _read_dive_out(path):
 
 # -- plan emission -----------------------------------------------------------
 
-def stage_c_command(rec, root, mask_rel, clue_flags):
+def stage_c_command(rec, mask_rel, clue_flags):
     """The tool and flags implied by this board's window.
 
     The ender is the purpose-built endgame tool, so a complete board goes there;
@@ -519,6 +632,8 @@ def write_plan(recs, root, seed_path, in_path, clue_flags):
     Blocks are named by the global board sequence, and each cites the file its
     own board came from: --start_row is an index into ONE csv, so a run over
     several inputs cannot share a single $IN."""
+    # Named after the first input; a run over several files still writes one
+    # plan, and each block inside it cites its own board's file.
     out_dir = Path.cwd() / f"plan_{Path(in_path).stem}"
     out_dir.mkdir(exist_ok=True)
 
@@ -536,7 +651,7 @@ def write_plan(recs, root, seed_path, in_path, clue_flags):
         mask_name = f"{tag}_{rec['win']}.holes.csv"
         write_mask(out_dir / mask_name, rec["mask"],
                    f"rank {rank}: {rec['path']} row {rec['row']}, window {rec['win']}")
-        script, args = stage_c_command(rec, root, f'"$HERE/{mask_name}"', clue_flags)
+        script, args = stage_c_command(rec, f'"$HERE/{mask_name}"', clue_flags)
         floor = rec["floor"] if rec["floor"] is not None else "-"
         lines += [
             f"# rank {rank}  {rec['file']} row {rec['row']}  breaks={rec['breaks']}  "
@@ -561,7 +676,7 @@ def write_plan(recs, root, seed_path, in_path, clue_flags):
 TABLE = (("rank", 5), ("seq", 5), ("file", 20), ("row", 5), ("id", 16),
          ("score", 6), ("win", 6), ("cells", 6), ("J", 5), ("floor", 6),
          ("fixers", 7), ("dive_min", 9), ("break_rows", 11), ("span", 6),
-         ("clues", 6), ("rsum", 6))
+         ("clues", 6), ("rsum", 6), ("agree", 6))
 
 
 def print_table(recs):

@@ -1986,6 +1986,19 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   the board with the worst window holding the most escape routes, so they are
   genuinely independent information.
 
+  The dive engine is `E555_backtracker` itself, and the script header documents
+  what driving it from outside actually requires: `--holes` applies one mask to
+  every record in a file, so boards batch only when their windows are
+  byte-identical (grouping on the window *name* is a bug -- two `hull` boards
+  rarely share an outline); the RNG is seeded from the clock and pid with no
+  `--rng_seed`, which makes separate invocations independent samples but also
+  makes `dive_min` move a break or two between runs; and each record comes back
+  re-tagged `<id>_<score>`, so a batch written as `d7` reads back as `d7_463`.
+  The batch uses a synthetic `d<seq>` id because neither obvious key works --
+  `config_id` repeats in real corpora and the row index restarts in every input
+  file. A run that dies (`-march=native` built elsewhere is the usual cause)
+  costs one notice and its measure, not the ranking.
+
   Ranking is **rank-sum** (a Borda count) over `breaks`, `J`, `fixers` and
   `dive_min`: each board's position in each measure's ordering, added. The
   measures are in incompatible units, so adding them directly would need
@@ -1996,7 +2009,10 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   passes -- cheap measures on everything, mobility and dives on a shortlist --
   which is why there is no dive budget to set. Selection finishes with a greedy
   max-min spread over the **repair signature** (the window plus the pieces
-  inside it), deliberately not `E555_rank.py`'s whole-board agreement: a cluster
+  inside it), reported as the `agree` column -- which is why the printed `rank`
+  is deliberately *not* sorted by `rsum`: the spread reaches past a slightly
+  better board for a much more independent one. It is deliberately not
+  `E555_rank.py`'s whole-board agreement: a cluster
   of beam siblings shares rows 0..11 and differs only in rows 12..15, so
   whole-board agreement keeps one and drops the rest -- but rows 12..15 *are*
   the repair problem, and those siblings are several different Stage C jobs.
