@@ -56,6 +56,70 @@ GEOMETRY  (n quarter-turns CLOCKWISE, viewed the way E555_viewer prints:
     the leading meta fields of every board row are copied unchanged, so the id
     of a rotated row still names the board it came from.
 
+SINKING  (--sink N)
+
+    A turn moves the breaks around the board; it does not remove them. --sink N
+    does: it translates every piece N rows down, so the input's bottom N rows
+    fall out of the board and their pieces go back in the pool. Turn first and
+    the sink eats whichever side you aim it at -- `FILE 2 --sink 3` drops the
+    top three rows of the input, which is the point of it. The turn is a
+    positional N, as always here; there is no --rotate flag on this tool.
+
+    Two rules, and everything else follows from them.
+
+    fall    a piece landing below row 0 is unset. That is the N rows you asked
+            to sink.
+
+    frame   a piece is unset unless its grey sides are exactly the sides of its
+            new cell that face out of the board. Grey is the frame colour and
+            nothing else -- of the 256 pieces, 196 carry no grey side, 56 carry
+            one and 4 carry two -- so this one test places every piece.
+
+    The frame rule is what leaves a board rather than a wreck, and it fires in
+    two places you did not ask for:
+
+      - row 0 receives the input's row N, an interior row whose pieces have no
+        grey south face, so the whole row is unset. A sink removes N+1 rows of
+        pieces, not N, and opens a fresh bottom border.
+
+      - the input's top frame row lands at row 15-N, its 14 border pieces and 2
+        corners now showing grey into the interior. Grey matches nothing but the
+        outside of the board, so leaving them placed would be 16 mismatches no
+        solver could ever repair. They are unset instead, which is also how all
+        four corners come free.
+
+    So --sink N opens row 0 and rows 15-N..15 -- 16(N+2) cells -- and frees
+    exactly 16(N+2) pieces. The two counts are equal by kind as well as in
+    total, corner for corner and border for border: what the sink takes off the
+    board is exactly what the board it leaves behind has room for.
+
+    Sinks compose, so N is a dial you can turn one notch at a time on the same
+    file: --sink 1 twice returns the boards --sink 2 returns, byte for byte.
+
+    Measured on data/best_463.csv (7 boards, 17 breaks each in the top rows) at
+    `FILE 2 --sink N`, the last column being the breaks left among the pieces
+    that survive:
+
+        --sink 1   opens rows 0, 14..15    48 cells    9 8 12 8 3 6 7
+        --sink 2   opens rows 0, 13..15    64 cells    1 2  1 0 1 0 1
+        --sink 3   opens rows 0, 12..15    80 cells    0 0  1 0 0 0 0
+
+    That last column is what N is chosen by, and the run reports it: six of
+    these seven boards keep a perfectly matched 176-piece core at --sink 3.
+
+THE CENTRE CLUE  (--clue_center)
+
+    The centre clue is piece 138 at one of four (cell, spin) pairs -- (7,7):0,
+    (8,7):3, (8,8):2, (7,8):1, one per board orientation. A translation moves a
+    piece's cell and leaves its spin alone, so after a sink the clue is in place
+    only if 138 already carried the spin belonging to the cell it lands on.
+    --clue_center keeps only the boards where it does, and drops the rest.
+
+    That is a roughly 1-in-250 event per (turn, depth). Of the twenty settings
+    tried on the seven shipped boards, `FILE 0 --sink 4` kept one board and
+    every other setting kept none, so an empty result is the normal outcome
+    rather than a failure. Off by default.
+
 VERIFICATION
 
     Every row's matched-edge count is recomputed after the turn and compared
@@ -63,6 +127,13 @@ VERIFICATION
     score is a bug, not a result -- and any row where they differ is reported
     loudly and makes the run exit non-zero. The seed is used for nothing else,
     so passing the wrong one weakens the check but cannot corrupt the output.
+
+    A sink is not lossless -- it destroys the junctions to the rows it drops --
+    but it must not touch the ones it keeps. A translation cannot change the
+    junction between two pieces that both survive it, so the sunk board's
+    matched edges are compared with the same board's before the sink, with
+    exactly the pieces the sink freed lifted out of it. Same law, same
+    treatment: a row where they differ is named and dropped.
 
 MASKS
 
@@ -86,6 +157,11 @@ CAVEATS
     --BL/--BR/--TL/--TR -- moves with the board, and that stage has to be told
     the new position.
 
+    A sunk board has holes in its frame, row 0 among them, so it is a partial
+    and not a complete board however complete its input was. This tool is a
+    geometric transform and emits nothing but boards: which cells the next
+    stage should open, and which stage that is, are the next stage's business.
+
 USAGE
 
     python3 E555_rotate.py best_463.csv 1       # 90 deg CW  -> best_463_rot1.csv
@@ -107,6 +183,16 @@ USAGE
 
     turns the mask with the board, to board_rot1.csv and
     holes_open_border_TR_rot1.csv. Works with --all too.
+
+    python3 E555_rotate.py best_463.csv 2 --sink 3   # -> best_463_rot2_sink3.csv
+    python3 E555_rotate.py best_463.csv --sink 1     # no turn, sink one row
+    python3 E555_rotate.py best_463.csv --all --sink 2      # four turns, sunk
+    python3 E555_rotate.py best_463.csv --sink 1 --clue_center
+
+    N may be omitted when --sink is given, and --sink 0 is the identity, so
+    `--sink $DEPTH` scripts without a special case. --holes and --rotations are
+    both refused with --sink: a mask names cells in the geometry before the
+    sink, and a rotations row is a spin per piece with no rows to move.
 """
 from __future__ import annotations
 import argparse, csv, sys
@@ -114,6 +200,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import E555_viewer as V                      # seed loading, row parsing, board build
+import E555_rank as R                        # FRAME_SIDES: the frame rule, already written
 
 SIDE, N_PIECES, N_TRAILING, UNPLACED = V.SIDE, V.N_PIECES, V.N_TRAILING, V.UNPLACED
 
@@ -133,14 +220,62 @@ def rotate_board(pos, rot, n):
     return new_pos, new_rot
 
 
+def frame_legal(cell, pid, spin, seed):
+    """May piece `pid` at spin `spin` sit on `cell`?
+
+    It may exactly when its grey sides are the sides of the cell that face out
+    of the board: an inner piece (no grey) anywhere off the frame, a border
+    piece with its one grey side pointing out, a corner with both of them. The
+    same rule everything downstream assumes, read off R.FRAME_SIDES."""
+    shown = V.rotate_edges(seed[pid], spin)
+    out = R.FRAME_SIDES.get(cell, ())
+    return all((shown[d] == 0) == (d in out) for d in range(4))
+
+
+def sink_board(pos, rot, n, seed):
+    """Move every piece n rows down; unset what cannot survive the move.
+
+    Returns the new pos array only: a translation does not turn a tile, so rot
+    is unchanged, and a freed piece keeps its old spin for the same reason an
+    already-unplaced one does -- nothing reads it, and rewriting it would only
+    obscure the diff."""
+    new_pos = list(pos)
+    for pid, cell in enumerate(pos):
+        if cell == UNPLACED:
+            continue
+        r, c = divmod(cell, SIDE)
+        dst = (r - n) * SIDE + c
+        new_pos[pid] = dst if r >= n and frame_legal(dst, pid, rot[pid], seed) \
+            else UNPLACED
+    return new_pos
+
+
+def matched(pos, rot, seed):
+    """(matched junctions, junctions with a placed piece on both sides)."""
+    st = V.board_stats(V.build_board(pos, rot), seed)
+    return st["h_ok"] + st["v_ok"], st["h_tot"] + st["v_tot"]
+
+
 def score(pos, rot, seed):
     """Matched internal edges, 0..480 -- the invariant a turn must preserve."""
-    return V.board_stats(V.build_board(pos, rot), seed)["correct_edges"]
+    return matched(pos, rot, seed)[0]
 
 
-def rotate_file(path, n, out_path, seed):
-    """Write the rotated copy of `path`; return (board rows, other rows, bad rows)."""
-    idx = boards = others = bad = 0        # idx counts board rows read, good or not
+def lift(pos, keep):
+    """`pos` with every piece the sink freed unset, and nothing moved.
+
+    The board the sunk one is compared against: same pieces, same cells, so any
+    difference in matched edges is the translation's doing and therefore a bug."""
+    return [p if keep[pid] != UNPLACED else UNPLACED for pid, p in enumerate(pos)]
+
+
+def rotate_file(path, n, out_path, seed, sink=0, clue_center=False):
+    """Write the transformed copy of `path`.
+
+    Returns (board rows written, other rows, bad rows, rows the clue filter
+    dropped, the breaks left in each written board's surviving core)."""
+    idx = boards = others = bad = dropped = 0   # idx counts board rows read, good or not
+    cores = []
     with open(path, newline="") as fh, open(out_path, "w", newline="") as out:
         writer = csv.writer(out, lineterminator="\n")   # LF, not the csv module's CRLF
         for raw in csv.reader(fh):
@@ -168,10 +303,30 @@ def rotate_file(path, n, out_path, seed):
                       f"{after} under the turn -- row dropped", file=sys.stderr)
                 bad += 1
                 continue
+            core = None
+            if sink:
+                sunk = sink_board(new_pos, new_rot, sink, seed)
+                kept, total = matched(sunk, new_rot, seed)
+                # the law: the translation may destroy junctions, never alter one
+                # it keeps, so the same pieces score the same before the move.
+                if kept != score(lift(new_pos, sunk), new_rot, seed):
+                    print(f"[ERROR] row {idx - 1} ({cid}): the sink changed a "
+                          "junction between two surviving pieces -- row dropped",
+                          file=sys.stderr)
+                    bad += 1
+                    continue
+                new_pos, core = sunk, total - kept
+            # the filter reads the board as written, so it means the same thing
+            # whether the transform was a turn, a sink, or both.
+            if clue_center and not V.clue_orient(new_pos, new_rot, V.CLUE_CENTER)[1]:
+                dropped += 1
+                continue
+            if core is not None:
+                cores.append(core)
             meta = fields[:-N_TRAILING]        # leading fields carried through
             writer.writerow(meta + [str(v) for v in new_pos + new_rot])
             boards += 1
-    return boards, others, bad
+    return boards, others, bad, dropped, cores
 
 
 # Seed order is (N, E, S, W) and grey is colour 0. A border piece carries one
@@ -316,9 +471,10 @@ def rotate_holes(path, n, out_path):
     return sum(sum(row) for row in new)
 
 
-def turned_name(src, n):
-    """The default output path for `src` under n quarter-turns: FILE_rotN.ext."""
-    return src.with_name(f"{src.stem}_rot{n}{src.suffix}")
+def turned_name(src, n, sink=0):
+    """The default output path: FILE_rotN.ext, plus _sinkM when sinking."""
+    tag = f"_rot{n}" + (f"_sink{sink}" if sink else "")
+    return src.with_name(f"{src.stem}{tag}{src.suffix}")
 
 
 def main():
@@ -335,6 +491,15 @@ def main():
     ap.add_argument("--all", action="store_true",
                     help="write all four turns at once (_rot0 .. _rot3); takes "
                          "no N, --out or --holes_out")
+    ap.add_argument("--sink", type=int, default=0, metavar="M",
+                    help="after the turn, move every piece M rows down: the "
+                         "bottom M rows fall out of the board, row 0 and the "
+                         "top M+1 rows come free. 0..14, 0 = no sink. N may be "
+                         "omitted when this is given.")
+    ap.add_argument("--clue_center", action="store_true",
+                    help="keep only boards whose centre clue is in place after "
+                         "the transform (piece 138 at one of its four cells and "
+                         "spins). Very selective; off by default.")
     ap.add_argument("--out", metavar="FILE",
                     help="output path (default: the input with _rotN appended)")
     ap.add_argument("--rotations", action="store_true",
@@ -355,13 +520,22 @@ def main():
     if args.all and (args.out or args.holes_out):
         raise SystemExit("[ERROR] --all writes four files and names them itself; "
                          "drop --out / --holes_out")
-    if args.n is None and not args.all:
-        raise SystemExit("[ERROR] give N (0..4), or --all for every turn")
+    if args.n is None and not (args.all or args.sink):
+        raise SystemExit("[ERROR] give N (0..4), --all for every turn, or --sink M")
     if args.holes_out and not args.holes:
         raise SystemExit("[ERROR] --holes_out only means something with --holes")
     if args.rotations and args.holes:
         raise SystemExit("[ERROR] --rotations turns a border's side assignment, "
                          "which has no cells for a --holes mask to name")
+    if not 0 <= args.sink <= SIDE - 2:
+        raise SystemExit(f"[ERROR] --sink {args.sink} is outside 0..{SIDE - 2}; "
+                         f"{SIDE - 1} rows down leaves an empty board")
+    if args.sink and args.rotations:
+        raise SystemExit("[ERROR] --rotations is a spin per piece, not a board: "
+                         "it has no rows to sink")
+    if args.sink and args.holes:
+        raise SystemExit("[ERROR] --holes names cells in the geometry before the "
+                         "sink; turn the mask in a separate run")
 
     src = Path(args.input)
     if not src.exists():
@@ -375,17 +549,24 @@ def main():
         raise SystemExit(f"[ERROR] refusing to overwrite the mask '{holes}'")
 
     seed = V.load_seed(V.find_seed(args.seed_file))
-    turns = [0, 1, 2, 3] if args.all else [args.n % 4]
+    turns = [0, 1, 2, 3] if args.all else [(args.n or 0) % 4]
     rc = 0
 
     for turn in turns:
-        dst = Path(args.out) if args.out else turned_name(src, turn)
+        dst = Path(args.out) if args.out else turned_name(src, turn, args.sink)
         if dst.resolve() == src.resolve():
             raise SystemExit(f"[ERROR] refusing to overwrite the input '{src}'")
+        dropped, cores = 0, []
         if args.rotations:
             boards, others, bad = rotate_rotations(src, turn, dst, seed)
         else:
-            boards, others, bad = rotate_file(src, turn, dst, seed)
+            boards, others, bad, dropped, cores = rotate_file(
+                src, turn, dst, seed, args.sink, args.clue_center)
+        if not boards and dropped:
+            raise SystemExit(f"[ERROR] --clue_center dropped all {dropped} board "
+                             "row(s): none carries piece 138 at a centre cell "
+                             "with the spin that cell wants. Try another --sink "
+                             "depth or another turn")
         if not boards:
             raise SystemExit(f"[ERROR] no {'border' if args.rotations else 'board'} "
                              f"rows survived from {src}")
@@ -402,6 +583,17 @@ def main():
             rc = 1
         else:
             print(f"[rot] {check}")
+        if args.sink:
+            opened = [0] + list(range(SIDE - 1 - args.sink, SIDE))
+            # cells, not pieces: a partial input may already have had some of
+            # them empty, so this is what the sink opens, not what it freed.
+            print(f"[rot] sunk {args.sink} row(s): rows "
+                  + ", ".join(str(r) for r in opened)
+                  + f" now open -- {16 * (args.sink + 2)} cell(s)")
+            print(f"[rot] breaks left in the surviving core: min {min(cores)}, "
+                  f"max {max(cores)}, {cores.count(0)} of {len(cores)} clean")
+        if dropped:
+            print(f"[rot] --clue_center kept {boards} row(s) and dropped {dropped}")
         print(f"[out] {dst}")
 
         if holes:
