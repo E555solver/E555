@@ -1,25 +1,19 @@
 #!/usr/bin/env python3
 """
-E555_rotate.py -- turn every board in a CSV by a quarter-turn multiple.
+E555_rotate.py -- rigid transforms of a board CSV: quarter-turns, and --sink.
 
 WHY
 
-    A board's open cells, and the breaks around them, sit wherever the search
-    that produced them left off -- in practice all bunched against one edge.
-    Everything downstream is direction-biased: the finalizer frees rows from
-    the top down, the roundhouse grows its strip against one border, the
-    topper herds breaks toward the nearest corner, and the backtracker's cell
-    orders start from a fixed corner. A region that is awkward to attack from
-    the top may be easy from the left.
+    Every stage downstream is direction-biased: the finalizer frees rows from
+    the top down, the roundhouse grows its strip against one border, the topper
+    herds breaks toward the nearest corner, the backtracker orders cells from a
+    fixed corner. A region that is awkward to attack from the top may be easy
+    from the left, so turning a board and re-running the same stage is a real
+    move. Run 0/1/2/3 and hand all four to the next stage.
 
-    Rotating is free and lossless. The frame rule is the same on all four
-    sides (every outward border side must be grey), the board is square, and
-    the piece set never changes -- so a rotated board is the same board seen
-    from a different corner. What moves is WHICH rows and columns hold the
-    open cells, and therefore which direction the next stage gets to eat them
-    from.
-
-    Run the same board at 0/1/2/3 and hand all four to the next stage.
+    A turn is lossless: the frame rule is the same on all four sides, the board
+    is square, and the piece set never changes. A sink is not, deliberately --
+    it throws rows away.
 
 WHAT A TURN PRESERVES  (measured with tools/E555_rank.py)
 
@@ -28,171 +22,140 @@ WHAT A TURN PRESERVES  (measured with tools/E555_rank.py)
     rotated      one clockwise turn sends clean_b -> clean_l -> clean_t ->
                  clean_r -> clean_b, following the board
     different    border, and only it. Its walk starts at a fixed corner, so an
-                 incomplete frame reports a different arc from each of the
-                 four starting points -- 28 / 13 / 0 / 0 on
+                 incomplete frame reports a different arc from each of the four
+                 starting points -- 28 / 13 / 0 / 0 on
                  data/board_partial_row12.csv. A complete, break-free frame
                  gives 60 whichever way you turn it.
 
 GEOMETRY  (n quarter-turns CLOCKWISE, viewed the way E555_viewer prints:
            row 0 at the BOTTOM, col 0 at the LEFT)
 
-    cell    one turn sends (r, c) -> (SIDE-1-c, r), applied n times: the
-            bottom-left corner goes to the top-left, top-left to top-right,
-            and so on round.
+    cell    (r, c) -> (SIDE-1-c, r), applied n times.
+    spin    (spin + 3n) % 4, from the seed convention
+            shown[d] = seed[(d + spin) % 4].
 
-    spin    turning a tile clockwise moves its north face to the east, so the
-            colour now shown on side d is the one that used to be on side d-1.
-            With the seed convention shown[d] = seed[(d + spin) % 4] that makes
-            the new spin (spin + 3n) % 4.
+    The same convention as `bin/E555_roundhouse --rotate K`, which turns the
+    board internally by exactly this map.
 
-    This is the same convention as `bin/E555_roundhouse --rotate K`, which
-    turns the board internally by exactly this map, so the two agree on what
-    "one turn clockwise" means.
+    Unplaced pieces (pos == 999) keep both fields untouched. Rows that are not
+    boards -- comments, headers -- pass through verbatim, and the leading meta
+    fields of a board row are copied unchanged, so a transformed row still names
+    the board it came from.
 
-    Unplaced pieces (pos == 999) keep both fields untouched; their rotation is
-    meaningless and rewriting it would only obscure diffs.
+SINKING  (--sink M)
 
-    Rows that are not boards -- comments, headers -- pass through verbatim, and
-    the leading meta fields of every board row are copied unchanged, so the id
-    of a rotated row still names the board it came from.
+    --sink M translates every piece M rows down. The turn is the positional N,
+    applied first, which is how the sink is aimed: `FILE 2 --sink 3` turns the
+    board 180 degrees and then drops what were the input's top three rows.
 
-SINKING  (--sink N)
+    Two rules define it.
 
-    A turn moves the breaks around the board; it does not remove them. --sink N
-    does: it translates every piece N rows down, so the input's bottom N rows
-    fall out of the board and their pieces go back in the pool. Turn first and
-    the sink eats whichever side you aim it at -- `FILE 2 --sink 3` drops the
-    top three rows of the input, which is the point of it. The turn is a
-    positional N, as always here; there is no --rotate flag on this tool.
-
-    Two rules, and everything else follows from them.
-
-    fall    a piece landing below row 0 is unset. That is the N rows you asked
-            to sink.
-
+    fall    a piece landing below row 0 is unset -- the M rows you asked to sink.
     frame   a piece is unset unless its grey sides are exactly the sides of its
             new cell that face out of the board. Grey is the frame colour and
-            nothing else -- of the 256 pieces, 196 carry no grey side, 56 carry
-            one and 4 carry two -- so this one test places every piece.
+            nothing else, so this single test places every piece.
 
-    The frame rule is what leaves a board rather than a wreck, and it fires in
-    two places you did not ask for:
+    The frame rule fires in two places besides the M rows that fall:
 
-      - row 0 receives the input's row N, an interior row whose pieces have no
-        grey south face, so the whole row is unset. A sink removes N+1 rows of
-        pieces, not N, and opens a fresh bottom border.
+    row 0        receives an interior row, whose pieces carry no grey south
+                 face, so it empties -- a fresh bottom border to solve.
+    row 15-M     receives the input's top frame row, its 14 border pieces and 2
+                 corners now showing grey inward. They are unset, which is also
+                 how all four corners come free.
 
-      - the input's top frame row lands at row 15-N, its 14 border pieces and 2
-        corners now showing grey into the interior. Grey matches nothing but the
-        outside of the board, so leaving them placed would be 16 mismatches no
-        solver could ever repair. They are unset instead, which is also how all
-        four corners come free.
+    So --sink M opens row 0 and rows 15-M..15 -- 16(M+2) cells -- and frees
+    exactly 16(M+2) pieces, matching the opened cells by kind as well as in
+    total. Sinks compose: --sink 1 twice returns what --sink 2 returns, byte for
+    byte, so M is a dial you can turn one notch at a time on the same file.
 
-    So --sink N opens row 0 and rows 15-N..15 -- 16(N+2) cells -- and frees
-    exactly 16(N+2) pieces. The two counts are equal by kind as well as in
-    total, corner for corner and border for border: what the sink takes off the
-    board is exactly what the board it leaves behind has room for.
+    Choose M by the breaks left among the surviving pieces, which the run
+    reports. On data/best_463.csv (7 boards, 17 breaks each in the top rows) at
+    `FILE 2 --sink M`:
 
-    Sinks compose, so N is a dial you can turn one notch at a time on the same
-    file: --sink 1 twice returns the boards --sink 2 returns, byte for byte.
+        --sink 1   opens rows 0, 14..15    48 cells    3..12 breaks left
+        --sink 2   opens rows 0, 13..15    64 cells    0..2
+        --sink 3   opens rows 0, 12..15    80 cells    0..1
 
-    Measured on data/best_463.csv (7 boards, 17 breaks each in the top rows) at
-    `FILE 2 --sink N`, the last column being the breaks left among the pieces
-    that survive:
-
-        --sink 1   opens rows 0, 14..15    48 cells    9 8 12 8 3 6 7
-        --sink 2   opens rows 0, 13..15    64 cells    1 2  1 0 1 0 1
-        --sink 3   opens rows 0, 12..15    80 cells    0 0  1 0 0 0 0
-
-    That last column is what N is chosen by, and the run reports it: six of
-    these seven boards keep a perfectly matched 176-piece core at --sink 3.
+    A sunk board has holes in its frame, row 0 among them, so it is a partial
+    however complete its input was: Stage C input, not Stage B input.
 
 THE CENTRE CLUE  (--clue_center)
 
-    The centre clue is piece 138 at one of four (cell, spin) pairs -- (7,7):0,
-    (8,7):3, (8,8):2, (7,8):1, one per board orientation. A translation moves a
-    piece's cell and leaves its spin alone, so after a sink the clue is in place
-    only if 138 already carried the spin belonging to the cell it lands on.
-    --clue_center keeps only the boards where it does, and drops the rest.
+    The clue is piece 138 on one of the four centre cells, and each cell demands
+    its own spin -- (7,7):0, (7,8):1, (8,8):2, (8,7):3, one per board
+    orientation. Orientation is part of the clue, not a free choice.
 
-    That is a roughly 1-in-250 event per (turn, depth). Of the twenty settings
-    tried on the seven shipped boards, `FILE 0 --sink 4` kept one board and
-    every other setting kept none, so an empty result is the normal outcome
-    rather than a failure. Off by default.
+    A turn carries a clue that is already in place round to the next centre
+    cell, spin and all, so turning never breaks one. A translation moves the
+    cell and leaves the spin alone, so a sink of any depth always does: the spin
+    names the target cell, and only M = 0 lands on it. --clue_center therefore
+    selects boards whose clue the transform puts RIGHT; it cannot preserve one.
+
+    Which settings can is arithmetic, not a search. For turn k the spin becomes
+    (spin + 3k) % 4, naming the target cell; the turned column must already
+    equal the target's column, and then M = turned_row - target_row is forced.
+    Turns k and k+2 give M and -M, the same move read from either end, so at
+    most one of that pair is a sink. Few boards admit any (turn, M) at all, so
+    an empty result is the normal outcome: the filter is off by default, and a
+    run it empties exits non-zero.
 
 VERIFICATION
 
     Every row's matched-edge count is recomputed after the turn and compared
-    with the count before it. They must agree -- a rotation that changes the
-    score is a bug, not a result -- and any row where they differ is reported
-    loudly and makes the run exit non-zero. The seed is used for nothing else,
-    so passing the wrong one weakens the check but cannot corrupt the output.
+    with the count before it. A turn that changes the score is a bug, and such a
+    row is named on stderr, dropped, and makes the run exit non-zero.
 
-    A sink is not lossless -- it destroys the junctions to the rows it drops --
-    but it must not touch the ones it keeps. A translation cannot change the
-    junction between two pieces that both survive it, so the sunk board's
-    matched edges are compared with the same board's before the sink, with
-    exactly the pieces the sink freed lifted out of it. Same law, same
-    treatment: a row where they differ is named and dropped.
+    A sink destroys the junctions to the rows it drops, but a translation cannot
+    alter a junction between two pieces that both survive it. So a sunk board is
+    compared against the input holding exactly the surviving pieces on their old
+    cells, and a row where the two disagree is named and dropped the same way.
 
 MASKS
 
     A --holes mask is a separate 16x16 grid, so a turned board needs a turned
-    mask or the next stage opens the wrong region. Pass `--holes IN.csv` and
-    the mask is turned by the same map and written alongside the board.
+    mask or the next stage opens the wrong region. `--holes IN.csv` turns it by
+    the same map and writes it alongside the board.
 
 ANNEALED BORDERS
 
-    A Stage A rotations CSV is a spin per piece, and for a border piece the
-    spin IS its side: the grey face points at the edge of the frame it belongs
-    to. Turn the board and those spins no longer describe it, so the finalizer
-    stops matching the row and drops to --free_edges. `--rotations` turns the
-    file instead of a board -- same spin map, applied only to the pieces that
-    have a grey side -- so the annealed side assignment follows the board round
-    and keeps constraining which pieces may sit on each edge.
+    A Stage A rotations CSV is a spin per piece, and for a border piece the spin
+    IS its side: the grey face points at the edge of the frame it belongs to.
+    Turn the board and those spins no longer describe it, so fin_rot_match stops
+    recognising the row and the finalizer drops to --free_edges. `--rotations`
+    turns the file instead of a board -- the same spin map, applied only to the
+    pieces that have a grey side -- so the annealed side assignment follows the
+    board round.
 
 CAVEATS
 
-    Anything that pins a specific cell -- a clue piece, a corner fixed with
+    Anything that pins a cell -- a clue piece, a corner fixed with
     --BL/--BR/--TL/--TR -- moves with the board, and that stage has to be told
     the new position.
 
-    A sunk board has holes in its frame, row 0 among them, so it is a partial
-    and not a complete board however complete its input was. This tool is a
-    geometric transform and emits nothing but boards: which cells the next
-    stage should open, and which stage that is, are the next stage's business.
+    This tool is a geometric transform and emits nothing but boards. Which cells
+    the next stage should open, and which stage that is, are the next stage's
+    business.
 
 USAGE
 
-    python3 E555_rotate.py best_463.csv 1       # 90 deg CW  -> best_463_rot1.csv
-    python3 E555_rotate.py best_463.csv 2       # 180 deg    -> best_463_rot2.csv
-    python3 E555_rotate.py best_463.csv 3       # 270 deg CW -> best_463_rot3.csv
-    python3 E555_rotate.py best_463.csv 0       # copy, no rotation
+    python3 E555_rotate.py best_463.csv 1     # 90 deg CW -> best_463_rot1.csv
+    python3 E555_rotate.py best_463.csv 2     # 180 deg
+    python3 E555_rotate.py best_463.csv 0     # copy, no rotation
+    python3 E555_rotate.py best_463.csv --all # _rot0 .. _rot3 in one pass
     python3 E555_rotate.py best_463.csv 1 --out /tmp/left.csv
-
-    N is 0..4; 0 and 4 both mean no rotation. The output name is the input
-    with _rotN before the extension unless --out overrides it.
-
-    python3 E555_rotate.py best_463.csv --all   # all four at once
-
-    --all writes _rot0.._rot3 in one pass -- the "hand all four to the next
-    stage" workflow above, without four commands. It takes no N, and no --out
-    or --holes_out, because it names four files.
-
     python3 E555_rotate.py board.csv 1 --holes data/holes_open_border_TR.csv
+    python3 E555_rotate.py best_463.csv 2 --sink 3  # -> best_463_rot2_sink3.csv
+    python3 E555_rotate.py best_463.csv --sink 1    # no turn, sink one row
+    python3 E555_rotate.py best_463.csv --all --sink 2
+    python3 E555_rotate.py best_463.csv 0 --sink 4 --clue_center
 
-    turns the mask with the board, to board_rot1.csv and
-    holes_open_border_TR_rot1.csv. Works with --all too.
-
-    python3 E555_rotate.py best_463.csv 2 --sink 3   # -> best_463_rot2_sink3.csv
-    python3 E555_rotate.py best_463.csv --sink 1     # no turn, sink one row
-    python3 E555_rotate.py best_463.csv --all --sink 2      # four turns, sunk
-    python3 E555_rotate.py best_463.csv --sink 1 --clue_center
-
-    N may be omitted when --sink is given, and --sink 0 is the identity, so
-    `--sink $DEPTH` scripts without a special case. --holes and --rotations are
-    both refused with --sink: a mask names cells in the geometry before the
-    sink, and a rotations row is a spin per piece with no rows to move.
+    N is 0..4, with 0 and 4 both meaning no rotation, and may be omitted when
+    --sink is given, so `--sink $DEPTH` scripts without a special case. The
+    output is the input name with _rotN (plus _sinkM) before the extension
+    unless --out overrides it; --all names its own four files and takes no --out
+    or --holes_out. --holes and --rotations are both refused with --sink: a mask
+    names cells in the geometry before the sink, and a rotations row is a spin
+    per piece with no rows to move.
 """
 from __future__ import annotations
 import argparse, csv, sys
@@ -223,10 +186,9 @@ def rotate_board(pos, rot, n):
 def frame_legal(cell, pid, spin, seed):
     """May piece `pid` at spin `spin` sit on `cell`?
 
-    It may exactly when its grey sides are the sides of the cell that face out
-    of the board: an inner piece (no grey) anywhere off the frame, a border
-    piece with its one grey side pointing out, a corner with both of them. The
-    same rule everything downstream assumes, read off R.FRAME_SIDES."""
+    Exactly when its grey sides are the sides of the cell that face out of the
+    board: an inner piece anywhere off the frame, a border piece with its one
+    grey side pointing out, a corner with both. R.FRAME_SIDES holds the rule."""
     shown = V.rotate_edges(seed[pid], spin)
     out = R.FRAME_SIDES.get(cell, ())
     return all((shown[d] == 0) == (d in out) for d in range(4))
@@ -236,9 +198,8 @@ def sink_board(pos, rot, n, seed):
     """Move every piece n rows down; unset what cannot survive the move.
 
     Returns the new pos array only: a translation does not turn a tile, so rot
-    is unchanged, and a freed piece keeps its old spin for the same reason an
-    already-unplaced one does -- nothing reads it, and rewriting it would only
-    obscure the diff."""
+    is unchanged, and a freed piece keeps its old spin exactly as an
+    already-unplaced one does."""
     new_pos = list(pos)
     for pid, cell in enumerate(pos):
         if cell == UNPLACED:
@@ -257,15 +218,15 @@ def matched(pos, rot, seed):
 
 
 def score(pos, rot, seed):
-    """Matched internal edges, 0..480 -- the invariant a turn must preserve."""
+    """Matched internal edges, 0..480: the invariant a turn must preserve."""
     return matched(pos, rot, seed)[0]
 
 
 def lift(pos, keep):
     """`pos` with every piece the sink freed unset, and nothing moved.
 
-    The board the sunk one is compared against: same pieces, same cells, so any
-    difference in matched edges is the translation's doing and therefore a bug."""
+    The board the sunk one is compared against: same pieces, same cells, so a
+    difference in matched edges is the translation's doing, and a bug."""
     return [p if keep[pid] != UNPLACED else UNPLACED for pid, p in enumerate(pos)]
 
 
@@ -307,8 +268,8 @@ def rotate_file(path, n, out_path, seed, sink=0, clue_center=False):
             if sink:
                 sunk = sink_board(new_pos, new_rot, sink, seed)
                 kept, total = matched(sunk, new_rot, seed)
-                # the law: the translation may destroy junctions, never alter one
-                # it keeps, so the same pieces score the same before the move.
+                # A translation may destroy junctions but never alter one it
+                # keeps, so the surviving pieces score the same before the move.
                 if kept != score(lift(new_pos, sunk), new_rot, seed):
                     print(f"[ERROR] row {idx - 1} ({cid}): the sink changed a "
                           "junction between two surviving pieces -- row dropped",
@@ -316,7 +277,7 @@ def rotate_file(path, n, out_path, seed, sink=0, clue_center=False):
                     bad += 1
                     continue
                 new_pos, core = sunk, total - kept
-            # the filter reads the board as written, so it means the same thing
+            # Applied to the board as written, so it means the same thing
             # whether the transform was a turn, a sink, or both.
             if clue_center and not V.clue_orient(new_pos, new_rot, V.CLUE_CENTER)[1]:
                 dropped += 1
@@ -331,9 +292,9 @@ def rotate_file(path, n, out_path, seed, sink=0, clue_center=False):
 
 # Seed order is (N, E, S, W) and grey is colour 0. A border piece carries one
 # grey side and a corner two, so once a spin is applied the grey side says which
-# edge of the frame the piece belongs to -- which is the entire content of a
-# rotations row. This is classify_deal_from_rotations() in E555_database.c,
-# rewritten in Python; V.rotate_edges is the same formula the beamer applies.
+# edge of the frame the piece belongs to -- the entire content of a rotations
+# row. classify_deal_from_rotations() in E555_database.c, in Python;
+# V.rotate_edges is the same formula the beamer applies.
 SIDE_NAMES = ("top", "right", "bottom", "left")
 EDGE_LEN = SIDE - 2                       # 14 non-corner pieces per side
 # One clockwise turn carries the bottom row round to the left column.

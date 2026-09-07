@@ -551,21 +551,26 @@ python3 tools/E555_rotate.py FILE 2 --sink 3 --seed_file data/seed_Edge5.txt
 
 which opens row 0 and rows 12..15 -- 80 cells -- and frees exactly the 80 pieces
 those cells need, corner for corner. Two of those rows you did not ask for: the
-new row 0 receives an interior row and inner pieces have no grey face for the
-frame, and the old top frame row lands inside the board with its grey pointing
-the wrong way. Both come free, which is also how all four corners do.
+new row 0 receives an interior row, and inner pieces have no grey face for the
+frame; the old top frame row lands inside the board with its grey pointing the
+wrong way. Both come free, which is also how all four corners do.
 
-The run prints the breaks left among the pieces that survived, and that is the
-number to choose N by:
+Choose N by the breaks left among the pieces that survived, which the run
+prints:
 
 ```
 [rot] sunk 3 row(s): rows 0, 12, 13, 14, 15 now open -- 80 cell(s)
 [rot] breaks left in the surviving core: min 0, max 1, 6 of 7 clean
 ```
 
-Six of the seven shipped 463s keep a perfectly matched 176-piece core at
-`--sink 3`, and only two of them do at `--sink 2`. A sunk board has holes in its
-frame, so it is a partial: it goes to Stage C, not back to the beamer.
+On the shipped 463s that number falls from 3..12 at `--sink 1` to 0..1 at
+`--sink 3`. A sunk board has holes in its frame, so it is a partial: it goes to
+Stage C, not back to the beamer.
+
+`--clue_center` keeps only the boards whose centre clue is in place afterwards.
+The clue fixes an orientation as well as a cell, and sinking moves the cell
+without touching the spin, so any non-zero sink breaks a clue that was already
+right -- the filter finds boards the sink puts right, which are rare.
 
 ## Three things that look like failures and are not
 

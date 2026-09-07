@@ -5,116 +5,99 @@ commands to attack them.
 
 WHY
 
-    Stage C is the expensive stage, and E555_rank.py sorts by what a board IS.
-    Above ~450 that is nearly a constant: every board sits within a couple of
-    breaks of the same entropy floor, so `score` stops discriminating and CP-SAT
-    time gets spread evenly over thousands of boards, most of which are finished.
+    Above ~450 the score stops discriminating: every board sits within a couple
+    of breaks of the same entropy floor, so ranking by what a board IS spreads
+    CP-SAT time evenly over thousands of boards, most of them finished.
 
     This tool ranks by what a board could BECOME. For each board it finds the
-    cheapest repair neighbourhood that covers that board's own breaks, measures
-    how much freedom is left inside it, and then writes the exact Stage C command
-    to try -- masks and a runnable shell script, one block per kept board.
-
-    There are no quality or speed knobs. Everything that would be a knob is
-    either derived from the corpus at runtime or is a constant in this file. It
-    has to be right by default, because nobody is going to tune it.
+    cheapest repair neighbourhood covering that board's own breaks, measures the
+    freedom left inside it, and writes the Stage C command to try -- masks and a
+    runnable shell script, one block per kept board. There are no quality or
+    speed knobs: everything that would be one is either derived from the corpus
+    at runtime or a constant in this file.
 
 THE MEASURES  (a "break" is an internal junction whose two cells disagree; a
                junction touching an unplaced cell counts as broken, exactly as
                everywhere else in Stage C)
 
-    win         the cheapest repair window covering every break on THIS board:
-                a T/B/L/R band at its minimal covering depth, or `hull`, a
-                1-cell-padded outline of the break cells. Boards whose breaks
-                hug one border get a cheap band; sprawling ones get a hull,
-                which is exactly when --holes earns its place. This is the
-                measure that decides which Stage C command gets written.
+    win       the cheapest repair window covering every break on THIS board: a
+              T/B/L/R band at its minimal covering depth, or `hull`, a 1-cell
+              padded outline of the break cells. Breaks that hug one border get
+              a cheap band; sprawling ones get a hull, which is exactly when
+              --holes earns its place. This decides which Stage C command gets
+              written.
 
-    cells       free cells in that window.
-    J           junctions with at least one endpoint in it. THE cost measure:
-                it is what the re-solve actually has to satisfy, and it is what
-                `win` is chosen to minimise. Lower is better.
+    cells     free cells in that window.
 
-    floor       the first-moment entropy floor for that window shape: the
-                fewest breaks a TYPICAL board of that shape can be completed
-                to. It is a property of the WINDOW, not of the board -- every
-                board sharing a window shape has the same floor -- so it can
-                never rank boards and is printed for context only. Blank for
-                hull masks, whose shape differs per board.
-                (Derived offline from the measured palette: an inner junction
-                matches with p=0.0589, a ring junction with p=0.2004, both flat
-                to within 0.2% on data/seed_Edge5.txt.)
+    J         junctions with at least one endpoint in it. THE cost measure: what
+              the re-solve has to satisfy, and what `win` is chosen to minimise.
+              Lower is better.
 
-    fixers      piece-orientations that could sit on a BREAK cell and match
-                strictly more of its junctions than the incumbent does: literal
-                single-swap escape routes. Higher is better. Measured 2..24
-                across seven boards that all score 463, and it DISAGREES with
-                the geometry -- the board with the worst window had the most
-                escape routes -- so it is real independent information.
+    floor     the first-moment entropy floor for that window shape: the fewest
+              breaks a TYPICAL board of that shape can be completed to. A
+              property of the WINDOW, not the board, so it never ranks anything
+              and is printed for context only; blank for hull masks, whose shape
+              differs per board. (From the measured palette: an inner junction
+              matches with p=0.0589, a ring junction with p=0.2004, both flat to
+              within 0.2% on data/seed_Edge5.txt.)
 
-    subs        the same count, relaxed to "no worse than the incumbent", over
-                every cell of the window: how loose the neighbourhood is
-                overall. Context; not ranked on.
+    fixers    piece-orientations that could sit on a BREAK cell and match
+              strictly more of its junctions than the incumbent does: literal
+              single-swap escape routes. Higher is better. It disagrees with the
+              geometry -- measured 2..24 over seven boards that all score 463,
+              the worst window carrying the most escape routes -- so it is real
+              independent information.
 
-    dive_min    the best break count randomized greedy dives reach over the
-                window (E555_backtracker --break_mode stuck, ~12k dives). Lower
-                is better: it is a sampled measure of how good completions of
-                THIS neighbourhood get. It lands far above a CP-SAT incumbent
-                (26..30 against 17 on data/best_463.csv) and is useless as a
-                bound -- but as a RANKING of windows it has real spread and it
-                is the only measure here that samples the repair landscape
-                rather than describing it. Blank without bin/E555_backtracker.
+    subs      the same count relaxed to "no worse than the incumbent", over
+              every cell of the window: how loose the neighbourhood is overall.
+              Context; not ranked on.
 
-                (An earlier draft ranked on median-minus-min over several runs,
-                meaning to measure the landscape's tail thickness. Measured, it
-                spread 0..2 over seven boards and discriminated nothing: a
-                best-of-N statistic is already extreme-value concentrated, so
-                repeated samples of it agree. Removed rather than left in.)
+    dive_min  the best break count randomized greedy dives reach over the window
+              (E555_backtracker --break_mode stuck, ~12k dives). Lower is
+              better. It lands far above a CP-SAT incumbent -- 26..30 against 17
+              on data/best_463.csv -- so it ranks windows against each other and
+              is never a bound on one, but it is the only measure here that
+              samples the repair landscape rather than describing it. It is also
+              the only one that moves between runs (see THE DIVE ENGINE). Blank
+              without bin/E555_backtracker.
 
-    rsum        the rank-sum: lower is better. See RANK-SUM below.
+    rsum      the rank-sum; lower is better. See below.
 
-    agree       how much of its repair window this board shares with the boards
-                already picked, as a percentage. Not a property of the board but
-                of the selection, which is why `rank` is NOT sorted by `rsum`:
-                the spread deliberately reaches past a slightly better board for
-                a much more independent one, so a lower `rsum` further down the
-                table is the diversity pass doing its job. Blank for rank 1,
-                which had nothing to agree with.
+    agree     how much of its repair window this board shares with the boards
+              already picked, as a percentage. A property of the selection, not
+              of the board, which is why `rank` is NOT sorted by `rsum`: the
+              spread reaches past a slightly better board for a much more
+              independent one. Blank for rank 1.
 
-    Every measure E555_rank.py already computes (score, solid, placed, border,
-    break_rows, break_cols, span, clean_b/t/l/r, corner_d, clues) is imported
-    from it rather than recomputed, and a few are printed here too.
+    score, solid, placed, border, break_rows, break_cols, span, clean_b/t/l/r,
+    corner_d and clues come from E555_rank.py rather than being recomputed.
 
-RANK-SUM  (the Borda count, if you want its textbook name)
+RANK-SUM  (a Borda count)
 
-    The measures are in incompatible units -- breaks, junction counts,
-    substitution counts, dive spread. Adding them would need weights, and there
-    is no data to fit weights with. So instead: sort the corpus by each measure
-    separately, give each board its POSITION in each list, and add the
-    positions. Lowest total wins.
+    The measures are in incompatible units and there is no data to fit weights
+    with. So: sort the corpus by each measure separately, give each board its
+    POSITION in each list, and add the positions. Lowest total wins.
 
         board     breaks    J    fixers  dive_min |  positions       sum
-        0_1568      17     124     20        27   |  1 + 1 + 2 + 3  =  7   <- 1st
+        0_1568      17     124     20        27   |  1 + 1 + 2 + 3  =  7
         a10_965     17     124     19        30   |  1 + 1 + 3 + 4  =  9
-        a10_53      17     155     25        26   |  1 + 3 + 1 + 1  =  6
+        a10_53      17     155     25        26   |  1 + 3 + 1 + 1  =  6   <- 1st
 
-    Positions are unitless, so summing them needs no constants: nothing to tune,
-    nothing to calibrate. It is robust to outliers, and it degrades cleanly to
-    three measures when the dive engine is missing. The honest cost is that it
-    discards MAGNITUDE -- slightly better and hugely better score the same --
-    which is acceptable here only because the corpus is clustered tightly near
-    the floor, so the magnitudes are small anyway.
+    Positions are unitless, so summing them needs no constants, it is robust to
+    outliers, and it degrades cleanly to three measures when the dive engine is
+    missing. The cost is that it discards MAGNITUDE -- slightly better and
+    hugely better score the same -- acceptable only because the corpus is
+    clustered tightly near the floor.
 
 STRATEGY
 
-    Pass 1, every board: the rank.py measures plus the window. Both are cheap
-    and linear, so this scales to a corpus of any size. Rank-sum on
-    (breaks, J, corner_d) and keep a generous shortlist.
+    Pass 1, every board: the rank.py measures plus the window, both cheap and
+    linear, so this scales to a corpus of any size. Rank-sum on
+    (breaks, J, corner_d), keep a generous shortlist.
 
-    Pass 2, the shortlist only: mobility (bitsets) and dives (one subprocess per
-    window shape, not per board). This is why there is no dive budget to set --
-    pass 1 has already cut the corpus to a few hundred, so the per-board budget
-    is fixed and generous whatever you fed in.
+    Pass 2, the shortlist only: mobility (bitsets) and dives, one subprocess per
+    window shape rather than per board. Pass 1 has already cut the corpus to a
+    few hundred, so the per-board dive budget is fixed whatever you fed in.
 
     Pass 3: rank-sum on (breaks, J, fixers, dive_min), then greedy max-min
     spread down to --top. The spread runs on the REPAIR SIGNATURE -- the window
@@ -124,86 +107,52 @@ STRATEGY
     sees one board and drops the rest -- but rows 12..15 ARE the repair problem,
     and those siblings are several genuinely different Stage C jobs.
 
-    dive_min is sampled, and the backtracker seeds its RNG from the clock and
-    pid, so it moves by a break or two between runs and boards with close rsum
-    can swap places. That is the measure being honest about being a sample; the
-    window, fixers and subs columns are exact and do not move.
+THE DIVE ENGINE
 
-THE DIVE ENGINE -- what E555_backtracker does here, and what it took to read it
-
-    dive_min is the only measure that samples the repair landscape instead of
-    describing it, and it is not computed here: it shells out to
-    `bin/E555_backtracker --break_mode stuck`, the project's tuned dive engine.
-    A dive takes an exact fit where one exists and a minimal break where none
-    does, never backtracks, and therefore always reaches 256 pieces in one pass
-    -- piece-type counts are exactly balanced, so the candidate set is never
-    empty. It runs at ~9k-18k dives/s on four cores. Re-implementing that in
-    Python would be both slower and a second thing to keep correct.
-
-    The invocation is
+    dive_min shells out to the project's tuned dive engine,
 
         bin/E555_backtracker SEED BATCH.csv OUT.csv \
             --break_mode stuck --restarts N --breaks B --holes MASK.csv
 
-    and five things about it are worth writing down, because none is obvious
-    from the outside and two of them cost real debugging time.
+    which takes an exact fit where one exists and a minimal break where none
+    does, never backtracks, and so always reaches 256 pieces in one pass at
+    ~9k-18k dives/s on four cores. Five properties of that interface shape the
+    code here.
 
-    1. ONE MASK PER PROCESS. --holes applies a single mask to every record in
-       the input file, so boards can only be batched when their windows are
-       byte-identical. Grouping by the window NAME is a bug: two boards both
-       reading `hull` generally have different outlines. run_dives() groups on
-       the mask itself, and trades DIVE_RUNS against the number of groups
-       (DIVE_CALL_BUDGET) so a corpus of all-distinct hulls cannot turn into
+    1. --holes applies ONE mask to every record, so boards batch together only
+       when their windows are byte-identical -- and two boards both reading
+       `hull` generally have different outlines. run_dives() groups on the mask
+       itself and trades DIVE_RUNS against the number of groups
+       (DIVE_CALL_BUDGET), so a corpus of all-distinct hulls cannot become
        thousands of subprocess calls.
 
-    2. THE RNG IS NOT SEEDABLE. g_rng_master comes from the clock and the pid,
-       and there is no --rng_seed: "runs are not reproducible by design"
-       (E555_backtracker.c). Two consequences. Good: separate invocations are
-       genuinely independent samples, which is the only way to get more than
-       one number out of a tool that reports one best per record -- so DIVE_RUNS
-       short runs beat one long one for robustness against an unlucky batch.
-       Bad: this tool's own dive_min moves a break or two between runs, and
-       boards with close rsum can swap places. Everything else it prints is
-       exact.
+    2. The RNG is not seedable: g_rng_master comes from the clock and the pid
+       and there is no --rng_seed. Separate invocations are therefore
+       independent samples, which is the only way to get more than one number
+       out of a tool that reports one best per record, and why DIVE_RUNS short
+       runs beat one long one. The price is that dive_min moves by a break or
+       two between runs, and boards with close rsum can swap places.
 
-    3. IT REWRITES THE RECORD ID. The output is a canonical board CSV
-       (`config_id,score,pos[256],rot[256]`), but each record comes back tagged
-       `<input id>_<score>` -- feed it `d7` and the row says `d7_463`. The first
-       implementation matched on the whole id, parsed nothing, and reported
-       blank dive columns after 20 s of CPU with no error anywhere. _read_dive_out
-       takes the first "_"-separated segment.
+    3. Records come back tagged `<input id>_<score>`, so feeding it `d7` returns
+       `d7_463`; _read_dive_out takes the first "_"-separated segment.
 
-    4. NEITHER OBVIOUS KEY WORKS FOR MAPPING RESULTS BACK. config_id repeats in
-       real corpora -- data/best_463.csv lines 1 and 4 share
-       `lowB_free_Maha10_68` while agreeing on ZERO of 256 cells -- and the row
-       index restarts at 0 in every input file. So the batch is written with a
-       synthetic `d<seq>` id, seq counting boards across the whole run.
+    4. Neither obvious key maps results back: config_id repeats in real corpora
+       (data/best_463.csv lines 1 and 4 share `lowB_free_Maha10_68` while
+       agreeing on ZERO of 256 cells) and the row index restarts in every input
+       file. The batch carries a synthetic `d<seq>` id counting across the run.
 
-    5. --breaks IS A CEILING THE DIVE CAN HIT. stuck mode spends a break
-       wherever no exact fit exists, and a run whose budget is too small emits
-       nothing rather than something worse. DIVE_BREAK_CEILING is deliberately
+    5. --breaks is a ceiling the dive can hit, and a run whose budget is too
+       small emits nothing rather than something worse. DIVE_BREAK_CEILING sits
        far above anything a real window needs.
 
-    What the numbers are worth: dives land WELL above a CP-SAT incumbent --
-    26..30 against 17 on data/best_463.csv, matching the project's own measured
-    ~28 best-of-200k on a 74-cell region whose input carried 18. So dive_min is
-    a ranking signal between windows and never a bound on one.
-
-    A dead end worth not repeating: the first design ranked on median-minus-min
-    across runs, meaning to measure the landscape's tail thickness. Measured, it
-    spread 0..2 over seven boards and separated nothing -- a best-of-N statistic
-    is already extreme-value concentrated, so repeated samples of it agree.
-    dive_min has real spread; the gap did not, and was removed.
-
-    None of this is required: without the binary the tool prints one notice and
-    ranks on the three exact measures instead.
+    Without the binary the tool prints one notice and ranks on the three exact
+    measures instead.
 
 PATHS
 
-    The tool lives in tools/, so --root defaults to its own parent's parent,
-    the same convention E555_viewer.py uses to find its seed. Everything else
-    hangs off that: bin/E555_backtracker for dives, src/C_tail/*.py for the
-    commands --plan writes. Missing dive engine is a notice, not an error.
+    The tool lives in tools/, so --root defaults to its own parent's parent, the
+    same convention E555_viewer.py uses to find its seed; bin/E555_backtracker
+    for dives, src/C_tail/*.py for the commands --plan writes.
 """
 from __future__ import annotations
 
@@ -236,11 +185,9 @@ FLOOR_BY_DEPTH = {2: 18, 3: 20, 4: 20, 5: 20, 6: 20, 7: 20}
 SHORTLIST_MIN = 500
 SHORTLIST_MULT = 20
 
-# Dive budget for pass 2. Five independent runs rather than one long one: the
-# backtracker seeds its RNG from the clock and pid and takes no --rng_seed
-# ("runs are not reproducible by design"), so separate invocations are genuine
-# independent samples -- which is the only way to get a spread out of a tool
-# that reports one best per record.
+# Dive budget for pass 2: several independent runs rather than one long one,
+# because the backtracker's RNG is not seedable and separate invocations are the
+# only way to get a spread out of it (see THE DIVE ENGINE).
 DIVE_RUNS = 3
 DIVE_RESTARTS = 4000
 DIVE_BREAK_CEILING = 400            # generous: a dive must never hit the ceiling
@@ -546,8 +493,8 @@ def run_dives(recs, seed_path, backtracker, tmpdir):
                 # A negative code is a signal. SIGILL (-4) here almost always
                 # means the binary was built with the Makefile's -march=native
                 # on a different machine (or a migrated VM) from the one running
-                # it -- rebuilding in place fixes it. Say so rather than making
-                # the reader guess from "CalledProcessError".
+                # it; rebuilding in place fixes it, so name that rather than
+                # reporting a bare CalledProcessError.
                 rc = exc.returncode
                 why = f"signal {-rc}" if rc < 0 else f"exit {rc}"
                 if rc in (-4, 132):
