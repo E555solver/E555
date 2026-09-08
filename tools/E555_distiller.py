@@ -33,13 +33,13 @@ THE MEASURES  (a "break" is an internal junction whose two cells disagree; a
               the re-solve has to satisfy, and what `win` is chosen to minimise.
               Lower is better.
 
-    floor     the first-moment entropy floor for that window shape: the fewest
-              breaks a TYPICAL board of that shape can be completed to. A
-              property of the WINDOW, not the board, so it never ranks anything
-              and is printed for context only; blank for hull masks, whose shape
-              differs per board. (From the measured palette: an inner junction
-              matches with p=0.0589, a ring junction with p=0.2004, both flat to
-              within 0.2% on data/seed_Edge5.txt.)
+    closure   the colour ledger: how far the mix of interior colours still in
+              the POOL has drifted from flat, weighted by how many pairings are
+              left to make. Higher is better. Every other measure here reads the
+              board's shape, which a corpus grown to one stop row makes constant
+              -- closure reads what is left to place, so it still separates them.
+              It is the beamer's own --lambda_J objective (closure_raw() in
+              src/B_beam/E555_beamer.c); 0 on a complete board, which has no pool.
 
     fixers    piece-orientations that could sit on a BREAK cell and match
               strictly more of its junctions than the incumbent does: literal
@@ -47,10 +47,6 @@ THE MEASURES  (a "break" is an internal junction whose two cells disagree; a
               geometry -- measured 2..24 over seven boards that all score 463,
               the worst window carrying the most escape routes -- so it is real
               independent information.
-
-    subs      the same count relaxed to "no worse than the incumbent", over
-              every cell of the window: how loose the neighbourhood is overall.
-              Context; not ranked on.
 
     dive_min  the best break count randomized greedy dives reach over the window
               (E555_backtracker --break_mode stuck, ~12k dives). Lower is
@@ -63,11 +59,12 @@ THE MEASURES  (a "break" is an internal junction whose two cells disagree; a
 
     rsum      the rank-sum; lower is better. See below.
 
-    agree     how much of its repair window this board shares with the boards
-              already picked, as a percentage. A property of the selection, not
-              of the board, which is why `rank` is NOT sorted by `rsum`: the
-              spread reaches past a slightly better board for a much more
-              independent one. Blank for rank 1.
+    agree     cells on which this board matches the closest board already
+              picked, 0..256 -- E555_rank.py's own unit, and its select_diverse
+              is what does the picking. A property of the selection, not of the
+              board, which is why `rank` is NOT sorted by `rsum`: the spread
+              reaches past a slightly better board for a much more independent
+              one. 0 for rank 1, which had nothing to agree with.
 
     score, solid, placed, border, break_rows, break_cols, span, clean_b/t/l/r,
     corner_d and clues come from E555_rank.py rather than being recomputed.
@@ -87,25 +84,54 @@ RANK-SUM  (a Borda count)
     outliers, and it degrades cleanly to three measures when the dive engine is
     missing. The cost is that it discards MAGNITUDE -- slightly better and
     hugely better score the same -- acceptable only because the corpus is
-    clustered tightly near the floor.
+    clustered tightly near the entropy floor.
+
+    Two rules stop a tie becoming a ranking, and they matter more than they
+    sound. A measure every board agrees on is skipped: a sort is stable, so a
+    constant measure would otherwise hand out an arbitrary 0..N-1 by file
+    position, and three of them together outweigh the measures that do vary. And
+    boards tied WITHIN a measure share the first position they span, so a tie
+    costs them all the same. Without both, a beamer dump ranks by file order.
 
 STRATEGY
 
-    Pass 1, every board: the rank.py measures plus the window, both cheap and
-    linear, so this scales to a corpus of any size. Rank-sum on
-    (breaks, J, corner_d), keep a generous shortlist.
+    Pass 1, every board: the rank.py measures, the window, and closure. Rank-sum
+    on (closure, breaks, J), keep a generous shortlist. A tied measure is
+    skipped rather than ranked on -- see RANK-SUM -- so closure carries this pass
+    on a corpus that shares a stop row, which is what a beamer dump is.
 
     Pass 2, the shortlist only: mobility (bitsets) and dives, one subprocess per
     window shape rather than per board. Pass 1 has already cut the corpus to a
     few hundred, so the per-board dive budget is fixed whatever you fed in.
 
-    Pass 3: rank-sum on (breaks, J, fixers, dive_min), then greedy max-min
-    spread down to --top. The spread runs on the REPAIR SIGNATURE -- the window
-    name plus the pieces inside it -- and not on E555_rank.py's whole-board
-    agreement, which measures the wrong thing here: a cluster of beam siblings
-    shares rows 0..11 and differs only in rows 12..15, so whole-board agreement
-    sees one board and drops the rest -- but rows 12..15 ARE the repair problem,
-    and those siblings are several genuinely different Stage C jobs.
+    Pass 3: rank-sum on (closure, breaks, J, fixers, dive_min), then
+    E555_rank.py's select_diverse down to --top. The spread runs on whole-board
+    agreement because what survives a Stage C run is the board OUTSIDE the
+    window: comparing the pieces inside it compares exactly the ones about to be
+    lifted, and on a corpus whose top row is unique per board that makes every
+    pair maximally distant and the spread a no-op.
+
+TRIAGE  (--triage)
+
+    The pass-1 measures build a board per row and hold a record per row, and on
+    a dump where every board stopped at the same row none of them says anything.
+    --triage is the first cut for that case.
+
+        python3 E555_distiller.py boards*.csv --triage --top 500 --out short.csv
+
+    One streaming pass on closure alone -- no board built, no window, no
+    mobility, no dives -- keeping a bounded heap of --top records, so the time
+    is flat in the corpus and the memory is flat in --top. On 24,268 twelve-row
+    partials: 4.9 s, 17 MB, and a top 500 drawing on all 23 Stage A borders in
+    the file where pass 1 drew on one.
+
+    It also drops boards repeating a Stage C job -- identical below the topmost
+    full row, which the window frees anyway. That is a third of a typical beam
+    dump (24,268 -> 16,502 here) and E555_clean_csv.py cannot see it, collapsing
+    only the single-cell case. --no_dedup keeps them.
+
+    Shard by file and concatenate the --out files: closure depends on the board
+    alone, so a second pass over the concatenation gives the global top N.
 
 THE DIVE ENGINE
 
@@ -158,7 +184,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import heapq
 import itertools
+import math
 import subprocess
 import sys
 import tempfile
@@ -172,13 +200,12 @@ SIDE, N_PIECES, N_EDGES = V.SIDE, V.N_PIECES, V.N_EDGES
 NORTH, EAST, SOUTH, WEST = R.NORTH, R.EAST, R.SOUTH, R.WEST
 ALL_JUNCTIONS = R.ALL_JUNCTIONS
 FRAME_SIDES = R.FRAME_SIDES
-GREY = 0
-UNPLACED = 999
+GREY, UNPLACED = R.GREY, V.UNPLACED
 
-# The entropy floor per window SHAPE, computed offline from the measured palette
-# (see THE MEASURES). Board-independent by construction, hence context only.
-# B/L/R equal T at the same depth by symmetry, so one entry serves all four.
-FLOOR_BY_DEPTH = {2: 18, 3: 20, 4: 20, 5: 20, 6: 20, 7: 20}
+# Colour 0 is the frame and 1..5 face it from inside; 6..22 are the interior
+# colours, and only those pair with each other, so only those enter closure.
+INNER_MIN = 6
+N_INNER = 17
 
 # Pass-1 shortlist size: enough head-room that a board with unusual mobility is
 # not cut before mobility is ever measured, small enough that pass 2 is quick.
@@ -196,12 +223,74 @@ DIVE_CALL_BUDGET = 400              # ceiling on total subprocess calls, runs tr
 
 # -- small helpers -----------------------------------------------------------
 
-def popcount(x):
-    """Bits set. int.bit_count() is 3.10+, and requirements.txt allows 3.9."""
-    try:
-        return x.bit_count()
-    except AttributeError:
-        return bin(x).count("1")
+def mask_cells(mask):
+    """The cells a 256-bit window mask names, ascending.
+
+    Windows are bitmasks and not sets: a corpus is measured before it is cut, so
+    every board carries one, and a set of up to 256 small ints costs about 8 KB
+    against 60 bytes for the integer."""
+    return [c for c in range(N_PIECES) if mask >> c & 1]
+
+
+def closure(pos, rot, seed):
+    """The beamer's --lambda_J objective, read off a board. Higher is better.
+
+    Every free interior half-edge must eventually meet another of the SAME
+    colour, so what matters is the colour mix the pool still holds against the
+    demands the frontier has already committed to:
+
+        R_c  interior half-edges of colour c left in the POOL
+        D_c  interior faces of placed pieces that look at an empty cell
+        S_c  R_c - D_c, the free half-edges that must pair with each other
+
+        J = 0.5 * sum_c S_c (log S_c - log Sbar) + sum_c D_c (log R_c - log Rbar)
+
+    which is closure_raw() in src/B_beam/E555_beamer.c, centred the same way.
+    Unlike every other measure here it reads the POOL rather than the board, so
+    it still separates boards a fixed stop row has made identical in shape.
+
+    Two things keep it cheap enough to run on a whole corpus: a piece's colours
+    are a multiset, so the pool sum needs no rotation at all, and the demands
+    are found by walking the EMPTY cells rather than the placed ones."""
+    placed = {}
+    supply = [0] * N_INNER
+    for pid, cell in enumerate(pos):
+        if cell == UNPLACED:
+            for col in seed[pid]:                 # a multiset: no rotation needed
+                if col >= INNER_MIN:
+                    supply[col - INNER_MIN] += 1
+        else:
+            placed[cell] = pid
+
+    demand = [0] * N_INNER
+    for r in range(SIDE):
+        for c in range(SIDE):
+            if r * SIDE + c in placed:
+                continue
+            # The face each placed neighbour turns towards this empty cell: the
+            # cell above shows its south side, the one below its north, and so on.
+            for nr, nc, side in ((r + 1, c, SOUTH), (r - 1, c, NORTH),
+                                 (r, c + 1, WEST), (r, c - 1, EAST)):
+                if not (0 <= nr < SIDE and 0 <= nc < SIDE):
+                    continue
+                pid = placed.get(nr * SIDE + nc)
+                if pid is None:
+                    continue
+                col = V.rotate_edges(seed[pid], rot[pid])[side]
+                if col >= INNER_MIN:
+                    demand[col - INNER_MIN] += 1
+
+    # Centring cannot change a ranking -- both sums are fixed at a given depth --
+    # but it keeps the value near 0 instead of near a thousand nats.
+    free = [supply[k] - demand[k] for k in range(N_INNER)]
+    sum_s, sum_r = sum(free), sum(supply)
+    if sum_s <= 0 or sum_r <= 0:
+        return 0.0
+    log_sbar, log_rbar = math.log(sum_s / N_INNER), math.log(sum_r / N_INNER)
+    conc = sum(s * (math.log(s) - log_sbar) for s in free if s > 0)
+    dem = sum(demand[k] * (math.log(supply[k]) - log_rbar)
+              for k in range(N_INNER) if demand[k] > 0 and supply[k] > 0)
+    return 0.5 * conc + dem
 
 
 def board_colors(pos, rot, seed):
@@ -225,38 +314,47 @@ def board_colors(pos, rot, seed):
 # -- repair windows ----------------------------------------------------------
 
 def band(side, depth):
-    """The `depth`-deep band against one border, as a set of cell indices."""
+    """The `depth`-deep band against one border, as a 256-bit cell mask."""
     if side == "T":
-        return {r * SIDE + c for r in range(SIDE - depth, SIDE) for c in range(SIDE)}
-    if side == "B":
-        return {r * SIDE + c for r in range(depth) for c in range(SIDE)}
-    if side == "R":
-        return {r * SIDE + c for r in range(SIDE) for c in range(SIDE - depth, SIDE)}
-    if side == "L":
-        return {r * SIDE + c for r in range(SIDE) for c in range(depth)}
-    raise ValueError(f"unknown side {side!r}")
+        cells = [r * SIDE + c for r in range(SIDE - depth, SIDE) for c in range(SIDE)]
+    elif side == "B":
+        cells = [r * SIDE + c for r in range(depth) for c in range(SIDE)]
+    elif side == "R":
+        cells = [r * SIDE + c for r in range(SIDE) for c in range(SIDE - depth, SIDE)]
+    elif side == "L":
+        cells = [r * SIDE + c for r in range(SIDE) for c in range(depth)]
+    else:
+        raise ValueError(f"unknown side {side!r}")
+    mask = 0
+    for cell in cells:
+        mask |= 1 << cell
+    return mask
 
 
-def hull(bad, pad=1):
-    """The break cells grown by `pad` in every direction, clipped to the board.
+# There are only 64 of them and none depends on the board, so a corpus pays for
+# each one once instead of once per row.
+BANDS = {(side, depth): band(side, depth)
+         for side in "TBLR" for depth in range(1, SIDE + 1)}
+
+
+def hull(bad):
+    """The break cells grown by one in every direction, clipped to the board.
 
     A mask of exactly the break cells would force the freed pieces to permute
     among themselves; the padding is what gives the re-solve somewhere to put
     them."""
-    out = set()
+    out = 0
     for cell in bad:
         r, c = divmod(cell, SIDE)
-        for dr in range(-pad, pad + 1):
-            for dc in range(-pad, pad + 1):
-                rr, cc = r + dr, c + dc
-                if 0 <= rr < SIDE and 0 <= cc < SIDE:
-                    out.add(rr * SIDE + cc)
+        for rr in range(max(0, r - 1), min(SIDE, r + 2)):
+            for cc in range(max(0, c - 1), min(SIDE, c + 2)):
+                out |= 1 << (rr * SIDE + cc)
     return out
 
 
 def window_cost(mask):
     """Junctions with at least one endpoint free. What the re-solve must satisfy."""
-    return sum(1 for a, b, _, _ in ALL_JUNCTIONS if a in mask or b in mask)
+    return sum(1 for a, b, _, _ in ALL_JUNCTIONS if mask >> a & 1 or mask >> b & 1)
 
 
 def pick_window(bad):
@@ -270,19 +368,15 @@ def pick_window(bad):
     depths = {"T": SIDE - min(rows), "B": max(rows) + 1,
               "L": max(cols) + 1, "R": SIDE - min(cols)}
 
-    cands = []
-    for side, depth in depths.items():
-        if depth <= SIDE:
-            cands.append((f"{side}{depth}", band(side, depth), depth))
-    cands.append(("hull", hull(bad), None))
+    cands = [(f"{side}{depth}", BANDS[(side, depth)])
+             for side, depth in depths.items() if depth <= SIDE]
+    cands.append(("hull", hull(bad)))
 
     best = None
-    for name, mask, depth in cands:
-        cost = window_cost(mask)
-        if best is None or cost < best["J"] or (cost == best["J"] and len(mask) < best["cells"]):
-            best = dict(win=name, mask=mask, cells=len(mask), J=cost,
-                        floor=FLOOR_BY_DEPTH.get(depth) if depth else None,
-                        depths=depths)
+    for name, mask in cands:
+        cost, cells = window_cost(mask), mask.bit_count()
+        if best is None or cost < best["J"] or (cost == best["J"] and cells < best["cells"]):
+            best = dict(win=name, mask=mask, cells=cells, J=cost)
     return best
 
 
@@ -360,8 +454,8 @@ def mobility(colors, cells, idx, placed_bits):
             if cols[d] == want:
                 cur += 1
 
-        better += popcount(_at_least(legal, masks, cur + 1))
-        worse += popcount(_at_least(legal, masks, cur)) - 1
+        better += _at_least(legal, masks, cur + 1).bit_count()
+        worse += _at_least(legal, masks, cur).bit_count() - 1
     return better, worse
 
 
@@ -372,68 +466,34 @@ def rank_sum(recs, keys):
 
     `keys` is (name, high_is_better) pairs. Boards missing a measure share the
     worst position for it, so a corpus where dives did not run still ranks.
-    Sorts `recs` in place and returns it; ties break on breaks, then J."""
+    Sorts `recs` in place and returns it; ties break on breaks, then J.
+
+    Two rules keep a tie from becoming a ranking. A measure every board agrees
+    on is skipped outright -- a beamer dump with one stop row makes `breaks`,
+    `J` and the rest constants, and a stable sort would otherwise turn each of
+    them into an arbitrary permutation that outweighs the measures that do vary.
+    Boards that tie WITHIN a measure share the first of the positions they span,
+    so a tie costs them all the same instead of ordering them by file position."""
     for rec in recs:
         rec["rsum"] = 0
     for name, high_is_better in keys:
         have = [r for r in recs if r.get(name) is not None]
         missing = [r for r in recs if r.get(name) is None]
+        if len({r[name] for r in have}) <= 1:
+            continue                          # a constant measure ranks nothing
         have.sort(key=lambda r: r[name], reverse=high_is_better)
-        for i, rec in enumerate(have):
-            rec["rsum"] += i
+        i = 0
+        while i < len(have):
+            j = i
+            while j < len(have) and have[j][name] == have[i][name]:
+                j += 1
+            for rec in have[i:j]:
+                rec["rsum"] += i              # competition ranking: ties share
+            i = j
         for rec in missing:
             rec["rsum"] += len(have)
     recs.sort(key=lambda r: (r["rsum"], r["breaks"], r["J"]))
     return recs
-
-
-def repair_signature(rec):
-    """What Stage C will actually see: the window, and the pieces inside it.
-
-    Deliberately NOT E555_rank.py's whole-board agreement -- see STRATEGY."""
-    _, _, pos, rot = V.parse_row(next(csv.reader([rec["line"]])))
-    mask = rec["mask"]
-    return frozenset(pos[p] * 1024 + p * 4 + rot[p]
-                     for p in range(N_PIECES)
-                     if pos[p] != UNPLACED and pos[p] in mask)
-
-
-def select_spread(recs, k):
-    """Greedy max-min over the repair signature: take the best, then repeatedly
-    the highest-ranked board least like everything already taken."""
-    if k <= 0 or len(recs) <= k:
-        return recs
-    for rec in recs:
-        rec["_sig"] = repair_signature(rec)
-
-    # Each candidate carries its distance to the CLOSEST chosen board, updated
-    # against the one board just added rather than recomputed against all of
-    # them: K x M comparisons, not K x M x K. Same shape as R.select_diverse.
-    chosen = [recs[0]]
-    rest = recs[1:]
-    dmin = [_sig_distance(rec, chosen[0]) for rec in rest]
-    while len(chosen) < k and rest:
-        best_i = max(range(len(rest)), key=lambda i: dmin[i])
-        rec = rest.pop(best_i)
-        rec["agree"] = round((1.0 - dmin.pop(best_i)) * 100)
-        chosen.append(rec)
-        for i, cand in enumerate(rest):
-            d = _sig_distance(cand, rec)
-            if d < dmin[i]:
-                dmin[i] = d
-    for rec in recs:
-        rec.pop("_sig", None)
-    return chosen
-
-
-def _sig_distance(a, b):
-    """1 for boards whose windows differ at all, else 1 - overlap fraction."""
-    if a["win"] != b["win"]:
-        return 1.0
-    span = max(len(a["_sig"]), len(b["_sig"]))
-    if span == 0:
-        return 0.0
-    return 1.0 - len(a["_sig"] & b["_sig"]) / span
 
 
 # -- dives -------------------------------------------------------------------
@@ -445,7 +505,7 @@ def write_mask(path, mask, note):
         fh.write(f"# {note}\n")
         fh.write("# Row convention: first data line below = row 0 (BOTTOM), last = row 15 (TOP).\n")
         for r in range(SIDE):
-            vals = ["1" if r * SIDE + c in mask else "0" for c in range(SIDE)]
+            vals = ["1" if mask >> (r * SIDE + c) & 1 else "0" for c in range(SIDE)]
             fh.write(",".join(vals) + "\n")
 
 
@@ -462,8 +522,11 @@ def run_dives(recs, seed_path, backtracker, tmpdir):
     # distinct hulls cannot turn into thousands of subprocess calls.
     shapes = {}
     for rec in recs:
-        shapes.setdefault(frozenset(rec["mask"]), []).append(rec)
-    runs = max(2, min(DIVE_RUNS, DIVE_CALL_BUDGET // max(1, len(shapes))))
+        shapes.setdefault(rec["mask"], []).append(rec)
+    # The budget wins. A floor of 2 here would defeat it outright: 500 boards
+    # with 500 distinct hulls give 400 // 500 == 0, and max(2, 0) would launch
+    # 1000 subprocesses rather than the 400 the constant promises.
+    runs = max(1, min(DIVE_RUNS, DIVE_CALL_BUDGET // max(1, len(shapes))))
 
     for gi, (mask, group) in enumerate(shapes.items()):
         batch = tmpdir / f"batch_{gi}.csv"
@@ -561,7 +624,8 @@ def stage_c_command(rec, mask_rel, clue_flags):
     The ender is the purpose-built endgame tool, so a complete board goes there;
     --mode ring when the window is mostly border, since a border break heals by
     cascading around the frame. A board with empty cells is the topper's job."""
-    border_frac = sum(1 for c in rec["mask"] if c in FRAME_SIDES) / max(1, len(rec["mask"]))
+    cells = mask_cells(rec["mask"])
+    border_frac = sum(1 for c in cells if c in FRAME_SIDES) / max(1, len(cells))
     if rec["placed"] == N_PIECES:
         mode = "ring" if border_frac >= 0.60 else "patch"
         args = ["--mode", mode, "--holes", mask_rel,
@@ -601,11 +665,11 @@ def write_plan(recs, root, seed_path, in_path, clue_flags):
         write_mask(out_dir / mask_name, rec["mask"],
                    f"rank {rank}: {rec['path']} row {rec['row']}, window {rec['win']}")
         script, args = stage_c_command(rec, f'"$HERE/{mask_name}"', clue_flags)
-        floor = rec["floor"] if rec["floor"] is not None else "-"
         lines += [
             f"# rank {rank}  {rec['file']} row {rec['row']}  breaks={rec['breaks']}  "
-            f"win={rec['win']} ({rec['cells']} cells, J={rec['J']}, floor {floor})  "
-            f"fixers={rec['fixers']}  dive_min={rec.get('dive_min', '-')}",
+            f"win={rec['win']} ({rec['cells']} cells, J={rec['J']})  "
+            f"closure={rec['closure']:.2f}  fixers={rec['fixers']}  "
+            f"dive_min={rec.get('dive_min', '-')}",
             f'"$PY" "$ROOT/{script}" "$SEED" "{rec["path"]}" "$OUT/{tag}.csv" \\',
             f'      --start_row {rec["row"]} --num_rows 1 ' + " ".join(args),
             "",
@@ -622,8 +686,8 @@ def write_plan(recs, root, seed_path, in_path, clue_flags):
 # `seq` is the board's number over the whole run: it is what --explain takes and
 # what --plan names its blocks and masks by, so it has to be on screen. `row` is
 # the index inside its own file, which is what --start_row wants.
-TABLE = (("rank", 5), ("seq", 5), ("file", 20), ("row", 5), ("id", 16),
-         ("score", 6), ("win", 6), ("cells", 6), ("J", 5), ("floor", 6),
+TABLE = (("rank", 5), ("seq", 8), ("file", 20), ("row", 8), ("id", 16),
+         ("score", 6), ("win", 6), ("cells", 6), ("J", 5), ("closure", 8),
          ("fixers", 7), ("dive_min", 9), ("break_rows", 11), ("span", 6),
          ("clues", 6), ("rsum", 6), ("agree", 6))
 
@@ -639,6 +703,8 @@ def print_table(recs):
             val = rec.get(name)
             if val is None:
                 val = "-"
+            elif name == "closure":
+                val = f"{val:.2f}"
             if name in ("id", "file"):
                 val = str(val)[-(w - 1):]
             cells.append(f"{val:>{w}}")
@@ -656,20 +722,83 @@ def explain(rec, seed, colors, bad):
           f"placed {rec['placed']}  clues {rec['clues']}")
     print(f"  breaks touch rows {sorted({c // SIDE for c in bad})}")
     print(f"  breaks touch cols {sorted({c % SIDE for c in bad})}")
-    print(f"  minimal covering band depth   " +
-          "  ".join(f"{s}={d}" for s, d in sorted(rec["depths"].items())))
-    print(f"  chosen window  {rec['win']}: {rec['cells']} cells, J={rec['J']}, "
-          f"floor {rec['floor'] if rec['floor'] is not None else '-'}")
-    print(f"  fixers {rec['fixers']}   subs {rec['subs']}   "
+    print(f"  chosen window  {rec['win']}: {rec['cells']} cells, J={rec['J']}")
+    print(f"  closure {rec['closure']:.2f}   fixers {rec['fixers']}   "
           f"dive_min {rec.get('dive_min', '-')}")
     print("\n  window (o = free, . = kept, # = touches a break):")
     for r in range(SIDE - 1, -1, -1):
         row = ""
         for c in range(SIDE):
             cell = r * SIDE + c
-            row += "#" if cell in bad else ("o" if cell in rec["mask"] else ".")
+            row += "#" if cell in bad else ("o" if rec["mask"] >> cell & 1 else ".")
         print(f"    ({r + 1:2d})  {row}")
     print()
+
+
+# -- triage ------------------------------------------------------------------
+
+def job_key(pos, rot):
+    """What Stage C will actually be handed, as one hashable value.
+
+    The window frees the topmost placed row along with the empty ones, so two
+    boards that agree BELOW that row are the same job however their top row
+    differs -- E555_clean_csv.py only collapses the single-cell case. On a
+    corpus of 12-row partials this is worth about a third of the rows.
+
+    The first board of a group represents it. The group's members hold the same
+    pieces and hand Stage C the same problem, but they arrange the top row
+    differently, so their closure -- which reads the pool as the file leaves it,
+    one row lower than the window will -- can differ by a nat or so. Which
+    member is kept therefore moves a board slightly in the ranking, never in
+    what it solves."""
+    rows = [0] * SIDE
+    for cell in pos:
+        if cell != UNPLACED:
+            rows[cell // SIDE] += 1
+    full = [r for r in range(SIDE) if rows[r] == SIDE]
+    cut = (max(full) if full else 0) * SIDE
+    return hash(tuple(sorted((c, p, rot[p]) for p, c in enumerate(pos)
+                             if c != UNPLACED and c < cut)))
+
+
+def triage(paths, seed, top, dedup):
+    """Rank a corpus by closure alone, in one streaming pass.
+
+    No board is built and no record outlives the heap, so the cost is flat in
+    the corpus size and the memory is flat in `top`. That is the whole point:
+    the full pipeline measures every board before it can rank any, which a
+    six-figure corpus cannot afford.
+
+    Returns (kept records best first, boards read, boards dropped as repeats)."""
+    heap, seen, seq, dropped = [], set(), 0, 0
+    for path in paths:
+        name = Path(path).name
+        full = str(Path(path).resolve())
+        with open(path, newline="") as fh:
+            for row, raw in enumerate(csv.reader(fh)):
+                rec = V.parse_row([f.strip() for f in raw])
+                if rec is None:                       # comment, header, short row
+                    continue
+                cid, _sol, pos, rot = rec
+                seq += 1
+                if dedup:
+                    key = job_key(pos, rot)
+                    if key in seen:
+                        dropped += 1
+                        continue
+                    seen.add(key)
+                j = closure(pos, rot, seed)
+                item = (j, -seq, dict(file=name, path=full, row=row, id=cid,
+                                      seq=seq - 1, closure=j,
+                                      line=",".join(raw) + "\n"))
+                # A bounded min-heap on closure: the worst of the keepers is
+                # always at the root, so a corpus of any size costs `top` records.
+                if len(heap) < top:
+                    heapq.heappush(heap, item)
+                elif item[0] > heap[0][0]:
+                    heapq.heapreplace(heap, item)
+    kept = [rec for _, _, rec in sorted(heap, key=lambda t: (-t[0], -t[1]))]
+    return kept, seq, dropped
 
 
 # -- main --------------------------------------------------------------------
@@ -685,9 +814,16 @@ def main():
                     help="write the distilled boards, input rows re-ordered verbatim")
     ap.add_argument("--plan", action="store_true",
                     help="write plan_<stem>/: hole masks plus a runnable run_plan.sh")
+    ap.add_argument("--triage", action="store_true",
+                    help="first cut for a corpus too large to measure in full: "
+                         "one streaming pass, rank by closure, no windows, no "
+                         "mobility, no dives. Honours --top and --out")
+    ap.add_argument("--no_dedup", action="store_true",
+                    help="with --triage, keep boards that present the same Stage C "
+                         "job (identical below their topmost full row)")
     ap.add_argument("--explain", type=int, metavar="N", default=None,
-                    help="deep-dive board N instead of ranking (the row, for a "
-                         "single input file; otherwise the Nth board overall)")
+                    help="deep-dive board seq N instead of ranking (the seq "
+                         "column, which counts boards over the whole run)")
     ap.add_argument("--seed_file", help="piece seed file (default: data/seed_Edge5.txt)")
     ap.add_argument("--root", help="repo root (default: this tool's parent directory)")
     args = ap.parse_args()
@@ -695,6 +831,29 @@ def main():
     root = Path(args.root).resolve() if args.root else Path(__file__).resolve().parent.parent
     seed_path = V.find_seed(args.seed_file)
     seed = V.load_seed(seed_path)
+
+    if args.triage:
+        if args.explain is not None or args.plan:
+            raise SystemExit("[ERROR] --triage ranks and nothing else; it has no "
+                             "windows to explain and no masks to plan with")
+        kept, total, dropped = triage(args.inputs, seed, args.top, not args.no_dedup)
+        if not kept:
+            print("[triage] no board rows in the input", file=sys.stderr)
+            return 1
+        print(f"[triage] {total} board(s) read"
+              + (f", {dropped} repeat Stage C job(s) dropped" if dropped else "")
+              + f", {total - dropped} ranked, top {len(kept)} kept", file=sys.stderr)
+        print()
+        print(f"{'rank':>5}{'seq':>7}{'file':>22}{'row':>7}{'id':>18}{'closure':>10}")
+        print("-" * 69)
+        for rank, rec in enumerate(kept, 1):
+            print(f"{rank:>5}{rec['seq']:>7}{rec['file'][-21:]:>22}{rec['row']:>7}"
+                  f"{str(rec['id'])[-17:]:>18}{rec['closure']:>10.2f}")
+        print()
+        if args.out:
+            R.write_emit(args.out, kept, rescore=False)
+        return 0
+
     idx = orient_index(seed)
 
     backtracker = root / "bin" / "E555_backtracker"
@@ -718,6 +877,7 @@ def main():
             _, _, pos, rot = V.parse_row(next(csv.reader([rec["line"]])))
             _, bad = board_colors(pos, rot, seed)
             rec.update(pick_window(bad))
+            rec["closure"] = closure(pos, rot, seed)
             rec["path"] = full
             rec["seq"] = len(recs)
             recs.append(rec)
@@ -732,32 +892,40 @@ def main():
                 continue
             _, _, pos, rot = V.parse_row(next(csv.reader([rec["line"]])))
             colors, bad = board_colors(pos, rot, seed)
-            placed_bits = _placed_bits(pos)
-            rec["fixers"], rec["subs"] = _measure_mobility(rec, colors, bad, idx, placed_bits)
+            rec["fixers"] = mobility(colors, bad, idx, _placed_bits(pos))[0]
             explain(rec, seed, colors, bad)
             return 1 if skipped else 0
         print(f"[distil] board {args.explain} not found in the input", file=sys.stderr)
         return 1
 
-    # Pass 1 -- cheap measures on everything.
-    rank_sum(recs, (("breaks", False), ("J", False), ("corner_d", False)))
+    # Pass 1 -- cheap measures on everything. closure leads because it is the
+    # only one of these that still varies when a corpus shares a stop row.
+    rank_sum(recs, (("closure", True), ("breaks", False), ("J", False)))
     short = recs[:max(SHORTLIST_MIN, SHORTLIST_MULT * args.top)]
     print(f"[distil] {len(recs)} board(s) measured, {len(short)} shortlisted", file=sys.stderr)
+    # The window is the biggest thing on a record and only the shortlist needs
+    # one from here on, so a large corpus does not carry the rest of them.
+    cut = set(id(rec) for rec in short)
+    for rec in recs:
+        if id(rec) not in cut:
+            rec.pop("mask", None)
 
     # Pass 2 -- mobility and dives on the shortlist only.
     for rec in short:
         _, _, pos, rot = V.parse_row(next(csv.reader([rec["line"]])))
         colors, bad = board_colors(pos, rot, seed)
-        rec["fixers"], rec["subs"] = _measure_mobility(rec, colors, bad, idx, _placed_bits(pos))
+        rec["fixers"] = mobility(colors, bad, idx, _placed_bits(pos))[0]
 
     if backtracker is not None:
         with tempfile.TemporaryDirectory(prefix="e555_distil_") as td:
             run_dives(short, seed_path, backtracker, Path(td))
 
-    # Pass 3 -- rank, then spread.
-    rank_sum(short, (("breaks", False), ("J", False),
+    # Pass 3 -- rank, then spread. The spread runs on E555_rank.py's whole-board
+    # agreement: what Stage C keeps is the board OUTSIDE the window, so comparing
+    # the pieces inside it -- the ones about to be lifted -- separates nothing.
+    rank_sum(short, (("closure", True), ("breaks", False), ("J", False),
                      ("fixers", True), ("dive_min", False)))
-    kept = select_spread(short, args.top)
+    kept = R.select_diverse(short, args.top)
 
     print_table(kept)
     if args.out:
@@ -779,13 +947,6 @@ def _placed_bits(pos):
         if pos[pid] != UNPLACED:
             bits |= 0xF << (pid * 4)
     return bits
-
-
-def _measure_mobility(rec, colors, bad, idx, placed_bits):
-    """fixers over the break cells, subs over the whole window."""
-    fixers, _ = mobility(colors, bad, idx, placed_bits)
-    _, subs = mobility(colors, rec["mask"], idx, placed_bits)
-    return fixers, subs
 
 
 if __name__ == "__main__":

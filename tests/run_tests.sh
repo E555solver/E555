@@ -285,6 +285,30 @@ for mask_file in sorted(plan.glob("*.holes.csv")):
         sys.exit(f"{mask_file.name}: misses {len(bad - free)} break cell(s)")
 PY
     echo "ok: --explain picks hull, 3 masks cover every break, run_plan.sh parses"
+
+    # --triage ranks on closure alone. A complete board has no pool left, so its
+    # closure must be exactly 0 -- the cheapest proof the ledger is being read
+    # rather than invented.
+    python3 tools/E555_distiller.py data/best_463.csv --seed_file data/seed_Edge5.txt \
+        --triage --top 3 > "$OUT/triage.txt" 2>"$OUT/triage.err" \
+        || fail "--triage exited nonzero"
+    trows=$(grep -cE '^ *[0-9]+ ' "$OUT/triage.txt")
+    [ "$trows" = "3" ] || fail "--triage: expected 3 rows, got $trows"
+    nonzero=$(awk '$1 ~ /^[0-9]+$/ && $6 != "0.00"' "$OUT/triage.txt" | wc -l)
+    [ "$nonzero" = "0" ] || fail "--triage: a complete board scored closure != 0"
+
+    # The point of the measure: a corpus the ranker cannot separate at all --
+    # every board grown to the same stop row, so every shape measure is a
+    # constant -- must still come out ordered.
+    python3 tools/E555_distiller.py data/E565_lowB_baseline.csv \
+        --seed_file data/seed_Edge5.txt --triage --top 50 \
+        > "$OUT/triage_partial.txt" 2>&1 || fail "--triage on the partial corpus failed"
+    spread=$(awk '$1 ~ /^[0-9]+$/ {print $6}' "$OUT/triage_partial.txt" | sort -u | wc -l)
+    [ "$spread" -ge 10 ] || fail "closure took only $spread value(s) over 50 partials: it is not separating them"
+    shapes=$(python3 tools/E555_rank.py data/E565_lowB_baseline.csv --csv 2>/dev/null \
+        | awk -F, 'NR>1{$1="";$2="";print}' | sort -u | wc -l)
+    echo "ok: --triage keeps closure 0 on complete boards, and splits into $spread value(s)"
+    echo "    a corpus E555_rank.py reduces to $shapes distinct measure vector(s)"
 }
 
 step_rotate() {
