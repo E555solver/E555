@@ -1975,10 +1975,18 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   `E555_backtracker.c` builds. And **`dive_min`**: the best break count
   randomized greedy dives reach inside the window, by shelling out to
   `bin/E555_backtracker --break_mode stuck` (absent binary is a notice, not an
-  error). `floor` is the first-moment entropy floor of the window *shape*, which
-  is board-independent by construction and therefore printed for context only --
-  it can never rank boards, and a version that ranked on it would be sorting by
-  the score it was built to replace.
+  error).
+
+  Every one of those reads the board's *shape*, which is why a beamer dump
+  defeats them: a corpus grown to one stop row has the same shape on every row,
+  so `breaks`, `J` and `corner_d` are literally constant and the ranking falls
+  back to file order. **`closure`** is the measure that still separates them. It
+  is the beamer's own `--lambda_J` objective (`closure_raw()` in
+  `src/B_beam/E555_beamer.c`) read off a board: how far the mix of interior
+  colours still in the *pool* has drifted from flat, weighted by how many
+  pairings are left to make. It reads what is left to place rather than what is
+  already placed, costs 17 logarithms, and is 0 on a complete board, which has
+  no pool.
 
   On the seven boards of `data/best_463.csv`, which all score 463, the
   structural measures separate cleanly where the score cannot: minimal covering
@@ -1999,28 +2007,45 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   file. A run that dies (`-march=native` built elsewhere is the usual cause)
   costs one notice and its measure, not the ranking.
 
-  Ranking is **rank-sum** (a Borda count) over `breaks`, `J`, `fixers` and
-  `dive_min`: each board's position in each measure's ordering, added. The
+  Ranking is **rank-sum** (a Borda count) over `closure`, `breaks`, `J`,
+  `fixers` and `dive_min`: each board's position in each measure's ordering,
+  added, with a measure every board agrees on skipped and boards tied within a
+  measure sharing one position -- without both rules a constant measure hands
+  out an arbitrary order by file position and drowns the ones that vary. The
   measures are in incompatible units, so adding them directly would need
   weights and there is no data to fit weights with; positions are unitless, so
   nothing has to be tuned or calibrated. It degrades to three measures when the
   dive engine is missing. The cost is that it discards magnitude, acceptable
   only because the corpus is clustered tightly near the floor. Work runs in two
   passes -- cheap measures on everything, mobility and dives on a shortlist --
-  which is why there is no dive budget to set. Selection finishes with a greedy
-  max-min spread over the **repair signature** (the window plus the pieces
-  inside it), reported as the `agree` column -- which is why the printed `rank`
-  is deliberately *not* sorted by `rsum`: the spread reaches past a slightly
-  better board for a much more independent one. It is deliberately not
-  `E555_rank.py`'s whole-board agreement: a cluster
-  of beam siblings shares rows 0..11 and differs only in rows 12..15, so
-  whole-board agreement keeps one and drops the rest -- but rows 12..15 *are*
-  the repair problem, and those siblings are several different Stage C jobs.
+  which is why there is no dive budget to set. Selection finishes with
+  `E555_rank.py`'s `select_diverse`, reported as the `agree` column (cells
+  shared with the closest board already picked, 0..256) -- which is why the
+  printed `rank` is deliberately *not* sorted by `rsum`: the spread reaches past
+  a slightly better board for a much more independent one. The agreement is
+  measured over the whole board because what a Stage C run *keeps* is everything
+  outside the window; comparing the pieces inside it compares the ones about to
+  be lifted, and on a corpus whose top row is unique per board that makes every
+  pair maximally distant and the spread a no-op.
 
-  Five flags, none of them a quality or speed knob: `--top`, `--out` (verbatim
-  re-ordering, as the ranker), `--plan`, `--explain N` (one board's ASCII map,
-  chosen window and every measure) and `--seed_file`, plus `--root` for a
-  checkout the tool was copied out of. `--plan` writes `plan_<stem>/`: one
+  **`--triage`** is the first cut for a corpus too large to measure in full. One
+  streaming pass ranking on `closure` alone -- no board built, no window, no
+  mobility, no dives -- keeping a bounded heap of `--top` records, so the time
+  is flat in the corpus and the memory is flat in `--top`. On 24,268 twelve-row
+  partials: 4.9 s and 17 MB, and the top 500 drew on all 23 Stage A borders in
+  the file where the full pass 1 drew on one. It also drops boards presenting
+  the same Stage C job -- identical below the topmost full row, since the window
+  frees that row too -- which is a third of a typical beam dump and something
+  `E555_clean_csv.py` cannot see, as it collapses only the single-cell case
+  (`--no_dedup` keeps them). Shard by feeding one file per node and
+  concatenating the outputs; closure depends on the board alone, so a second
+  pass over the concatenation gives the global top N.
+
+  Seven flags, none of them a quality or speed knob: `--top`, `--out` (verbatim
+  re-ordering, as the ranker), `--plan`, `--triage`, `--no_dedup`,
+  `--explain N` (one board's ASCII map, chosen window and every measure) and
+  `--seed_file`, plus `--root` for a checkout the tool was copied out of.
+  `--plan` writes its directory relative to the *current* directory, not `--root`. `--plan` writes `plan_<stem>/`: one
   `--holes` mask per kept board, named by its input row, and a `run_plan.sh`
   whose blocks target single rows via `--start_row N --num_rows 1`. Complete
   boards route to `E555_ender.py` -- the purpose-built endgame tool -- in
