@@ -71,7 +71,7 @@ data/seed_Edge5.txt
 │   E555_topper.py      break minimizer; herds breaks to the NEAREST    │
 │                       corner; --side opens any border band            │
 │   E555_backtracker    exact / bounded-mismatch DFS tail closer        │
-│   E555_ender.py       budgeted local re-solve; --mode patch|ring      │
+│   E555_ender.py       adaptive closer; profiles + true per-board budget│
 │   - laptop             - output → canonical board CSV, score /480     │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -705,8 +705,8 @@ flags (only the centre, which it never frees) and **5/5** with them.
 **How Stage C holds them.** `E555_topper.py` and `E555_ender.py` take the
 same two flags, and without them they treat a clue like any other piece: the
 topper's `--side T --band_depth 4` band covers rows 12..15, exactly where the two
-row-13 clues sit, and the ender's `--mode ring` opens the whole border with the
-centre clue inside any interior break box. Measured on 40 clued row-11 partials,
+row-13 clues sit, and the ender's broad phase can open a pool with the centre
+clue inside it. Measured on 40 clued row-11 partials,
 a single default topper pass drops every board from 5/5 clues to 3/5; with
 `--clue_center --clue_corners` all 40 keep 5/5.
 
@@ -1164,9 +1164,30 @@ set at level 1 **proves** the wall dead. `--verbose` prints the live count per
 level, which names the level at which the coloring collapses -- the most
 diagnostic number the tool produces.
 
-`--selfcheck` re-counts the same relaxation by brute-force enumeration and
-compares signature by signature. It is the regression that makes every prune
-trustworthy, and it is wired into `tests/run_tests.sh`.
+`--selfcheck` used to re-count the same relaxation by brute-force enumeration,
+signature by signature, and was the regression that made every prune
+trustworthy. It was removed with the exhaustive rewrite, and **the depth oracle
+that replaced it on the final side has no in-binary proof of its own** -- that
+is open work. What is checked today is narrower but still load-bearing: check 13
+`roundhouse_cache` runs the same board with and without `--no_transition_cache`
+and requires byte-identical output, because a wrong cached successor would not
+crash, it would silently refute live branches while the run still reported a
+clean proof.
+
+### Two oracles, one per situation
+
+An **earlier side** must finish: the next rotation needs the wall and the prefix
+it leaves behind, so its search is refuted against a required endpoint -- the
+backward colour sweep described above. The **final side** has no such
+obligation. With no explicit `--stop_row` or `--stop_after` it therefore uses a
+**depth oracle** instead: `g_reach[level][sig]` is the maximum number of further
+whole strip levels reachable from that state when pieces may be reused, so a
+branch is cut only when even that upper bound cannot tie the deepest board found
+so far. Branches need not reach the far border; the deepest exact prefix is kept
+and emitted. Because the bound over-counts (it assumes every future level places
+a full W pieces, which fixed prefixes and held cells make impossible), it can
+never cut a branch that could have tied, and the comparison is strict so ties
+survive for `--ties`.
 
 The relaxation is strong while the pool is rich and weak in the last round,
 where exhaustion rather than color is what kills. There the **parity/supply
@@ -1178,7 +1199,7 @@ inside the strip, so each inner color's surplus must be non-negative *and even*.
 
 ### Geometry
 
-Work in a **frame**: the board mirrored by `--reverse`, then rotated `--rotate`
+Work in a **frame**: the board mirrored by `--cw`, then rotated `--rotate`
 quarter-turns clockwise, so
 the strip is always the rightmost W columns. A rotation maps `(r,c) → (15-c, r)`
 and spin `s → (s+3)&3`. Boards are emitted in the input's orientation.
@@ -1288,13 +1309,13 @@ provably has a solution, which makes a round-1 failure diagnostic rather than
 normal. Expect it to die earlier overall, since it reaches the hard region with
 a depleted pool.
 
-### --reverse: the spiral the other way round
+### --cw: the spiral the other way round
 
 Every strip level ends on a frame-**right** edge terminal, so the spiral has one
-handedness and the four rows above are all `--rotate` can offer. `--reverse`
+handedness and the four rows above are all `--rotate` can offer. `--cw`
 mirrors the board left-right instead and gives the other four:
 
-| `--reverse --rotate` | round 1 | round 2 | round 3 | core hugs |
+| `--cw --rotate` | round 1 | round 2 | round 3 | core hugs |
 |---|---|---|---|---|
 | 0 | left | top | right | bottom |
 | 1 | top | right | bottom | left |
@@ -1313,7 +1334,7 @@ odd `K`: `--rotate 1` still attacks the input's top either way.
 
 It does **not** free a region `--rotate` cannot already free. The kept core is
 either mirror-symmetric or lands on another `--rotate`'s core - at `--rounds 3
---strip_width 5` the 11x6 core sits on columns 5..10, dead centre, so `--reverse
+--strip_width 5` the 11x6 core sits on columns 5..10, dead centre, so `--cw
 --rotate 0` keeps exactly the same 66 cells. What changes is the **search**: each
 band is traversed the other way with the wall on the other side, so the strip DFS
 and the oracle's layered graph are different problems over the same cells, and
@@ -1342,7 +1363,7 @@ into the same board the moment a later stage frees the frontier.
 
 Boards go to `<out_dir>/roundhouse_round<N>_rot<K>[rev]_W<w>_miss<B>.csv`,
 appended one atomic line at a time, duplicates suppressed. The name carries
-`--rounds`, `--rotate`, `--reverse` and `--strip_width`, so runs with different
+`--rounds`, `--rotate`, direction and `--strip_width`, so runs with different
 geometry never share a file -- while runs with the *same* geometry do, which is
 what lets a corpus sweep accumulate.
 
@@ -1364,7 +1385,7 @@ is uniquely named and stdout names the id it just wrote.
 
 **Boards are always written in the input's orientation** - the frame is rotated
 back (and un-mirrored) first, so cell `(r,c)` means what it meant in the input
-whatever `--rotate` and `--reverse` were. Every placed junction matches, so `score` is 480 minus the junctions a hole
+whatever `--rotate` and the direction were. Every placed junction matches, so `score` is 480 minus the junctions a hole
 still leaves unrealized - it falls with every *empty* cell and never with a
 mismatch. A 191-piece board scoring 350 is perfectly matched, not damaged;
 compare a partial with a partial, or re-score both with `tools/E555_rank.py`.
@@ -1400,8 +1421,10 @@ rows 13-15: `--rounds 1 --strip_width 3` frees 48 cells and refills them for
 break per two cells filled. The fill is there so Stage C receives a full board
 rather than a hole, not because it beats the board you fed in.
 
-Volume is set by `--ties` (boards kept at the deepest reach), `--max_emitted` and
-`--only_complete`. There is no diversity knob and no need for one: the search
+Volume is set by `--ties` (boards kept at the deepest reach), `--tie_depth`
+(how far behind the frontier two of them must differ) and `--max_emitted`.
+`--target_ties N` stops an input as soon as N such boards reach the endpoint.
+There is no diversity knob beyond that and no need for one: the search
 enumerates every break-free filling, so what limits the output is the depth the
 board reaches, not which subtree the engine happened to explore.
 
@@ -1427,29 +1450,40 @@ feeds any stage unchanged.
 
 | option | default | meaning |
 |---|---|---|
-| `--out_dir DIR` | `round_out` | output directory; names carry the geometry, and break-free boards are filed apart from break-bought ones |
+The invocation is `bin/E555_roundhouse SEED BOARDS OUTPUT.csv [options]`. The
+**third positional argument is the output CSV**: it is replaced at startup and
+every emitted board goes to it -- break-free, hold-join and break-bought alike,
+told apart by the class in the log and by the id tag. There is no `--out_dir`
+and no generated filename to guess. `<dir-of-output>/outputs.txt` is still
+written, and lists the file only when a board actually reached it.
+
+| option | default | meaning |
+|---|---|---|
 | `--start_row N` / `--num_rows N` | 0 / 0 | first input CSV data line, and how many (0 = to the end of the file) |
+| `--shard_count N` / `--shard_index I` | 1 / 0 | process every N-th row of the window; the efficient way to split a large corpus over independent processes |
 | `--strip_width W` | 5 | 2..5; chain length, and hence the core. 0 = narrowest usable |
-| `--rounds N` | 3 | 1..3; bands freed and refilled (right, top, left) |
+| `--rounds N` | 3 | 1..4; bands freed and refilled. 1..3 are the nested right/top/left cuts; 4 keeps a centred core, the whole wall column and the bottom-right W-piece anchor, and traverses all four sides |
 | `--rotate K` | 1 | quarter-turns before the cut, -3..3; negative turns anticlockwise |
-| `--reverse` | off | spiral the other way round, by mirroring the seed; a second exhaustive attack on the same cells, not a new region |
-| `--stop_row R` | last level | stop each strip at this level instead of its last |
+| `--ccw` / `--cw` | `--ccw` | spiral direction. `--cw` mirrors the seed and the board, runs the same frame search, and mirrors the output back: a second exhaustive attack on the same cells, not a new region |
+| `--stop_row R` | last level | stop the final side at this absolute frame level instead of its last |
+| `--stop_after N` | off | stop the final side after N new levels; rotation-independent, unlike `--stop_row` |
+| `--hold_band` | off | rounds 1..3: retain the occupied cells in the half of the final side opposite the traversal and search the other half |
 | `--BL/--BR/--TL/--TR P` | -- | pin a corner piece by its role on the **input** board |
 | `--breaks B` | 0 = off | after the exhaustive search, greedily fill the rest of the deepest board, spending at most B mismatches |
 | `--max_nodes N` | 0 | node budget per input board |
 | `--time_limit S` | 600 | wall-time budget per input board |
 | `--wall_time S` / `--max_emitted N` | 0 / 0 | budgets for the whole run |
 | `--ties N` | 1 | boards to emit at the deepest reach |
-| `--only_complete` | off | emit only boards with all 256 pieces placed |
-| `--selfcheck` | off | validate the oracle against brute force and exit |
+| `--tie_depth N` | 2 | ties must differ at least N complete chain levels behind the newest placement, which drops cosmetic last-level variants |
+| `--target_ties N` | 0 = off | stop one input as soon as N such boards reach the endpoint |
+| `--no_transition_cache` | cache on | decode each chain record's successor on the fly instead of once at build time. A debugging switch: the two paths must produce identical output, which is what check 13 `roundhouse_cache` asserts |
 | `--threads N` / `--verbose` | all / off | as Stage B |
 
-Retired in the exhaustive rewrite and now accepted with a warning, so older
-scripts keep running: `--beam_width`, `--mode`, `--frac_rand`, `--repeats`,
-`--finalize_repeats`, `--lambda_Mahalanobis`, `--top_bottoms`,
-`--emit_each_round`, `--emit_deepest`, `--rng_seed`, `--max_partials`,
-`--free_edges`. The search is exhaustive and deterministic, so none of them
-have anything left to do, and the deepest board is emitted by default.
+There are no aliases: one name per concept. `--reverse`, `--direction` and
+`--stop_level` were synonyms and have been removed, as have `--out_dir`,
+`--only_complete` and `--selfcheck`. A flag this tool does not have is a hard
+error rather than a warning, so a stale script fails at startup instead of
+running with a control that silently does nothing.
 
 ### What the input has to satisfy
 
@@ -1879,21 +1913,39 @@ record; output is re-feedable.
 For a full board the topper has already tidied. One CP-SAT engine opens a slice
 of the board, caps how many pieces may actually move (`--max_changes`), and
 re-solves to cut breaks -- never returning a board worse than its input. An
-internal escalation ladder climbs (reach x budget) rungs, warm-starting from
-the best board so far and stopping the instant breaks hit zero; you set only the
-ceilings (`--reach`, `--max_changes`). `--mode` picks the neighbourhood and the
-objective:
+adaptive portfolio replaces the old fixed escalation ladder: it opens small
+**break-centred pools first** and only then widens to broad global
+neighbourhoods, warm-starting from the best board so far and stopping the
+instant breaks hit zero. You choose an effort `--profile` and a **true
+per-board budget**, and the tool picks the neighbourhoods:
 
-| `--mode` | interior opened | objective | good for |
-|---|---|---|---|
-| `patch` (default) | a box around the current breaks, or an explicit `--holes` mask | minimize breaks, then **compact** the broken region and its perimeter | surgically healing and tidying a few local breaks |
-| `ring` | every cell within `--reach` BFS layers of a break | pure break count (kept lean so the big model stays fast) | breaks on/near the border, which heal by an "avalanche" cascading around the frame |
+| option | default | meaning |
+|---|---|---|
+| `--profile` | `overnight` | `overnight`, `deep` or `superdeep`; sets the pool sizes, the escalation and the thread count |
+| `--board_time_limit S` | profile | the total wall-clock budget for ONE input board, every focused pool, broad phase and restart included. This is the knob to set |
+| `--attempt_time S` | profile | optional ceiling on a single `CpSolver.Solve()` call. Leave it alone unless you are running a deliberate timing experiment |
+| `--search_mode` | `improve` | `improve` adds the hard constraint `breaks <= current-1` and stops at the first witness; `optimize` minimises breaks and then collateral damage until the call ends |
+| `--max_new_breaks N` | 3 | how many previously matched junctions a candidate may break, counted against the board it started from rather than the previous iteration |
+| `--holes FILE` | -- | pin the pool to exactly this 16x16 mask instead of letting the tool choose |
+| `--threads N` | profile | CP-SAT workers in one process |
+| `--shard_count`/`--shard_index` | 1 / 0 | split a corpus over independent processes; resume and exact-duplicate reuse are built in |
 
-Both modes always free the whole 60-cell border ring; only the interior set and
-the objective differ. It exploits the border's Euler-trail richness -- a top
-break can cascade all the way around the frame -- and the corners' three-way
-commodity symmetry falls out of the per-class `AddAllDifferent` for free.
-`--verbose` prints an ASCII map of the open pool per rung.
+`--search_mode improve` is a pure satisfaction model: no objective and no
+objective-bound machinery is built, because the first acceptable witness ends
+the call. `--stall_time` therefore applies only to `optimize`, and the tool says
+so rather than ignoring it silently.
+
+**`repair_hint` is off by default and that is not a tuning preference.** On
+OR-Tools 9.15.6755 it aborts the process -- `Check failed: heuristics.fixed_search
+!= nullptr`, SIGABRT, no output, every board after it in the corpus lost. It
+fires when the hint violates the model, which in `improve` mode is every call:
+the incumbent breaches the one-break-better target by construction. Re-enable it
+only against a build you have confirmed is fixed.
+
+The border ring is no longer freed wholesale. That was worth doing when the
+ender was the only tool that could re-thread the frame, but the roundhouse
+handles the border far more efficiently now, so the ender concentrates on the
+pool it is given. `--verbose` prints an ASCII map of the open pool per phase.
 
 It takes the same **`--clue_center` / `--clue_corners` / `--clue_orient`** as the
 topper, with two extras this tool needs. Its piece domains are exactly the
@@ -2048,9 +2100,10 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   `--plan` writes its directory relative to the *current* directory, not `--root`. `--plan` writes `plan_<stem>/`: one
   `--holes` mask per kept board, named by its input row, and a `run_plan.sh`
   whose blocks target single rows via `--start_row N --num_rows 1`. Complete
-  boards route to `E555_ender.py` -- the purpose-built endgame tool -- in
-  `--mode ring` when the window is mostly border and `--mode patch` otherwise;
-  boards with empty cells route to `E555_topper.py`. `dive_min` is sampled and
+  boards route to `E555_ender.py` -- the purpose-built endgame tool -- with the
+  board's own window as `--holes`, a `--profile` and a `--board_time_limit`;
+  there is no mode to choose any more. Boards with empty cells route to
+  `E555_topper.py`. `dive_min` is sampled and
   the backtracker seeds its RNG from the clock, so it moves a break or two
   between runs and close ranks can swap; the window and mobility columns are
   exact.
@@ -2096,7 +2149,7 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
 | Stage A | `rotations.csv` | `# comment` lines + `id, spin[0..255]` (60 border spins, 196 zeros) |
 | beamer | `beam_completions_<border>_<row>.csv` / `..._random_<row>.csv` | `config_id, sol_idx, pos[256], rot[256]` (514) |
 | beamer | `sweep_checkpoint.txt` | resume state, one line |
-| roundhouse | `roundhouse_round<N>_rot<K>[rev]_W<w>_miss0.csv` (break-free) and `..._miss<B>.csv` (with breaks) | canonical 514-field layout, ids `p<line><tag><n>` |
+| roundhouse | the output CSV named as the third positional argument; every board goes to it | canonical 514-field layout, ids `<input-id>_<line><tag><n>`, tag `s`/`d`/`j`/`f` for solved, deepest, hold-join, break-filled |
 | finalizer | `beam_completions_finalized_<row>.csv` | same 514-field layout, ids `p<line>r<repeat>l<column>` |
 | Stage C (all) | output CSV | **canonical**: `config_id, score, pos[256], rot[256]` (514) |
 | backtracker | `<out>.checkpoint.csv`, `<out>.status.csv`, `<out>.best_*.csv` | canonical rows / diagnostic sidecars |
@@ -2130,7 +2183,7 @@ cd ~/runs && bash ~/E555/examples/07_barebones_chain.sh
 # stage by stage. Settings are NAME=value ARGUMENTS, not environment variables:
 bash examples/01_beamer_quickstart.sh ANNEAL=1          # Stage A then Stage B
 bash examples/02_finalizer_regrow.sh BOARDS=beam_out/beam_completions_0_10.csv
-bash examples/04_stage_c_close.sh BOARDS=final_out/beam_completions_finalized_12.csv
+bash examples/04a_CP-SAT_top_and_end.sh BOARDS=final_out/beam_completions_finalized_12.csv
 
 # validate everything (includes the synthetic-solution regression):
 bash tests/run_tests.sh
@@ -2195,7 +2248,7 @@ tools to the same-seed-same-threads contract.
 | `src/B_beam/E555_roundhouse.c` | Strip solver: board rotation, width-W chain DB, relaxed DP oracle, exhaustive/sampling strip search, 3-round spiral. |
 | `src/C_tail/E555_topper.py` | CP-SAT break minimizer, nearest-corner pull, `--side` bands + sliding window, or an explicit `--holes` mask. |
 | `src/C_tail/E555_backtracker.c` | Exact/bounded-mismatch DFS tail closer. |
-| `src/C_tail/E555_ender.py` | CP-SAT closer: budgeted local re-solve, `--mode patch` (compacting LNS) or `ring` (border sweep). |
+| `src/C_tail/E555_ender.py` | CP-SAT closer: adaptive portfolio of focused then broad neighbourhoods, driven by `--profile` and a true `--board_time_limit`. |
 | `tools/E555_viewer.py` | Board viewer/differ + bucas URL. |
 | `tools/E555_rank.py` | Ranks/sorts board CSVs by compactness, solidity, clean rows; `--rescore` rewrites them canonically; `--diverse K` picks independent roots. |
 | `tools/E555_rotate.py` | Turns every board in a CSV by a quarter-turn multiple, losslessly; `--sink N` drops the board N rows so the bad rows fall out of it. |

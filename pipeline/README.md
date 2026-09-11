@@ -382,7 +382,7 @@ roundhouse leaves it in the band of its LAST round:
 | `--rotate 0` | left | `closeL` |
 
 ```bash
-bash pipeline/topper_sweep.sh INPUT=round_out/roundhouse_round1_rot1_W5_miss0.csv PRESET=closeB
+bash pipeline/topper_sweep.sh INPUT=round_out/strip.csv PRESET=closeB
 ```
 
 Read the DEPTH off the roundhouse's `[emit]` line

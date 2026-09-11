@@ -28,6 +28,8 @@ runs/
 under_development/
 old/
 .claude/
+# staging area for upgrades under review; never shipped
+tmp/
 
 # Python
 __pycache__/

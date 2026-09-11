@@ -74,7 +74,9 @@ value. Copy that line and you have the run, without this script in the middle.
 | `01_beamer_quickstart.sh` | beamer (+ annealer) | Stage B from nothing: sample a border, grow the board row by row. `ANNEAL=1` runs Stage A first, so the borders are searched for rather than sampled | 8 GB RAM, ~5 min |
 | `02_finalizer_regrow.sh` | finalizer | free the top rows of a board and re-grow them from a reduced database | seconds to minutes |
 | `03_roundhouse_strip.sh` | roundhouse | rotate the board, refill a border strip; can prove a board dead in milliseconds | megabytes |
-| `04_stage_c_close.sh` | topper + ender | the whole CP-SAT tail in the documented order: herd the breaks onto a band, sweep the ring, then patch what is left | `pip install ortools` |
+| `04a_CP-SAT_top_and_end.sh` | topper + ender | the CP-SAT funnel: scout widely, promote a diverse set, polish it, then one adaptive ender close | `pip install ortools` |
+| `04b_CP-SAT_ender_overnight.sh` | ender | deduplicate and shard a large full-board corpus over several ender processes | `pip install ortools`, hours |
+| `04c_CP-SAT_ender_elite.sh` | ender | pick diverse elites and give each repeated `deep` or ten-hour `superdeep` passes | `pip install ortools`, hours |
 | `05_backtracker_dives.sh` | backtracker | greedy dives to triage, exhaustive DFS to prove | minutes to overnight |
 | `06_roundhouse_both_ways.sh` | roundhouse | chain two roundhouse passes per board, once each way round, so the two spirals cover all four sides | seconds to minutes |
 | `08_distiller_quickstart.sh` | distiller (+ backtracker) | triage a corpus: rank thousands of >=450 boards by how much repair headroom is left, then write the Stage C commands to attack the best of them | seconds to minutes |
@@ -89,8 +91,8 @@ including a tool's own output. That is what makes iteration possible:
 ```bash
 bash examples/01_beamer_quickstart.sh
 bash examples/02_finalizer_regrow.sh BOARDS=beam_out/beam_completions_random_10.csv
-bash examples/04_stage_c_close.sh    BOARDS=final_out/beam_completions_finalized_12.csv
-bash examples/05_backtracker_dives.sh BOARDS=stage_c_out/3_patched.csv
+bash examples/04a_CP-SAT_top_and_end.sh BOARDS=final_out/beam_completions_finalized_12.csv
+bash examples/05_backtracker_dives.sh BOARDS=stage_c_funnel/4_closed.csv
 ```
 
 Between any two steps, look at what you have:
@@ -250,25 +252,34 @@ expect roughly one break per two cells it has to fill.
 
 ---
 
-## 04 -- Stage C, and why the three passes are one script
+## 04 -- Stage C, and why it is now three scripts
 
-They only make sense together: the topper deliberately **piles** breaks onto a
-border band, and the ender's two modes are what un-pile them.
+The topper and the ender only make sense together: the topper deliberately
+**piles** breaks onto a border band, and the ender is what un-piles them. What
+changed is that the ender no longer has modes you pick between -- it runs an
+adaptive portfolio, small break-centred pools first and broad neighbourhoods
+after -- so the old three-pass chain collapsed into one ender call, and the
+three scripts now differ by *how much effort* they spend rather than by which
+neighbourhood they open.
 
-1. **topper** opens a band along one border and re-solves it under a strictly
-   lexicographic objective: fewest broken edges, then push the unavoidable ones
-   to the nearest horizontal border, then slide them along it toward a corner.
-   Measuring to the *nearest* border keeps the worst trip at 7+7 cells instead
-   of 15+15 and lets all four corners share the load.
-2. **ender ring** opens every cell within `REACH` BFS layers of a break plus the
-   whole 60-cell border ring. A border break heals by an avalanche cascading
-   around the frame, so this comes right after the topper piled them there.
-3. **ender patch** opens a box around what is left and, besides minimising
-   breaks, **compacts** them. The finishing pass.
+- **`04a_CP-SAT_top_and_end.sh`** is the funnel and the one to read first:
+  topper scout (wide, cheap) -> promote a diverse subset -> topper polish ->
+  one adaptive ender close.
+- **`04b_CP-SAT_ender_overnight.sh`** takes a large full-board corpus,
+  exact-deduplicates it and shards it over several ender processes.
+- **`04c_CP-SAT_ender_elite.sh`** picks a few diverse elites and gives each
+  repeated `deep` or ten-hour `superdeep` passes with independent seeds.
 
-Neither ender pass can return a board worse than its input, so running the chain
-is always safe. `SKIP_TOPPER=1` starts at the ring sweep -- right when the
-damage is already on the border, e.g. after a roundhouse run.
+**The two ender knobs that matter.** `ENDER_PROFILE` is the effort level --
+`overnight`, `deep`, `superdeep` -- and `ENDER_BOARD_TIME` (`--board_time_limit`)
+is the **true total budget for one board**, every focused pool, broad phase and
+restart included. Do not set `--attempt_time` unless you are deliberately
+capping one CP-SAT call. The ender never returns a board worse than its input,
+so running any of these is always safe.
+
+The topper still writes what the ender reads, so a roundhouse output whose
+damage is already on the border can go straight to `04b`/`04c` and skip the
+topper entirely.
 
 **The topper's two knobs.** `SIDE` is which band opens: `T B L R`, or the
 L-shaped pairs `TR TL TB`. Open **only** where the breaks are: a pass over a
@@ -322,11 +333,12 @@ after `OUT`. They are all listed in `$OUT.outputs.txt`.
 
 ## 06 -- does the spiral direction matter?
 
-Each input board is run through two chains of two roundhouse passes: forward
-then `--reverse`, and `--reverse` then forward. Two passes each way cover all
+Each input board is run through two chains of two roundhouse passes: `--ccw`
+then `--cw`, and `--cw` then `--ccw`. Two passes each way cover all
 four sides. Both chains start from the same board, so the scores are comparable
 and the tally at the end answers the question. `HOLD=1` makes the second pass
-keep what the first left standing in the band instead of re-cutting it.
+keep the half of its final side that the first left standing, and search the
+other half; the seam between the two is deliberately left unconstrained.
 
 Each board is tagged with the pass that made it (`..._a1`, `..._b2`), so
 provenance survives when the four passes are `cat`-ed into one file.
@@ -348,7 +360,7 @@ cd ~/runs && bash ~/E555/examples/07_barebones_chain.sh
 
 **Output goes to the directory you run it from.** It is the one script that does
 not `cd` into the checkout: `REPO` prefixes `bin/`, `data/` and `tools/`, and
-every `--out_dir` is a bare relative path. Run it from a scratch folder and the
+every output path is a bare relative path. Run it from a scratch folder and the
 whole run stays there. `THREADS` and `PREFIX` are the only other variables.
 
 **Flags absent from the file are the tool's tuned defaults**, not oversights.
