@@ -69,11 +69,10 @@ RH_WALL=600
 
 # stages 5/6: CP-SAT tail (needs: pip install ortools)
 TOP_N=20                # boards carried into the CP-SAT stages
-CPSAT_TIME=120          # seconds per SOLVE, and the ender solves per break --
-                        # measured, its two passes were 474 s of a 620 s run
-CPSAT_STALL=40
-ENDER_REACH=2           # interior BFS layers opened around each break
-ENDER_CHANGES=16        # how many pieces the ender may actually move
+CPSAT_TIME=120          # topper: total seconds per board, split over its ranks
+CPSAT_STALL=40          # topper: stop a rank after this long without progress
+ENDER_PROFILE=overnight # ender: overnight | deep | superdeep
+ENDER_BOARD_TIME=240    # ender: TRUE total seconds per board, every call included
 
 # stage 7: backtracker
 BT_MISMATCH=30
@@ -257,14 +256,15 @@ echo "A completion here would be a solved puzzle; a refusal is a proof; a failur
 echo "still yields break-free boards with the hole gathered in one corner."
 echo
 
-"$BIN/E555_roundhouse" "$SEED" "$FIN_OUT" "${CLUE_ARG[@]}" \
-    --out_dir strip --threads "$THREADS" \
+mkdir -p strip
+"$BIN/E555_roundhouse" "$SEED" "$FIN_OUT" strip/boards.csv "${CLUE_ARG[@]}" \
+    --threads "$THREADS" \
     --rounds 1 --strip_width "$RH_WIDTH" --rotate "$RH_ROTATE" \
     --num_rows "$RH_LINES" --wall_time "$RH_WALL" --print_cmd --verbose
 
-RH_OUT=$(head -1 strip/outputs.txt)
-if [ -n "$RH_OUT" ]; then
-    cp "$RH_OUT" 4_strip.csv
+# The output file is named above, so this only asks whether anything reached it.
+if [ -s strip/boards.csv ]; then
+    cp strip/boards.csv 4_strip.csv
     rank 4_strip.csv
     echo
     echo ">> $(rows 4_strip.csv) boards, best $(best 4_strip.csv)/480 -> 4_strip.csv"
@@ -300,27 +300,24 @@ echo ">> $(rows 5_corners.csv) boards, best $(best 5_corners.csv)/480 -> 5_corne
 show 5_corners.csv
 
 # -----------------------------------------------------------------------------
-next "ender -- ring sweep, then patch"
-echo "The stages above leave the damage in and around the border ring, which is"
-echo "exactly what the ring sweep re-threads. The patch pass then runs a"
-echo "localized LNS on whatever break the sweep left."
+next "ender -- one adaptive closing pass"
+echo "The ender now runs its own portfolio: small break-centred neighbourhoods"
+echo "first, then progressively broader ones, restarting the cheap phase after"
+echo "every accepted gain. It stops when the board budget runs out, so this is"
+echo "one call, not the hand-built ring-then-patch chain it replaces."
 echo
 
-python3 "$SRC/C_tail/E555_ender.py" "$SEED" 5_corners.csv 6_rung.csv "${CLUE_ARG[@]}" \
-    --mode ring --reach "$ENDER_REACH" --max_changes "$ENDER_CHANGES" \
-    --threads "$THREADS" \
-    --time_limit "$((CPSAT_TIME*2))" --stall_time "$CPSAT_STALL" --verbose
-python3 "$SRC/C_tail/E555_ender.py" "$SEED" 6_rung.csv 6_patched.csv "${CLUE_ARG[@]}" \
-    --reach "$ENDER_REACH" --max_changes "$ENDER_CHANGES" --threads "$THREADS" \
-    --time_limit "$((CPSAT_TIME*3))" --stall_time "$((CPSAT_STALL*2))" --verbose
-rank 6_rung.csv; rank 6_patched.csv
+python3 "$SRC/C_tail/E555_ender.py" "$SEED" 5_corners.csv 6_patched.csv "${CLUE_ARG[@]}" \
+    --profile "$ENDER_PROFILE" --search_mode improve \
+    --board_time_limit "$ENDER_BOARD_TIME" --threads "$THREADS" --verbose
+rank 6_patched.csv
 echo
-echo ">> ring sweep best $(best 6_rung.csv)/480, patch best $(best 6_patched.csv)/480"
+echo ">> ender best $(best 6_patched.csv)/480"
 show 6_patched.csv
 
 # -----------------------------------------------------------------------------
 next "backtracker -- greedy dives on the best board"
-cat 5_corners.csv 6_rung.csv 6_patched.csv > all_candidates.csv
+cat 5_corners.csv 6_patched.csv > all_candidates.csv
 rank all_candidates.csv
 head -1 all_candidates.csv > 7_best_input.csv
 rm -f all_candidates.csv

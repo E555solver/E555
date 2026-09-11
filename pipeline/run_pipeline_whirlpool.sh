@@ -286,17 +286,17 @@ echo "rows on purpose. A completion here would be a solved puzzle; a refusal is"
 echo "a proof, delivered in milliseconds."
 echo
 
-"$BIN/E555_roundhouse" "$SEED" "$CURRENT" \
-    --out_dir strip --threads "$THREADS" \
+mkdir -p strip
+"$BIN/E555_roundhouse" "$SEED" "$CURRENT" strip/boards.csv \
+    --threads "$THREADS" \
     --rounds "$RH_ROUNDS" --strip_width "$RH_WIDTH" --rotate "$RH_ROTATE" \
     --num_rows "$RH_LINES" --wall_time "$RH_WALL" --print_cmd --verbose "${CLUE_ARG[@]}"
 
-# First existing match, or empty. NOT `$(ls GLOB | head -1)`: an unmatched glob
-# makes ls exit 2, pipefail promotes it, and set -e kills the run -- which is
-# exactly the "emitted nothing" case the else branch exists to report.
-RH_OUT=$(head -1 strip/outputs.txt)
-if [ -n "$RH_OUT" ] && [ -s "$RH_OUT" ]; then
-    cp "$RH_OUT" C1_strip.csv
+# The output path is chosen here rather than discovered, so the "emitted
+# nothing" case the else branch reports is just an empty file. The run still
+# writes strip/outputs.txt, which lists this file only when a board reached it.
+if [ -s strip/boards.csv ]; then
+    cp strip/boards.csv C1_strip.csv
     rank C1_strip.csv
     echo
     echo ">> $(rows C1_strip.csv) boards, best $(best C1_strip.csv)/480 -> C1_strip.csv"

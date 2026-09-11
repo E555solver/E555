@@ -54,6 +54,24 @@ THE MODEL
     - Chunked CSV reading (--start_row / --num_rows) for Slurm array jobs; writes
       are retried once on transient network-filesystem errors.
 
+VERSION 2 CHANGES
+
+    - --beam_slack is now literally a bound on extra BREAKS, rather than a
+      packed-objective offset that accidentally included corner-distance costs.
+    - Diversity can be measured by piece only (--beam_diff_mode piece, the
+      default: --beam_diff counts distinct PIECE placements, as the flag has
+      always promised) or by the full (piece, rotation) placement, which also
+      counts a rotation-only change and is therefore a weaker requirement.
+    - Later beam ranks are re-hinted from the preceding solution. CP-SAT hint
+      repair (--repair_hint) can consume that hint, but is off by default: it
+      aborts the process on OR-Tools 9.15.6755.
+    - When --top is greater than one, --rank1_fraction can reserve most of the
+      board budget for finding a strong first rank instead of dividing time
+      equally before the optimum has matured.
+    - The stall watchdog resets only on a strict objective improvement.
+    - CP-SAT symmetry, linearization, hint-repair, and search-log controls are
+      exposed instead of hard-wiring symmetry_level=0.
+
 WHAT IS OPEN FOR MUTATION
 
     band   = the --side bands, each --band_depth deep
@@ -351,7 +369,7 @@ def solve_frontier(pos, rot, tiles, free_cells, args, verbose, pins=()):
         pv = model.NewIntVarFromDomain(cp_model.Domain.FromValues(d), f"pc_{cell}")
         rv = model.NewIntVar(0, 3, f"ro_{cell}")
         nv, ev, sv, wv = (model.NewIntVar(0, maxc, f"{x}_{cell}") for x in "NESW")
-        
+
         # Domain filtering: Only allow assignments that satisfy the frame rules (grey edges)
         allowed = [(p, s) + rotate_edges(tiles[p], s) for p in d for s in range(4)
                    if frame_rule_ok(r, c, rotate_edges(tiles[p], s))]
@@ -375,7 +393,7 @@ def solve_frontier(pos, rot, tiles, free_cells, args, verbose, pins=()):
 
     fixed_col = {c: rotate_edges(tiles[piece_at[c]], rot[piece_at[c]])
                  for c in piece_at if c not in free_cells}
-                 
+
     def ecolor(cell, d):
         if cell in col_of: return col_of[cell][d]
         if cell in fixed_col: return fixed_col[cell][d]
@@ -427,6 +445,12 @@ def solve_frontier(pos, rot, tiles, free_cells, args, verbose, pins=()):
         Pr, Pc = divmod(rem, w_row)
         return B, Pr, Pc
 
+    # Keep the break count as its own expression.  Version 1 constrained the
+    # packed objective for lower beam ranks; because that objective also contains
+    # corner distance, ``--beam_slack 1`` did not literally mean one extra break.
+    # The explicit expression below restores the CLI promise.
+    break_count_expr = sum(brk for brk, _rc, _cc in breaks)
+
     # Objective: minimize breaks; among equal-break boards, pull them to the
     # nearest horizontal border, then along it to the nearest corner.
     obj_expr = sum((w_b + w_row * rc + cc) * brk for brk, rc, cc in breaks)
@@ -445,53 +469,78 @@ def solve_frontier(pos, rot, tiles, free_cells, args, verbose, pins=()):
     # ONE SOLVE, with incumbent telemetry and a stall watchdog
     # ---------------------------------------------------------
     class _Tracker(cp_model.CpSolverSolutionCallback):
-        """Reports incumbents as they arrive and feeds the stall watchdog."""
+        """Report only strict objective improvements to the stall watchdog."""
         def __init__(self):
             cp_model.CpSolverSolutionCallback.__init__(self)
-            self._t0 = self.last = time.monotonic()
+            self._t0 = time.monotonic()
+            self.last_improvement = self._t0
+            self.best_obj = None
             self.found = 0
 
         def on_solution_callback(self):
-            self.last = time.monotonic()
             self.found += 1
+            obj = int(round(self.ObjectiveValue()))
+            if self.best_obj is not None and obj >= self.best_obj:
+                return
+            self.best_obj = obj
+            self.last_improvement = time.monotonic()
             if verbose:
-                B, Pr, Pc = decode_obj(int(round(self.ObjectiveValue())))
-                print(f"      [inc] t={self.last-self._t0:6.1f}s | open-break={B} | "
-                      f"corner-dist={Pr + Pc} ({Pr} up/down + {Pc} sideways)", flush=True)
+                B, Pr, Pc = decode_obj(obj)
+                print(f"      [inc] t={self.last_improvement-self._t0:6.1f}s | "
+                      f"open-break={B} | corner-dist={Pr + Pc} "
+                      f"({Pr} up/down + {Pc} sideways)", flush=True)
 
-    def run_solve(budget):
-        """Solves the current model for at most `budget` seconds."""
+    def run_solve(budget, solve_index):
+        """Solve the current model for at most ``budget`` seconds."""
         solver = cp_model.CpSolver()
-        solver.parameters.num_search_workers = args.threads
-        solver.parameters.linearization_level = 1
-        solver.parameters.symmetry_level = 0
-        solver.parameters.random_seed = (args.rng_seed & 0x7fffffff
-                                         if args.rng_seed != 0 else random.randrange(1 << 31))
+        if hasattr(solver.parameters, "num_workers"):
+            solver.parameters.num_workers = args.threads
+        else:
+            solver.parameters.num_search_workers = args.threads
+        solver.parameters.linearization_level = args.linearization_level
+        solver.parameters.symmetry_level = args.symmetry_level
+        seed = (args.rng_seed + solve_index if args.rng_seed != 0
+                else random.randrange(1 << 31))
+        solver.parameters.random_seed = seed & 0x7fffffff
         solver.parameters.max_time_in_seconds = float(budget)
+        # OFF BY DEFAULT: on OR-Tools 9.15.6755 this parameter aborts the
+        # process -- "Check failed: heuristics.fixed_search != nullptr",
+        # SIGABRT, and the board in flight plus every board after it is lost.
+        # It fires when the hint violates the model, which is exactly the case
+        # this code creates for ranks 2..N: add_state_hint() re-hints the board
+        # the freshly added forbid() cut has just outlawed. Measured: --top 8
+        # aborts in seconds; --no-repair_hint completes the same run.
+        if args.repair_hint and hasattr(solver.parameters, "repair_hint"):
+            solver.parameters.repair_hint = True
+            solver.parameters.hint_conflict_limit = args.hint_conflicts
+        if args.log_search:
+            solver.parameters.log_search_progress = True
+            solver.parameters.log_subsolver_statistics = args.threads > 1
 
         tracker = _Tracker()
         done, state = threading.Event(), {"stalled": False}
 
-        # Watchdog thread to stop the solver early if IMPROVEMENT stalls. It only
-        # arms once a first solution exists: for ranks 2..N the search may have
-        # to prove that no distinct board is left, and that is not a stall.
         def watchdog():
-            while not done.wait(0.5):
-                if (args.stall_time > 0 and tracker.found > 0
-                        and time.monotonic() - tracker.last > args.stall_time):
+            while not done.wait(0.25):
+                if (args.stall_time > 0 and tracker.found > 0 and
+                        time.monotonic() - tracker.last_improvement > args.stall_time):
                     state["stalled"] = True
-                    if verbose: print("      [!] Solver stalled. Halting search early.", flush=True)
+                    if verbose:
+                        print("      [!] Strict objective stalled; stopping this rank.",
+                              flush=True)
                     solver.StopSearch()
                     return
 
-        w = threading.Thread(target=watchdog, daemon=True); w.start()
+        w = threading.Thread(target=watchdog, daemon=True)
+        w.start()
         status = solver.Solve(model, tracker)
         done.set(); w.join()
 
         rsn = ("optimal" if status == cp_model.OPTIMAL else
+               "infeasible" if status == cp_model.INFEASIBLE else
+               "model-invalid" if status == cp_model.MODEL_INVALID else
                "stalled" if state["stalled"] else
-               "max-time" if status == cp_model.FEASIBLE else
-               "infeasible" if status == cp_model.INFEASIBLE else "no-sol")
+               "max-time" if status == cp_model.FEASIBLE else "unknown")
         ok = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
         return ok, solver, rsn
 
@@ -508,14 +557,37 @@ def solve_frontier(pos, rot, tiles, free_cells, args, verbose, pins=()):
             temp_pos[p], temp_rot[p] = c, r
         return (temp_pos, temp_rot), state
 
+    def add_state_hint(state):
+        """Hint a complete placement, including colors, for repair search."""
+        if hasattr(model, "ClearHints"):
+            model.ClearHints()
+        elif hasattr(model, "clear_hints"):
+            model.clear_hints()
+        for c, (p, r) in state.items():
+            model.AddHint(piece_of[c], p)
+            model.AddHint(rot_of[c], r)
+            for d, v in enumerate(col_of[c]):
+                model.AddHint(v, rotate_edges(tiles[p], r)[d])
+
     def forbid(state, k):
-        """Requires at least `k` free cells to hold a piece other than in `state`."""
+        """Require at least k cells to differ from one emitted board."""
         diffs = []
-        for c, (p, _r) in state.items():
-            bv = model.NewBoolVar(f"df_{c}_{len(diffs)}")
-            model.Add(piece_of[c] != p).OnlyEnforceIf(bv)
-            model.Add(piece_of[c] == p).OnlyEnforceIf(bv.Not())
-            diffs.append(bv)
+        for c, (p, r) in state.items():
+            if args.beam_diff_mode == "piece":
+                same = model.NewBoolVar(f"same_{c}_{len(diffs)}")
+                model.Add(piece_of[c] == p).OnlyEnforceIf(same)
+                model.Add(piece_of[c] != p).OnlyEnforceIf(same.Not())
+            else:
+                same_p = model.NewBoolVar(f"samep_{c}_{len(diffs)}")
+                same_r = model.NewBoolVar(f"samer_{c}_{len(diffs)}")
+                same = model.NewBoolVar(f"samepr_{c}_{len(diffs)}")
+                model.Add(piece_of[c] == p).OnlyEnforceIf(same_p)
+                model.Add(piece_of[c] != p).OnlyEnforceIf(same_p.Not())
+                model.Add(rot_of[c] == r).OnlyEnforceIf(same_r)
+                model.Add(rot_of[c] != r).OnlyEnforceIf(same_r.Not())
+                model.AddBoolAnd([same_p, same_r]).OnlyEnforceIf(same)
+                model.AddBoolOr([same_p.Not(), same_r.Not()]).OnlyEnforceIf(same.Not())
+            diffs.append(same.Not())
         model.Add(sum(diffs) >= min(k, len(diffs)))
 
     # ---------------------------------------------------------
@@ -525,11 +597,18 @@ def solve_frontier(pos, rot, tiles, free_cells, args, verbose, pins=()):
     # near-duplicates of the optimum, so they are NOT used as ranks.
     # ---------------------------------------------------------
     ranks = max(1, args.top)
-    budget = float(args.time_limit) if ranks == 1 else float(args.time_limit) / ranks
+    if ranks == 1:
+        budgets = [float(args.time_limit)]
+    elif args.rank1_fraction > 0.0:
+        first = float(args.time_limit) * args.rank1_fraction
+        rest = (float(args.time_limit) - first) / (ranks - 1)
+        budgets = [first] + [rest] * (ranks - 1)
+    else:
+        budgets = [float(args.time_limit) / ranks] * ranks
     results, wall, rsn = [], 0.0, "no-sol"
 
     for rank in range(ranks):
-        ok, solver, reason = run_solve(budget)
+        ok, solver, reason = run_solve(budgets[rank], rank)
         wall += solver.WallTime()
         if rank == 0:
             rsn = reason
@@ -543,13 +622,16 @@ def solve_frontier(pos, rot, tiles, free_cells, args, verbose, pins=()):
         board, state = board_from(solver)
         results.append(board)
         if rank == 0 and ranks > 1:
-            # Keep every later rank within --beam_slack breaks of the optimum
-            best_obj = int(round(solver.ObjectiveValue()))
-            model.Add(obj_expr <= best_obj + args.beam_slack * w_b)
-            # The warm start points at the board we are about to forbid
-            if hasattr(model, "ClearHints"): model.ClearHints()
+            # Literal break slack: secondary corner-distance terms cannot spend
+            # or steal any part of this allowance.
+            best_breaks = sum(solver.Value(brk) for brk, _rc, _cc in breaks)
+            model.Add(break_count_expr <= best_breaks + args.beam_slack)
         if rank + 1 < ranks:
             forbid(state, args.beam_diff)
+            # The just-emitted solution violates the new diversity cut, but a
+            # repair hint is exactly useful here: it asks CP-SAT to make the
+            # smallest legal departure rather than restart from a blank phase.
+            add_state_hint(state)
 
     return results, rsn, wall
 
@@ -633,9 +715,20 @@ def main():
 
     # Heuristic & Output Options
     ap.add_argument("--top",        type=int, default=1, help="Beam Search: Output N distinct near-optimal boards per input board.")
-    ap.add_argument("--beam_diff",  type=int,   default=4, help="Beam Search: minimum cells by which ranks must differ.")
-    ap.add_argument("--beam_slack", type=int,   default=1, help="Beam Search: extra breaks a lower rank may cost.")
-    ap.add_argument("--relax_breaks", action="store_true", help="Smart Scoring: Allows more total breaks if pushed further.")
+    ap.add_argument("--beam_diff", type=int, default=4,
+                    help="minimum cells by which emitted ranks must differ")
+    ap.add_argument("--beam_diff_mode", choices=("piece", "placement"),
+                    default="piece",
+                    help="piece (default): ranks must differ in --beam_diff "
+                         "distinct PIECE placements. placement: a rotation-only "
+                         "change also counts, which is a weaker requirement")
+    ap.add_argument("--beam_slack", type=int, default=1,
+                    help="literal extra-break allowance for lower ranks")
+    ap.add_argument("--rank1_fraction", type=float, default=0.60,
+                    help="with --top > 1, fraction of total board time reserved "
+                         "for rank 1; 0 restores equal splitting (default 0.60)")
+    ap.add_argument("--relax_breaks", action="store_true",
+                    help="allow break count to trade against a longer corner push")
 
     # Clue Options: hold the published Eternity II hint pieces in place.
     ap.add_argument("--clue_center", action="store_true",
@@ -651,11 +744,23 @@ def main():
     ap.add_argument("--tag_id", action="store_true", help="Also append _<score> to each output config_id (legacy naming).")
 
     # Solver Options
-    ap.add_argument("--time_limit", type=float, default=300.0, help="Absolute max time allowed per board (seconds)")
-    ap.add_argument("--stall_time", type=float, default=120.0, help="Stop solver if no improvements seen in X seconds")
-    ap.add_argument("--threads",    type=int,   default=8, help="CP-SAT thread count")
-    ap.add_argument("--rng_seed",   type=int,   default=0, help="Random seed (0 = OS entropy)")
-    ap.add_argument("--verbose",    action="store_true", help="Print detailed solver telemetry")
+    ap.add_argument("--time_limit", type=float, default=300.0,
+                    help="total seconds per input board, divided over --top ranks")
+    ap.add_argument("--stall_time", type=float, default=120.0,
+                    help="stop a rank after this long without a strict objective improvement")
+    ap.add_argument("--threads", type=int, default=8, help="CP-SAT portfolio workers")
+    ap.add_argument("--symmetry_level", type=int, default=2, choices=range(0, 5),
+                    help="OR-Tools symmetry handling; 2 is the library default")
+    ap.add_argument("--linearization_level", type=int, default=1, choices=(0, 1, 2))
+    ap.add_argument("--repair_hint", action=argparse.BooleanOptionalAction, default=False,
+                    help="repair the incumbent/previous-rank hint before general "
+                         "search; aborts the process on OR-Tools 9.15.6755")
+    ap.add_argument("--hint_conflicts", type=int, default=1000,
+                    help="conflict budget for hint repair")
+    ap.add_argument("--log_search", action="store_true",
+                    help="enable CP-SAT progress and per-subsolver logs")
+    ap.add_argument("--rng_seed", type=int, default=0, help="base seed (0 = OS entropy)")
+    ap.add_argument("--verbose", action="store_true", help="Print detailed solver telemetry")
     args = ap.parse_args()
 
     if not (1 <= args.band_depth <= SIDE): sys.exit(f"[ERROR] --band_depth must be in 1..{SIDE}.")
@@ -672,6 +777,8 @@ def main():
     if args.top < 1: sys.exit("[ERROR] --top must be >= 1.")
     if args.beam_diff < 1: sys.exit("[ERROR] --beam_diff must be >= 1.")
     if args.beam_slack < 0: sys.exit("[ERROR] --beam_slack must be >= 0.")
+    if not 0.0 <= args.rank1_fraction < 1.0:
+        sys.exit("[ERROR] --rank1_fraction must be in [0,1).")
 
     CL = clue_mask = None
     if args.clue_center or args.clue_corners:
@@ -789,7 +896,7 @@ def main():
             for rank, (pos, rot) in enumerate(results, 1):
                 B, _, _, _ = board_metrics(pos, rot, tiles)
                 score = NUM_EDGES - B
-                
+
                 # Print terminal info for the Rank 1 (Best) solution
                 if rank == 1:
                     if args.verbose:
@@ -809,7 +916,7 @@ def main():
                     cid += f"_{score}"
                 out_row = [cid, str(score)]
                 out_row += [str(x) for x in pos] + [str(x) for x in rot]
-                
+
                 # Resilient Write (catches transient NFS/Lustre I/O errors on clusters)
                 try:
                     writer.writerow(out_row)
@@ -819,9 +926,9 @@ def main():
                     time.sleep(2)
                     writer.writerow(out_row)
                     out.flush()
-                    
+
             processed_count += 1
-            
+
     total_time = time.time() - script_start_time
     print("\n=== run summary ===")
     print(f"[sum] {processed_count} boards processed in {total_time:.1f}s"

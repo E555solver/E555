@@ -55,13 +55,16 @@ cat "${PREFIX}_beam"/beam_completions_random_12.csv \
     "${PREFIX}_fin"/beam_completions_finalized_12.csv > "${PREFIX}_full12.csv"
 
 echo; echo "3/6 roundhouse: any complete row 12, three sides freed and refilled"
+mkdir -p "${PREFIX}_rh"
+: > "${PREFIX}_rh/spiral.csv"           # exists even when this stage is skipped
 if [ -s "${PREFIX}_full12.csv" ]; then
     # --strip_width is the dial here: 5 frees a five-piece band per round, 2 the
-    # narrowest. Three rounds at width 5 keep only the 66-piece core.
+    # narrowest. Three rounds at width 5 keep only the 66-piece core. The third
+    # positional argument is the file every emitted board goes to.
     "$REPO/bin/E555_roundhouse" "$REPO/data/seed_Edge5.txt" "${PREFIX}_full12.csv" \
+        "${PREFIX}_rh/spiral.csv" \
         --rotate -1 --rounds 3 --strip_width 5 --num_rows 0 \
-        --wall_time 600 --threads "$THREADS" \
-        --out_dir "${PREFIX}_rh" --print_cmd
+        --wall_time 600 --threads "$THREADS" --print_cmd
 else
     echo "    nothing reached a complete row 12, so there is nothing to spiral."
     echo "    Raise --wall_time on stage 1 and this stage starts doing work."
@@ -69,7 +72,7 @@ fi
 
 cat "${PREFIX}_beam12.csv" \
     "${PREFIX}_fin"/beam_completions_finalized_12*.csv \
-    "${PREFIX}_rh"/*.csv > "${PREFIX}_row12.csv"
+    "${PREFIX}_rh/spiral.csv" > "${PREFIX}_row12.csv"
 
 echo; echo "4/6 backtracker: every board from all three stages, fill row 12 and 13..15"
 "$REPO/bin/E555_backtracker" "$REPO/data/seed_Edge5.txt" \

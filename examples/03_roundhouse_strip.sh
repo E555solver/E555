@@ -46,20 +46,24 @@ cd "$REPO"
 
 CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 
-bin/E555_roundhouse "$SEED" "$BOARDS" "${CLUE_ARG[@]}" \
+mkdir -p "$OUT_DIR"
+OUT_CSV="$OUT_DIR/strip.csv"
+
+bin/E555_roundhouse "$SEED" "$BOARDS" "$OUT_CSV" "${CLUE_ARG[@]}" \
     --start_row "$FIRST_LINE" --num_rows "$N_LINES" \
     --rounds "$ROUNDS" --strip_width "$WIDTH" --rotate "$ROTATE" \
     --ties "$TIES" --breaks "$BREAKS" --threads "$THREADS" \
-    --wall_time "$MAX_WALL" --out_dir "$OUT_DIR" --print_cmd --verbose
+    --wall_time "$MAX_WALL" --print_cmd --verbose
 
-# The tool names its files after the geometry and splits break-free boards from
-# break-bought ones, so read the list it wrote rather than guessing the names.
+# Every board goes to the one file named above -- break-free, hold-join and
+# break-bought alike, told apart by the class in the log and the id tag. The
+# manifest still lists it, and is empty when the run emitted nothing.
 echo
-if [ -s "$OUT_DIR/outputs.txt" ]; then
+if [ -s "$OUT_CSV" ]; then
     echo "Boards written:"
     sed 's/^/  /' "$OUT_DIR/outputs.txt"
     echo
-    echo "  python3 tools/E555_rank.py \$(head -1 $OUT_DIR/outputs.txt) --seed_file $SEED --top 10"
+    echo "  python3 tools/E555_rank.py $OUT_CSV --seed_file $SEED --top 10"
     echo
     echo "A break-free partial scores 480 minus the junctions its EMPTY cells"
     echo "leave open, never a mismatch. Compare it with another partial."

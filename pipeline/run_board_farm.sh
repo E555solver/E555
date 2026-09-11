@@ -175,13 +175,15 @@ resample() {  # RUN_DIR ITER
     # around the board instead of staying put.
     local rot=1
     [ $(( iter / RESAMPLE_EVERY % 2 )) -eq 0 ] || rot=-1
-    bin/E555_roundhouse "$SEED" "$run/in.csv" "${CLUE_ARG[@]}" \
-        --out_dir "$run/rh" --threads "$THREADS" \
+    mkdir -p "$run/rh"
+    bin/E555_roundhouse "$SEED" "$run/in.csv" "$run/rh/boards.csv" "${CLUE_ARG[@]}" \
+        --threads "$THREADS" \
         --rounds 1 --strip_width 5 --rotate "$rot" \
         --num_rows 0 --wall_time "$PASS_RH_WALL" || rc=$?
 
     # Harvest whatever did get written even when a tool died: half a phase of
-    # boards is still boards. The status is reported separately, above.
+    # boards is still boards. The status is reported separately, above. The
+    # roundhouse writes one named file, so its manifest lists that or nothing.
     harvest $(cat "$run/fin/outputs.txt" "$run/rh/outputs.txt" 2>/dev/null)
     return $rc
 }

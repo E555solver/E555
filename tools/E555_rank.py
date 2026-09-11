@@ -16,13 +16,11 @@ WHY
     rows byte for byte. Add --rescore when you want the file rewritten
     canonically instead; see CANONICAL OUTPUT below.
 
-THE MEASURES  (a "break" is an internal junction whose two cells disagree;
-               a junction touching an unplaced cell counts as broken, exactly
-               as everywhere else in Stage C)
+THE MEASURES
 
-    breaks      480 - score. Lower is better. Measured and sortable, but NOT
-                printed: it is exactly 480 - score, so the table shows score
-                alone and you read closeness to a finished board off it.
+    breaks      480 - score: every internal junction not currently matched.
+                Lower is better. It is sortable but omitted from the human
+                table because score carries the same information.
     score       matched internal edges, 0..480. Higher is better.
     solid       pieces with all four sides satisfied (the viewer's "Solid
                 pieces"), 0..256. Higher is better.
@@ -39,10 +37,11 @@ THE MEASURES  (a "break" is an internal junction whose two cells disagree;
     break_cols  the same for columns -- the one to watch after --side L/R.
     span        bounding box of the break cells, "HxW".
 
-    clean_b     contiguous break-free rows counting up from row 0: rows
-    clean_t     0..clean_b-1 hold no break at all. clean_t counts down from
-    clean_l     row 15, clean_l right from col 0, clean_r left from col 15.
-    clean_r     Higher is better. clean_b is the old "completed rows".
+    clean_b     contiguous COMPLETE, mismatch-free rows from row 0 upward.
+    clean_t     the same from row 15 downward.
+    clean_l     contiguous complete, mismatch-free columns from col 0 rightward.
+    clean_r     the same from col 15 leftward. An open frontier just beyond a
+                complete line does not invalidate it. Higher is better.
 
     corner_d    total distance the breaks still have to travel to reach their
                 nearest corner: the quantity E555_topper.py minimizes after
@@ -60,7 +59,19 @@ THE MEASURES  (a "break" is an internal junction whose two cells disagree;
                 of the board but of the selection, so it cannot be sorted on.
                 Lower means more independent; the first root always reads 0.
 
-CHOOSING INDEPENDENT ROOTS  (--diverse, --max_agree)
+STRUCTURAL GROUPING  (--group_box, --per_group, --unique)
+
+    Quality-first `--top` can accidentally remove whole lineages before diversity
+    selection sees them. `--group_box R0:R1,C0:C1` groups boards by the exact
+    piece+spin contents of an inclusive board rectangle and keeps the best
+    `--per_group N` from every group BEFORE the global top-K. Examples:
+
+        --group_box 0:11,0:15       one representative per 12-row foundation
+        --group_box 4:11,0:11       W4 rounds-3 CCW retained core
+        --group_box 4:11,4:15       W4 rounds-3 CW retained core
+        --unique                    exact whole-board deduplication
+
+CHOOSING INDEPENDENT ROOTS  (--diverse, --max_agree, --diversity_box)
 
     A run that emits a thousand boards rarely emits a thousand ideas. The top
     of a ranking is usually one lineage -- the same board with three cells
@@ -81,10 +92,9 @@ CHOOSING INDEPENDENT ROOTS  (--diverse, --max_agree)
                       more than fraction P of its placed cells -- a plain
                       near-duplicate filter. Runs before --diverse.
 
-    Both run AFTER --sort and --top, so quality still decides which board
-    represents a cluster and dissimilarity decides how many clusters you see.
-    With --top N the choice is made among those N: raise it when the top of
-    the ranking turns out to be one lineage.
+    These run after structural grouping, ranking and --top. Use
+    `--diversity_box 0:9,0:15` to measure agreement only in the lower ten rows,
+    so superficial top-frontier changes do not count as diversity.
 
     On the 15 exact row-12 partials of a whirlpool run, `--diverse 4` returns
     one board from each of the four lineages the pool actually holds (within a
@@ -97,8 +107,9 @@ MEMORY
     96 MB CSV peak at 165 MB.
 
     `--top N` streams instead, keeping only the best N in a bounded heap, so
-    peak memory does not depend on the file size at all (14 MB for the same
-    input). Use it on anything large; it is the only mode that scales.
+    peak memory does not depend on file size (14 MB for the same input). The
+    exception is `--group_box`/`--unique`: grouping happens first and may retain
+    one small heap per distinct group, so its worst case still grows with input.
 
     Without --top, an input projected to need more than `--max_mem` GB
     (default 8) is refused before it starts, rather than being OOM-killed
@@ -136,6 +147,9 @@ USAGE
     python3 tools/E555_rank.py boards.csv --csv > metrics.csv
     python3 tools/E555_rank.py pool.csv --top 200 --diverse 5 --out roots.csv
     python3 tools/E555_rank.py huge.csv --top 100 --max_agree 0.9
+    python3 tools/E555_rank.py raw.csv --group_box 0:11,0:15 --per_group 1 --out roots.csv
+    python3 tools/E555_rank.py pool.csv --top 5000 --diverse 500 --diversity_box 0:9,0:15
+    python3 tools/E555_rank.py boards.csv --split score 460 high.csv low.csv
 
     --sort takes a comma-separated list of measure names, applied in order,
     and always puts the BEST board first -- `--sort solid` gives the most
@@ -147,7 +161,7 @@ USAGE
     appears and --out merges them into one ranked CSV.
 """
 from __future__ import annotations
-import argparse, csv, heapq, sys
+import argparse, csv, heapq, os, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -222,22 +236,39 @@ def measure(pos, rot, seed):
                 colors[r * SIDE + c] = V.rotate_edges(seed[cell[0]], cell[1])
     n_placed = len(colors)
 
-    # One pass over the junctions gives breaks, break cells and corner distance.
-    # A cell touched by any break cannot be solid, which is precisely the
-    # viewer's rule (an unplaced neighbour leaves the piece unsatisfied).
-    breaks = 0
+    # One pass separates real color mismatches from unresolved junctions.
+    # `bad` retains the viewer's solidity semantics: a piece beside a hole is not
+    # solid. Deficit rows/columns still describe the whole unresolved region.
+    breaks = mismatches = open_edges = 0
     corner_d = 0
     bad = set()
     rows, cols = set(), set()
+    mismatch_rows, mismatch_cols = set(), set()
     for a, b, da, db in ALL_JUNCTIONS:
         ca, cb = colors.get(a), colors.get(b)
-        if ca is not None and cb is not None and ca[da] == cb[db]:
-            continue
+        if ca is not None and cb is not None:
+            if ca[da] == cb[db]:
+                continue
+            mismatches += 1
+            mismatch_rows.update((a // SIDE, b // SIDE))
+            mismatch_cols.update((a % SIDE, b % SIDE))
+        else:
+            open_edges += 1
         breaks += 1
         corner_d += _v(a) + _v(b) + _h(a) + _h(b)
         bad.add(a); bad.add(b)
-        rows.add(a // SIDE); rows.add(b // SIDE)
-        cols.add(a % SIDE);  cols.add(b % SIDE)
+        rows.update((a // SIDE, b // SIDE))
+        cols.update((a % SIDE, b % SIDE))
+
+    # A mis-seated frame face is not an internal junction, but it still makes the
+    # corresponding complete row/column unusable as a locked foundation.
+    frame_bad_rows, frame_bad_cols = set(), set()
+    for cell, col in colors.items():
+        for side in FRAME_SIDES.get(cell, ()):
+            if col[side] != GREY:
+                frame_bad_rows.add(cell // SIDE)
+                frame_bad_cols.add(cell % SIDE)
+                bad.add(cell)
 
     solid = 0
     for cell, col in colors.items():
@@ -246,20 +277,26 @@ def measure(pos, rot, seed):
         if all(col[s] == GREY for s in FRAME_SIDES.get(cell, ())):
             solid += 1
 
-    def leading_clean(order, marked):
-        """How many border lines, in this order, hold no break before the first that does."""
+    occupied = set(colors)
+    row_full = [all(r * SIDE + c in occupied for c in range(SIDE))
+                for r in range(SIDE)]
+    col_full = [all(r * SIDE + c in occupied for r in range(SIDE))
+                for c in range(SIDE)]
+
+    def leading_clean(order, full, mismatched, frame_bad):
+        """Complete lines from one side before the first hole or true mismatch."""
         n = 0
         for k in order:
-            if k in marked:
+            if not full[k] or k in mismatched or k in frame_bad:
                 break
             n += 1
         return n
 
     up, down = range(SIDE), range(SIDE - 1, -1, -1)
-    clean_b = leading_clean(up, rows)      # rows, bottom upwards
-    clean_t = leading_clean(down, rows)    # rows, top downwards
-    clean_l = leading_clean(up, cols)      # columns, left to right
-    clean_r = leading_clean(down, cols)    # columns, right to left
+    clean_b = leading_clean(up, row_full, mismatch_rows, frame_bad_rows)
+    clean_t = leading_clean(down, row_full, mismatch_rows, frame_bad_rows)
+    clean_l = leading_clean(up, col_full, mismatch_cols, frame_bad_cols)
+    clean_r = leading_clean(down, col_full, mismatch_cols, frame_bad_cols)
 
     # Clean-border arc: walk the frame ring from the bottom-left corner, counting
     # consecutive frame cells that are placed and whose seam to the previous frame
@@ -270,6 +307,8 @@ def measure(pos, rot, seed):
     border = 0
     for i, cell in enumerate(BORDER_RING):
         if cell not in colors:
+            break
+        if any(colors[cell][side] != GREY for side in FRAME_SIDES[cell]):
             break
         if i > 0:
             sa, sb = RING_SIDES[i - 1]
@@ -294,25 +333,27 @@ def measure(pos, rot, seed):
     # candidate still qualifies as a clue-satisfying solution.
     _clue_o, n_clues = V.clue_orient(pos, rot)
 
-    return dict(breaks=breaks, score=N_EDGES - breaks, solid=solid,
-                placed=len(colors), border=border,
+    return dict(breaks=breaks, score=N_EDGES - breaks,
+                mismatches=mismatches, open=open_edges, solid=solid,
+                placed=n_placed, border=border,
                 break_rows=len(rows), break_cols=len(cols),
+                mismatch_rows=len(mismatch_rows), mismatch_cols=len(mismatch_cols),
                 span=span, clean_b=clean_b, clean_t=clean_t,
                 clean_l=clean_l, clean_r=clean_r, corner_d=corner_d,
                 clues=n_clues)
 
 
-# Every measure, in this order; `span` is text, the rest are integers. This is
-# what --sort, --field and --csv see.
+# Public measures. Real mismatch/open counts remain internal so clean-line
+# calculations stay correct, but they are not separate ranking columns: the
+# normal monitor table should fit on one line.
 COLUMNS = ("breaks", "score", "solid", "placed", "border", "break_rows",
-           "break_cols", "span", "clean_b", "clean_t", "clean_l", "clean_r",
-           "corner_d", "clues")
+           "break_cols", "span", "clean_b", "clean_t", "clean_l",
+           "clean_r", "corner_d", "clues")
 
-# What the human table prints. `breaks` is left out because score = 480 - breaks
-# EXACTLY, so the pair carried no information the other did not, and score is the
-# one that says how close the board is to a finished 480. It stays a measure, so
-# --sort breaks, --field breaks and --csv are unaffected.
-SHOWN = tuple(k for k in COLUMNS if k != "breaks")
+# Compact monitor table. The omitted measures remain available to --sort,
+# --field and --csv; they simply do not make every ordinary row wrap.
+SHOWN = ("score", "solid", "placed", "break_rows", "break_cols", "span",
+         "clean_b", "clean_t", "clean_l", "clean_r", "corner_d", "clues")
 
 # Which way is "better" for each measure. Sorting is always best-first, so
 # --sort solid puts the most solid board on top without any extra syntax; a
@@ -322,22 +363,44 @@ HIGH_IS_BETTER = {"score", "solid", "placed", "border", "clues",
 SORTABLE = tuple(k for k in COLUMNS if k != "span")
 
 
-def fingerprint(line):
-    """The board of a stored input line as a set of (cell, piece, spin) triples.
+def parse_box(spec):
+    """Inclusive `r0:r1,c0:c1` rectangle as an ordered tuple of cells."""
+    try:
+        rs, cs = spec.split(",", 1)
+        r0, r1 = (int(x) for x in rs.split(":", 1))
+        c0, c1 = (int(x) for x in cs.split(":", 1))
+    except (AttributeError, ValueError):
+        raise SystemExit("[ERROR] a box must be r0:r1,c0:c1, e.g. 4:11,0:11")
+    if not (0 <= r0 <= r1 < SIDE and 0 <= c0 <= c1 < SIDE):
+        raise SystemExit(f"[ERROR] box '{spec}' lies outside the 0..{SIDE-1} board")
+    return tuple(r * SIDE + c for r in range(r0, r1 + 1)
+                 for c in range(c0, c1 + 1))
 
-    Two boards agree on a cell when both put the same piece there at the same
-    spin, so the agreement is just `len(a & b)` -- one C-speed set intersection
-    instead of a 256-step Python loop. Built only for the records --diverse or
-    --max_agree actually compare, which is why the record keeps the line rather
-    than the parsed arrays: everything else in the file is measured once and
-    never looked at again.
-    """
+
+def region_key(pos, rot, cells):
+    """Compact exact piece+spin contents of `cells`, including empty cells."""
+    inv = [0xFFFF] * N_PIECES
+    for p, cell in enumerate(pos):
+        if cell != 999:
+            inv[cell] = (p << 2) | rot[p]
+    out = bytearray(2 * len(cells))
+    for i, cell in enumerate(cells):
+        v = inv[cell]
+        out[2*i] = v & 0xFF
+        out[2*i+1] = v >> 8
+    return bytes(out)
+
+
+def fingerprint(line, cells=None):
+    """Set of placed (cell,piece,spin) triples, optionally inside a rectangle."""
     _, _, pos, rot = V.parse_row(next(csv.reader([line])))
+    allowed = None if cells is None else frozenset(cells)
     return frozenset(pos[p] * 1024 + p * 4 + rot[p]
-                     for p in range(N_PIECES) if pos[p] != 999)
+                     for p in range(N_PIECES)
+                     if pos[p] != 999 and (allowed is None or pos[p] in allowed))
 
 
-def read_boards(paths, seed, skipped, progress_every=0):
+def read_boards(paths, seed, skipped, progress_every=0, group_cells=None):
     """Yield one light record per board row of every input file.
 
     The record keeps the input LINE, not the parsed field list and not the
@@ -364,10 +427,6 @@ def read_boards(paths, seed, skipped, progress_every=0):
                 if rec is None:
                     continue
                 cid, sol, pos, rot = rec
-                # Canonical id: keep both leading metadata fields when the row
-                # had them, so --rescore does not throw away a Stage B solution
-                # index while collapsing everything else into one score column.
-                canon_id = f"{cid}_{sol}" if sol not in ("", "?") else cid
                 try:
                     m = measure(pos, rot, seed)
                 except ValueError as exc:
@@ -378,15 +437,20 @@ def read_boards(paths, seed, skipped, progress_every=0):
                     skipped.append((path, idx))
                     idx += 1
                     continue
+                # Preserve the second leading field in a canonicalized id. Stage B
+                # writes its solution index there, and a mixed corpus cannot infer
+                # reliably whether the number was metadata or an already-valid score.
+                canon_id = f"{cid}_{sol}" if sol not in ("", "?") else cid
                 n += 1
                 if progress_every and n % progress_every == 0:
                     print(f"[rank] measured {n} boards", file=sys.stderr)
+                extra = {"group": region_key(pos, rot, group_cells)} if group_cells else {}
                 yield dict(file=Path(path).name, row=idx, id=cid,
-                           canon_id=canon_id, line=line, **m)
+                           canon_id=canon_id, line=line, **extra, **m)
                 idx += 1
 
 
-def write_emit(path, records, rescore):
+def write_emit(path, records, rescore, quiet=False):
     """Write the ranked rows: canonical when `rescore`, else byte for byte."""
     with open(path, "w", newline="") as out:
         w = csv.writer(out, lineterminator="\n")   # LF, not the csv module's CRLF
@@ -398,8 +462,69 @@ def write_emit(path, records, rescore):
                 # The stored line, not a re-serialization of its fields: this is
                 # the only way "verbatim" is literally true, quoting included.
                 out.write(r["line"] if r["line"].endswith("\n") else r["line"] + "\n")
-    kind = "canonical" if rescore else "verbatim"
-    print(f"[emit] {len(records)} {kind} row(s) -> {path}")
+    if not quiet:
+        kind = "canonical" if rescore else "verbatim"
+        print(f"[emit] {len(records)} {kind} row(s) -> {path}")
+
+
+
+def split_by_threshold(input_path, seed, key, threshold,
+                       at_least_path, below_path, skipped, quiet=False):
+    """Split one board file by an integer measure, preserving input order."""
+    src = Path(input_path)
+    high = Path(at_least_path)
+    low = Path(below_path)
+
+    src_abs = src.resolve()
+    high_abs = high.resolve()
+    low_abs = low.resolve()
+    if high_abs == low_abs:
+        raise SystemExit("[ERROR] the two split output paths must be different")
+    if src_abs in (high_abs, low_abs):
+        raise SystemExit("[ERROR] a split output must not overwrite the input file")
+
+    high.parent.mkdir(parents=True, exist_ok=True)
+    low.parent.mkdir(parents=True, exist_ok=True)
+    # The outputs are NOT removed here. os.replace() below is atomic, so the
+    # previous pair stays intact and readable until the new pair is complete --
+    # and a run that ends up rejecting a row must not leave the caller with
+    # neither the old files nor the new ones.
+
+    tag = f".tmp.{os.getpid()}"
+    high_tmp = Path(str(high) + tag)
+    low_tmp = Path(str(low) + tag)
+    high_tmp.unlink(missing_ok=True)
+    low_tmp.unlink(missing_ok=True)
+
+    n_high = n_low = 0
+    try:
+        with high_tmp.open("w", newline="") as out_high, \
+             low_tmp.open("w", newline="") as out_low:
+            for record in read_boards([str(src)], seed, skipped):
+                line = record["line"]
+                if not line.endswith("\n"):
+                    line += "\n"
+                if record[key] >= threshold:
+                    out_high.write(line)
+                    n_high += 1
+                else:
+                    out_low.write(line)
+                    n_low += 1
+
+        # A rejected row is reported through the exit status, but the rows that
+        # DID parse are still a correct split of what could be read, and
+        # throwing them away silently left the caller with nothing at all.
+        os.replace(high_tmp, high)
+        os.replace(low_tmp, low)
+    except BaseException:
+        high_tmp.unlink(missing_ok=True)
+        low_tmp.unlink(missing_ok=True)
+        raise
+
+    if not quiet:
+        print(f"[split] {key} >= {threshold}: {n_high} row(s) -> {high}")
+        print(f"[split] {key} <  {threshold}: {n_low} row(s) -> {low}")
+    return n_high, n_low
 
 
 def parse_sort_spec(spec):
@@ -452,26 +577,44 @@ def collect(records, keys, top):
     return [r for _, r in sorted(heap, reverse=True)]
 
 
-def _agree_prints(records):
-    """Attach a fingerprint to each record, once, and return the list."""
+def collect_grouped(records, keys, per_group):
+    """Keep the best `per_group` records for every exact structural group."""
+    groups = {}
+    seen = 0
+    for seq, r in enumerate(records):
+        seen += 1
+        nk = tuple(-x for x in sort_key_of(keys, r, seq))
+        h = groups.setdefault(r["group"], [])
+        if len(h) < per_group:
+            heapq.heappush(h, (nk, r))
+        elif nk > h[0][0]:
+            heapq.heapreplace(h, (nk, r))
+    kept = [r for h in groups.values() for _, r in h]
+    kept.sort(key=lambda r: sort_key_of(keys, r, r["row"]))
+    print(f"[group] kept {len(kept)} of {seen} boards from {len(groups)} exact "
+          f"group(s), at most {per_group} per group", file=sys.stderr)
+    return kept
+
+
+def _agree_prints(records, cells=None):
+    """Attach the requested-region fingerprint to each record once."""
     for r in records:
         if "fp" not in r:
-            r["fp"] = fingerprint(r["line"])
+            r["fp"] = fingerprint(r["line"], cells)
     return records
 
 
-def filter_max_agree(records, frac):
+def filter_max_agree(records, frac, cells=None):
     """Drop boards agreeing with an already-kept board on more than `frac`.
 
     A plain near-duplicate filter, walked best-first so the board that survives
-    a cluster is its best member. The denominator is the smaller placed count,
-    so a 96-cell band and a 203-cell partial that share the band are correctly
-    read as the same board carried forward, not as 47% different.
+    a cluster is its best member. The denominator is the smaller number of placed
+    cells in the selected diversity region.
     """
-    _agree_prints(records)
+    _agree_prints(records, cells)
     kept = []
     for r in records:
-        n = max((len(r["fp"] & k["fp"]) / max(1, min(r["placed"], k["placed"]))
+        n = max((len(r["fp"] & k["fp"]) / max(1, min(len(r["fp"]), len(k["fp"])))
                  for k in kept), default=0.0)
         if n <= frac:
             kept.append(r)
@@ -480,39 +623,38 @@ def filter_max_agree(records, frac):
     return kept
 
 
-def select_diverse(records, k):
-    """`k` boards spread as far apart as the pool allows, best board first.
+def select_diverse(records, k, cells=None, metric="cells"):
+    """Farthest-first roots using raw or placed-normalized cell agreement."""
+    _agree_prints(records, cells)
+    if not records:
+        return records
 
-    Farthest-first: the first root is the best-ranked board, and each next root
-    is the one whose CLOSEST already-chosen root is furthest away. That is the
-    practical question -- "give me a few starting points that are not siblings"
-    -- answered in k x M comparisons rather than the M^2 of a full matrix, so a
-    thousand-board pool costs nothing.
+    def sim(a, b):
+        shared = len(a["fp"] & b["fp"])
+        if metric == "fraction":
+            return shared / max(1, min(len(a["fp"]), len(b["fp"])))
+        return shared
 
-    Each root carries `agree`, its highest cell agreement with the roots before
-    it, so the clustering is visible instead of asserted. Root 1 reads 0.
-    """
-    _agree_prints(records)
     if k >= len(records):
-        # Nothing to choose: annotate anyway so the `agree` column is real for
-        # every row it is printed beside.
         records[0]["agree"] = 0
         for i, r in enumerate(records[1:], 1):
             r["agree"] = max((len(r["fp"] & q["fp"]) for q in records[:i]), default=0)
         return records
+
     roots = [records[0]]
     records[0]["agree"] = 0
     rest = records[1:]
-    best = [len(r["fp"] & roots[0]["fp"]) for r in rest]   # agreement, high = close
+    closest = [sim(r, roots[0]) for r in rest]       # high = close
     while len(roots) < k and rest:
-        i = min(range(len(rest)), key=lambda j: (best[j], j))
+        i = min(range(len(rest)), key=lambda j: (closest[j], j))
         pick = rest.pop(i)
-        pick["agree"] = best.pop(i)
+        closest.pop(i)
+        pick["agree"] = max((len(pick["fp"] & q["fp"]) for q in roots), default=0)
         roots.append(pick)
         for j, r in enumerate(rest):
-            a = len(r["fp"] & pick["fp"])
-            if a > best[j]:
-                best[j] = a
+            a = sim(r, pick)
+            if a > closest[j]:
+                closest[j] = a
     return roots
 
 
@@ -537,27 +679,37 @@ def count_rows(paths):
 # build them.
 RECORD_OVERHEAD = 1.8
 BYTES_PER_PRINT = 16000
+GROUP_KEY_BASE = 96
 
 
-def check_memory(paths, args):
-    """Refuse a run that would not fit, instead of being OOM-killed halfway.
+def check_memory(paths, args, group_cells=None):
+    """Refuse a run projected to exceed --max_mem.
 
-    Only the unbounded mode can grow with the file: --top N holds N records
-    whatever the input is, which is the answer this message points at.
+    A plain --top N is streaming. Structural grouping must precede the global
+    top-K, however, and may retain one heap per distinct group; in the worst case
+    every input row is its own group. Account for that rather than claiming the
+    later --top makes the grouping pass bounded.
     """
-    if args.top > 0:
+    grouping = group_cells is not None
+    if args.top > 0 and not grouping:
         return
     size = sum(Path(p).stat().st_size for p in paths)
-    want = size * RECORD_OVERHEAD
     rows = count_rows(paths)
+    want = size * RECORD_OVERHEAD
+    if grouping:
+        want += rows * (GROUP_KEY_BASE + 2 * len(group_cells))
     if args.diverse or args.max_agree is not None:
-        want += rows * BYTES_PER_PRINT
+        compared = args.top if args.top > 0 else rows
+        want += compared * BYTES_PER_PRINT
     limit = args.max_mem * (1 << 30)
     if want > limit:
+        hint = ("Reduce the input in stages, use a smaller --group_box, or raise --max_mem."
+                if grouping else
+                "Add --top N to stream with bounded memory, or raise --max_mem.")
         raise SystemExit(
-            f"[ERROR] {rows:,} boards would need about {want / (1<<30):.2g} GB, over "
+            f"[ERROR] {rows:,} boards would need up to about {want / (1<<30):.2g} GB, over "
             f"the --max_mem limit of {args.max_mem:g} GB.\n"
-            f"        Add --top N to stream with bounded memory, or raise --max_mem.")
+            f"        {hint}")
 
 
 def _status(skipped):
@@ -601,9 +753,20 @@ def main():
                     help="drop the board-id column from the table, which is the "
                          "widest one and the usual reason a row wraps; `row` "
                          "still identifies the board. Ignored by --csv.")
+    ap.add_argument("--quiet", action="store_true",
+                    help="write --out without printing the human ranking table")
     ap.add_argument("--border_only", action="store_true",
                     help="keep only boards with a fully clean, complete external "
                          "border (border == 60)")
+    ap.add_argument("--group_box", metavar="R0:R1,C0:C1",
+                    help="before global --top, group by exact piece+spin contents "
+                         "of this inclusive rectangle")
+    ap.add_argument("--per_group", type=int, default=1, metavar="N",
+                    help="with --group_box/--unique, retain the best N from each "
+                         "group before global ranking (default 1)")
+    ap.add_argument("--unique", action="store_true",
+                    help="exact whole-board deduplication; shorthand for grouping "
+                         "on 0:15,0:15 with --per_group")
     ap.add_argument("--diverse", type=int, default=0, metavar="K",
                     help="after ranking, keep K boards chosen farthest-first on "
                          "cell agreement -- independent roots to post-process, "
@@ -614,10 +777,16 @@ def main():
                     help="drop any board agreeing with an already-kept board on "
                          "more than fraction P of its placed cells (0..1). A plain "
                          "near-duplicate filter; runs before --diverse")
+    ap.add_argument("--diversity_box", metavar="R0:R1,C0:C1",
+                    help="compute --max_agree/--diverse only in this rectangle; "
+                         "use 0:9,0:15 to demand lower-board diversity")
+    ap.add_argument("--diversity_metric", choices=("cells", "fraction"),
+                    default="cells", help="farthest-first similarity: raw shared "
+                         "cells (default) or fraction of the smaller placement")
     ap.add_argument("--max_mem", type=float, default=8.0, metavar="GB",
                     help="refuse an input projected to need more than this much "
-                         "memory (default 8). Only applies without --top, which "
-                         "streams in bounded memory whatever the file size")
+                         "memory (default 8). A plain --top streams; --group_box "
+                         "must run first and can still retain many groups")
     ap.add_argument("--seed_file", help="piece seed file (default: data/seed_Edge5.txt)")
     ap.add_argument("--count", action="store_true",
                     help="print just the number of board rows across the inputs "
@@ -632,7 +801,39 @@ def main():
                          "BEST=$(E555_rank.py boards.csv --field score). Reads "
                          "the real board instead of trusting field 2, which "
                          "Stage B writes its solution index into.")
+    ap.add_argument("--split", nargs=4,
+                    metavar=("KEY", "N", "AT_LEAST.csv", "BELOW.csv"),
+                    help="stream one input file into two verbatim board files: "
+                         "KEY >= integer N goes to AT_LEAST.csv and KEY < N "
+                         "goes to BELOW.csv. Input order is preserved.")
     args = ap.parse_args()
+
+    if args.split:
+        if len(args.inputs) != 1:
+            raise SystemExit("[ERROR] --split accepts exactly one input CSV")
+        if (args.out or args.rescore or args.csv or args.count or args.field or
+                args.border_only or args.group_box or args.unique or args.diverse or
+                args.max_agree is not None or args.top):
+            raise SystemExit("[ERROR] --split is a standalone mode; do not combine it "
+                             "with ranking, grouping, diversity, or --out options")
+        key, threshold_text, at_least_path, below_path = args.split
+        if key not in SORTABLE:
+            if key == "span":
+                raise SystemExit("[ERROR] span is text (HxW), not an integer measure; "
+                                 "use break_rows, break_cols, or another numeric key")
+            raise SystemExit(f"[ERROR] unknown split key '{key}'; choose from: "
+                             f"{', '.join(SORTABLE)}")
+        try:
+            threshold = int(threshold_text, 10)
+        except ValueError:
+            raise SystemExit(f"[ERROR] split threshold must be an integer, got "
+                             f"'{threshold_text}'")
+        seed = V.load_seed(V.find_seed(args.seed_file))
+        skipped = []
+        split_by_threshold(args.inputs[0], seed, key, threshold,
+                           at_least_path, below_path, skipped, args.quiet)
+        return _status(skipped)
+
     if args.rescore and not args.out:
         raise SystemExit("[ERROR] --rescore only means something with --out FILE")
     if args.field and args.field not in SORTABLE:
@@ -641,6 +842,10 @@ def main():
 
     if args.diverse < 0:
         raise SystemExit("[ERROR] --diverse wants a positive count")
+    if args.per_group < 1:
+        raise SystemExit("[ERROR] --per_group must be >= 1")
+    if args.group_box and args.unique:
+        raise SystemExit("[ERROR] use either --group_box or --unique, not both")
     if args.max_agree is not None and not 0.0 <= args.max_agree <= 1.0:
         raise SystemExit("[ERROR] --max_agree is a fraction of placed cells, 0..1")
 
@@ -653,11 +858,15 @@ def main():
         print(n)
         return 0
 
-    check_memory(args.inputs, args)
+    group_cells = (parse_box("0:15,0:15") if args.unique else
+                   parse_box(args.group_box) if args.group_box else None)
+    diversity_cells = parse_box(args.diversity_box) if args.diversity_box else None
+
+    check_memory(args.inputs, args, group_cells)
     seed = V.load_seed(V.find_seed(args.seed_file))
     skipped = []
     keys = parse_sort_spec(args.sort)
-    stream = read_boards(args.inputs, seed, skipped, progress_every=50000)
+    stream = read_boards(args.inputs, seed, skipped, progress_every=12500, group_cells=group_cells)
     # Counted as it streams, so --border_only can still report "N of M" without
     # a second pass and without holding the boards it rejects.
     seen = [0]
@@ -666,14 +875,20 @@ def main():
             seen[0] += 1
             yield r
     stream = _count(stream)
+    border_kept = [0]
     if args.border_only:
-        stream = (r for r in stream if r["border"] == N_BORDER)
-    # --field wants the single best board and returns before anything is
-    # written, so it is exactly --top 1 with the printing left out; asking the
-    # heap for it keeps that path bounded too.
+        def _border(it):
+            for r in it:
+                if r["border"] == N_BORDER:
+                    border_kept[0] += 1
+                    yield r
+        stream = _border(stream)
+    if group_cells is not None:
+        stream = iter(collect_grouped(stream, keys, args.per_group))
+    # --field is exactly --top 1 with printing suppressed.
     records = collect(stream, keys, 1 if args.field else args.top)
     if args.border_only and seen[0]:
-        print(f"[border] {len(records)} of {seen[0]} boards have a complete, "
+        print(f"[border] {border_kept[0]} of {seen[0]} boards have a complete, "
               f"break-free external border", file=sys.stderr)
     if not records:
         # --field is meant to be captured in a shell variable, so an empty
@@ -685,7 +900,7 @@ def main():
         if seen[0] == 0:
             raise SystemExit("[ERROR] no board rows found in the input")
         if args.out:
-            write_emit(args.out, [], args.rescore)
+            write_emit(args.out, [], args.rescore, args.quiet)
         return _status(skipped)
     if args.field:
         print(records[0][args.field])
@@ -693,13 +908,14 @@ def main():
     # Ranking first, then the two dissimilarity passes: quality decides who
     # represents a cluster, dissimilarity decides how many clusters you see.
     if args.max_agree is not None:
-        records = filter_max_agree(records, args.max_agree)
+        records = filter_max_agree(records, args.max_agree, diversity_cells)
     if args.diverse:
-        records = select_diverse(records, args.diverse)
+        records = select_diverse(records, args.diverse, diversity_cells,
+                                 args.diversity_metric)
     shown = records
     if not shown:
         if args.out:
-            write_emit(args.out, [], args.rescore)
+            write_emit(args.out, [], args.rescore, args.quiet)
         return _status(skipped)
 
     multi = len(args.inputs) > 1
@@ -713,15 +929,19 @@ def main():
                        + [r[k] for k in cols])
         return _status(skipped)
 
+    if args.quiet:
+        if args.out:
+            write_emit(args.out, shown, args.rescore, True)
+        return _status(skipped)
+
     order = " then ".join(f"{n}{' (worst first)' if d else ''}" for n, d in keys) \
             or "input order"
-    print(f"\n=== E555 rank ===  {len(records)} boards from "
-          f"{len(args.inputs)} file(s), sorted by {order}\n")
+    print(f"E555 rank: {len(records)} board(s), sort: {order}")
 
     # --no_id drops the widest column of all: board ids run to 44 characters and
     # are the main reason a row wraps. `row` still identifies the board, and it
     # is what --row of the other tools wants anyway.
-    idw = 0 if args.no_id else min(44, max(len(r["id"]) for r in shown))
+    idw = 0 if args.no_id else min(20, max(len(r["id"]) for r in shown))
     idh = "" if args.no_id else f"{'id':<{idw}}  "
     fw = max((len(r["file"]) for r in shown), default=4) if multi else 0
     cols = SHOWN + (("agree",) if args.diverse else ())
@@ -737,14 +957,11 @@ def main():
         print(line)
 
     b = shown[0]
-    print(f"\n[best] {b['id']}  breaks={b['breaks']} in {b['break_rows']} row(s) / "
-          f"{b['break_cols']} col(s), span {b['span']}, solid {b['solid']}/256, "
-          f"clean rows {b['clean_b']} from the bottom, {b['clean_t']} from the top")
-    print("[note] lower is better: breaks break_rows break_cols corner_d   |   "
-          "higher is better: score solid placed border clues clean_*")
+    print(f"best: {b['id']}  score={b['score']} placed={b['placed']} "
+          f"solid={b['solid']} clean_b={b['clean_b']} span={b['span']}")
 
     if args.out:
-        write_emit(args.out, shown, args.rescore)
+        write_emit(args.out, shown, args.rescore, args.quiet)
     return _status(skipped)
 
 

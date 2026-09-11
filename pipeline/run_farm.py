@@ -10,7 +10,7 @@ ONE ITERATION, top to bottom. Every stage is one tool call in produce():
     1 beamer      random or annealed borders, grow to row 11, emit all
     2 clean_csv   drop the near-duplicates the beam emits in hundreds
     3 topper      open rows 8..12 and close row 12
-    4 roundhouse  width 3, forward then reverse, TIES refills each
+    4 roundhouse  width 3, CCW then CW, TIES refills each
     5 clean_csv   again, over the spirals and the boards they came from
     6 topper      open rows 10..15 and fill the top
     7 ender       the best ENDER_TOP, one pass       -> good.csv
@@ -61,24 +61,22 @@ TOP2      = 20              # 6 boards into the second topper
 T2_TIME   = 300             #   this stage IS budget-bound; the seconds count
 T2_STALL  = 45
 
-ENDER_TOP     = 5           # 7 boards given one ender pass per iteration
-ENDER_TIME    = 45
-ENDER_REACH   = 2           #   ladder length is reach x (changes / 4) solves
-ENDER_CHANGES = 16
+ENDER_TOP      = 5          # 7 boards given one ender pass per iteration
+ENDER_PROFILE  = "overnight"
+ENDER_TIME     = 120        #   TRUE total seconds per board, all calls included
 
-ELITE_EVERY   = 10          # 8 iterations between deep passes
-ELITE_TOP     = 10
-ELITE_TIME    = 120
-ELITE_REACH   = 3
-ELITE_CHANGES = 24
+ELITE_EVERY    = 10         # 8 iterations between deep passes
+ELITE_TOP      = 10
+ELITE_PROFILE  = "deep"
+ELITE_TIME     = 900        #   the deep profile's own budget, per board
 
 GIVE_UP_AFTER = 10          # consecutive failed iterations that end the run
 
 SETTINGS = ("REPO SEED FARM DB THREADS HOURS CLUES KEEP "
             "ANNEAL_EVERY ANNEAL_BORDERS ANNEAL_STEPS BEAM TOP1 T1_TIME "
-            "T1_STALL TIES RH TOP2 T2_TIME T2_STALL ENDER_TOP ENDER_TIME "
-            "ENDER_REACH ENDER_CHANGES ELITE_EVERY ELITE_TOP ELITE_TIME "
-            "ELITE_REACH ELITE_CHANGES GIVE_UP_AFTER").split()
+            "T1_STALL TIES RH TOP2 T2_TIME T2_STALL ENDER_TOP ENDER_PROFILE "
+            "ENDER_TIME ELITE_EVERY ELITE_TOP ELITE_PROFILE ELITE_TIME "
+            "GIVE_UP_AFTER").split()
 
 # -----------------------------------------------------------------------------
 
@@ -329,7 +327,7 @@ def build(d, n):
             "--threads", THREADS, "--print_cmd", *clue]
     spirals = []
 
-    # 4. ROUNDHOUSE, forward then reverse, at WIDTH 3 -- the width that keeps
+    # 4. ROUNDHOUSE, CCW then CW, at WIDTH 3 -- the width that keeps
     #    the most of the row stage 3 just built.
     #
     #    --rounds 3 --rotate -1 keeps rows W..(15-W) x columns 0..(15-2W), so
@@ -354,15 +352,14 @@ def build(d, n):
     if ready:
         write(d + "/rh_in.csv", ready)
         sh(BIN + "/E555_roundhouse", SEED, d + "/rh_in.csv",
-           "--out_dir", d + "/rh1", *geom)
+           d + "/rh1.csv", "--ccw", *geom)
 
-        spirals = [ln for p in emitted(d + "/rh1") for ln in read(p)]
+        spirals = read(d + "/rh1.csv")
         if spirals:
-            write(d + "/rh1.csv", spirals)
             sh(BIN + "/E555_roundhouse", SEED, d + "/rh1.csv",
-               "--out_dir", d + "/rh2", "--reverse", *geom)
+               d + "/rh2.csv", "--cw", *geom)
 
-            spirals += [ln for p in emitted(d + "/rh2") for ln in read(p)]
+            spirals += read(d + "/rh2.csv")
     else:
         LOG.write("!! nothing closed row 12, so there is nothing to spiral\n")
 
@@ -387,39 +384,26 @@ def build(d, n):
 # ---- stages 7 and 8: refine the best, graduate the very best ---------------
 
 def ender(d, boards, out, deep):
-    """7 and 8. One ender pass, or ring then patch for the deep one.
+    """7 and 8. One adaptive ender pass; the deep one just gets a wider profile.
 
     The ender never returns a board worse than its input, so a generous budget
-    carries no risk and chaining the two modes is free. It climbs a ladder per
-    board -- [r1 m4], [r1 m8], ... -- one solve per rung at the full
-    --time_limit, and the rungs number reach x (changes / 4): 8 solves a board
-    here, 18 deep. That multiplier is how an iteration turns into a day."""
+    carries no risk. It now runs its own portfolio per board -- small
+    break-centred neighbourhoods first, then progressively broader ones,
+    restarting the cheap phase after every accepted gain -- so the hand-built
+    ring-then-patch chain this used to drive is gone, and so is the ladder
+    arithmetic that priced it. --board_time_limit is a TRUE per-board wall
+    clock covering every call the portfolio makes, so an iteration now costs
+    ENDER_TOP x ENDER_TIME at worst instead of a rung multiplier."""
     if not boards:
         return []
     write(d + "/ender_in.csv", boards)
-    budget = ELITE_TIME if deep else ENDER_TIME
-    reach = ELITE_REACH if deep else ENDER_REACH
-    changes = ELITE_CHANGES if deep else ENDER_CHANGES
     src = d + "/ender_in.csv"
-
-    # Ring first: the topper leaves its damage on and near the border ring,
-    # which is exactly what the ring sweep re-threads.
-    modes = ["ring", "patch"] if deep else ["ring"]
-    for i, mode in enumerate(modes):
-        # The LAST pass writes to `out`; the deep one's ring pass feeds patch
-        # from a scratch file. Getting this wrong sends the single-mode result
-        # to the scratch file, and the boards never reach good.csv at all.
-        dst = out if i == len(modes) - 1 else d + "/ender_%s.csv" % mode
-        sh(sys.executable, ENDER, SEED, src, dst,
-           "--mode", mode, "--reach", reach, "--max_changes", changes,
-           "--num_rows", 0, "--time_limit", budget,
-           "--stall_time", max(10, budget // 3),
-           "--threads", THREADS, *CLUE[CLUES])
-
-        if not read(dst):
-            break
-        src = dst
-    return read(src)
+    sh(sys.executable, ENDER, SEED, src, out,
+       "--profile", ELITE_PROFILE if deep else ENDER_PROFILE,
+       "--search_mode", "improve",
+       "--board_time_limit", ELITE_TIME if deep else ENDER_TIME,
+       "--num_rows", 0, "--threads", THREADS, *CLUE[CLUES])
+    return read(out)
 
 
 def refine(d, n):

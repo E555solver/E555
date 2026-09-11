@@ -6,14 +6,18 @@
 #   bash examples/06_roundhouse_both_ways.sh OUT_DIR=bw1 N_LINES=5 ROUNDS=3
 #
 # Each input board is run through TWO chains of two roundhouse passes:
-#   chain a:  forward, then --reverse      (CCW then CW)
-#   chain b:  --reverse, then forward      (CW then CCW)
+#   chain a:  --ccw, then --cw   with --hold_band
+#   chain b:  --cw,  then --ccw  with --hold_band
 # Two passes each way cover all four sides. With HOLD=1 the second pass keeps
-# what the first left standing in the band instead of re-cutting it.
+# the half of its final side that the first pass left standing and searches the
+# other half, instead of re-cutting what is already there.
 #
 # Both chains start from the same board, so the score they reach is a fair
 # comparison and the tally at the end answers the question in the title.
 # A pass that emits nothing simply ends its chain, which is a real answer.
+#
+# Every pass names its own output CSV -- the roundhouse takes it as the third
+# positional argument -- so nothing here globs for a result.
 set -euo pipefail
 
 # ---- settings: edit here, or pass NAME=value on the command line ------------
@@ -27,6 +31,9 @@ ROUNDS=3                # 3 reaches the top band at ROTATE=-1
 WIDTH=4                 # 2..5 chain length
 ROTATE=-1               # both spirals start on the input's bottom
 HOLD=1                  # 1 = pass 2 keeps what pass 1 left in the band
+TIES=1                  # boards pass 1 keeps at its deepest reach
+FINAL_TIES=4            # pass 2 searches half a side, so it can afford more
+TIE_DEPTH=3             # ties must differ this many chain levels back
 FIRST_LINE=0
 N_LINES=1
 MAX_WALL=120            # seconds per pass, 0 = unlimited
@@ -47,21 +54,21 @@ CLUE_ARG=(); [ "$CLUES" = 1 ] && CLUE_ARG=(--clue_center --clue_corners)
 HOLD_ARG=(); [ "$HOLD"  = 1 ] && HOLD_ARG=(--hold_band)
 
 # One roundhouse pass. $1 output dir, $2 board CSV, $3 which line of it, then
-# any extra flags. Prints the path of the break-free board it produced, or
-# nothing. The tool lists what it wrote, so there is no filename to guess and
-# no `ls` to parse.
+# any extra flags -- --ties among them, so each call sets its own and the logged
+# [cmd] line carries it exactly once. Prints the path of the board file the pass
+# produced, or nothing. The output path is chosen here and passed in, so there
+# is no name to guess: an empty file means the pass emitted nothing, which ends
+# the chain.
 pass() {
     local dir="$1" src="$2" line="$3"; shift 3
     mkdir -p "$dir"
-    bin/E555_roundhouse "$SEED" "$src" \
+    local out="$dir/boards.csv"
+    bin/E555_roundhouse "$SEED" "$src" "$out" \
         --start_row "$line" --num_rows 1 \
         --rounds "$ROUNDS" --strip_width "$WIDTH" --rotate "$ROTATE" \
-        --ties 1 --wall_time "$MAX_WALL" --threads "$THREADS" \
-        --out_dir "$dir" --print_cmd "${CLUE_ARG[@]}" "$@" > "$dir/log" 2>&1
-    # Break-free boards go to the miss0 file; with --breaks 0 that is the
-    # only file the tool can write, so the manifest holds it or is empty.
-    local out; out=$(head -1 "$dir/outputs.txt")
-    [ -n "$out" ] || return 0
+        --wall_time "$MAX_WALL" --threads "$THREADS" \
+        --print_cmd "${CLUE_ARG[@]}" "$@" > "$dir/log" 2>&1
+    [ -s "$out" ] || return 0
 
     # Tag the board with the pass that made it, so provenance survives when the
     # four passes are cat-ed into one file. awk on field 1 rather than a sed
@@ -86,15 +93,28 @@ wins_a=0; wins_b=0; ties=0
 for ((i = FIRST_LINE; i < FIRST_LINE + N_LINES; i++)); do
     cfg="$OUT_DIR/cfg$i"; rm -rf "$cfg"; mkdir -p "$cfg"
 
-    # Chain a: forward, then reverse.   Chain b: reverse, then forward.
-    # Pass 2 reads pass 1's single-board output, so its line index is 0.
-    a1=$(pass "$cfg/a1" "$BOARDS" "$i")
-    a2=""; [ -n "$a1" ] && a2=$(pass "$cfg/a2" "$a1" 0 --reverse "${HOLD_ARG[@]}")
-    b1=$(pass "$cfg/b1" "$BOARDS" "$i" --reverse)
-    b2=""; [ -n "$b1" ] && b2=$(pass "$cfg/b2" "$b1" 0 "${HOLD_ARG[@]}")
+    # Chain a: CCW then CW.   Chain b: CW then CCW.
+    # Pass 2 reads pass 1's single-board output, so its line index is 0. The
+    # held pass searches half a side, so it is given the wider tie budget.
+    a1=$(pass "$cfg/a1" "$BOARDS" "$i" --ccw --ties "$TIES")
+    a2=""; [ -n "$a1" ] && a2=$(pass "$cfg/a2" "$a1" 0 --cw \
+        --ties "$FINAL_TIES" --tie_depth "$TIE_DEPTH" "${HOLD_ARG[@]}")
+    b1=$(pass "$cfg/b1" "$BOARDS" "$i" --cw --ties "$TIES")
+    b2=""; [ -n "$b1" ] && b2=$(pass "$cfg/b2" "$b1" 0 --ccw \
+        --ties "$FINAL_TIES" --tie_depth "$TIE_DEPTH" "${HOLD_ARG[@]}")
 
-    # The chain's result is its last surviving pass.
-    A=$(score "${a2:-$a1}"); B=$(score "${b2:-$b1}")
+    # The chain's result is its BEST pass, not its last. The held second pass
+    # keeps the deepest prefix it reaches, so it always emits something -- and
+    # that something can be shallower than the board it was handed. Scoring the
+    # last pass would then let a chain lose ground it had already won.
+    best() {                # max of two scores; "-" only if neither pass emitted
+        local x=$1 y=$2
+        [ "$x" = - ] && [ "$y" = - ] && { echo -; return; }
+        [ "$x" = - ] && x=0; [ "$y" = - ] && y=0
+        [ "$x" -ge "$y" ] && echo "$x" || echo "$y"
+    }
+    A=$(best "$(score "$a1")" "$(score "$a2")")
+    B=$(best "$(score "$b1")" "$(score "$b2")")
     na=$A; [ "$na" = - ] && na=0        # a chain that produced nothing scores 0
     nb=$B; [ "$nb" = - ] && nb=0
     if   [ "$na" -gt "$nb" ]; then verdict="CCW->CW"; wins_a=$((wins_a + 1))
@@ -108,5 +128,5 @@ done
 echo
 echo "does the order matter?  CCW->CW $wins_a   CW->CCW $wins_b   tie $ties"
 echo "boards and per-pass logs under $OUT_DIR/cfg<N>/"
-echo "  cat $OUT_DIR/cfg*/[ab][12]/roundhouse_*_miss0.csv > all.csv"
+echo "  cat $OUT_DIR/cfg*/[ab][12]/boards.csv > all.csv"
 echo "  python3 tools/E555_rank.py all.csv --seed_file $SEED --top 10"

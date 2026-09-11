@@ -621,15 +621,15 @@ def _read_dive_out(path):
 def stage_c_command(rec, mask_rel, clue_flags):
     """The tool and flags implied by this board's window.
 
-    The ender is the purpose-built endgame tool, so a complete board goes there;
-    --mode ring when the window is mostly border, since a border break heals by
-    cascading around the frame. A board with empty cells is the topper's job."""
-    cells = mask_cells(rec["mask"])
-    border_frac = sum(1 for c in cells if c in FRAME_SIDES) / max(1, len(cells))
+    The ender is the purpose-built endgame tool, so a complete board goes there
+    with this board's own mask as its neighbourhood. There is no mode choice to
+    make any more: the ender picks its own neighbourhoods, and --holes pins the
+    pool to exactly the window this distiller computed, so the profile supplies
+    only the escalation over that fixed pool (m4, m8, ... with repeats) and the
+    per-board budget. A board with empty cells is still the topper's job."""
     if rec["placed"] == N_PIECES:
-        mode = "ring" if border_frac >= 0.60 else "patch"
-        args = ["--mode", mode, "--holes", mask_rel,
-                "--reach", "3", "--max_changes", "24", "--time_limit", "300"]
+        args = ["--holes", mask_rel,
+                "--profile", "deep", "--board_time_limit", "900"]
         return "src/C_tail/E555_ender.py", args + clue_flags
     win = rec["win"]
     if win != "hull" and win[0] in "TBLR":
