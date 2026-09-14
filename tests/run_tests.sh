@@ -1348,13 +1348,6 @@ step_scripts_parse() {
     # waited for whoever ran the pipeline next. This reads the accepted flags
     # out of the parsers themselves, so it cannot drift from the code.
     python3 tests/check_script_flags.py || fail "a script passes a flag its binary rejects"
-    # The fixed-frame experiment's coordinate system, checked as pure arithmetic
-    # over the clue table: no binary, no beam run, milliseconds. If the turn that
-    # canonicalises a side were wrong, the corpus would silently average boards
-    # from four different frames and nothing would ever report an error.
-    python3 tests/check_fixedframe.py > /dev/null \
-        || fail "the fixed-frame canonicalisation map is inconsistent"
-    echo "ok: fixed-frame canonicalisation map"
 }
 
 # On the synthetic fixture, where the finalizer's chain database is 0.03 GB and

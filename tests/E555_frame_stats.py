@@ -151,6 +151,20 @@ def side_of(config_id):
     return -1
 
 
+def border_of(config_id):
+    """The independent unit: the BOTTOM row, not the (bottom, column) pair.
+
+    Ids look like s<side>_<runtag>_b<bottom>l<column>. With --top_columns 1 there
+    is one column per bottom and this is the config id. Raise --top_columns and
+    several configs share a bottom row exactly -- 16 of the 176 cells identical,
+    plus everything the bottom forces above it -- so treating them as separate
+    observations would inflate the sample. Grouping on the bottom is correct
+    under either setting, and identical to the config id under the default.
+    """
+    i = config_id.rfind("l")
+    return config_id[:i] if i > 0 else config_id
+
+
 def spearman(x, y):
     """Rank correlation of two 1-D arrays (ties averaged)."""
     if len(x) < 3:
@@ -198,7 +212,7 @@ def load_corpus(path, strict=True, progress=20000):
                 or rot[CANON_CLUE_PIECE] != CANON_CLUE_SPIN):
             off_frame += 1
             continue
-        by_config[cid].append(np.asarray(pos, np.int16))
+        by_config[border_of(cid)].append(np.asarray(pos, np.int16))
         if progress and total % progress == 0:
             print(f"[load]   {total} rows...", file=sys.stderr)
     if off_frame:
@@ -432,7 +446,9 @@ def main(argv=None):
 
     w_per_board = np.repeat(1.0 / n_boards, n_boards)
     n_eff = w_per_board.sum() ** 2 / (w_per_board ** 2).sum()
-    print(f"[load] {int(n_boards.sum())} boards / {n_cfg} configs / N_eff {n_eff:.0f}")
+    print(f"[load] {int(n_boards.sum())} boards / {n_cfg} borders / "
+          f"N_eff {n_eff:.0f}  (boards grouped by bottom row, which is the "
+          f"independent unit)")
 
     cover_z, frac_z = measure_coverage(sidec, "zone")
     cover_rb, frac_rb = measure_coverage(sidec, "rowband")

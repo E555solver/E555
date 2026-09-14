@@ -16,6 +16,21 @@
 # own RNG seed stream but sweeps hundreds of random borders, so the comparison is
 # between two RATES, not two lucky borders.
 #
+# WHAT IS MEASURED -- NOT EMISSIONS
+#
+# At --stop_row 12 with every clue on, a small machine emits essentially nothing:
+# the beam dies before it gets there on all but a freak border, so counting
+# emitted boards compares zero against zero. Both arms therefore run --verbose,
+# and the comparison uses the per-row line the beam prints on the way up:
+#
+#   [beam] <config> row=R cands=N uniq=U beam=B/K smax=S t=Ts
+#
+# `uniq` -- distinct surviving states after the dedup -- is continuous, recorded
+# for every border at every row it reaches, and is what "the search still has
+# room" means. tests/E555_ab_analyze.py compares its median per row, plus plain
+# survival to each row. A rare hero reaching row 12 shows up in the survival
+# column; it is a bonus, not the metric.
+#
 # WHY THE ARMS ARE NOT PAIRED
 #
 # You might expect the same --rng_seed to give both arms the same borders, making
@@ -47,6 +62,8 @@ WALL=1800               # seconds PER ARM
 STOP_ROW=12             # the depth we are trying to reach more often
 BEAM_WIDTH=100000
 MAX_PER_CONFIG=4        # this run is about depth, not about boards
+VERBOSE=1               # 1 = --verbose, which is where the per-row widths come
+                        # from. Turning it off leaves only survival to compare.
 CLUE_ORIENT=0           # the canonical frame -- the one the corpus measured
 EXCLUDE=                # required: comma-separated piece ids
 BASE_DB=                # optional path to an existing clue-built cache to reuse
@@ -87,8 +104,9 @@ run_arm() {           # $1 = arm name, $2 = extra args (may be empty)
     if [ "$arm" = "baseline" ] && [ -n "$BASE_DB" ] && [ -s "$BASE_DB" ]; then
         db="$BASE_DB"
     fi
-    local seed_arg=()
+    local seed_arg=() vflag=()
     [ "$RNG_SEED" != "0" ] && seed_arg=(--rng_seed "$RNG_SEED")
+    [ "$VERBOSE" = "1" ] && vflag=(--verbose)
     echo "[ab] ===== arm: $arm ====="
     "$BIN" "$REPO/$SEED" \
         --clue_orient "$CLUE_ORIENT" \
@@ -97,9 +115,11 @@ run_arm() {           # $1 = arm name, $2 = extra args (may be empty)
         --out_dir "$dir" --db_file "$db" --threads "$THREADS" \
         --beam_width "$BEAM_WIDTH" --stop_row "$STOP_ROW" \
         --max_per_config "$MAX_PER_CONFIG" --emit_mode sample \
-        --wall_time "$WALL" "${seed_arg[@]}" "$@" > "$dir/run.log" 2>&1
-    local n; n=$(grep -c '^\[sweep\]' "$dir/run.log" || true)
-    echo "[ab] $arm: $n border config(s) swept -> $dir/run.log"
+        --wall_time "$WALL" "${vflag[@]}" "${seed_arg[@]}" "$@" \
+        > "$dir/run.log" 2>&1
+    local n b; n=$(grep -c '^\[sweep\]' "$dir/run.log" || true)
+    b=$(grep -c '^\[beam\]' "$dir/run.log" || true)
+    echo "[ab] $arm: $n border(s) swept, $b per-row samples -> $dir/run.log"
 }
 
 run_arm baseline

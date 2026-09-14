@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
 """
-E555_ab_analyze.py -- did the exclusion list make the beam go deeper?
+E555_ab_analyze.py -- did the exclusion list make the search healthier?
 
     python3 tests/E555_ab_analyze.py ab_out/baseline/run.log ab_out/excluded/run.log
 
-Reads the [sweep] lines of two beamer logs and compares the DEPTH each border
-configuration reached. One line per config:
+WHAT TO MEASURE, AND WHY NOT EMISSIONS
 
-    [sweep] s0_ab12_b7l0 filled=11 width=... reason=stop_row ...   -> reached 11
-    [sweep] s0_ab12_b8l0 died=2    width=... reason=extinct ...    -> reached 1
+    On a small machine, with all the clues on, a run at --stop_row 12 emits
+    essentially nothing: the beam dies before it gets there on all but a freak
+    border. Counting emitted boards would compare zero against zero.
 
-so "depth" is the last row the beam actually completed. A run that sweeps more
-borders is not automatically better -- excluding pieces shrinks the database and
-speeds every config up -- so the headline is the RATE at which borders reach a
-given depth, with a confidence interval, not the raw count.
+    So both arms run with --verbose, and the comparison uses what the beam
+    reports on the way up. Each row prints
 
-Reported:
-  * the full depth distribution for each arm
-  * P(reach depth >= D) for each D, with a Wilson interval per arm and a
-    Newcombe interval on the difference
-  * a Mann-Whitney U test on the whole depth distribution, which uses every
-    config rather than collapsing to one threshold
-  * throughput, so a speed win is visible separately from a depth win
+        [beam] <config> row=R cands=N uniq=U beam=B/K smax=S t=Ts
+
+    and `uniq` -- distinct surviving states after the dedup -- is the useful one.
+    It is continuous, it is recorded for every config at every row it reaches,
+    and it is what "the search still has room" actually means. A binary
+    did-it-reach-row-12 throws all of that away and then has almost no events
+    left to count.
+
+    Two things are reported per row, and they answer different questions:
+
+      survival   what fraction of borders got to row R at all. Wilson interval
+                 per arm, Newcombe on the difference.
+      breadth    among the borders that got there, how wide the frontier was.
+                 Median `uniq`, with a bootstrap interval on the RATIO between
+                 arms, plus Mann-Whitney. This is the sensitive one.
+
+    The headline is breadth at the deepest row where both arms still have enough
+    configs to estimate it.
 """
 from __future__ import annotations
 
@@ -30,7 +39,7 @@ import json
 import math
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 # Consecutive identical deaths collapse into one line, which puts an "x<n>"
@@ -40,13 +49,15 @@ from pathlib import Path
 # borders vanishes from the denominator -- which would bias the rate upward for
 # whichever arm collapsed more.
 SWEEP = re.compile(r"^\[sweep\]\s+(\S+)(?:\s+x(\d+))?\s+(filled|died)=(\d+)")
+BEAM = re.compile(r"^\[beam\]\s+(\S+)\s+row=(\d+)\s+cands=(\d+)\s+uniq=(\d+)")
+
+MIN_CONFIGS = 30          # below this a per-row estimate is not worth reporting
 
 
 def parse_log(path):
-    """Depth reached per config. died=R means row R failed, so R-1 completed."""
+    """(depths per config, uniq[row] -> list of widths, n_configs)."""
     depths = []
-    wall = 0.0
-    emitted = 0
+    uniq = defaultdict(list)
     for line in Path(path).read_text(errors="replace").splitlines():
         m = SWEEP.match(line)
         if m:
@@ -54,14 +65,10 @@ def parse_log(path):
             kind, val = m.group(3), int(m.group(4))
             depths.extend([val if kind == "filled" else val - 1] * n)
             continue
-        if line.startswith("[done]") or "sol_total=" in line:
-            mm = re.search(r"sol_total=(\d+)", line)
-            if mm:
-                emitted = max(emitted, int(mm.group(1)))
-        mm = re.search(r"wall=([\d.]+)s", line)
-        if mm:
-            wall += float(mm.group(1))
-    return depths, wall, emitted
+        m = BEAM.match(line)
+        if m:
+            uniq[int(m.group(2))].append(int(m.group(4)))
+    return depths, uniq
 
 
 def wilson(k, n, z=1.96):
@@ -79,9 +86,38 @@ def newcombe(k1, n1, k2, n2, z=1.96):
     p1, l1, u1 = wilson(k1, n1, z)
     p2, l2, u2 = wilson(k2, n2, z)
     d = p2 - p1
-    lo = d - math.sqrt((p2 - l2) ** 2 + (u1 - p1) ** 2)
-    hi = d + math.sqrt((u2 - p2) ** 2 + (p1 - l1) ** 2)
-    return d, lo, hi
+    return (d,
+            d - math.sqrt((p2 - l2) ** 2 + (u1 - p1) ** 2),
+            d + math.sqrt((u2 - p2) ** 2 + (p1 - l1) ** 2))
+
+
+def median(v):
+    if not v:
+        return float("nan")
+    s = sorted(v)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def ratio_ci(a, b, n_boot=4000, seed=7):
+    """Bootstrap CI for median(b)/median(a), resampling configs in each arm."""
+    if not a or not b:
+        return float("nan"), float("nan"), float("nan")
+    import random
+    rng = random.Random(seed)
+    ma, mb = median(a), median(b)
+    if ma <= 0:
+        return float("nan"), float("nan"), float("nan")
+    out = []
+    for _ in range(n_boot):
+        ra = median([a[rng.randrange(len(a))] for _ in range(len(a))])
+        rb = median([b[rng.randrange(len(b))] for _ in range(len(b))])
+        if ra > 0:
+            out.append(rb / ra)
+    out.sort()
+    if not out:
+        return mb / ma, float("nan"), float("nan")
+    return mb / ma, out[int(.025 * len(out))], out[int(.975 * len(out))]
 
 
 def mannwhitney(a, b):
@@ -90,16 +126,14 @@ def mannwhitney(a, b):
     if n1 == 0 or n2 == 0:
         return float("nan"), float("nan"), float("nan")
     allv = sorted(a + b)
-    ranks = {}
-    i = 0
+    ranks, i = {}, 0
     while i < len(allv):
         j = i
         while j + 1 < len(allv) and allv[j + 1] == allv[i]:
             j += 1
         ranks[allv[i]] = (i + j) / 2.0 + 1.0
         i = j + 1
-    r1 = sum(ranks[v] for v in a)
-    u1 = r1 - n1 * (n1 + 1) / 2.0
+    u1 = sum(ranks[v] for v in a) - n1 * (n1 + 1) / 2.0
     mu = n1 * n2 / 2.0
     counts = Counter(allv)
     n = n1 + n2
@@ -108,99 +142,107 @@ def mannwhitney(a, b):
     if sd == 0:
         return u1, float("nan"), float("nan")
     z = (u1 - mu) / sd
-    p = 2 * 0.5 * math.erfc(abs(z) / math.sqrt(2))
-    return u1, z, p
+    return u1, z, math.erfc(abs(z) / math.sqrt(2))
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Compare two beamer runs by depth.")
+    ap = argparse.ArgumentParser(description="Compare two beamer runs.")
     ap.add_argument("baseline_log")
     ap.add_argument("excluded_log")
     ap.add_argument("--json_out", default=None)
     ap.add_argument("--label_a", default="baseline")
     ap.add_argument("--label_b", default="excluded")
+    ap.add_argument("--n_boot", type=int, default=4000)
     args = ap.parse_args(argv)
 
-    A, wa, ea = parse_log(args.baseline_log)
-    B, wb, eb = parse_log(args.excluded_log)
+    A, UA = parse_log(args.baseline_log)
+    B, UB = parse_log(args.excluded_log)
     if not A or not B:
         sys.exit("[ab] one of the logs has no [sweep] lines")
+    la, lb = args.label_a, args.label_b
+    na, nb = len(A), len(B)
 
-    dmax = max(max(A), max(B))
-    ca, cb = Counter(A), Counter(B)
+    print(f"[ab] {la}: {na:,} borders, mean depth {sum(A)/na:.3f}")
+    print(f"[ab] {lb}: {nb:,} borders, mean depth {sum(B)/nb:.3f}")
+    if not UA and not UB:
+        print("[ab] WARNING: no [beam] lines -- the runs were not --verbose, so "
+              "only survival can be compared", file=sys.stderr)
 
-    print(f"[ab] {args.label_a}: {len(A)} configs, mean depth {sum(A)/len(A):.3f}")
-    print(f"[ab] {args.label_b}: {len(B)} configs, mean depth {sum(B)/len(B):.3f}")
-    print()
-    print("depth   " + f"{args.label_a:>22}   {args.label_b:>22}")
-    for d in range(0, dmax + 1):
-        pa = ca.get(d, 0) / len(A) * 100
-        pb = cb.get(d, 0) / len(B) * 100
-        if ca.get(d, 0) or cb.get(d, 0):
-            print(f"  {d:>3}   {ca.get(d,0):>8} ({pa:5.1f}%)   "
-                  f"{cb.get(d,0):>8} ({pb:5.1f}%)")
-
-    print()
-    print("P(reach depth >= D)")
+    dmax = max(max(A), max(B), max(UA or [0]), max(UB or [0]))
     rows = []
-    for d in range(max(1, dmax - 4), dmax + 1):
-        ka = sum(1 for v in A if v >= d)
-        kb = sum(1 for v in B if v >= d)
-        pa, la, ua = wilson(ka, len(A))
-        pb, lb, ub = wilson(kb, len(B))
-        diff, dlo, dhi = newcombe(ka, len(A), kb, len(B))
+    print()
+    print(f"{'row':>4}  {'survival ' + la:>22}  {'survival ' + lb:>22}  "
+          f"{'diff':>9}   {'median uniq':>21}  {'ratio':>18}  {'MW p':>8}")
+    for r in range(1, dmax + 1):
+        ka = sum(1 for v in A if v >= r)
+        kb = sum(1 for v in B if v >= r)
+        if ka == 0 and kb == 0:
+            continue
+        pa, la_, ua_ = wilson(ka, na)
+        pb, lb_, ub_ = wilson(kb, nb)
+        d, dlo, dhi = newcombe(ka, na, kb, nb)
+        ua, ub = UA.get(r, []), UB.get(r, [])
+        enough = len(ua) >= MIN_CONFIGS and len(ub) >= MIN_CONFIGS
+        rat, rlo, rhi = ratio_ci(ua, ub, args.n_boot) if enough else (float("nan"),) * 3
+        _, _, p = mannwhitney(ua, ub) if enough else (0, 0, float("nan"))
         sig = "*" if (dlo > 0 or dhi < 0) else " "
-        print(f"  D>={d}: {args.label_a} {pa*100:6.2f}% [{la*100:5.2f},{ua*100:5.2f}]"
-              f"   {args.label_b} {pb*100:6.2f}% [{lb*100:5.2f},{ub*100:5.2f}]"
-              f"   diff {diff*100:+6.2f}pp [{dlo*100:+6.2f},{dhi*100:+6.2f}] {sig}")
-        rows.append({"D": d, "ka": ka, "na": len(A), "kb": kb, "nb": len(B),
-                     "pa": pa, "pb": pb, "diff": diff, "lo": dlo, "hi": dhi,
-                     "significant": bool(dlo > 0 or dhi < 0)})
+        rsig = "*" if enough and (rlo > 1 or rhi < 1) else " "
+        med_a = median(ua) if ua else float("nan")
+        med_b = median(ub) if ub else float("nan")
+        cell_med = (f"{med_a:>9,.0f} {med_b:>9,.0f}" if ua and ub
+                    else f"{'-':>9} {'-':>9}")
+        cell_rat = (f"{rat:6.3f}[{rlo:5.2f},{rhi:5.2f}]{rsig}" if enough
+                    else f"{'(too few)':>18}")
+        cell_p = f"{p:>8.3g}" if enough else f"{'-':>8}"
+        print(f"{r:>4}  {ka:>7,} {pa*100:6.2f}% [{la_*100:5.2f},{ua_*100:5.2f}]  "
+              f"{kb:>7,} {pb*100:6.2f}% [{lb_*100:5.2f},{ub_*100:5.2f}]  "
+              f"{d*100:+6.2f}pp{sig}  {cell_med}  {cell_rat}  {cell_p}")
+        rows.append({"row": r, "ka": ka, "na": na, "kb": kb, "nb": nb,
+                     "surv_a": pa, "surv_b": pb, "surv_diff": d,
+                     "surv_lo": dlo, "surv_hi": dhi,
+                     "n_uniq_a": len(ua), "n_uniq_b": len(ub),
+                     "med_a": med_a, "med_b": med_b,
+                     "ratio": rat, "ratio_lo": rlo, "ratio_hi": rhi,
+                     "mw_p": p, "estimable": bool(enough)})
 
-    # The verdict comes from the deepest threshold the BASELINE still reaches
-    # often enough to estimate (>= 30 configs). That is the tail we are trying to
-    # fatten, and the one a practical run cares about.
-    usable = [r for r in rows if r["ka"] >= 30]
-    head = usable[-1] if usable else (rows[-1] if rows else None)
-    u, z, p = mannwhitney(A, B)
+    # Headline: breadth at the deepest row both arms still populate enough to
+    # estimate. That is where the search is actually struggling, and where a
+    # change has to show up to matter.
+    est = [r for r in rows if r["estimable"]]
+    head = est[-1] if est else None
     print()
     if head:
-        D = head["D"]
-        if head["lo"] > 0:
-            verdict = (f"the exclusion HELPS: P(reach {D}) rises "
-                       f"{head['diff']*100:+.2f}pp "
-                       f"[{head['lo']*100:+.2f},{head['hi']*100:+.2f}]")
-        elif head["hi"] < 0:
-            verdict = (f"the exclusion HURTS: P(reach {D}) falls "
-                       f"{head['diff']*100:+.2f}pp "
-                       f"[{head['lo']*100:+.2f},{head['hi']*100:+.2f}]")
+        R, rat, rlo, rhi = head["row"], head["ratio"], head["ratio_lo"], head["ratio_hi"]
+        if rlo > 1:
+            verdict = (f"the exclusion HELPS: at row {R} the frontier is "
+                       f"{rat:.2f}x wider [{rlo:.2f},{rhi:.2f}]")
+        elif rhi < 1:
+            verdict = (f"the exclusion HURTS: at row {R} the frontier is "
+                       f"{rat:.2f}x as wide [{rlo:.2f},{rhi:.2f}]")
         else:
-            verdict = (f"no effect on P(reach {D}): {head['diff']*100:+.2f}pp "
-                       f"[{head['lo']*100:+.2f},{head['hi']*100:+.2f}] "
-                       f"straddles zero")
+            verdict = (f"no effect on frontier width at row {R}: {rat:.2f}x "
+                       f"[{rlo:.2f},{rhi:.2f}] straddles 1.00")
     else:
-        verdict = "not enough configs reached any useful depth"
+        verdict = (f"neither arm reached any row with {MIN_CONFIGS}+ configs -- "
+                   f"run longer, or lower --stop_row")
     print(f"[ab] VERDICT: {verdict}")
-    print(f"[ab] (secondary) Mann-Whitney over the WHOLE depth distribution: "
-          f"z = {z:+.3f}, p = {p:.4g}")
-    print("[ab] Note: most borders die at row 1-2 in both arms, so the rank test "
-          "is dominated by\n[ab] that bulk and can disagree with the deep tail. "
-          "The threshold above is the one to read.")
-    print()
-    print(f"[ab] throughput: {args.label_a} {len(A)} configs, "
-          f"{args.label_b} {len(B)} configs "
-          f"({len(B)/max(len(A),1):.2f}x)  -- a smaller database sweeps faster, "
-          f"which is a separate win from depth")
+
+    deep = [r for r in rows if r["ka"] + r["kb"] > 0]
+    if deep:
+        d = deep[-1]
+        print(f"[ab] deepest row reached at all: {d['row']} "
+              f"({d['ka']} {la}, {d['kb']} {lb})")
+    print(f"[ab] throughput: {na:,} vs {nb:,} borders ({nb/max(na,1):.2f}x) -- a "
+          f"smaller database sweeps faster, which is a win separate from depth")
 
     if args.json_out:
         Path(args.json_out).write_text(json.dumps({
-            "label_a": args.label_a, "label_b": args.label_b,
-            "n_a": len(A), "n_b": len(B),
-            "mean_a": sum(A)/len(A), "mean_b": sum(B)/len(B),
-            "hist_a": {str(d): ca.get(d, 0) for d in range(dmax+1)},
-            "hist_b": {str(d): cb.get(d, 0) for d in range(dmax+1)},
-            "thresholds": rows, "mw_z": z, "mw_p": p, "verdict": verdict,
-            "headline_D": (head or {}).get("D"),
+            "label_a": la, "label_b": lb, "n_a": na, "n_b": nb,
+            "mean_a": sum(A)/na, "mean_b": sum(B)/nb,
+            "hist_a": {str(d): sum(1 for v in A if v == d) for d in range(dmax+1)},
+            "hist_b": {str(d): sum(1 for v in B if v == d) for d in range(dmax+1)},
+            "rows": rows, "verdict": verdict,
+            "headline_row": (head or {}).get("row"),
         }, indent=1))
         print(f"[out] {args.json_out}")
     return 0
