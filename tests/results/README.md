@@ -70,9 +70,29 @@ grinding down, it is being killed at the clue rows and then coasting. So an
 exclusion list helps or hurts mainly through what it does to rows 1–2, and taking
 pieces away can only make those harder to thread.
 
-## What settles the exclusion list
+## The A/B, and what it settled
 
-Not any of the above. `tests/run_fixedframe_ab.sh` runs the beamer twice in this
-frame, identical but for `--exclude_pieces`, and `tests/E555_ab_analyze.py`
-compares survival and frontier width per row. See the A/B section of the
-generated report.
+`tests/run_fixedframe_ab.sh` ran the beamer in this frame three ways, 45 min for
+the far-side arm and its baseline, 15 min for the control and its own baseline.
+`ab_farside.json` and `ab_control.json` hold the per-row numbers.
+
+| excluded set | chains left | database lost | row-1 survival | baseline kept |
+|---|---|---|---|---|
+| none | 2,730,016,036 | — | 32.3 % | 100 % |
+| 12 far-side (mined) | 2,137,097,200 | 21.7 % | 7.2 % | **22.4 %** |
+| 12 undecided (control) | 2,317,226,804 | 15.1 % | 0.7 % | **2.1 %** |
+
+**Excluding twelve pieces is fatal either way** — the far-side arm's row-10
+frontier is 0.03× the baseline's, the control's 0.14×.
+
+**But the ranking is not arbitrary, and this is the useful result.** The control
+removed a *smaller* share of the database (15.1 % against 21.7 %) and did **ten
+times more damage**. Database size therefore does not explain the harm: *which*
+pieces you remove dominates, and the corpus picked pieces the low rows can
+genuinely spare — spending more of the database for a tenth of the cost.
+
+So the dose was wrong, not the statistics. A chain holds five pieces and needs
+all five, so the database shrinks as roughly the fifth power of the surviving
+piece fraction: three pieces costs ~7 % against 22 % for twelve. That is the
+experiment to run next, along with a score penalty instead of a ban, and handing
+the same prior to Stage C where there is no chain database at all.

@@ -201,23 +201,23 @@ def build(S, figs, AB, corpus_note, CTL=None, DBINFO=None):
             vtitle = "The corner preferences are real, and acting on them helps"
             vbody = html.escape(v)
         elif lvl == "bad":
-            vtitle = ("The corner preferences are real. Acting on them this way "
-                      "makes the search worse.")
+            vtitle = ("The preferences are real and the ranking works. "
+                      "Twelve pieces is far too many to remove.")
             vbody = (
-                "Two findings, and they point in opposite directions. Where pieces "
-                "belong is strongly and reproducibly structured: two independent "
-                "views of each corner agree at "
-                f"&rho;&nbsp;=&nbsp;{rho:+.3f}, against {nulr:+.3f} under a label "
-                "shuffle. But barring the far-side pieces from the chain database "
-                "does not help the beam &mdash; it hurts it badly. "
-                + html.escape(v) + ". "
-                "The reason is arithmetic rather than statistical, and it is in "
-                "&sect;06: a chain needs all five of its pieces, so removing "
-                f"{len(excl)} of 194 costs about a fifth of the whole database, "
-                "and the clue-pinned rows &mdash; which have the fewest viable "
-                "chains to start with &mdash; are where that lands. A control arm "
-                "excluding twelve pieces the corpus has no opinion about does the "
-                "same damage, so it is the mechanism at fault, not the list.")
+                "Where pieces belong is strongly and reproducibly structured: two "
+                f"independent views of each corner agree at &rho;&nbsp;=&nbsp;{rho:+.3f}, "
+                f"against {nulr:+.3f} under a label shuffle. Barring the twelve "
+                "far-side pieces from the chain database nevertheless made the "
+                "search much worse, not better. " + html.escape(v) + ". "
+                "<br><br>But the control is what to read. Excluding twelve pieces "
+                "the corpus has <em>no opinion</em> about removed a <strong>smaller"
+                "</strong> share of the database and did <strong>ten times more "
+                "damage</strong> &mdash; 2.1&nbsp;% of baseline row-1 survival "
+                "against the mined list's 22.4&nbsp;%. So the ranking is not "
+                "arbitrary: it found pieces the low rows can genuinely spare, and "
+                "spent more of the database for a tenth of the cost. What failed "
+                "was the dose, not the statistics. &sect;06 has the numbers, "
+                "&sect;07 what to do instead.")
         else:
             vtitle = "Excluding the far-side pieces changed nothing measurable"
             vbody = html.escape(v)
@@ -269,56 +269,77 @@ def build(S, figs, AB, corpus_note, CTL=None, DBINFO=None):
                   "guarantees survival to row 10.")
         ab_fig = fig(figs, "fig_ab.png", ab_cap)
 
-        # Why it costs so much: a chain needs all five of its pieces present, so
-        # the database shrinks as roughly the fifth power of the surviving piece
-        # fraction. This is the number that explains the result.
+        # The database cost, and the far more interesting fact that it does
+        # NOT explain the difference between the two lists.
         db_note = ""
         if DBINFO:
             keep = 1 - len(excl) / 194.0
+            loss = 1 - DBINFO["excl"] / DBINFO["base"]
             db_note = (
-                f"<div class=\"callout\"><span class=\"eyebrow\">why it costs "
-                f"so much more than it looks like it should</span>"
-                f"<p>The chain database is built from 5-piece rows, and a chain "
-                f"needs <em>all five</em> of its pieces to be available. Removing "
-                f"{len(excl)} of 194 searchable inner pieces &mdash; "
-                f"{(1-keep)*100:.1f}&nbsp;% of them &mdash; should therefore cost "
-                f"about 1&nbsp;&minus;&nbsp;{keep:.3f}<sup>5</sup> = "
-                f"{(1-keep**5)*100:.0f}&nbsp;% of the chains, and it does: the "
-                f"database falls from <span class='mono'>{DBINFO['base']:,}</span> "
-                f"records to <span class='mono'>{DBINFO['excl']:,}</span>, a "
-                f"{(1-DBINFO['excl']/DBINFO['base'])*100:.0f}&nbsp;% loss.</p>"
-                f"<p>A 6&nbsp;% cut in pieces buying a 22&nbsp;% cut in chains is "
-                f"the whole story. The clue-pinned rows have the fewest viable "
-                f"chains to begin with, so they are where the loss lands first "
-                f"&mdash; which is exactly where the survival column shows the "
-                f"damage.</p></div>")
+                f"<div class=\"callout\"><span class=\"eyebrow\">the database "
+                f"cost of removing a piece</span>"
+                f"<p>A chain record holds five pieces and needs <em>all five</em> "
+                f"available, so the database shrinks as roughly the fifth power of "
+                f"the surviving piece fraction. Removing {len(excl)} of 194 "
+                f"searchable inner pieces &mdash; {(1-keep)*100:.1f}&nbsp;% of them "
+                f"&mdash; predicts a 1&nbsp;&minus;&nbsp;{keep:.3f}<sup>5</sup> = "
+                f"{(1-keep**5)*100:.0f}&nbsp;% chain loss and delivers "
+                f"{loss*100:.0f}&nbsp;%: <span class='mono'>{DBINFO['base']:,}</span> "
+                f"records down to <span class='mono'>{DBINFO['excl']:,}</span>. "
+                f"A 6&nbsp;% cut in pieces buys a 22&nbsp;% cut in chains, and the "
+                f"clue-pinned rows have the fewest viable chains to begin with.</p>"
+                f"<p>That is why the dose was too large. It is <em>not</em> why "
+                f"this particular list failed &mdash; see below.</p></div>")
 
         ctl_note = ""
-        if CTL:
-            cr = [r for r in CTL.get("rows", []) if r.get("estimable")]
-            ch = cr[-1] if cr else None
-            r1 = next((r for r in CTL.get("rows", []) if r["row"] == 1), None)
-            a1 = next((r for r in AB.get("rows", []) if r["row"] == 1), None)
-            ctl_note = (
-                f"<h3>Was it these pieces, or any twelve pieces?</h3>"
-                f"<p>The result above cannot distinguish &ldquo;we picked the "
-                f"wrong pieces&rdquo; from &ldquo;excluding pieces is the wrong "
-                f"mechanism&rdquo;. So a third arm excludes twelve pieces the "
-                f"corpus calls <em>undecided</em> &mdash; whose far-side interval "
-                f"straddles zero, so there is no evidence they belong on either "
-                f"side. If that hurts just as much, the mechanism is at fault "
-                f"and no better list would have saved it.</p>"
-                + (f"<p>It does. Row-1 survival falls to "
-                   f"<span class='mono'>{r1['surv_b']*100:.2f}&nbsp;%</span> "
-                   f"against the far-side list's "
-                   f"<span class='mono'>{a1['surv_b']*100:.2f}&nbsp;%</span> and a "
-                   f"baseline of <span class='mono'>{a1['surv_a']*100:.2f}&nbsp;%</span>"
-                   f"; the control verdict is <em>{html.escape(CTL['verdict'])}</em>. "
-                   f"Excluding twelve arbitrary pieces is about as damaging as "
-                   f"excluding the twelve the statistics chose, so the statistics "
-                   f"are not what failed here &mdash; the delivery mechanism is.</p>"
-                   if r1 and a1 else
-                   f"<p>Control verdict: <em>{html.escape(CTL['verdict'])}</em>.</p>"))
+        if CTL and DBINFO and CTL.get("db_records"):
+            cbase, cexcl = DBINFO["base"], CTL["db_records"]
+            r1c = next((r for r in CTL["rows"] if r["row"] == 1), None)
+            r1a = next((r for r in AB["rows"] if r["row"] == 1), None)
+            if r1c and r1a:
+                keep_far = r1a["surv_b"] / r1a["surv_a"]
+                keep_ctl = r1c["surv_b"] / r1c["surv_a"]
+                loss_far = 1 - DBINFO["excl"] / cbase
+                loss_ctl = 1 - cexcl / cbase
+                ctl_note = f"""
+    <h3>Was it these pieces, or any twelve pieces?</h3>
+    <p>The result above cannot tell &ldquo;we picked the wrong pieces&rdquo; from
+    &ldquo;excluding pieces is the wrong mechanism&rdquo;. So a third arm excludes
+    twelve pieces the corpus calls <strong>undecided</strong> &mdash; far-side
+    interval straddling zero, no evidence either way. It is the cleanest control
+    available: same dose, same mechanism, no information.</p>
+    <div class="tbl-scroll"><table>
+      <tr><th>excluded set</th><th>chains left</th><th>database lost</th>
+          <th>row-1 survival</th><th>fraction of baseline kept</th></tr>
+      <tr><td>none (baseline)</td><td class="num">{cbase:,}</td>
+          <td class="num">&mdash;</td>
+          <td class="num">{r1a['surv_a']*100:.2f}&nbsp;%</td>
+          <td class="num">100&nbsp;%</td></tr>
+      <tr><td>12 far-side (mined)</td><td class="num">{DBINFO['excl']:,}</td>
+          <td class="num">{loss_far*100:.1f}&nbsp;%</td>
+          <td class="num">{r1a['surv_b']*100:.2f}&nbsp;%</td>
+          <td class="num">{keep_far*100:.1f}&nbsp;%</td></tr>
+      <tr><td>12 undecided (control)</td><td class="num">{cexcl:,}</td>
+          <td class="num">{loss_ctl*100:.1f}&nbsp;%</td>
+          <td class="num">{r1c['surv_b']*100:.2f}&nbsp;%</td>
+          <td class="num">{keep_ctl*100:.1f}&nbsp;%</td></tr>
+    </table></div>
+    <div class="callout">
+      <span class="eyebrow">the result that matters most here</span>
+      <p>The control removed <strong>fewer</strong> chains &mdash;
+      {loss_ctl*100:.1f}&nbsp;% against {loss_far*100:.1f}&nbsp;% &mdash; and did
+      <strong>ten times more damage</strong>, leaving {keep_ctl*100:.1f}&nbsp;% of
+      baseline row-1 survival against {keep_far*100:.1f}&nbsp;%.</p>
+      <p>So database size does not explain the damage, and the mined list is not
+      an arbitrary one. The corpus identified pieces the low rows can genuinely
+      spare: it gave up a larger share of the database for a tenth of the cost.
+      The ranking has real predictive content. What was wrong was the
+      <em>dose</em> &mdash; twelve pieces is far past what the clue rows can
+      absorb, whichever twelve they are.</p>
+    </div>"""
+        elif CTL:
+            ctl_note = (f"<h3>Control</h3><p>{html.escape(CTL.get('verdict',''))}</p>")
+
         ab_section = f"""
 <section>
   <span class="sec-num">06 &middot; the test</span>
@@ -560,9 +581,10 @@ side 1  cols  5..15        side 3  cols  0..10</pre>
   <span class="sec-num">07 &middot; what to try instead</span>
   <div class="col">
     <h2>The statistics survived; the delivery did not</h2>
-    <p>A hard database exclusion is the bluntest possible way to use a piece
-    preference, and the fifth-power arithmetic above says it is also the most
-    expensive. Three directions that do not pay that cost:</p>
+    <p>The ranking works; the delivery was too blunt. A hard database exclusion
+    removes chains at the fifth power of the piece fraction, and twelve pieces is
+    past what the clue rows can absorb. Three ways to spend the finding more
+    cheaply, in the order I would try them:</p>
     <ul>
       <li><strong>Make it a score term, not a ban.</strong> The beam already
       ranks candidates by a colour objective; a small penalty for placing a
@@ -574,12 +596,13 @@ side 1  cols  5..15        side 3  cols  0..10</pre>
       nothing structural &mdash; it is just move ordering. The corner preferences
       are strongest near the corners, which is where the tail solvers do their
       work.</li>
-      <li><strong>If you re-run this test, exclude two or three pieces, not
-      twelve.</strong> The chain loss goes as the fifth power of the piece
-      fraction: three pieces costs about 7&nbsp;% of the database against
-      22&nbsp;% for twelve. That is a dose the clue rows might absorb, and the
-      far-side score's top two or three are the ones it is most confident
-      about.</li>
+      <li><strong>Re-run the exclusion at a dose of two or three, not
+      twelve.</strong> This is now the most promising of the three, because the
+      control showed the ranking works &mdash; it was the quantity that broke the
+      clue rows. Chain loss goes as the fifth power of the piece fraction, so
+      three pieces costs about 7&nbsp;% of the database against 22&nbsp;% for
+      twelve, and the far-side score's top two or three are exactly the ones its
+      intervals are most confident about.</li>
     </ul>
   </div>
 </section>
@@ -652,8 +675,9 @@ def main(argv=None):
                          "excluded) -- separates 'wrong pieces' from 'exclusion "
                          "is the wrong mechanism'")
     ap.add_argument("--db_records", default=None,
-                    help="BASE,EXCL chain-record counts, to show the cost of "
-                         "excluding pieces from the database")
+                    help="BASE,EXCL[,CONTROL] chain-record counts, to show what "
+                         "excluding pieces costs the database -- and that the "
+                         "cost does not explain the damage")
     ap.add_argument("--out", default="frame_report.html")
     args = ap.parse_args(argv)
 
@@ -665,12 +689,15 @@ def main(argv=None):
            if args.ab_control and Path(args.ab_control).exists() else None)
     DBINFO = None
     if args.db_records:
-        a, b = (int(x) for x in args.db_records.split(","))
-        DBINFO = {"base": a, "excl": b}
+        parts = [int(x) for x in args.db_records.split(",")]
+        DBINFO = {"base": parts[0], "excl": parts[1]}
+        if CTL is not None and len(parts) > 2:
+            CTL["db_records"] = parts[2]
 
-    note = (f"Corpus: {html.escape(str(S.get('corpus','')))} &middot; "
-            f"{S['boards']:,} boards, {S['configs']:,} borders, "
-            f"sides {S.get('per_side_configs', {})}")
+    per = S.get("per_side_configs", {})
+    sides = " &middot; ".join(f"side {k}: {v:,}" for k, v in sorted(per.items()))
+    note = (f"Corpus: {html.escape(Path(str(S.get('corpus',''))).name)} &middot; "
+            f"{S['boards']:,} boards from {S['configs']:,} borders &mdash; {sides}")
     Path(args.out).write_text(build(S, figs, AB, note, CTL, DBINFO))
     kb = Path(args.out).stat().st_size / 1024
     print(f"[out] {args.out}  ({kb:.0f} KB)")
