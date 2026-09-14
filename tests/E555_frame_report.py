@@ -380,10 +380,19 @@ side 1  cols  5..15        side 3  cols  0..10</pre>
   <div class="col">
     <h2>Do independent views agree?</h2>
     <p>Two sides see each corner, using different random borders, a different RNG
-    stream and a different search direction. They share very little of the
-    heuristic's bias. If they rank the pieces the same way, something about the
-    puzzle is driving it; if they do not, the ranking is the search talking to
-    itself and no further analysis rescues it.</p>
+    stream and a different search direction. What they <em>do</em> share is the
+    frame &mdash; the same pinned corner piece, the same clue two cells in &mdash;
+    and that is the conditioning the whole experiment is about. What they do not
+    share is the search. So agreement means the frame is driving the placement;
+    disagreement would mean the heuristic is, and no further analysis would
+    rescue it.</p>
+    <p>One honest qualification. Each corner is reached early in the growth of
+    both sides that see it &mdash; within four rows or four columns. That is the
+    regime where the border and the clues dominate and the objective has barely
+    begun to matter, so the agreement below is strongest exactly where constraint
+    is strongest. That is the effect this experiment set out to find rather than
+    a flaw in it, but it does mean the numbers describe the constrained
+    neighbourhood of a corner, not the board at large.</p>
     <p>Mean Spearman across the four corner zones:
     <strong class="mono">{rho:+.3f}</strong>.{null_rho_line}</p>
     <div class="tbl-scroll"><table>
