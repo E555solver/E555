@@ -298,6 +298,13 @@ def build(S, figs, AB, corpus_note):
   </div>
 </section>"""
 
+    heat_cap = ("Every rankable piece against all nine zones, grouped by the zone "
+                "it prefers. The blue block down the diagonal is each group "
+                "preferring its own zone; the red block is the same group avoiding "
+                "the OPPOSITE corner. Almost nothing prefers the four edge zones "
+                "\u2014 pieces sort into corners and centre.")
+    heat_fig = fig(figs, "fig_zone_heatmap.png", heat_cap)
+
     excl_pills = "".join(f'<span class="pill">{p}</span>' for p in excl)
 
     return CSS + f"""
@@ -405,7 +412,19 @@ side 1  cols  5..15        side 3  cols  0..10</pre>
     {zone_table("TL")}
     {zone_table("TR")}
   </div>
-  {fig(figs, "fig_zone_heatmap.png", "Every rankable piece against all nine zones, grouped by the zone it prefers. Block structure down the diagonal is the finding: pieces do sort themselves by region.")}
+  {heat_fig}
+  <div class="col">
+    <p>Two things in that figure are worth more than the diagonal. The first is
+    the <strong>red opposite the blue</strong>: pieces that prefer the
+    bottom-left actively avoid the top-right, and vice versa. A piece does not
+    merely have a corner, it has an anti-corner &mdash; which is exactly what
+    makes the far-side score below possible.</p>
+    <p>The second is what is <em>missing</em>. Almost no piece prefers BM, ML, MR
+    or TM, the four edge zones. The sorting is into corners and centre, not into
+    nine regions. The corners are where the pinned pieces are, and the constraint
+    evidently does not propagate sideways along an edge the way it propagates
+    into a corner.</p>
+  </div>
 </section>
 
 <section>
@@ -456,7 +475,26 @@ side 1  cols  5..15        side 3  cols  0..10</pre>
 {ab_section}
 
 <section>
-  <span class="sec-num">07 &middot; limits</span>
+  <span class="sec-num">07 &middot; an aside worth keeping</span>
+  <div class="col">
+    <h2>Where the beam actually dies</h2>
+    <p>Measured across the farm: of every 100 borders the sweep tries, about
+    <strong>96 die at row 1 or 2</strong> &mdash; the two rows the clues pin. Of
+    the four that survive row 2, <strong>98&nbsp;% reach row 10</strong>. The
+    survival curve is a cliff followed by a plateau.</p>
+    <p>That reframes what an exclusion list can do. Rows 3&ndash;10 are close to
+    free; the search is not slowly grinding down, it is being killed at the
+    clue-pinned rows and then coasting. So a piece list helps or hurts mainly
+    through what it does to rows 1&ndash;2, and the danger is real: taking
+    pieces away can only make those rows harder to thread. That is why the test
+    reports survival per row as well as frontier width &mdash; a list that buys
+    width at row 11 by costing survival at row 2 is a bad trade, and the two
+    columns show it separately.</p>
+  </div>
+</section>
+
+<section>
+  <span class="sec-num">08 &middot; limits</span>
   <div class="col">
     <h2>What this does not show</h2>
     <ul>
@@ -474,6 +512,12 @@ side 1  cols  5..15        side 3  cols  0..10</pre>
       <li><strong>No board in the corpus is a solution.</strong> The statistics
       describe where a partial-board search puts pieces when it survives eleven
       rows, which is related to, but not the same as, where they belong.</li>
+      <li><strong>The zone preferences replicate far better than the far-side
+      ranking does.</strong> Two sides agree about a corner at
+      &rho;&nbsp;&asymp;&nbsp;0.70; the three sides that see rows 13&ndash;15
+      agree about the far-side score much more weakly, and one pair disagrees
+      outright. The corner result and the exclusion list do not stand or fall
+      together.</li>
     </ul>
   </div>
 </section>
