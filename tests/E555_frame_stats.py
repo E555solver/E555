@@ -182,8 +182,14 @@ def spearman(x, y):
 # Load
 
 
-def load_corpus(path, strict=True):
-    """Per-config weighted count tensors. The config is the independent unit."""
+def load_corpus(path, strict=True, progress=20000):
+    """Per-config weighted count tensors. The config is the independent unit.
+
+    Boards are kept as int16 arrays, not Python lists: a 60k-board corpus is
+    30 MB that way and roughly half a gigabyte the other. Accumulation goes
+    through bincount rather than np.add.at, which is the difference between
+    seconds and minutes at this size.
+    """
     by_config = defaultdict(list)
     off_frame = total = 0
     for _, cid, _sol, pos, rot in V.iter_records(path):
@@ -192,7 +198,9 @@ def load_corpus(path, strict=True):
                 or rot[CANON_CLUE_PIECE] != CANON_CLUE_SPIN):
             off_frame += 1
             continue
-        by_config[cid].append(pos)
+        by_config[cid].append(np.asarray(pos, np.int16))
+        if progress and total % progress == 0:
+            print(f"[load]   {total} rows...", file=sys.stderr)
     if off_frame:
         msg = (f"{off_frame} of {total} boards are not on the canonical frame; "
                f"the rotation step in run_fixedframe_farm.sh did not run")
@@ -209,8 +217,8 @@ def load_corpus(path, strict=True):
     sides = np.full(n_cfg, -1, np.int8)
     n_boards = np.zeros(n_cfg, np.int32)
 
-    zmap = np.array([zone_of(c) for c in range(256)])
-    rmap = np.array([rowband_of(c) for c in range(256)])
+    zmap = np.array([zone_of(c) for c in range(256)], np.int64)
+    rmap = np.array([rowband_of(c) for c in range(256)], np.int64)
 
     for i, cid in enumerate(cids):
         boards = by_config[cid]
@@ -218,15 +226,26 @@ def load_corpus(path, strict=True):
         sides[i] = s
         n_boards[i] = len(boards)
         w = 1.0 / len(boards)          # every border counts once, not every board
+        # One flat index per (piece, bucket) pair, summed in a single bincount
+        # per board -- np.add.at on the same data is ~50x slower.
+        zf = np.zeros(N_PIECES * N_ZONES)
+        rf = np.zeros(N_PIECES * N_RB)
+        cf = np.zeros(N_PIECES * N_PIECES)
         for pos in boards:
-            p = np.asarray(pos)
-            placed = np.flatnonzero(p != UNPLACED)
-            cells = p[placed]
-            np.add.at(zone[i], (placed, zmap[cells]), w)
-            np.add.at(rband[i], (placed, rmap[cells]), w)
-            np.add.at(cellc, (placed, cells), w)
-            if 0 <= s < 4:
-                np.add.at(sidec[s], cells, w)
+            placed = np.flatnonzero(pos != UNPLACED)
+            cells = pos[placed].astype(np.int64)
+            zf += np.bincount(placed * N_ZONES + zmap[cells],
+                              minlength=N_PIECES * N_ZONES)
+            rf += np.bincount(placed * N_RB + rmap[cells],
+                              minlength=N_PIECES * N_RB)
+            cf += np.bincount(placed * N_PIECES + cells,
+                              minlength=N_PIECES * N_PIECES)
+        zone[i] = (zf * w).reshape(N_PIECES, N_ZONES)
+        rband[i] = (rf * w).reshape(N_PIECES, N_RB)
+        cellc += (cf * w).reshape(N_PIECES, N_PIECES)
+        if 0 <= s < 4:
+            sidec[s] += (cf * w).reshape(N_PIECES, N_PIECES).sum(0)
+        by_config[cid] = None          # release as we go
     return cids, sides, n_boards, zone, rband, cellc, sidec, total, off_frame
 
 
