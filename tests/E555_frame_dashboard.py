@@ -174,9 +174,9 @@ td.num { font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-num
 .detail .sub { font-size:13px; color:var(--ink-2); margin-bottom:14px; }
 .bars { display:grid; gap:7px; }
 .bar-row { display:grid; grid-template-columns:58px 1fr 60px; gap:10px; align-items:center; font-size:12.5px; }
-.bar-track { height:13px; background:var(--sunk); border-radius:2px; overflow:hidden; position:relative; }
+.bar-track { display:block; height:13px; background:var(--sunk); border-radius:2px; overflow:hidden; position:relative; }
 .bar-mid { position:absolute; top:0; bottom:0; width:1px; background:var(--rule-2); }
-.bar-fill { height:100%; border-radius:2px; }
+.bar-fill { display:block; height:100%; border-radius:2px; }
 .bar-lab { font-family:"IBM Plex Mono",monospace; color:var(--ink-3); font-size:11px; }
 .bar-val { font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums;
            text-align:right; font-size:12px; }
@@ -194,7 +194,7 @@ footer { margin-top:56px; padding-top:22px; border-top:1px solid var(--rule);
          font-size:12.5px; color:var(--ink-3); display:grid; gap:6px; }
 .tt { position:fixed; z-index:50; pointer-events:none; opacity:0; transition:opacity .1s;
       background:var(--ink); color:var(--ground); padding:7px 10px; border-radius:3px;
-      font:400 12px/1.45 "IBM Plex Mono",monospace; box-shadow:var(--shadow); max-width:250px; }
+      font:400 12px/1.45 "IBM Plex Mono",monospace; white-space:pre-line; box-shadow:var(--shadow); max-width:250px; }
 :focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 @media (prefers-reduced-motion:reduce) { * { transition:none !important; animation:none !important; } }
 </style>
@@ -511,7 +511,7 @@ function render(){
 tbody.addEventListener('pointerover', e => {
   const sc = e.target.closest('.sc'); if (!sc) return;
   const p = D.pieces.find(x => x.piece == sc.dataset.p), k = sc.dataset.k;
-  showTip(e, `piece ${p.piece} · ring ${k}\\n${p['lift'+k].toFixed(2)}x expected\\n` +
+  showTip(e, `piece ${p.piece} · ring ${k}\n${p['lift'+k].toFixed(2)}x expected\n` +
              `${(p['p_ring'+k]*100).toFixed(1)}% of its placements`);
 });
 tbody.addEventListener('pointerout', e => { if (e.target.closest('.sc')) hideTip(); });
@@ -530,7 +530,7 @@ document.querySelectorAll('.sortable').forEach(th => {
       o.querySelector('.arr').textContent = '';
     });
     th.setAttribute('aria-sort', sortDir > 0 ? 'ascending' : 'descending');
-    th.querySelector('.arr').textContent = sortDir > 0 ? '\\u2191' : '\\u2193';
+    th.querySelector('.arr').textContent = sortDir > 0 ? '↑' : '↓';
     render();
   });
 });
@@ -582,7 +582,7 @@ function select(pid){
 }
 
 document.querySelector('.sortable[data-k="mean_ring"]').setAttribute('aria-sort','ascending');
-document.querySelector('.sortable[data-k="mean_ring"] .arr').textContent = '\\u2191';
+document.querySelector('.sortable[data-k="mean_ring"] .arr').textContent = '↑';
 render();
 if (D.pieces.length) select(visible()[0].piece);
 </script>
