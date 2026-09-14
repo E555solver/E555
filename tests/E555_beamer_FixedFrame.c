@@ -1477,7 +1477,7 @@ static void expand_clued(BeamCtx *ctx, const BeamEntry *p, uint32_t pi, int row,
 
         int nB = enumerate_pinned_segment(la_B, rt + 6, CHAIN_LEN, pin_idx[1], pin_kind[1], pin_val[1],
                                           fA, sc->seg[1], CLUE_SEG_CAP);
-        if (g_clue_debug) { 
+        if (g_clue_debug) {
             #pragma omp atomic
             g_dbg_nB[row] += nB; }
         for (int ib = 0; ib < nB && quota > 0 && budget > 0; ib++) {
@@ -1588,8 +1588,31 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     memcpy(&mv.ci[0], ciA, CHAIN_LEN * sizeof(uint16_t));
 
     if (e->at_stop) {
-        for (uint32_t jb = 0; cB && jb < cB->n && e->quota > 0; jb++) {
+        /* Budget is spent at BOTH loop levels, for the reason expand_clued spells
+           out above: e->quota falls only on an ACCEPTED child, so a parent whose
+           candidates all fail the conflict checks would otherwise walk the entire
+           cB->n x cC->n product. Every other expansion path in this file is
+           bounded by something -- an ordinary row by B_TRY and child_lookahead, a
+           clue row by exactly this budget -- and the stop row was bounded by
+           nothing at all.
+
+           It stayed latent because the stop row is the one row with no lookahead
+           gate (a board that completes it is emitted; whether a row fits above is
+           the next stage's problem), and because a free-edge run finds
+           completions easily: --free_edges offers all 56 edge pieces as
+           right-hand terminals, so quota drains and the loops end. Give this
+           program a rotations CSV instead and pick_segC must land on the 14 right
+           edges of THAT border; on a deep, clue-constrained row a parent can have
+           no completion at all, and then the scan is the full product -- observed
+           as a stop row that never returned from 18,899 parents.
+
+           SCAN_FACTOR (1024 per requested child, floor MIN_DECODE_BUDGET) is
+           described upstream as "a fixed safety valve against a pathological
+           cell", which is precisely what this is. A healthy parent never reaches
+           it; a dead one now stops. */
+        for (uint32_t jb = 0; cB && jb < cB->n && e->quota > 0 && e->budget > 0; jb++) {
             uint16_t ciB[CHAIN_LEN]; int la_C;
+            e->budget--;
             if (!pick_segB(cB, jb, rt + 6, forbidA, ciB, la_B, &la_C)) continue;
             memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));
             if (!color_is_inner(la_C)) {
@@ -1606,8 +1629,9 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
             mask_of_chain(ciB, CHAIN_LEN, maskB);
             for (int k = 0; k < 4; k++) forbidB[k] = forbidA[k] | maskB[k];
             bool ab_full = false;
-            for (uint32_t jc = 0; jc < cC->n && e->quota > 0; jc++) {
+            for (uint32_t jc = 0; jc < cC->n && e->quota > 0 && e->budget > 0; jc++) {
                 uint16_t ciC[CHAIN_LEN-1]; uint8_t rterm;
+                e->budget--;
                 if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
                 memcpy(&mv.ci[2*CHAIN_LEN], ciC, (CHAIN_LEN-1) * sizeof(uint16_t));
                 mv.rterm = rterm;
@@ -2731,11 +2755,11 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
    emitted nothing prints only what is not trivially zero, and consecutive
    barren ones that died the same way under the same bottom collapse into one
    counted line.
- 
+
    The first of a run always prints in full, and a run is flushed once its
    configurations have cost SWEEP_QUIET_SEC between them, so a slow sequence of
    identical deaths still reports progress rather than going silent.
- 
+
    `filled` and `died` are separate fields because one number cannot be both.
    res.row is the last row COMPLETED for stop_row, time and interrupted, and the
    row that FAILED for an extinction -- where res.width is then the width the
