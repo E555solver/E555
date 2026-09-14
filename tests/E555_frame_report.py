@@ -230,14 +230,24 @@ def build(S, figs, AB, corpus_note):
 
     ab_section = ""
     if AB:
+        rws = AB.get("rows", [])
         thr = "".join(
-            f"<tr><td class='num'>&ge; {r['D']}</td>"
-            f"<td class='num'>{r['pa']*100:.2f}%</td>"
-            f"<td class='num'>{r['pb']*100:.2f}%</td>"
-            f"<td class='num'>{r['diff']*100:+.2f} pp</td>"
-            f"<td class='num'>[{r['lo']*100:+.2f}, {r['hi']*100:+.2f}]</td>"
-            f"<td class='num'>{'yes' if r['significant'] else '&mdash;'}</td></tr>"
-            for r in AB["thresholds"])
+            f"<tr><td class='num'>{r['row']}</td>"
+            f"<td class='num'>{r['surv_a']*100:.2f}%</td>"
+            f"<td class='num'>{r['surv_b']*100:.2f}%</td>"
+            f"<td class='num'>{r['surv_diff']*100:+.2f} pp</td>"
+            f"<td class='num'>{'' if r['med_a']!=r['med_a'] else format(r['med_a'],',.0f')}</td>"
+            f"<td class='num'>{'' if r['med_b']!=r['med_b'] else format(r['med_b'],',.0f')}</td>"
+            f"<td class='num'>" + ("&mdash;" if not r["estimable"] else
+              f"{r['ratio']:.3f} [{r['ratio_lo']:.2f}, {r['ratio_hi']:.2f}]")
+            + f"</td></tr>"
+            for r in rws)
+        hr = AB.get("headline_row")
+        ab_cap = ("Left: how far each border got. Right: the width of the "
+                  "frontier at each row, among the borders that reached it \u2014 "
+                  "the sensitive measure, since survival past row 2 almost "
+                  "guarantees survival to row 10.")
+        ab_fig = fig(figs, "fig_ab.png", ab_cap)
         ab_section = f"""
 <section>
   <span class="sec-num">06 &middot; the test</span>
@@ -245,13 +255,23 @@ def build(S, figs, AB, corpus_note):
     <h2>Does acting on it work?</h2>
     <p>Everything above is description. This is the only part that decides
     anything: the beamer run twice in the canonical frame, identical except that
-    one arm bars the {len(excl)} far-side pieces, and the depth each border
-    reached compared between them.</p>
-    <p>The arms are not paired. You would expect the same seed to give both arms
-    the same borders, but the border sampler ranks candidates by fan-out into the
+    one arm bars the {len(excl)} far-side pieces.</p>
+    <div class="callout">
+      <span class="eyebrow">why this does not count emitted boards</span>
+      <p>At <code>--stop_row 12</code> with every clue on, this machine emits
+      essentially nothing &mdash; the beam dies before it gets there on all but a
+      freak border, so counting emissions would compare zero against zero. Both
+      arms therefore run <code>--verbose</code>, and the comparison uses the
+      per-row line the beam prints on the way up:
+      <span class="mono">uniq</span>, the number of distinct states surviving the
+      dedup at that row. It is continuous, recorded for every border at every row
+      it reaches, and it is what &ldquo;the search still has room&rdquo; means.</p>
+    </div>
+    <p>The arms are not paired. You would expect the same seed to give both the
+    same borders, but the border sampler ranks candidates by fan-out into the
     chain database, and excluding pieces changes that database &mdash; so the two
-    runs diverge from the first border. The comparison is therefore between two
-    rates over hundreds of borders, not a per-border delta.</p>
+    runs diverge from the first border. The comparison is between two rates over
+    thousands of borders.</p>
   </div>
   <div class="tiles">
     <div class="tile"><span class="k">baseline</span>
@@ -263,19 +283,18 @@ def build(S, figs, AB, corpus_note):
     <div class="tile"><span class="k">mean depth</span>
       <span class="v">{AB['mean_b']:.2f}</span><span class="n">excluded</span></div>
   </div>
-  {fig(figs, "fig_ab.png", "Depth reached per border configuration. The left panel is the whole distribution, which is dominated by borders that die at row 1 or 2 in both arms; the right panel is the deep tail, which is what a practical run cares about.")}
+  {ab_fig}
   <div class="col">
     <div class="tbl-scroll"><table>
-      <tr><th>reached depth</th><th>baseline</th><th>excluded</th>
-          <th>difference</th><th>95% interval</th><th>significant</th></tr>
+      <tr><th>row</th><th>survival base</th><th>survival excl</th><th>diff</th>
+          <th>median uniq base</th><th>median uniq excl</th>
+          <th>width ratio (95% CI)</th></tr>
       {thr}
     </table></div>
-    <p>Intervals on each rate are Wilson; on the difference, Newcombe. The
-    secondary Mann&ndash;Whitney over the whole distribution gives
-    <span class="mono">z = {AB['mw_z']:+.3f}</span>,
-    <span class="mono">p = {AB['mw_p']:.3g}</span> &mdash; but it is dominated by
-    the shallow bulk and can point the other way from the tail, so the threshold
-    table above is the one to read.</p>
+    <p>Survival intervals are Wilson per arm and Newcombe on the difference; the
+    width ratio is bootstrapped over borders. The verdict reads row
+    <span class="mono">{hr if hr else "&mdash;"}</span> &mdash; the deepest row
+    where both arms still have enough borders to estimate a median.</p>
   </div>
 </section>"""
 

@@ -324,50 +324,59 @@ def fig_far_score(D, S, out):
 
 
 def fig_ab(AB, out):
-    """The practical test: depth reached per border, baseline versus excluded."""
+    """The practical test: survival per row, and frontier width per row."""
     la, lb = AB["label_a"], AB["label_b"]
-    ha, hb = AB["hist_a"], AB["hist_b"]
-    dmax = max(int(k) for k in list(ha) + list(hb))
-    ds = np.arange(dmax + 1)
-    na, nb = AB["n_a"], AB["n_b"]
-    pa = np.array([ha.get(str(d), 0) / na * 100 for d in ds])
-    pb = np.array([hb.get(str(d), 0) / nb * 100 for d in ds])
+    rows = [r for r in AB.get("rows", []) if r["ka"] or r["kb"]]
+    if not rows:
+        return
+    x = np.array([r["row"] for r in rows])
 
-    fig, axes = plt.subplots(1, 2, figsize=(12.6, 4.5),
-                             gridspec_kw={"width_ratios": [1.1, 1]})
+    fig, axes = plt.subplots(1, 2, figsize=(12.8, 4.6))
+
+    # Survival. Log scale: it falls from 100% to a few percent across rows 1-2
+    # and is then almost flat, which a linear axis hides completely.
     ax = axes[0]
-    w = .38
-    ax.bar(ds - w / 2, pa, w, label=f"{la} (n={na:,})", color="#8a8779", zorder=2)
-    ax.bar(ds + w / 2, pb, w, label=f"{lb} (n={nb:,})", color="#2a78d6", zorder=2)
-    ax.set_xlabel("last row the beam completed")
-    ax.set_ylabel("% of border configurations")
-    ax.set_xticks(ds)
-    ax.set_title("Whole depth distribution\n(dominated by borders that die at row 1-2)")
-    ax.legend(loc="upper right")
-    ax.grid(axis="y", color=RULE, lw=.6, alpha=.7); ax.set_axisbelow(True)
-
-    # The tail is the point, and on a linear share axis it is invisible.
-    ax = axes[1]
-    rows = AB["thresholds"]
-    x = np.arange(len(rows))
-    ax.bar(x - w / 2, [r["pa"] * 100 for r in rows], w, color="#8a8779",
-           label=la, zorder=2)
-    ax.bar(x + w / 2, [r["pb"] * 100 for r in rows], w, color="#2a78d6",
-           label=lb, zorder=2)
-    for i, r in enumerate(rows):
-        lo, hi = r["lo"] * 100, r["hi"] * 100
-        mark = "*" if r["significant"] else ""
-        ax.annotate(f"{r['diff']*100:+.2f}pp{mark}",
-                    (i, max(r["pa"], r["pb"]) * 100), textcoords="offset points",
-                    xytext=(0, 6), ha="center", fontsize=7.5,
-                    color="#0ca30c" if lo > 0 else "#d03b3b" if hi < 0 else INK2)
-    ax.set_xticks(x); ax.set_xticklabels([f"$\\geq${r['D']}" for r in rows])
-    ax.set_xlabel("reached depth at least")
-    ax.set_ylabel("% of border configurations")
-    ax.set_title("The deep tail, which is what we are trying to fatten\n"
+    sa = np.array([r["surv_a"] * 100 for r in rows])
+    sb = np.array([r["surv_b"] * 100 for r in rows])
+    ax.plot(x, sa, "o-", color="#8a8779", lw=2, ms=5, label=f"{la} (n={AB['n_a']:,})")
+    ax.plot(x, sb, "s-", color="#2a78d6", lw=2, ms=5, label=f"{lb} (n={AB['n_b']:,})")
+    for r, ya, yb in zip(rows, sa, sb):
+        if r["surv_lo"] > 0 or r["surv_hi"] < 0:
+            ax.annotate("*", (r["row"], max(ya, yb)), textcoords="offset points",
+                        xytext=(0, 7), ha="center", fontsize=11, color="#d03b3b")
+    ax.set_yscale("log")
+    ax.set_xlabel("row"); ax.set_ylabel("% of borders still alive")
+    ax.set_xticks(x)
+    ax.set_title("Survival: almost all mortality is at rows 1-2\n"
                  "(* = 95% interval on the difference excludes zero)")
-    ax.legend(loc="upper right")
-    ax.grid(axis="y", color=RULE, lw=.6, alpha=.7); ax.set_axisbelow(True)
+    ax.legend(); ax.grid(color=RULE, lw=.6, alpha=.7); ax.set_axisbelow(True)
+
+    # Frontier width among the survivors -- the sensitive measure.
+    ax = axes[1]
+    est = [r for r in rows if r["n_uniq_a"] and r["n_uniq_b"]]
+    if est:
+        xe = np.array([r["row"] for r in est])
+        ma = np.array([r["med_a"] for r in est])
+        mb = np.array([r["med_b"] for r in est])
+        ax.plot(xe, ma, "o-", color="#8a8779", lw=2, ms=5, label=la)
+        ax.plot(xe, mb, "s-", color="#2a78d6", lw=2, ms=5, label=lb)
+        for r in est:
+            if not r["estimable"]:
+                continue
+            sig = r["ratio_lo"] > 1 or r["ratio_hi"] < 1
+            ax.annotate(f"{r['ratio']:.2f}x" + ("*" if sig else ""),
+                        (r["row"], max(r["med_a"], r["med_b"])),
+                        textcoords="offset points", xytext=(0, 8), ha="center",
+                        fontsize=7.5,
+                        color="#0ca30c" if (sig and r["ratio"] > 1)
+                        else "#d03b3b" if sig else INK2)
+        ax.set_yscale("log")
+        ax.set_xticks(xe)
+    ax.set_xlabel("row")
+    ax.set_ylabel("median distinct states at that row")
+    ax.set_title("Frontier width among the borders that got there\n"
+                 "(ratio excluded/baseline; * = interval excludes 1.00)")
+    ax.legend(); ax.grid(color=RULE, lw=.6, alpha=.7); ax.set_axisbelow(True)
     fig.tight_layout()
     fig.savefig(out / "fig_ab.png"); plt.close(fig)
 
