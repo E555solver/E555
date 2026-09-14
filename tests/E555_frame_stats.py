@@ -1,127 +1,149 @@
 #!/usr/bin/env python3
 """
-E555_frame_stats.py -- does any piece actually prefer a region of the board?
+E555_frame_stats.py -- which pieces belong near which corner?
 
-WHY
+THE QUESTION
 
-    tests/run_fixedframe_farm.sh produces a corpus of row-11 partials that all
-    share one frame: the published clue set at orientation 0, and one fixed
-    assignment of the four corner pieces. Four sides, each a 12-row band, turned
-    onto that frame. Nothing in it is a solution. The question is whether the
-    pieces nonetheless land somewhere systematic -- and if so, whether that can
-    be fed back into the search.
+    The frame pins four corner pieces and four corner clues. That is a lot of
+    constraint: only a few pieces can sit next to a given corner piece and still
+    leave room for the clue two cells in, and only a few can sit next to that
+    clue. So the placement distribution near a corner is NOT close to uniform,
+    and it is not the same near each of the four corners -- they carry different
+    pieces and different clues.
 
-    Two statistics, both chosen because they are estimable from a few thousand
-    boards and because something can be DONE with them:
+    That is the signal worth mining. Not "this piece likes the middle" but "this
+    piece belongs in the bottom-left, and these others belong in the top-right".
 
-    ring affinity   ring(r,c) = min(r, c, 15-r, 15-c). Ring 0 is the frame, so
-                    the 196 inner pieces live in rings 1..7 -- and rings 1..7
-                    hold exactly 196 cells. "Outer three rows" is rings 1-2,
-                    "the core" is rings 5-7. Far fewer buckets than 256 cells,
-                    so the counts per bucket are large enough to mean something.
+THE PARTITION
 
-    top-band        P(piece lands in canonical rows 12..15). This is the one with
-                    a use: the beamer fills rows 0..11 and dies attempting 12, so
-                    a piece that belongs up there is a piece the search should
-                    not be spending low down. --exclude_pieces bars it from the
-                    database outright; this script writes the candidate list.
+    A 3x3 grid on the bands [0-4], [5-10], [11-15] -- 5, 6, 5 cells:
 
-WHAT IT DOES NOT CLAIM
+        TL  TM  TR      rows 11-15       4 corner zones, 25 cells each
+        ML  CC  MR      rows 5-10        4 side zones,   30 cells each
+        BL  BM  BR      rows 0-4         1 centre zone,  36 cells
 
-    These are the beam's habits, not the puzzle's truth. The heuristic has its
-    own taste and the corpus inherits it. Two things are done about that, both
-    cheap and neither a theory:
+    Those cut points are not arbitrary. A farm run at --stop_row 10 fills eleven
+    rows, and canonicalised the four sides cover exactly
 
-    per-config weighting    Boards from one border config share that border
-                            EXACTLY -- they are one observation with variations,
-                            not N observations. Each board is weighted
-                            1/(boards from its config), so every border counts
-                            once. The reported N_eff (Kish) is the honest size of
-                            the corpus; it is much smaller than the board count
-                            and that is the point.
+        side 0  rows 0..10      side 2  rows 5..15
+        side 1  cols 5..15      side 3  cols 0..10
 
-    cross-side agreement    The four sides use different RNG, different borders
-                            and attack from different directions, so they share
-                            very little search bias. If the per-piece ranking
-                            reproduces across them, something real is driving it.
-                            If it does not, nothing is -- and no amount of
-                            further analysis will change that. This is the
-                            headline number, printed first. Spearman rank
-                            correlation, so a per-side coverage difference (each
-                            side sees a different band) shifts every piece the
-                            same way and cancels out of the ranking.
+    -- the same cuts. So every zone is either wholly inside a side's band or
+    wholly outside it, and each corner zone is covered by exactly two sides:
 
-                            It is reported twice: over all observed cells, and
-                            over the 8x8 core alone, which is the only region all
-                            four sides cover. If those two disagree, believe the
-                            core.
+        BL {0,3}   BR {0,1}   TL {2,3}   TR {1,2}   CC {0,1,2,3}
+
+    Two independent views of every corner is what turns "this piece prefers BL"
+    from an assertion into something that can be checked.
+
+WHY EXPOSURE IS THE WHOLE PROBLEM
+
+    Side 0 fills rows 0..10 and therefore CANNOT place anything in TL or TR. A
+    naive count says every piece has zero affinity for the top, which is an
+    artefact of where the beam was pointed, not a fact about the puzzle.
+
+    So every lift is computed per side first, over only the zones that side
+    actually covers, and pooled afterwards across the sides that cover the zone:
+
+        lift[a][z] = (A/B) / (C/D)      over sides S_z that cover z
+          A = weighted count of piece a in zone z
+          B = weighted count of piece a anywhere, in those sides
+          C = weighted count of any same-kind piece in zone z
+          D = weighted count of any same-kind piece anywhere, in those sides
+
+    1.00 means "exactly as often as an average piece of its kind". Edge pieces
+    and inner pieces get separate denominators: an edge piece can only ever sit
+    on the frame, so comparing it against inner pieces would measure the frame,
+    not a preference.
+
+UNCERTAINTY
+
+    Boards are not independent -- every board a config emits descends from one
+    border, shared exactly. The border config is the independent unit, so every
+    board is weighted 1/(boards from its config) and the bootstrap resamples
+    CONFIGS, not boards. Confidence intervals are percentiles over 2000 such
+    resamples. A piece whose interval straddles 1.00 has not shown us anything.
+
+THE ACTIONABLE OUTPUT
+
+    The beamer grows bottom-up. Run it in the canonical frame to --stop_row 12
+    and rows 13-15 are unreachable: any piece that belongs up there is budget the
+    search is wasting. `far_score` is
+
+        log2( lift(rows 13-15) / lift(rows 0-2) )
+
+    bootstrapped, and `exclude_pieces.txt` holds the pieces whose interval is
+    entirely above zero -- evidence of a far-side preference, not just a point
+    estimate that happens to be positive.
 
 USAGE
 
     python3 tests/E555_frame_stats.py ff_out/corpus.csv --out_dir ff_out/stats
-
-    Writes pieces.csv (one row per piece, sortable), agreement.csv, the
-    suggested --exclude_pieces list, and summary.json for the dashboard.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "tools"))
-import E555_viewer as V                  # seed loading, row parsing  # noqa: E402
+import E555_viewer as V                                          # noqa: E402
 
-SIDE = V.SIDE                            # 16
-N_PIECES = V.N_PIECES                    # 256
+SIDE = V.SIDE
+N_PIECES = V.N_PIECES
 UNPLACED = 999
 
-# The canonical frame this corpus is supposed to be in: the orientation-0 centre
-# clue. Every board must agree, or it was never turned onto the frame and every
-# number below would be averaging different coordinate systems.
 CANON_ORIENT = 0
 CANON_CLUE_CELL, CANON_CLUE_PIECE, CANON_CLUE_SPIN = V.clue_list(
     CANON_ORIENT, V.CLUE_CENTER)[0]
+CLUE_CELL_OF = {cell: p for cell, p, _s in V.clue_list(CANON_ORIENT)}
+CLUE_PIECES = set(CLUE_CELL_OF.values())
 
-# The five clue pieces are PINNED by the frame, so their "preference" is the
-# command line, not a finding. Two of them (the row-13 pair) are not even
-# searched -- format_board_tail attaches them to the emitted board. They are
-# dropped from every ranking and used instead as a positive control: the
-# machinery must recover them at their own cells, or it is broken.
-CLUE_CELL_OF = {p: cell for cell, p, _s in V.clue_list(CANON_ORIENT)}
-CLUE_PIECES = set(CLUE_CELL_OF)
+# 3x3 zones on the bands [0-4], [5-10], [11-15].
+BAND_EDGES = (0, 5, 11, 16)
+ZONE_NAMES = ["BL", "BM", "BR", "ML", "CC", "MR", "TL", "TM", "TR"]
+ZONE_LABEL = {
+    "BL": "bottom-left corner", "BM": "bottom edge", "BR": "bottom-right corner",
+    "ML": "left edge", "CC": "centre", "MR": "right edge",
+    "TL": "top-left corner", "TM": "top edge", "TR": "top-right corner",
+}
+CORNER_ZONES = ["BL", "BR", "TL", "TR"]
+N_ZONES = 9
 
-# The band the beam never fills. Four sides cover it between them; a piece that
-# concentrates here is a candidate for --exclude_pieces.
-TOP_BAND_ROW = 12
+# Row bands for the actionable score: what a --stop_row 12 run can and cannot
+# reach. Rows 13-15 are never filled; rows 0-2 are filled first and always.
+ROWBAND_NAMES = ["near(0-2)", "mid(3-12)", "far(13-15)"]
+N_RB = 3
 
-# The only region all four sides observe: rows 4..11 x cols 4..11, i.e. rings 4-7.
-CORE_LO, CORE_HI = 4, 11
+KIND_NAMES = ["inner", "edge", "corner"]
 
 
-def ring_of(cell):
+def band_of(v):
+    return 0 if v < BAND_EDGES[1] else (1 if v < BAND_EDGES[2] else 2)
+
+
+def zone_of(cell):
     r, c = divmod(cell, SIDE)
-    return min(r, c, SIDE - 1 - r, SIDE - 1 - c)
+    return band_of(r) * 3 + band_of(c)
 
 
-def in_core(cell):
-    r, c = divmod(cell, SIDE)
-    return CORE_LO <= r <= CORE_HI and CORE_LO <= c <= CORE_HI
+def rowband_of(cell):
+    r = cell // SIDE
+    return 0 if r <= 2 else (2 if r >= 13 else 1)
 
 
 def piece_kind(edges):
-    """corner / edge / inner, from how many frame-grey sides the piece carries."""
     greys = sum(1 for e in edges if e == 0)
-    return "corner" if greys == 2 else "edge" if greys == 1 else "inner"
+    return 2 if greys == 2 else (1 if greys == 1 else 0)
 
 
 def side_of(config_id):
-    """The side a board came from, off its config id: s<N>_<runtag>_b<i>l<j>."""
     if config_id.startswith("s") and "_" in config_id:
         head = config_id[1:config_id.index("_")]
         if head.isdigit():
@@ -129,75 +151,41 @@ def side_of(config_id):
     return -1
 
 
-def spearman(xs, ys):
-    """Rank correlation, ties averaged. Returns None for fewer than 3 points."""
-    n = len(xs)
-    if n < 3:
-        return None
+def spearman(x, y):
+    """Rank correlation of two 1-D arrays (ties averaged)."""
+    if len(x) < 3:
+        return float("nan")
 
-    def ranks(vals):
-        order = sorted(range(n), key=lambda i: vals[i])
-        out = [0.0] * n
+    def rank(a):
+        order = np.argsort(a, kind="mergesort")
+        r = np.empty(len(a), float)
+        r[order] = np.arange(len(a), dtype=float)
+        # average ties
+        a_sorted = a[order]
         i = 0
-        while i < n:
+        while i < len(a):
             j = i
-            while j + 1 < n and vals[order[j + 1]] == vals[order[i]]:
+            while j + 1 < len(a) and a_sorted[j + 1] == a_sorted[i]:
                 j += 1
-            avg = (i + j) / 2.0 + 1.0
-            for k in range(i, j + 1):
-                out[order[k]] = avg
+            if j > i:
+                r[order[i:j + 1]] = (i + j) / 2.0
             i = j + 1
-        return out
+        return r
 
-    rx, ry = ranks(xs), ranks(ys)
-    mx, my = sum(rx) / n, sum(ry) / n
-    num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
-    dx = math.sqrt(sum((a - mx) ** 2 for a in rx))
-    dy = math.sqrt(sum((b - my) ** 2 for b in ry))
-    return num / (dx * dy) if dx > 0 and dy > 0 else None
+    rx, ry = rank(np.asarray(x, float)), rank(np.asarray(y, float))
+    if rx.std() == 0 or ry.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(rx, ry)[0, 1])
 
 
-class Accum:
-    """Weighted placement counts. One of these per side, plus one pooled."""
-
-    def __init__(self):
-        self.ring = defaultdict(float)       # (piece, ring) -> weight
-        self.cell = defaultdict(float)       # (piece, cell) -> weight
-        self.ring_total = defaultdict(float)  # ring -> weight over inner pieces
-        self.core_ring = defaultdict(float)  # (piece, ring) -> weight, core only
-        self.top_band = defaultdict(float)   # piece -> weight in rows >= 12
-        self.seen = defaultdict(float)       # piece -> total weight placed
-        self.top_band_total = 0.0
-        self.placed_total = 0.0
-
-    def add(self, piece, cell, w, is_inner):
-        rg = ring_of(cell)
-        self.cell[(piece, cell)] += w
-        self.seen[piece] += w
-        if not is_inner:
-            return
-        self.ring[(piece, rg)] += w
-        self.ring_total[rg] += w
-        self.placed_total += w
-        if in_core(cell):
-            self.core_ring[(piece, rg)] += w
-        if cell // SIDE >= TOP_BAND_ROW:
-            self.top_band[piece] += w
-            self.top_band_total += w
-
-    def mean_ring(self, piece, core_only=False):
-        src = self.core_ring if core_only else self.ring
-        tot = sum(src.get((piece, k), 0.0) for k in range(1, 8))
-        if tot <= 0:
-            return None
-        return sum(k * src.get((piece, k), 0.0) for k in range(1, 8)) / tot
+# --------------------------------------------------------------------------
+# Load
 
 
-def load_corpus(path, strict):
-    """Group boards by config id, checking every one is on the canonical frame."""
+def load_corpus(path, strict=True):
+    """Per-config weighted count tensors. The config is the independent unit."""
     by_config = defaultdict(list)
-    off_frame = 0
-    total = 0
+    off_frame = total = 0
     for _, cid, _sol, pos, rot in V.iter_records(path):
         total += 1
         if (pos[CANON_CLUE_PIECE] != CANON_CLUE_CELL
@@ -206,243 +194,422 @@ def load_corpus(path, strict):
             continue
         by_config[cid].append(pos)
     if off_frame:
-        msg = (f"{off_frame} of {total} board(s) are NOT on the canonical frame "
-               f"(piece {CANON_CLUE_PIECE} not at row 7 col 7 spin 0). They were "
-               f"never turned onto it -- check the rotation step in "
-               f"run_fixedframe_farm.sh")
+        msg = (f"{off_frame} of {total} boards are not on the canonical frame; "
+               f"the rotation step in run_fixedframe_farm.sh did not run")
         if strict:
             sys.exit(f"[frame] FATAL: {msg}")
-        print(f"[frame] WARNING: {msg}; skipped", file=sys.stderr)
-    return by_config, total, off_frame
+        print(f"[frame] WARNING: {msg}", file=sys.stderr)
+
+    cids = sorted(by_config)
+    n_cfg = len(cids)
+    zone = np.zeros((n_cfg, N_PIECES, N_ZONES), np.float32)
+    rband = np.zeros((n_cfg, N_PIECES, N_RB), np.float32)
+    cellc = np.zeros((N_PIECES, N_PIECES), np.float32)     # piece x cell
+    sidec = np.zeros((4, N_PIECES), np.float32)            # side x cell coverage
+    sides = np.full(n_cfg, -1, np.int8)
+    n_boards = np.zeros(n_cfg, np.int32)
+
+    zmap = np.array([zone_of(c) for c in range(256)])
+    rmap = np.array([rowband_of(c) for c in range(256)])
+
+    for i, cid in enumerate(cids):
+        boards = by_config[cid]
+        s = side_of(cid)
+        sides[i] = s
+        n_boards[i] = len(boards)
+        w = 1.0 / len(boards)          # every border counts once, not every board
+        for pos in boards:
+            p = np.asarray(pos)
+            placed = np.flatnonzero(p != UNPLACED)
+            cells = p[placed]
+            np.add.at(zone[i], (placed, zmap[cells]), w)
+            np.add.at(rband[i], (placed, rmap[cells]), w)
+            np.add.at(cellc, (placed, cells), w)
+            if 0 <= s < 4:
+                np.add.at(sidec[s], cells, w)
+    return cids, sides, n_boards, zone, rband, cellc, sidec, total, off_frame
+
+
+# --------------------------------------------------------------------------
+# Coverage, measured rather than assumed
+
+
+def measure_coverage(sidec, per="zone"):
+    """Which (side, zone) pairs the corpus actually observed.
+
+    Derived from the boards, not from the rotation algebra, so a farm run at a
+    different --stop_row -- or a bug in the turn -- shows up here instead of
+    silently biasing every lift downstream.
+    """
+    n = N_ZONES if per == "zone" else N_RB
+    mapper = zone_of if per == "zone" else rowband_of
+    size = np.zeros(n)
+    hit = np.zeros((4, n))
+    for cell in range(256):
+        k = mapper(cell)
+        size[k] += 1
+        for s in range(4):
+            if sidec[s, cell] > 0:
+                hit[s, k] += 1
+    frac = hit / np.maximum(size, 1)
+    return frac > 0.5, frac
+
+
+# --------------------------------------------------------------------------
+# Lifts
+
+
+# Pieces the frame nails to a cell: the four corners and the five clues. They
+# are not search results, so they must not sit in the denominator either -- the
+# baseline is "an average FREE piece of this kind". Two of the clues are not even
+# searched; format_board_tail attaches them to every emitted board, which would
+# otherwise add a constant to the TL and TR exposure and deflate every piece's
+# lift in exactly the two zones the study is about.
+PINNED = sorted(CLUE_PIECES)
+
+
+def lift_from_counts(sub, kind, kinds_of_interest=(0, 1)):
+    """lift[b, piece, zone] from summed counts sub[b, piece, zone].
+
+    Denominators are per KIND: an edge piece is compared against edge pieces, an
+    inner piece against inner pieces. Mixing them would measure the frame.
+    """
+    B = sub.shape[0]
+    nz = sub.shape[2]
+    out = np.full((B, N_PIECES, nz), np.nan, np.float64)
+    tot_piece = sub.sum(2)                                   # [B, piece]
+    free = np.ones(N_PIECES, bool)
+    free[PINNED] = False
+    for k in kinds_of_interest:
+        m = (kind == k) & free
+        if not m.any():
+            continue
+        C = sub[:, m, :].sum(1)                              # [B, zone]
+        D = tot_piece[:, m].sum(1)                           # [B]
+        base = C / np.maximum(D, 1e-12)[:, None]             # [B, zone]
+        num = kind == k                                      # includes pinned
+        with np.errstate(divide="ignore", invalid="ignore"):
+            share = sub[:, num, :] / np.maximum(tot_piece[:, num], 1e-12)[:, :, None]
+            out[:, num, :] = share / np.maximum(base, 1e-12)[:, None, :]
+    return out
+
+
+def pooled_lift(per_side_counts, cover, kind, n_units):
+    """Point-estimate lift per zone, pooling only the sides that cover it."""
+    out = np.full((N_PIECES, n_units), np.nan)
+    for z in range(n_units):
+        S = [s for s in range(4) if cover[s, z]]
+        if not S:
+            continue
+        sub = sum(per_side_counts[s] for s in S)[None, :, :]   # [1, piece, unit]
+        out[:, z] = lift_from_counts(sub, kind)[0, :, z]
+    return out
+
+
+def bootstrap_lift(zone, sides, cover, kind, n_boot, rng, n_units):
+    """Percentile CIs by resampling CONFIGS -- the independent unit."""
+    n_cfg = zone.shape[0]
+    flat = zone.reshape(n_cfg, -1)
+    idx_by_side = {s: np.flatnonzero(sides == s) for s in range(4)}
+
+    # One multinomial draw over ALL configs per replicate, then split by side, so
+    # each replicate is a coherent resample of the whole corpus.
+    W = rng.multinomial(n_cfg, np.full(n_cfg, 1.0 / n_cfg), size=n_boot
+                        ).astype(np.float32)
+    boot_side = {}
+    for s, idx in idx_by_side.items():
+        if len(idx) == 0:
+            boot_side[s] = np.zeros((n_boot, N_PIECES, n_units), np.float32)
+            continue
+        boot_side[s] = (W[:, idx] @ flat[idx]).reshape(n_boot, N_PIECES, n_units)
+
+    lo = np.full((N_PIECES, n_units), np.nan)
+    hi = np.full((N_PIECES, n_units), np.nan)
+    for z in range(n_units):
+        S = [s for s in range(4) if cover[s, z]]
+        if not S:
+            continue
+        sub = sum(boot_side[s] for s in S)
+        lz = lift_from_counts(sub, kind)[:, :, z]            # [B, piece]
+        with np.errstate(invalid="ignore"):
+            keep = np.isfinite(lz).any(0)                     # pieces ever placed
+            lo[keep, z] = np.nanpercentile(lz[:, keep], 2.5, axis=0)
+            hi[keep, z] = np.nanpercentile(lz[:, keep], 97.5, axis=0)
+    return lo, hi
+
+
+def bootstrap_far_score(rband, sides, cover_rb, kind, n_boot, rng):
+    """log2( lift(rows 13-15) / lift(rows 0-2) ), point estimate + CI.
+
+    The two bands are seen by different side sets (the far band by 1,2,3; the
+    near band by 0,1,3), which is exactly why each is normalised against an
+    average piece of its own kind within its own sides before the ratio is
+    taken -- the normalisation is what makes them comparable.
+    """
+    n_cfg = rband.shape[0]
+    flat = rband.reshape(n_cfg, -1)
+    idx_by_side = {s: np.flatnonzero(sides == s) for s in range(4)}
+    W = rng.multinomial(n_cfg, np.full(n_cfg, 1.0 / n_cfg), size=n_boot
+                        ).astype(np.float32)
+
+    def score_from(get_side):
+        vals = []
+        for band in (2, 0):                                  # far, near
+            S = [s for s in range(4) if cover_rb[s, band]]
+            sub = sum(get_side(s) for s in S)
+            vals.append(lift_from_counts(sub, kind)[:, :, band])
+        far, near = vals
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.log2(np.maximum(far, 1e-6) / np.maximum(near, 1e-6))
+
+    point = score_from(lambda s: rband[idx_by_side[s]].sum(0)[None]
+                       if len(idx_by_side[s]) else np.zeros((1, N_PIECES, N_RB)))[0]
+    boot_side = {}
+    for s, idx in idx_by_side.items():
+        boot_side[s] = ((W[:, idx] @ flat[idx]).reshape(n_boot, N_PIECES, N_RB)
+                        if len(idx) else np.zeros((n_boot, N_PIECES, N_RB), np.float32))
+    bs = score_from(lambda s: boot_side[s])
+    keep = np.isfinite(bs).any(0)
+    blo = np.full(N_PIECES, np.nan); bhi = np.full(N_PIECES, np.nan)
+    blo[keep] = np.nanpercentile(bs[:, keep], 2.5, axis=0)
+    bhi[keep] = np.nanpercentile(bs[:, keep], 97.5, axis=0)
+    return point, blo, bhi
+
+
+# --------------------------------------------------------------------------
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(
-        description="Ring and top-band preferences of individual pieces, "
-                    "measured over a canonical-frame corpus.")
-    ap.add_argument("corpus", help="canonical board CSV (ff_out/corpus.csv)")
-    ap.add_argument("--out_dir", default="frame_stats", help="where to write")
-    ap.add_argument("--seed_file", default=None, help="piece seed (default: found)")
-    ap.add_argument("--exclude_top", type=int, default=20,
-                    help="how many pieces the suggested --exclude_pieces list "
-                         "holds (default 20)")
-    ap.add_argument("--min_obs", type=float, default=5.0,
-                    help="weighted observations a piece needs before it is "
-                         "ranked at all (default 5)")
-    ap.add_argument("--no_strict_frame", action="store_true",
-                    help="warn instead of dying when boards are off-frame")
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+    ap.add_argument("corpus")
+    ap.add_argument("--out_dir", default="frame_stats")
+    ap.add_argument("--seed_file", default=None)
+    ap.add_argument("--n_boot", type=int, default=2000)
+    ap.add_argument("--min_obs", type=float, default=10.0,
+                    help="weighted observations a piece needs to be ranked")
+    ap.add_argument("--exclude_top", type=int, default=12,
+                    help="cap on the suggested --exclude_pieces list (default 12; "
+                         "the hard ceiling is the piece budget, see --ab_stop_row)")
+    ap.add_argument("--ab_stop_row", type=int, default=12,
+                    help="the --stop_row the exclusion list will be TESTED at. "
+                         "Sets the piece budget: the beam must still be able to "
+                         "fill rows 1..R from what is left (default 12)")
+    ap.add_argument("--rng_seed", type=int, default=12345)
+    ap.add_argument("--no_strict_frame", action="store_true")
     args = ap.parse_args(argv)
 
     seed = V.load_seed(V.find_seed(args.seed_file))
-    kinds = [piece_kind(seed[p]) for p in range(N_PIECES)]
+    kind = np.array([piece_kind(seed[p]) for p in range(N_PIECES)])
 
-    by_config, n_rows, off_frame = load_corpus(args.corpus,
-                                               strict=not args.no_strict_frame)
-    if not by_config:
-        sys.exit("[stats] no usable boards in the corpus")
+    print("[load] reading corpus...")
+    (cids, sides, n_boards, zone, rband, cellc, sidec,
+     n_rows, off_frame) = load_corpus(args.corpus, strict=not args.no_strict_frame)
+    n_cfg = len(cids)
+    if n_cfg == 0:
+        sys.exit("[stats] no usable boards")
 
-    pooled = Accum()
-    per_side = {s: Accum() for s in range(4)}
-    weights = []
+    w_per_board = np.repeat(1.0 / n_boards, n_boards)
+    n_eff = w_per_board.sum() ** 2 / (w_per_board ** 2).sum()
+    print(f"[load] {int(n_boards.sum())} boards / {n_cfg} configs / N_eff {n_eff:.0f}")
 
-    for cid, boards in by_config.items():
-        # Every border counts once, however many boards it emitted: boards from
-        # one config share that border exactly.
-        w = 1.0 / len(boards)
-        s = side_of(cid)
-        for pos in boards:
-            weights.append(w)
-            for piece, cell in enumerate(pos):
-                if cell == UNPLACED:
-                    continue
-                is_inner = kinds[piece] == "inner"
-                pooled.add(piece, cell, w, is_inner)
-                if s in per_side:
-                    per_side[s].add(piece, cell, w, is_inner)
+    cover_z, frac_z = measure_coverage(sidec, "zone")
+    cover_rb, frac_rb = measure_coverage(sidec, "rowband")
+    print("[cover] zone -> sides that observed it")
+    for z, nm in enumerate(ZONE_NAMES):
+        S = [s for s in range(4) if cover_z[s, z]]
+        print(f"[cover]   {nm}  sides {S}")
 
-    sum_w = sum(weights)
-    n_eff = (sum_w ** 2) / sum(w * w for w in weights) if weights else 0.0
+    per_side_z = {s: zone[sides == s].sum(0) if (sides == s).any()
+                  else np.zeros((N_PIECES, N_ZONES)) for s in range(4)}
 
-    # -- ring lift: how much more often this piece is in ring k than any inner
-    # piece is. Both sides of the ratio come from the SAME observed cells, so the
-    # four sides' different coverage cancels without any exposure model.
-    ring_share = {k: (pooled.ring_total.get(k, 0.0) / pooled.placed_total
-                      if pooled.placed_total else 0.0) for k in range(1, 8)}
-    top_share = (pooled.top_band_total / pooled.placed_total
-                 if pooled.placed_total else 0.0)
+    print(f"[boot] {args.n_boot} resamples over {n_cfg} configs...")
+    rng = np.random.default_rng(args.rng_seed)
+    lift = pooled_lift(per_side_z, cover_z, kind, N_ZONES)
+    lo, hi = bootstrap_lift(zone, sides, cover_z, kind, args.n_boot, rng, N_ZONES)
+    far, far_lo, far_hi = bootstrap_far_score(rband, sides, cover_rb, kind,
+                                              args.n_boot, rng)
 
-    # Positive control. Each clue piece is pinned at a known cell, so its
-    # recovered mean ring must be that cell's ring, with a large lift. If this
-    # does not hold, the corpus is not on the frame and nothing below means
-    # anything -- so it is checked, not assumed.
+    obs = zone.sum(0).sum(1)                                 # weighted, per piece
+
+    # -- positive control: the pinned pieces must come back at their own zones --
     control = []
-    for p in sorted(CLUE_PIECES):
-        want = ring_of(CLUE_CELL_OF[p])
-        got = pooled.mean_ring(p)
-        control.append({"piece": p, "want_ring": want,
-                        "got_mean_ring": None if got is None else round(got, 3),
-                        "ok": got is not None and abs(got - want) < 1e-6})
+    for cell, p in CLUE_CELL_OF.items():
+        z = zone_of(cell)
+        control.append({"piece": int(p), "zone": ZONE_NAMES[z],
+                        "lift": None if np.isnan(lift[p, z]) else round(float(lift[p, z]), 2),
+                        "ok": bool(np.isnan(lift[p, z]) or lift[p, z] > 1.5)})
+    ctrl_ok = all(c["ok"] for c in control)
 
-    rows = []
+    # Pieces worth ranking at all: enough observations, not a pinned corner, not
+    # a pinned clue. Defined here because the replication check needs it too --
+    # a pinned piece agrees with itself perfectly and would inflate every rho.
+    rankable = (obs >= args.min_obs) & (kind < 2) & ~np.isin(
+        np.arange(N_PIECES), sorted(CLUE_PIECES))
+
+    # -- cross-side replication: every corner zone is seen by exactly two sides --
+    repl = {}
+    for z, nm in enumerate(ZONE_NAMES):
+        S = [s for s in range(4) if cover_z[s, z]]
+        if len(S) < 2:
+            continue
+        pairs = []
+        for i in range(len(S)):
+            for j in range(i + 1, len(S)):
+                a = lift_from_counts(per_side_z[S[i]][None], kind)[0, :, z]
+                b = lift_from_counts(per_side_z[S[j]][None], kind)[0, :, z]
+                m = (rankable & (obs >= args.min_obs)
+                     & np.isfinite(a) & np.isfinite(b))
+                if m.sum() >= 10:
+                    pairs.append({"sides": [int(S[i]), int(S[j])],
+                                  "rho": round(spearman(a[m], b[m]), 4),
+                                  "n": int(m.sum())})
+        if pairs:
+            repl[nm] = pairs
+    corner_rhos = [p["rho"] for nm in CORNER_ZONES for p in repl.get(nm, [])
+                   if np.isfinite(p["rho"])]
+    corner_rho = float(np.mean(corner_rhos)) if corner_rhos else float("nan")
+
+    # -- colours per zone: the mechanism behind any piece-level preference ------
+    # A piece cannot prefer a corner for its own sake; it prefers it because the
+    # colours it carries are the ones that corner's pinned pieces demand. Colours
+    # are 22 buckets against 256, so this is far better estimated than the piece
+    # level and says whether the piece-level pattern has a mechanism under it.
+    ncol = 23
+    zsum = zone.sum(0)                                       # [piece, zone]
+    col_z = np.zeros((ncol, N_ZONES))
     for p in range(N_PIECES):
-        if kinds[p] != "inner" or p in CLUE_PIECES:
+        if kind[p] == 2:
             continue
-        obs = sum(pooled.ring.get((p, k), 0.0) for k in range(1, 8))
-        if obs < args.min_obs:
-            continue
-        probs = {k: pooled.ring.get((p, k), 0.0) / obs for k in range(1, 8)}
-        lift = {k: (probs[k] / ring_share[k]) if ring_share[k] > 0 else 0.0
-                for k in range(1, 8)}
-        p_top = pooled.top_band.get(p, 0.0) / obs
-        best = max(range(1, 8), key=lambda k: lift[k])
-        rows.append({
-            "piece": p,
-            "obs": round(obs, 2),
-            "mean_ring": round(pooled.mean_ring(p), 3),
-            "p_top_band": round(p_top, 4),
-            "top_lift": round(p_top / top_share, 3) if top_share > 0 else 0.0,
-            "best_ring": best,
-            "best_lift": round(lift[best], 3),
-            **{f"p_ring{k}": round(probs[k], 4) for k in range(1, 8)},
-            **{f"lift{k}": round(lift[k], 3) for k in range(1, 8)},
-        })
-
-    # -- the headline: do the four sides agree on the ranking? -----------------
-    agree = {}
-    for label, core_only in (("all", False), ("core", True)):
-        mat = {}
-        for a in range(4):
-            for b in range(a + 1, 4):
-                xs, ys = [], []
-                for p in range(N_PIECES):
-                    if kinds[p] != "inner" or p in CLUE_PIECES:
-                        continue
-                    ma = per_side[a].mean_ring(p, core_only)
-                    mb = per_side[b].mean_ring(p, core_only)
-                    if ma is not None and mb is not None:
-                        xs.append(ma)
-                        ys.append(mb)
-                rho = spearman(xs, ys)
-                mat[f"{a}-{b}"] = {"rho": None if rho is None else round(rho, 4),
-                                   "n": len(xs)}
-        vals = [m["rho"] for m in mat.values() if m["rho"] is not None]
-        agree[label] = {"pairs": mat,
-                        "mean_rho": round(sum(vals) / len(vals), 4) if vals else None}
+        for e in seed[p]:
+            if e > 0:
+                col_z[e] += zsum[p]
+    col_tot = col_z.sum(1, keepdims=True)
+    zone_share = col_z.sum(0) / max(col_z.sum(), 1e-12)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        col_lift = (col_z / np.maximum(col_tot, 1e-12)) / np.maximum(zone_share, 1e-12)
 
     # -- the actionable list ---------------------------------------------------
-    # Pieces most concentrated in canonical rows 12..15 -- the band the beam never
-    # fills. Ranked by lift so a piece that is merely common does not qualify.
-    ranked_top = sorted((r for r in rows if r["top_lift"] > 1.0),
-                        key=lambda r: (-r["top_lift"], -r["obs"]))
-    exclude = [r["piece"] for r in ranked_top[:args.exclude_top]]
+    #
+    # There is a hard ceiling on how many pieces may be excluded, and it is not a
+    # statistical one. Rows 1..14 hold 14x14 = 196 inner cells and there are
+    # exactly 196 inner pieces, so the puzzle has no spare inner pieces at all.
+    # A beam to row R places R*14 of them; two more (the row-13 clues) are
+    # reserved and never searched. So:
+    #
+    #     slack = 196 - 2 - R*14      R=10 -> 54,  R=11 -> 40,  R=12 -> 26
+    #
+    # Excluding K pieces cuts the slack to slack-K. Take it to zero and the beam
+    # has exactly one way to fill the board and almost certainly cannot; take it
+    # near zero and the run collapses for a reason that has nothing to do with
+    # whether these statistics are right. Half the slack is the cap used here.
+    inner_budget = 196 - 2 - args.ab_stop_row * 14
+    hard_cap = max(1, inner_budget // 2)
+    eff_top = min(args.exclude_top, hard_cap)
+    sig_far = rankable & np.isfinite(far_lo) & (far_lo > 0)
+    order = np.argsort(-np.where(sig_far, far, -np.inf))
+    exclude = [int(p) for p in order[:eff_top] if sig_far[p]]
 
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out / "arrays.npz",
+                        per_side_zone=np.stack([per_side_z[s_] for s_ in range(4)]),
+                        lift=lift, lo=lo, hi=hi, obs=obs, kind=kind,
+                        far=far, far_lo=far_lo, far_hi=far_hi,
+                        cellc=cellc, sidec=sidec, cover_z=cover_z,
+                        frac_z=frac_z, col_lift=col_lift, col_z=col_z,
+                        rankable=rankable, sides=sides, n_boards=n_boards)
 
     import csv as _csv
-    with (out / "pieces.csv").open("w", newline="") as fh:
-        if rows:
-            w_ = _csv.DictWriter(fh, fieldnames=list(rows[0].keys()),
-                                 lineterminator="\n")
-            w_.writeheader()
-            for r in sorted(rows, key=lambda r: r["mean_ring"]):
-                w_.writerow(r)
-
-    with (out / "agreement.csv").open("w", newline="") as fh:
+    with (out / "zones.csv").open("w", newline="") as fh:
         w_ = _csv.writer(fh, lineterminator="\n")
-        w_.writerow(["scope", "side_pair", "spearman_rho", "n_pieces"])
-        for label, blk in agree.items():
-            for pair, m in blk["pairs"].items():
-                w_.writerow([label, pair, m["rho"], m["n"]])
+        w_.writerow(["piece", "kind", "obs", "best_zone", "best_lift",
+                     "far_score", "far_lo", "far_hi"]
+                    + [f"lift_{z}" for z in ZONE_NAMES]
+                    + [f"lo_{z}" for z in ZONE_NAMES]
+                    + [f"hi_{z}" for z in ZONE_NAMES])
+        for p in np.flatnonzero(rankable):
+            row = lift[p]
+            bz = int(np.nanargmax(row)) if np.isfinite(row).any() else 0
+            w_.writerow([p, KIND_NAMES[kind[p]], round(float(obs[p]), 2),
+                         ZONE_NAMES[bz], round(float(row[bz]), 3),
+                         round(float(far[p]), 3), round(float(far_lo[p]), 3),
+                         round(float(far_hi[p]), 3)]
+                        + [("" if np.isnan(v) else round(float(v), 3)) for v in lift[p]]
+                        + [("" if np.isnan(v) else round(float(v), 3)) for v in lo[p]]
+                        + [("" if np.isnan(v) else round(float(v), 3)) for v in hi[p]])
+
+    with (out / "replication.csv").open("w", newline="") as fh:
+        w_ = _csv.writer(fh, lineterminator="\n")
+        w_.writerow(["zone", "side_a", "side_b", "spearman_rho", "n_pieces"])
+        for nm, ps in repl.items():
+            for pr in ps:
+                w_.writerow([nm, pr["sides"][0], pr["sides"][1], pr["rho"], pr["n"]])
 
     (out / "exclude_pieces.txt").write_text(
-        ",".join(str(p) for p in exclude) + "\n" if exclude else "\n")
+        (",".join(str(p) for p in exclude) if exclude else "") + "\n")
+
+    top_by_zone = {}
+    for z, nm in enumerate(ZONE_NAMES):
+        cand = [p for p in np.flatnonzero(rankable)
+                if np.isfinite(lift[p, z]) and lo[p, z] > 1.0]
+        cand.sort(key=lambda p: -lift[p, z])
+        top_by_zone[nm] = [{"piece": int(p), "lift": round(float(lift[p, z]), 2),
+                            "lo": round(float(lo[p, z]), 2),
+                            "hi": round(float(hi[p, z]), 2),
+                            "kind": KIND_NAMES[kind[p]]} for p in cand[:15]]
 
     summary = {
         "corpus": str(args.corpus),
-        "boards": n_rows,
-        "boards_used": sum(len(b) for b in by_config.values()),
-        "off_frame": off_frame,
-        "configs": len(by_config),
-        "n_eff": round(n_eff, 1),
-        "ring_share": {str(k): round(v, 5) for k, v in ring_share.items()},
-        "top_band_share": round(top_share, 5),
-        "control_clue_pieces": control,
-        "agreement": agree,
-        "pieces": rows,
+        "boards": int(n_boards.sum()), "boards_seen": n_rows,
+        "off_frame": off_frame, "configs": n_cfg, "n_eff": round(float(n_eff), 1),
+        "n_boot": args.n_boot,
+        "per_side_configs": {str(s): int((sides == s).sum()) for s in range(4)},
+        "per_side_boards": {str(s): int(n_boards[sides == s].sum()) for s in range(4)},
+        "zone_names": ZONE_NAMES, "zone_label": ZONE_LABEL,
+        "coverage": {ZONE_NAMES[z]: [s for s in range(4) if cover_z[s, z]]
+                     for z in range(N_ZONES)},
+        "control": control, "control_ok": ctrl_ok,
+        "replication": repl, "corner_replication_rho": round(corner_rho, 4),
+        "top_by_zone": top_by_zone,
+        "n_significant": int(((lo > 1.0) & rankable[:, None]).any(1).sum()),
+        "n_rankable": int(rankable.sum()),
         "exclude_suggestion": exclude,
-        "per_side_configs": {str(s): sum(1 for c in by_config if side_of(c) == s)
-                             for s in range(4)},
-        # 16x16 weighted occupancy per piece, sparse: only cells a piece actually
-        # reached. Full dense would be 256x256 of mostly zeros.
-        "cell_map": {str(p): {str(c): round(v, 3)
-                              for (pp, c), v in pooled.cell.items() if pp == p}
-                     for p in (r["piece"] for r in rows)},
+        "far_significant": int(sig_far.sum()),
+        "ab_stop_row": args.ab_stop_row,
+        "inner_slack": inner_budget,
+        "exclude_cap": hard_cap,
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=1))
 
     # -- report ----------------------------------------------------------------
-    print(f"[stats] {summary['boards_used']} board(s) from {len(by_config)} border "
-          f"config(s); N_eff = {n_eff:.1f}")
-    print(f"[stats] per-side configs: " +
-          " ".join(f"s{s}={summary['per_side_configs'][str(s)]}" for s in range(4)))
-    bad = [c for c in control if not c["ok"]]
-    print("[check] pinned clue pieces recovered at their own cells: "
-          + ("all %d ok" % len(control) if not bad
-             else "FAILED for %s" % ", ".join(str(c["piece"]) for c in bad)))
-    if bad:
-        print("[check] the corpus is not on the canonical frame -- stop here",
-              file=sys.stderr)
     print()
-    print("[agree] Do the four sides rank pieces the same way? (Spearman, "
-          "mean over the 6 side pairs)")
-    for label in ("all", "core"):
-        mr = agree[label]["mean_rho"]
-        print(f"[agree]   {label:5s}: " + ("n/a (a side has too few boards)"
-                                           if mr is None else f"rho = {mr:+.3f}"))
-    mr = agree["core"]["mean_rho"] or agree["all"]["mean_rho"]
-    if mr is None:
-        verdict = "not enough data yet -- run the farm longer"
-    elif mr > 0.5:
-        verdict = "STRONG: the sides agree, the preference is not a search artefact"
-    elif mr > 0.2:
-        verdict = "WEAK but present -- worth more boards before acting on it"
-    else:
-        verdict = ("NOTHING THERE: the sides disagree, so the ranking is noise "
-                   "or search bias. More analysis will not help; more boards might")
-    print(f"[agree]   verdict: {verdict}")
+    print(f"[check] pinned clue pieces recovered at their own zones: "
+          f"{'all ok' if ctrl_ok else 'FAILED'}")
+    print(f"[repl ] corner-zone cross-side agreement: rho = {corner_rho:+.3f}")
+    for nm in CORNER_ZONES:
+        for pr in repl.get(nm, []):
+            print(f"[repl ]   {nm}  sides {pr['sides'][0]} vs {pr['sides'][1]}: "
+                  f"rho {pr['rho']:+.3f}  (n={pr['n']})")
     print()
-    if rows:
-        by_mean = sorted(rows, key=lambda r: r["mean_ring"])
-        print("[rings] most border-loving pieces (low mean ring):")
-        for r in by_mean[:8]:
-            print(f"[rings]   piece {r['piece']:3d}  mean_ring {r['mean_ring']:.2f}"
-                  f"  best ring {r['best_ring']} at {r['best_lift']:.2f}x"
-                  f"  (obs {r['obs']:.0f})")
-        print("[rings] most core-loving pieces (high mean ring):")
-        for r in by_mean[-8:][::-1]:
-            print(f"[rings]   piece {r['piece']:3d}  mean_ring {r['mean_ring']:.2f}"
-                  f"  best ring {r['best_ring']} at {r['best_lift']:.2f}x"
-                  f"  (obs {r['obs']:.0f})")
+    print(f"[zones] {summary['n_significant']} of {summary['n_rankable']} pieces "
+          f"have a zone preference whose 95% CI clears 1.00")
+    for nm in CORNER_ZONES:
+        t = top_by_zone[nm][:6]
+        if t:
+            print(f"[zones] {nm}: " + "  ".join(
+                f"{d['piece']}({d['lift']:.1f}x)" for d in t))
     print()
+    print(f"[far  ] {int(sig_far.sum())} pieces are significantly far-side "
+          f"(rows 13-15 over rows 0-2, CI above 0)")
+    print(f"[budget] a beam to row {args.ab_stop_row} needs {args.ab_stop_row*14} "
+          f"of the 194 searchable inner pieces, so only {inner_budget} are spare; "
+          f"excluding at most {hard_cap} keeps half that slack")
     if exclude:
-        print(f"[top]   {len(exclude)} piece(s) concentrate in rows {TOP_BAND_ROW}..15 "
-              f"-- the band the beam never fills:")
-        print(f"[top]   {','.join(str(p) for p in exclude)}")
-        print(f"[top]   Test it (NOT with the production beamer -- this list is "
-              f"specific to THIS frame):")
-        print(f"[top]     bin/E555_beamer_FixedFrame data/seed_Edge5.txt "
-              f"--clue_orient 0 --stop_row 12 \\")
-        print(f"[top]       --exclude_pieces $(cat {out}/exclude_pieces.txt) "
-              f"--db_file excl.db --wall_time 1800")
-        print(f"[top]   and compare the count of 'filled=12' sweep lines against "
-              f"the same run without --exclude_pieces.")
-    else:
-        print(f"[top]   no piece concentrates in rows {TOP_BAND_ROW}..15 above "
-              f"chance -- nothing to exclude")
+        print(f"[far  ] excluding top {len(exclude)}: "
+              f"{','.join(str(p) for p in exclude)}")
     print()
-    print(f"[out]   {out}/pieces.csv  {out}/agreement.csv  "
-          f"{out}/exclude_pieces.txt  {out}/summary.json")
+    print(f"[out  ] {out}/zones.csv  replication.csv  exclude_pieces.txt  "
+          f"summary.json  arrays.npz")
     return 0
 
 

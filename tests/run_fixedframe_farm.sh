@@ -48,9 +48,9 @@ SEED=data/seed_Edge5.txt                # relative to REPO
 OUT_DIR=ff_out                          # relative to where you START it
 THREADS=8
 WALL=900                # seconds PER SIDE; four sides, so 900 is ~1 hour total
-STOP_ROW=11             # last row filled. 7 already covers the board from four
-                        # sides and yields far more boards; 11 gives deeper,
-                        # rarer material. See the note at the bottom.
+STOP_ROW=10             # last row filled. 10 is the default for a REASON -- it
+                        # makes the four bands line up exactly with the zone
+                        # partition the analysis uses. See ZONES below.
 BEAM_WIDTH=100000
 MAX_PER_CONFIG=32       # boards written per border (0 = every survivor)
 EMIT_MODE=sample        # sample | top -- see --help
@@ -161,9 +161,25 @@ echo "[farm] done in $(( $(date +%s) - t0 ))s: $total board(s) from $configs bor
 echo "[farm] corpus -> $OUT_DIR/corpus.csv"
 echo "[farm] next:  python3 tests/E555_frame_stats.py $OUT_DIR/corpus.csv --out_dir $OUT_DIR/stats"
 
-# A NOTE ON STOP_ROW. Four sides each filling R rows cover the whole board as
-# soon as 2R >= 16, i.e. STOP_ROW >= 7. Rows 8..11 are where the beam is most
-# squeezed, so lowering STOP_ROW buys orders of magnitude more boards from more
-# borders while still covering every cell -- at the price of shallower, less
-# selected material. Running the farm at 7 and again at 11 and comparing is a
-# cheap way to see which conclusions depend on the depth and which do not.
+# ZONES, and why STOP_ROW defaults to 10.
+#
+# Four sides each filling R rows cover the whole board as soon as 2R >= 16, so
+# STOP_ROW >= 7 suffices. But 10 does something better: it makes each side's band
+# land exactly on the analysis's zone boundaries.
+#
+# STOP_ROW 10 fills rows 0..10, eleven rows. Canonicalised, the four sides become
+#
+#     side 0  canonical rows 0..10      (bottom)
+#     side 1  canonical cols 5..15      (right)
+#     side 2  canonical rows 5..15      (top)
+#     side 3  canonical cols 0..10      (left)
+#
+# and the analysis partitions the board into 3x3 zones on the bands [0-4],
+# [5-10], [11-15] -- 5, 6, 5. Those are the SAME cut points. So every zone is
+# either fully inside a side's band or fully outside it, never half-covered, and
+# each of the four corner zones is seen by exactly two sides. That is what makes
+# "which pieces like this corner" measurable twice, independently, instead of
+# once with a coverage artefact baked in.
+#
+# Raise STOP_ROW for deeper, rarer material and the alignment is lost; lower it
+# and the bands stop covering the far corners at all.
