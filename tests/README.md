@@ -73,6 +73,10 @@ three sides mmap it in seconds.
 | `run_fixedframe_ab.sh` | the practical test: the beamer twice, identical but for `--exclude_pieces`. Refuses a list that would overrun the piece budget. |
 | `E555_ab_analyze.py` | depth reached per border, Wilson intervals per arm, Newcombe on the difference. |
 | `check_fixedframe.py` | proves the canonicalisation map, as arithmetic, from the clue table alone. Run it by hand; it is not wired into `run_tests.sh`. |
+| `E555_border_prior.py` | the Stage A half: reduces the corpus to "which of the 56 edge pieces belong on which side of the border", with bootstrap intervals, a cross-view replication check and a label-shuffle null. Writes `border_prior.txt` and `border_prior.json`. |
+| `E555_edge_annealer_FixedFrame.py` | a copy of the Stage A annealer that pins the study's corner assignment and adds the measured prior to its Euler-trail objective. New flags: `--prior`, `--w_affinity`, `--w_spread`, `--canon_BL/BR/TL/TR`, `--pool`, `--fix_corners 3`. |
+| `check_frame_border.py` | rebuilds every claim an emitted border makes — orientation, frame, Euler counts, colour inventory, prior fit — from the seed file alone, with its own determinant. The annealer keeps those numbers incrementally; this is what catches a drift. |
+| `run_fixedframe_border.sh` | the whole Stage A loop and its A/B: prior → two border pools (with and without the prior) → verification → the beamer on each → `E555_ab_analyze.py`. |
 
 ### The zone partition, and why STOP_ROW is 10
 
@@ -200,6 +204,135 @@ twelve.
 
 ---
 
+## Feeding it back into Stage A
+
+The study's prior could not be handed to Stage C: no board in `data/` is in this
+frame, most satisfy zero clues, and a zone prior measured under one corner
+assignment says nothing about a board under another. That blocker does not exist
+at Stage A, and the reason is the whole argument for putting it there.
+
+**The annealer builds the frame.** Pin the corners the study pinned and the table
+applies verbatim — same corners, same clue orientation, same coordinates, nothing
+to re-key. Stage A is also where the information is cheapest to use: choosing
+which 14 edge pieces sit on each side costs nothing. The chain database is
+identical either way, the piece budget is identical, and unlike `--exclude_pieces`
+there is no throughput to lose.
+
+### What Stage A actually decides, and what was measured
+
+One thing: which of the 56 edge pieces goes on each side. So the prior is measured
+on the border cells alone — row 0, row 15, col 0, col 15 — and each side is split
+into three buckets on the same band cuts the zone study used, `[1-4] [5-10]
+[11-14]`, sizes 4, 6, 4.
+
+Those cuts do more than keep the two studies comparable. A study side at
+`--stop_row 10` sees some border sides whole and others in part — side 0 fills the
+bottom row completely but only rows 1–10 of the two columns — which at cell
+granularity is a partial exposure that has to be corrected for. At bucket
+granularity it disappears: every (study side, bucket) pair is covered whole or not
+at all. Measured, not assumed; `E555_border_prior.py` prints the coverage table it
+found.
+
+| | cross-view Spearman | label-shuffled |
+|---|---|---|
+| side affinity | **+0.38** | −0.03 |
+| within-side contrast (which END of the side) | **+0.65** | |
+
+The views being compared use different borders, a different RNG stream and a
+different search role — one side's bottom **row** is another's left **column** —
+so this is not the beam agreeing with itself. It also disposes of the obvious
+confound: if the pattern came from how bottom rows are sampled it would be the
+same on all four sides, and instead adjacent sides correlate *negatively*
+(BOTTOM vs LEFT −0.48), which is the anti-corner structure the zone study found.
+
+The within-side contrast replicating better than the side aggregate is not a
+surprise either. "Which end of this side" *is* the corner preference; averaging a
+side's three buckets is exactly what throws it away.
+
+**What did not work, and is therefore not in the objective.** Shrinking each piece
+toward the affinity of the colour it turns inward — the obvious move, and the
+study's own stated mechanism — makes cross-view agreement monotonically *worse*:
++0.381, +0.373, +0.363, +0.336, +0.316, +0.255 at blend 0.00 → 1.00. The colour is
+just a coarser view of the same thing. The table is written out and nothing reads
+it.
+
+### The objective, in three parts
+
+All three in the same 100-point unit, so the weights are a real trade-off and not
+a units conversion:
+
+- **trails** — what the original annealer optimises. Each side scored on how many
+  decades its Euler-trail count sits from its target. This number is not a proxy
+  for anything: a Stage B run on one of these borders prints
+  `bottoms=360 ... left-cols=432`, which are the annealer's own `BOTTOM=360` and
+  `LEFT=432`. The trail count **is** the size of Stage B's option space.
+- **affinity** — 0 = dealing the pieces out at random, 100 = the best assignment
+  the prior admits, found by an exact transportation DP rather than a bound.
+- **spread** — a side has 4 cells at one end, 6 in the middle and 4 at the other,
+  and its 14 pieces have opinions. Crowding is the transport distance between the
+  two, in pieces. This is the term that could not be guessed: a side made entirely
+  of pieces that all want the bottom-left end scores well on affinity and is
+  useless, because only four of them can have it.
+
+### Two things the weight sweep settled
+
+6 restarts × 120k steps per setting.
+
+| target_scale | w_affinity | trails | affinity | weakest side | sum of 4 sides |
+|---|---|---|---|---|---|
+| 250 | 0 | 88.0 | 11.6 | 192 | 1,980 |
+| 250 | 3 | 84.7 | 24.7 | 288 | 2,304 |
+| 1000 | 0 | 90.1 | 15.1 | 432 | 4,056 |
+| **1000** | **3** | **94.3** | **26.6** | **648** | **4,704** |
+| 4000 | 0 | 74.0 | 18.8 | 684 | 6,360 |
+| 4000 | 3 | 84.2 | 34.7 | 912 | 8,112 |
+
+**The prior and the trail count were never in conflict.** At `--target_scale 250`
+adding the prior costs 3.3 trail points, which looks like a trade — but the target
+term punishes overshoot as hard as shortfall, and the prior pushes sides *past* a
+low target. At 1000 and 4000 the prior **buys** trail points: 94.3 against 90.1,
+with more trails on every side as well. So the default here is 1000, not the 250
+it was first tried at.
+
+**Spread is nearly free and affinity is not.** At a fixed target, `--w_spread 3`
+costs a few trail points and drags affinity up with it — a side whose pieces all
+want the same end is also a side whose pieces came from the same corner — while
+`--w_affinity` past 10 abandons the trail targets to chase a term that saturates
+near 47 anyway. Defaults: `--w_affinity 3 --w_spread 1`.
+
+### Running it
+
+```bash
+# the whole loop, including the A/B that decides whether it helps
+bash tests/run_fixedframe_border.sh WALL=900 RESTARTS=24
+
+# or by hand
+python3 tests/E555_border_prior.py ff_out/corpus.csv --out_dir ff_out/prior
+python3 -u tests/E555_edge_annealer_FixedFrame.py data/seed_Edge5.txt \
+    --prior ff_out/prior/border_prior.txt --out borders_ff.csv \
+    --restarts 24 --steps 200000 --threads 8
+python3 tests/check_frame_border.py data/seed_Edge5.txt borders_ff.csv \
+    --prior ff_out/prior/border_prior.txt
+bin/E555_beamer_FixedFrame data/seed_Edge5.txt borders_ff.csv --clue_orient 0 ...
+```
+
+`E555_beamer_FixedFrame.c` gained one capability for this: **give it a rotations
+CSV and it searches those borders** instead of sampling its own. The `--canon_*`
+flags then flip meaning — they stop pinning the corners and start *checking* them,
+and a row from a different frame is refused rather than searched. Without a
+rotations file nothing changed: it samples borders and pins corners exactly as
+before.
+
+### What this does not test
+
+The corner bet. Every border here, and every number in the prior, is conditional
+on `BL=3 BR=2 TL=0 TR=1` being the solution's assignment — 1 of 4! = 24. Both arms
+of the A/B pin the same four corners, so the comparison measures the prior and
+nothing else; it cannot say whether the frame itself is the right one. Nothing in
+this folder can.
+
+---
+
 ## The run this was measured on, and how to pick it up again
 
 `tests/results/` holds the whole study as shipped — **start with
@@ -253,6 +386,14 @@ The study answered its own question — pieces have strong, reproducible corner
 preferences — and then the practical test of that answer came out **negative**:
 banning the twelve far-side pieces cost ~78 % of row-1 survival. Three follow-ups
 come out of that, in order of how much they are worth:
+
+**0. Done, and it changed the order of the other three: the prior went to Stage A
+instead.** Re-keying was only ever needed because the prior had to be carried
+*to* a board built in some other frame. Stage A does not have that problem — the
+annealer builds the frame, so pinning the study's corners makes the table apply
+verbatim. That is what `E555_border_prior.py`,
+`E555_edge_annealer_FixedFrame.py` and `run_fixedframe_border.sh` are, and the
+section above is what they measured. The three below still stand for Stage C.
 
 **1. Re-key the prior to corner pieces, which is a prerequisite for everything
 else.** The table is currently expressed as "piece 124 prefers the top-right zone

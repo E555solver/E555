@@ -88,8 +88,9 @@
  *   so repeated runs sample uncorrelated regions of the search space.
  *
  * COMPILE / RUN
- *   make beamer_fixedframe        (builds bin/E555_beamer_FixedFrame; it is NOT
- *                                  part of `make all` -- this is an experiment)
+ *   make -C tests                 (builds bin/E555_beamer_FixedFrame; tests/ has
+ *                                  its own Makefile -- this is an experiment and
+ *                                  is not part of `make all`)
  *   bin/E555_beamer_FixedFrame --help
  *   bash tests/run_fixedframe_farm.sh      -- all four sides, then canonicalise
  */
@@ -268,6 +269,35 @@ static void apply_canon_corners(int orient) {
     }
     for (int role = 0; role < 4; role++)
         if (g_fixed_corner_pid[role] < 0) g_fixed_corner_pid[role] = phys[role];
+}
+
+/* Does the border just read from the rotations CSV sit in the frame this run was
+ * told to search?
+ *
+ * In random-border mode the corners are an OUTPUT of --canon_*: the sampler is
+ * told which piece goes where and obeys. With a rotations file they are an INPUT,
+ * fixed by the spins in the row, and --canon_* can only check them. That check is
+ * not a formality. Every clue this run pins, and every number in a border prior
+ * measured under this frame, is conditional on which corner piece sits in which
+ * corner -- one assignment of 4! = 24. A row from a different assignment would
+ * search perfectly happily and mean nothing, which is exactly the failure a
+ * silent mismatch produces.
+ *
+ * Called after classify_deal_from_rotations(), which is what fills g_cBL..g_cTR. */
+static void verify_border_frame(uint32_t row) {
+    static const char *nm[4]   = { "BL", "BR", "TL", "TR" };
+    const Oriented *got[4]     = { &g_cBL, &g_cBR, &g_cTL, &g_cTR };
+    for (int r = 0; r < 4; r++) {
+        if (g_fixed_corner_pid[r] < 0) continue;
+        if ((int)got[r]->piece_id != g_fixed_corner_pid[r])
+            fatal("border row %u puts piece %u in the %s corner, but --clue_orient %d "
+                  "with --canon_BL/BR/TL/TR pins piece %d there.\n"
+                  "       The row is from a different frame. Re-anneal it under this "
+                  "corner assignment, or run this beamer under that one.",
+                  row, got[r]->piece_id, nm[r], g_orient_pin, g_fixed_corner_pid[r]);
+    }
+    printf("[frame] border row %u: corners BL=%u BR=%u TL=%u TR=%u -- matches the pin\n",
+           row, g_cBL.piece_id, g_cBR.piece_id, g_cTL.piece_id, g_cTR.piece_id);
 }
 
 /* --clue_orient O. The finalizer takes a list (src/B_beam/E555_finalizer.c);
@@ -2608,7 +2638,12 @@ static void usage(const char *a0) {
 "                         BL=3 BR=2 TL=0 TR=1). No clue pins a corner, so this is a bet\n"
 "                         on 1 of the 4! = 24 assignments: it conditions everything near\n"
 "                         the border and very little in the core. Raw --BL/--BR/--TL/--TR\n"
-"                         still work and override the mapping\n"
+"                         still work and override the mapping.\n"
+"                         GIVE A ROTATIONS CSV and the meaning flips: the file already\n"
+"                         carries a corner assignment, so these flags stop pinning and\n"
+"                         start CHECKING, and a row from another frame is refused rather\n"
+"                         than searched. That is how a border from\n"
+"                         tests/E555_edge_annealer_FixedFrame.py is tested here\n"
 "  --exclude_pieces LIST  bar these pieces (comma-separated ids) from the chain database\n"
 "                         entirely. This is the payoff flag: feed back the pieces the\n"
 "                         corpus says belong in the rows the beam never reaches, and it\n"
@@ -2807,21 +2842,21 @@ int main(int argc, char *argv[]) {
         if (!strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
         if (!strcmp(argv[i], "--random_edges")) g_random_edges = true;
     }
-    /* Always on here, not merely implied later: borders are sampled per config,
-       and random mode is the only one that can pin corners. Setting it before
-       the positional check is what makes rotation.csv genuinely optional rather
-       than "optional if you also pass a flag that says so". */
-    g_random_edges = true;
-    /* Positional arguments: seed.txt always; rotation.csv only without
-       --random_edges (it may still be given, but is ignored in random mode). */
+    /* Positional arguments: seed.txt always, rotation.csv optionally -- and the
+       rotations file is what chooses between this program's two modes.
+         WITHOUT one  borders are sampled at random and the corners are pinned by
+                      --canon_*; this is the corpus-harvesting mode the study used.
+         WITH one     the borders in the file are searched in order, corners and
+                      all. That is how a border the fixed-frame annealer produced
+                      gets tested: the file already IS the frame, and the run
+                      verifies it matches the pins rather than imposing them.
+       Deciding here, before the option loop, is what makes rotation.csv genuinely
+       optional rather than "optional if you also pass a flag that says so". */
     if (argc < 2 || argv[1][0] == '-') { usage(argv[0]); return 1; }
     const char *seed_path = argv[1], *csv_path = NULL;
     int opt_start = 2;
     if (argc > 2 && argv[2][0] != '-') { csv_path = argv[2]; opt_start = 3; }
-    if (!g_random_edges && !csv_path) {
-        fprintf(stderr, "rotation.csv is required unless --random_edges is given\n\n");
-        usage(argv[0]); return 1;
-    }
+    if (!csv_path) g_random_edges = true;
     bool resume = false;
 
     for (int i = opt_start; i < argc; i++) {
@@ -2935,7 +2970,10 @@ int main(int argc, char *argv[]) {
               "       tests/run_fixedframe_farm.sh, which does both.");
     g_clue_orients = (uint8_t)(1u << g_orient_pin);
     g_clue_mask |= CLUE_CENTER | CLUE_CORNERS;   /* the frame IS the clue set */
-    g_random_edges = true;                       /* corners can only be pinned here */
+    /* g_random_edges was decided by the positional arguments above: on without a
+       rotations file, off with one. In random mode --canon_* PINS the corners; in
+       rotations mode the file already carries them and --canon_* becomes the
+       assertion that it carries the right ones (verify_border_frame below). */
 
     for (int r = 0; r < 4; r++) {
         if (g_canon_corner[r] < 0 || g_canon_corner[r] >= (int)NUM_PIECES)
@@ -2953,8 +2991,7 @@ int main(int argc, char *argv[]) {
         if (g_fixed_corner_pid[r] >= (int)NUM_PIECES)
             fatal("--BL/--BR/--TL/--TR piece index must be in 0..%d", NUM_PIECES - 1);
     }
-    if (any_fixed_corner && !g_random_edges)
-        fatal("--BL/--BR/--TL/--TR are only valid with --random_edges");
+    (void)any_fixed_corner;   /* legal in both modes: pinned in one, checked in the other */
     if (g_random_edges) {
         g_free_edges = true;               /* the border is not a fixed assignment */
         if (resume) fatal("--resume is not supported with --random_edges (borders are sampled fresh)");
@@ -3198,6 +3235,7 @@ int main(int argc, char *argv[]) {
         memcpy(g_spin, spins, sizeof g_spin);
 
         classify_deal_from_rotations();
+        verify_border_frame(cur_row);
         build_top_border_demands();
         if (!g_free_edges) { build_edge_terminal_pool(); build_db_edge_and_sort(); }
         validate_color_constants();
