@@ -218,16 +218,27 @@ def fig_replication(D, S, out):
 
 
 def fig_colors(D, S, out):
-    """Colour composition per zone -- the mechanism under any piece preference."""
-    cl = D["col_lift"][1:23]                       # colours 1..22
-    fig, ax = plt.subplots(figsize=(7.6, 6.4))
+    """Colour composition per zone -- the mechanism under a piece preference.
+
+    Two panels, because one of them is nearly tautological on its own. Across all
+    nine zones the dominant contrast is frame-interface colours (1-5) piling into
+    the corner zones and vanishing from the centre -- true, but structural: a
+    corner zone contains border cells and the centre does not, so that is where
+    edge pieces have to be. The interesting question is which of the FOUR corners
+    a colour prefers, and that only becomes visible once the corners are compared
+    against each other rather than against the middle of the board.
+    """
+    col_z = D["col_z"][1:23]                       # raw weighted counts, colours 1..22
+    cl = D["col_lift"][1:23]
+    fig, axes = plt.subplots(1, 2, figsize=(13.6, 6.6),
+                             gridspec_kw={"width_ratios": [1.25, 1]})
+
+    ax = axes[0]
     L = np.log2(np.where(cl > 0, cl, np.nan))
-    norm = TwoSlopeNorm(vmin=-.45, vcenter=0.0, vmax=.45)
-    im = ax.imshow(L, cmap=CMAP_LIFT, norm=norm, aspect="auto",
-                   interpolation="nearest")
+    im = ax.imshow(L, cmap=CMAP_LIFT, norm=TwoSlopeNorm(vmin=-.45, vcenter=0, vmax=.45),
+                   aspect="auto", interpolation="nearest")
     ax.set_xticks(range(9)); ax.set_xticklabels(ZONE_NAMES)
-    ax.set_yticks(range(22)); ax.set_yticklabels([str(c) for c in range(1, 23)],
-                                                 fontsize=7.5)
+    ax.set_yticks(range(22)); ax.set_yticklabels(range(1, 23), fontsize=7.5)
     ax.set_ylabel("edge colour")
     ax.tick_params(length=0)
     for i in range(22):
@@ -235,12 +246,40 @@ def fig_colors(D, S, out):
             if np.isfinite(L[i, j]) and abs(L[i, j]) > .18:
                 ax.text(j, i, f"{cl[i, j]:.2f}", ha="center", va="center",
                         fontsize=6.2, color="white" if abs(L[i, j]) > .34 else INK)
-    ax.set_title("Where each edge colour ends up\n"
-                 "(a piece prefers a corner because of the colours it carries)")
+    ax.set_title("All nine zones\n(blank = colour cannot occur there)")
     cb = fig.colorbar(im, ax=ax, fraction=.046, pad=.04,
                       ticks=[-.415, -.19, 0, .19, .415])
     cb.ax.set_yticklabels(["0.75x", "0.88x", "1x", "1.14x", "1.33x"])
     cb.outline.set_edgecolor(RULE)
+
+    # Corners only, each colour renormalised across the four so the corner/centre
+    # split cancels and only the between-corner preference is left.
+    ax = axes[1]
+    ci = [ZONE_NAMES.index(c) for c in CORNER_ZONES]
+    sub = col_z[:, ci]
+    share = sub / np.maximum(sub.sum(1, keepdims=True), 1e-12)
+    base = sub.sum(0) / max(sub.sum(), 1e-12)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        CL = np.log2(np.maximum(share / np.maximum(base, 1e-12), 1e-6))
+    im = ax.imshow(CL, cmap=CMAP_LIFT, norm=TwoSlopeNorm(vmin=-.6, vcenter=0, vmax=.6),
+                   aspect="auto", interpolation="nearest")
+    ax.set_xticks(range(4)); ax.set_xticklabels(CORNER_ZONES)
+    ax.set_yticks(range(22)); ax.set_yticklabels(range(1, 23), fontsize=7.5)
+    ax.tick_params(length=0)
+    for i in range(22):
+        for j in range(4):
+            if np.isfinite(CL[i, j]):
+                v = 2 ** CL[i, j]
+                ax.text(j, i, f"{v:.2f}", ha="center", va="center", fontsize=6.8,
+                        color="white" if abs(CL[i, j]) > .42 else INK)
+    ax.set_title("Corners only, renormalised across the four\n"
+                 "(which corner does this colour belong to?)")
+    cb = fig.colorbar(im, ax=ax, fraction=.046, pad=.04,
+                      ticks=[-.585, -.263, 0, .263, .585])
+    cb.ax.set_yticklabels(["0.67x", "0.83x", "1x", "1.2x", "1.5x"])
+    cb.outline.set_edgecolor(RULE)
+    fig.suptitle("Where each edge colour ends up", fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, .95))
     fig.savefig(out / "fig_colors.png"); plt.close(fig)
 
 

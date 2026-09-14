@@ -444,11 +444,20 @@ def main(argv=None):
     if n_cfg == 0:
         sys.exit("[stats] no usable boards")
 
-    w_per_board = np.repeat(1.0 / n_boards, n_boards)
-    n_eff = w_per_board.sum() ** 2 / (w_per_board ** 2).sum()
+    # Effective sample size, at the level the bootstrap actually resamples.
+    #
+    # Kish over the PER-BOARD weights is the wrong instrument here and gives a
+    # badly flattering answer: every board of a config carries the same 1/n, so
+    # the weights are perfectly even and Kish dutifully returns the board count
+    # (55,712 on this corpus) -- it measures how uneven the weights are, not how
+    # many independent things there are. Each border contributes total weight 1
+    # whatever its board count, so the independent units are the borders and
+    # Kish over THEIR totals is the number to report.
+    border_w = np.ones(n_cfg)                 # each border sums to 1 by construction
+    n_eff = border_w.sum() ** 2 / (border_w ** 2).sum()
     print(f"[load] {int(n_boards.sum())} boards / {n_cfg} borders / "
-          f"N_eff {n_eff:.0f}  (boards grouped by bottom row, which is the "
-          f"independent unit)")
+          f"N_eff {n_eff:.0f}  (the border is the independent unit; boards are "
+          f"grouped by bottom row and each border carries total weight 1)")
 
     cover_z, frac_z = measure_coverage(sidec, "zone")
     cover_rb, frac_rb = measure_coverage(sidec, "rowband")
