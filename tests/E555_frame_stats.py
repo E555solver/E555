@@ -395,6 +395,9 @@ def main(argv=None):
                          "Sets the piece budget: the beam must still be able to "
                          "fill rows 1..R from what is left (default 12)")
     ap.add_argument("--rng_seed", type=int, default=12345)
+    ap.add_argument("--n_perm", type=int, default=20,
+                    help="label-shuffle replicates used to calibrate how many "
+                         "'significant' pieces pure noise would produce (0 = skip)")
     ap.add_argument("--no_strict_frame", action="store_true")
     args = ap.parse_args(argv)
 
@@ -468,6 +471,71 @@ def main(argv=None):
     corner_rhos = [p["rho"] for nm in CORNER_ZONES for p in repl.get(nm, [])
                    if np.isfinite(p["rho"])]
     corner_rho = float(np.mean(corner_rhos)) if corner_rhos else float("nan")
+
+    # -- is that a lot? ---------------------------------------------------------
+    # "116 of 247 pieces have a preference" means nothing until you know what the
+    # same procedure returns when there is provably no preference to find. So run
+    # it again on corpora where piece identity has been shuffled WITHIN each
+    # board, among pieces of the same kind: every board keeps its shape, its
+    # occupied cells and its per-kind counts, and only the labels move. Anything
+    # the procedure still calls significant is the multiplicity of 247 pieces x 9
+    # zones leaking through.
+    null_sig, null_rho = [], []
+    if args.n_perm > 0:
+        print(f"[null] {args.n_perm} label-shuffle replicates for calibration...")
+        prng = np.random.default_rng(args.rng_seed + 777)
+        free = np.ones(N_PIECES, bool); free[sorted(CLUE_PIECES)] = False
+        groups = [np.flatnonzero((kind == k) & free) for k in (0, 1)]
+        rowsel = np.arange(n_cfg)[:, None]
+        for _ in range(args.n_perm):
+            zp = zone.copy()
+            for g in groups:
+                # INDEPENDENTLY per config. One global permutation would only
+                # rename the pieces: both sides' lift vectors would be reordered
+                # the same way, leaving every correlation and every count exactly
+                # as observed. It has to break the piece-to-position link, which
+                # means a different shuffle in every config.
+                perm = prng.random((n_cfg, len(g))).argsort(1)
+                zp[:, g, :] = zone[rowsel, g[perm], :]
+            ps = {s_: zp[sides == s_].sum(0) if (sides == s_).any()
+                  else np.zeros((N_PIECES, N_ZONES)) for s_ in range(4)}
+            lf = pooled_lift(ps, cover_z, kind, N_ZONES)
+            l2, _ = bootstrap_lift(zp, sides, cover_z, kind,
+                                   max(200, args.n_boot // 8), rng, N_ZONES)
+            null_sig.append(int(((l2 > 1.0) & rankable[:, None]).any(1).sum()))
+            rs = []
+            for z in [ZONE_NAMES.index(c) for c in CORNER_ZONES]:
+                S_ = [s_ for s_ in range(4) if cover_z[s_, z]]
+                a = lift_from_counts(ps[S_[0]][None], kind)[0, :, z]
+                b = lift_from_counts(ps[S_[1]][None], kind)[0, :, z]
+                m = rankable & np.isfinite(a) & np.isfinite(b)
+                if m.sum() >= 10:
+                    rs.append(spearman(a[m], b[m]))
+            if rs:
+                null_rho.append(float(np.mean(rs)))
+
+    # -- is the exclusion list one side's opinion? ------------------------------
+    # The far band (rows 13-15) is seen by three sides. If the score is driven by
+    # just one of them it is a property of that search direction, not the board.
+    far_by_side = {}
+    for s_ in range(4):
+        if not cover_rb[s_, 2] or not (sides == s_).any():
+            continue
+        sub = rband[sides == s_].sum(0)[None]
+        v = lift_from_counts(sub, kind)[0]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            far_by_side[s_] = np.log2(np.maximum(v[:, 2], 1e-6)
+                                      / np.maximum(v[:, 0], 1e-6))
+    far_agree = []
+    ks = sorted(far_by_side)
+    for i in range(len(ks)):
+        for j in range(i + 1, len(ks)):
+            a, b = far_by_side[ks[i]], far_by_side[ks[j]]
+            m = rankable & np.isfinite(a) & np.isfinite(b)
+            if m.sum() >= 10:
+                far_agree.append({"sides": [ks[i], ks[j]],
+                                  "rho": round(spearman(a[m], b[m]), 4),
+                                  "n": int(m.sum())})
 
     # -- colours per zone: the mechanism behind any piece-level preference ------
     # A piece cannot prefer a corner for its own sake; it prefers it because the
@@ -575,6 +643,11 @@ def main(argv=None):
         "n_rankable": int(rankable.sum()),
         "exclude_suggestion": exclude,
         "far_significant": int(sig_far.sum()),
+        "far_agreement": far_agree,
+        "null_significant": null_sig,
+        "null_significant_mean": round(float(np.mean(null_sig)), 1) if null_sig else None,
+        "null_rho": null_rho,
+        "null_rho_mean": round(float(np.mean(null_rho)), 4) if null_rho else None,
         "ab_stop_row": args.ab_stop_row,
         "inner_slack": inner_budget,
         "exclude_cap": hard_cap,
@@ -593,6 +666,11 @@ def main(argv=None):
     print()
     print(f"[zones] {summary['n_significant']} of {summary['n_rankable']} pieces "
           f"have a zone preference whose 95% CI clears 1.00")
+    if null_sig:
+        print(f"[zones] label-shuffled control: {np.mean(null_sig):.0f} "
+              f"(range {min(null_sig)}-{max(null_sig)}) over {len(null_sig)} "
+              f"replicates, corner rho {np.mean(null_rho):+.3f}"
+              if null_rho else "")
     for nm in CORNER_ZONES:
         t = top_by_zone[nm][:6]
         if t:
@@ -604,6 +682,9 @@ def main(argv=None):
     print(f"[budget] a beam to row {args.ab_stop_row} needs {args.ab_stop_row*14} "
           f"of the 194 searchable inner pieces, so only {inner_budget} are spare; "
           f"excluding at most {hard_cap} keeps half that slack")
+    for fa in far_agree:
+        print(f"[far  ] sides {fa['sides'][0]} vs {fa['sides'][1]} agree on the "
+              f"far-side score: rho {fa['rho']:+.3f}")
     if exclude:
         print(f"[far  ] excluding top {len(exclude)}: "
               f"{','.join(str(p) for p in exclude)}")

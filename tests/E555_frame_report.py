@@ -147,6 +147,50 @@ def build(S, figs, AB, corpus_note):
     cov = S["coverage"]
     rho = S.get("corner_replication_rho", float("nan"))
     n_sig, n_rank = S.get("n_significant", 0), S.get("n_rankable", 0)
+
+    # "116 of 247" means nothing without knowing what the same procedure returns
+    # when there is provably nothing to find.
+    nul = S.get("null_significant_mean")
+    nulr = S.get("null_rho_mean")
+    if nul is not None:
+        ns = S.get("null_significant", [])
+        null_line = (f"Run the identical procedure on corpora where piece labels "
+                     f"have been shuffled within each board, and it returns "
+                     f"<strong>{nul:.0f}</strong> "
+                     f"(range {min(ns)}&ndash;{max(ns)} over {len(ns)} replicates) "
+                     f"&mdash; that is the multiplicity of {n_rank} pieces across "
+                     f"nine zones leaking through, and the observed count is "
+                     f"{n_sig/max(nul,1e-9):.1f}&times; it.")
+    else:
+        null_line = ""
+    null_rho_line = (f" Under the same shuffle the correlation is "
+                     f"<span class='mono'>{nulr:+.3f}</span>, which is what "
+                     f"\u201cno structure\u201d looks like."
+                     if nulr is not None else "")
+
+    # Does the far-side score itself replicate? Three sides see rows 13-15.
+    fa = S.get("far_agreement", [])
+    if fa:
+        fr = sum(x["rho"] for x in fa) / len(fa)
+        fa_rows = ", ".join(f"sides {x['sides'][0]}&ndash;{x['sides'][1]}: "
+                            f"<span class='mono'>{x['rho']:+.3f}</span>" for x in fa)
+        if fr > 0.25:
+            fa_note = (f"<p>The score replicates across the three sides that see "
+                       f"rows 13&ndash;15 ({fa_rows}; mean "
+                       f"<strong>{fr:+.3f}</strong>), so it is not one search "
+                       f"direction's opinion.</p>")
+        else:
+            fa_note = (f"<div class=\"callout\" style=\"background:var(--sunk)\">"
+                       f"<span class=\"eyebrow\" style=\"color:var(--bad)\">"
+                       f"read this before using the list</span>"
+                       f"<p>The three sides that see rows 13&ndash;15 do "
+                       f"<em>not</em> agree on this score ({fa_rows}; mean "
+                       f"<strong>{fr:+.3f}</strong>). The zone preferences above "
+                       f"replicate; this particular ranking does not yet. Treat "
+                       f"the exclusion list as a hypothesis the A/B test is "
+                       f"about to judge, not as a finding.</p></div>")
+    else:
+        fa_note = ""
     excl = S.get("exclude_suggestion", [])
 
     # --- the headline verdict comes from the A/B, if it ran -------------------
@@ -315,7 +359,7 @@ side 1  cols  5..15        side 3  cols  0..10</pre>
     puzzle is driving it; if they do not, the ranking is the search talking to
     itself and no further analysis rescues it.</p>
     <p>Mean Spearman across the four corner zones:
-    <strong class="mono">{rho:+.3f}</strong>.</p>
+    <strong class="mono">{rho:+.3f}</strong>.{null_rho_line}</p>
     <div class="tbl-scroll"><table>
       <tr><th>zone</th><th>sides compared</th><th>Spearman &rho;</th><th>pieces</th></tr>
       {rrows}
@@ -333,7 +377,7 @@ side 1  cols  5..15        side 3  cols  0..10</pre>
     baselines: an edge piece can only sit on the frame, so comparing it against
     inner pieces would measure the frame, not a preference.</p>
     <p><strong>{n_sig} of {n_rank}</strong> pieces have at least one zone whose
-    95&nbsp;% bootstrap interval clears 1.00&times;.</p>
+    95&nbsp;% bootstrap interval clears 1.00&times;. {null_line}</p>
   </div>
   {fig(figs, "fig_corner_tops.png", "The strongest pieces for each corner, with bootstrap 95% intervals. Bars whose interval crosses the dashed line at 1.00x are not shown at all — only pieces with a preference the resampling supports.")}
   <div class="col">
@@ -385,6 +429,7 @@ side 1  cols  5..15        side 3  cols  0..10</pre>
       at <strong>{S.get('exclude_cap', 13)}</strong> &mdash; half the slack
       &mdash; for that reason alone.</p>
     </div>
+    {fa_note}
     <div class="pills">{excl_pills or '<span class="pill">none</span>'}</div>
   </div>
   {fig(figs, "fig_far_score.png", "Left: every rankable piece ordered by far-side score, with bootstrap intervals; red pieces belong to the far side, blue to the near side, grey are undecided. Right: the candidates actually excluded.")}
