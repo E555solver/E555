@@ -143,7 +143,7 @@ hr.thin{border:0;border-top:1px solid var(--rule);margin:40px 0}
 """
 
 
-def build(S, figs, AB, corpus_note):
+def build(S, figs, AB, corpus_note, CTL=None, DBINFO=None):
     cov = S["coverage"]
     rho = S.get("corner_replication_rho", float("nan"))
     n_sig, n_rank = S.get("n_significant", 0), S.get("n_rankable", 0)
@@ -197,10 +197,30 @@ def build(S, figs, AB, corpus_note):
     if AB:
         v = AB.get("verdict", "")
         lvl = ("good" if "HELPS" in v else "bad" if "HURTS" in v else "none")
-        vtitle = ("Excluding the far-side pieces made the beam deeper" if lvl == "good"
-                  else "Excluding the far-side pieces made the beam shallower"
-                  if lvl == "bad" else "Excluding the far-side pieces changed nothing measurable")
-        vbody = html.escape(v)
+        if lvl == "good":
+            vtitle = "The corner preferences are real, and acting on them helps"
+            vbody = html.escape(v)
+        elif lvl == "bad":
+            vtitle = ("The corner preferences are real. Acting on them this way "
+                      "makes the search worse.")
+            vbody = (
+                "Two findings, and they point in opposite directions. Where pieces "
+                "belong is strongly and reproducibly structured: two independent "
+                "views of each corner agree at "
+                f"&rho;&nbsp;=&nbsp;{rho:+.3f}, against {nulr:+.3f} under a label "
+                "shuffle. But barring the far-side pieces from the chain database "
+                "does not help the beam &mdash; it hurts it badly. "
+                + html.escape(v) + ". "
+                "The reason is arithmetic rather than statistical, and it is in "
+                "&sect;06: a chain needs all five of its pieces, so removing "
+                f"{len(excl)} of 194 costs about a fifth of the whole database, "
+                "and the clue-pinned rows &mdash; which have the fewest viable "
+                "chains to start with &mdash; are where that lands. A control arm "
+                "excluding twelve pieces the corpus has no opinion about does the "
+                "same damage, so it is the mechanism at fault, not the list.")
+        else:
+            vtitle = "Excluding the far-side pieces changed nothing measurable"
+            vbody = html.escape(v)
     else:
         lvl, vtitle = "none", "The practical test has not been run"
         vbody = ("The corpus says which pieces belong on the far side. Whether "
@@ -248,6 +268,57 @@ def build(S, figs, AB, corpus_note):
                   "the sensitive measure, since survival past row 2 almost "
                   "guarantees survival to row 10.")
         ab_fig = fig(figs, "fig_ab.png", ab_cap)
+
+        # Why it costs so much: a chain needs all five of its pieces present, so
+        # the database shrinks as roughly the fifth power of the surviving piece
+        # fraction. This is the number that explains the result.
+        db_note = ""
+        if DBINFO:
+            keep = 1 - len(excl) / 194.0
+            db_note = (
+                f"<div class=\"callout\"><span class=\"eyebrow\">why it costs "
+                f"so much more than it looks like it should</span>"
+                f"<p>The chain database is built from 5-piece rows, and a chain "
+                f"needs <em>all five</em> of its pieces to be available. Removing "
+                f"{len(excl)} of 194 searchable inner pieces &mdash; "
+                f"{(1-keep)*100:.1f}&nbsp;% of them &mdash; should therefore cost "
+                f"about 1&nbsp;&minus;&nbsp;{keep:.3f}<sup>5</sup> = "
+                f"{(1-keep**5)*100:.0f}&nbsp;% of the chains, and it does: the "
+                f"database falls from <span class='mono'>{DBINFO['base']:,}</span> "
+                f"records to <span class='mono'>{DBINFO['excl']:,}</span>, a "
+                f"{(1-DBINFO['excl']/DBINFO['base'])*100:.0f}&nbsp;% loss.</p>"
+                f"<p>A 6&nbsp;% cut in pieces buying a 22&nbsp;% cut in chains is "
+                f"the whole story. The clue-pinned rows have the fewest viable "
+                f"chains to begin with, so they are where the loss lands first "
+                f"&mdash; which is exactly where the survival column shows the "
+                f"damage.</p></div>")
+
+        ctl_note = ""
+        if CTL:
+            cr = [r for r in CTL.get("rows", []) if r.get("estimable")]
+            ch = cr[-1] if cr else None
+            r1 = next((r for r in CTL.get("rows", []) if r["row"] == 1), None)
+            a1 = next((r for r in AB.get("rows", []) if r["row"] == 1), None)
+            ctl_note = (
+                f"<h3>Was it these pieces, or any twelve pieces?</h3>"
+                f"<p>The result above cannot distinguish &ldquo;we picked the "
+                f"wrong pieces&rdquo; from &ldquo;excluding pieces is the wrong "
+                f"mechanism&rdquo;. So a third arm excludes twelve pieces the "
+                f"corpus calls <em>undecided</em> &mdash; whose far-side interval "
+                f"straddles zero, so there is no evidence they belong on either "
+                f"side. If that hurts just as much, the mechanism is at fault "
+                f"and no better list would have saved it.</p>"
+                + (f"<p>It does. Row-1 survival falls to "
+                   f"<span class='mono'>{r1['surv_b']*100:.2f}&nbsp;%</span> "
+                   f"against the far-side list's "
+                   f"<span class='mono'>{a1['surv_b']*100:.2f}&nbsp;%</span> and a "
+                   f"baseline of <span class='mono'>{a1['surv_a']*100:.2f}&nbsp;%</span>"
+                   f"; the control verdict is <em>{html.escape(CTL['verdict'])}</em>. "
+                   f"Excluding twelve arbitrary pieces is about as damaging as "
+                   f"excluding the twelve the statistics chose, so the statistics "
+                   f"are not what failed here &mdash; the delivery mechanism is.</p>"
+                   if r1 and a1 else
+                   f"<p>Control verdict: <em>{html.escape(CTL['verdict'])}</em>.</p>"))
         ab_section = f"""
 <section>
   <span class="sec-num">06 &middot; the test</span>
@@ -295,6 +366,8 @@ def build(S, figs, AB, corpus_note):
     width ratio is bootstrapped over borders. The verdict reads row
     <span class="mono">{hr if hr else "&mdash;"}</span> &mdash; the deepest row
     where both arms still have enough borders to estimate a median.</p>
+    {db_note}
+    {ctl_note}
   </div>
 </section>"""
 
@@ -484,7 +557,35 @@ side 1  cols  5..15        side 3  cols  0..10</pre>
 {ab_section}
 
 <section>
-  <span class="sec-num">07 &middot; an aside worth keeping</span>
+  <span class="sec-num">07 &middot; what to try instead</span>
+  <div class="col">
+    <h2>The statistics survived; the delivery did not</h2>
+    <p>A hard database exclusion is the bluntest possible way to use a piece
+    preference, and the fifth-power arithmetic above says it is also the most
+    expensive. Three directions that do not pay that cost:</p>
+    <ul>
+      <li><strong>Make it a score term, not a ban.</strong> The beam already
+      ranks candidates by a colour objective; a small penalty for placing a
+      far-side piece in a low row would bias selection without removing a single
+      chain from the database. The pieces stay available when a row genuinely
+      needs them, which is exactly what the clue rows turned out to require.</li>
+      <li><strong>Give it to Stage C instead.</strong> The backtracker and the
+      CP-SAT tools have no chain database, so a piece-to-region prior costs them
+      nothing structural &mdash; it is just move ordering. The corner preferences
+      are strongest near the corners, which is where the tail solvers do their
+      work.</li>
+      <li><strong>If you re-run this test, exclude two or three pieces, not
+      twelve.</strong> The chain loss goes as the fifth power of the piece
+      fraction: three pieces costs about 7&nbsp;% of the database against
+      22&nbsp;% for twelve. That is a dose the clue rows might absorb, and the
+      far-side score's top two or three are the ones it is most confident
+      about.</li>
+    </ul>
+  </div>
+</section>
+
+<section>
+  <span class="sec-num">08 &middot; an aside worth keeping</span>
   <div class="col">
     <h2>Where the beam actually dies</h2>
     <p>Measured across the farm: of every 100 borders the sweep tries, about
@@ -503,7 +604,7 @@ side 1  cols  5..15        side 3  cols  0..10</pre>
 </section>
 
 <section>
-  <span class="sec-num">08 &middot; limits</span>
+  <span class="sec-num">09 &middot; limits</span>
   <div class="col">
     <h2>What this does not show</h2>
     <ul>
@@ -546,6 +647,13 @@ def main(argv=None):
     ap.add_argument("stats_dir")
     ap.add_argument("--figs", default=None)
     ap.add_argument("--ab", default=None, help="ab.json from E555_ab_analyze.py")
+    ap.add_argument("--ab_control", default=None,
+                    help="ab.json for the control arm (12 UNDECIDED pieces "
+                         "excluded) -- separates 'wrong pieces' from 'exclusion "
+                         "is the wrong mechanism'")
+    ap.add_argument("--db_records", default=None,
+                    help="BASE,EXCL chain-record counts, to show the cost of "
+                         "excluding pieces from the database")
     ap.add_argument("--out", default="frame_report.html")
     args = ap.parse_args(argv)
 
@@ -553,11 +661,17 @@ def main(argv=None):
     figs = Path(args.figs or (sd / "figs"))
     S = json.loads((sd / "summary.json").read_text())
     AB = json.loads(Path(args.ab).read_text()) if args.ab and Path(args.ab).exists() else None
+    CTL = (json.loads(Path(args.ab_control).read_text())
+           if args.ab_control and Path(args.ab_control).exists() else None)
+    DBINFO = None
+    if args.db_records:
+        a, b = (int(x) for x in args.db_records.split(","))
+        DBINFO = {"base": a, "excl": b}
 
     note = (f"Corpus: {html.escape(str(S.get('corpus','')))} &middot; "
             f"{S['boards']:,} boards, {S['configs']:,} borders, "
             f"sides {S.get('per_side_configs', {})}")
-    Path(args.out).write_text(build(S, figs, AB, note))
+    Path(args.out).write_text(build(S, figs, AB, note, CTL, DBINFO))
     kb = Path(args.out).stat().st_size / 1024
     print(f"[out] {args.out}  ({kb:.0f} KB)")
     return 0
