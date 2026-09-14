@@ -78,20 +78,7 @@ RNG_SEED=20260914       # both arms share it: same walks, different objective
 
 THREADS=8
 WALL=900                # beamer seconds PER ARM
-STOP_ROW=10             # NOT 11, and this one is expensive to get wrong. At 11 a
-                        # config that reaches row 10 with a handful of states can
-                        # spend HOURS on the row-11 expansion: from 90 survivors
-                        # and a 400k expanded width the generator has an enormous
-                        # space to grind through and very few legal completions in
-                        # it. Neither --time_limit nor --wall_time can preempt
-                        # that, because both are only consulted at row boundaries
-                        # inside beam_search_config -- a single runaway row runs to
-                        # completion whatever the budget says. 10 is the depth the
-                        # farm itself ran at, it is the depth the prior was
-                        # measured at, and the metric here is per-row `uniq` rather
-                        # than emissions, so the shallower stop costs nothing.
-TIME_LIMIT=60           # per-config budget. Hygiene only, for the reason above:
-                        # it bounds a slow config, not a runaway row.
+STOP_ROW=11             # 11 emits; 12 does not on a small machine
 BEAM_WIDTH=100000
 MAX_PER_CONFIG=4        # this is about depth, not about boards
 TOP_BOTTOMS=150         # (bottom x left-column) configs tried per border. The
@@ -195,7 +182,6 @@ beam() {                # $1 = arm name
         --out_dir "$dir" --db_file "$DB" --threads "$THREADS" \
         --beam_width "$BEAM_WIDTH" --stop_row "$STOP_ROW" \
         --top_bottoms "$TOP_BOTTOMS" --top_columns "$TOP_COLUMNS" \
-        --time_limit "$TIME_LIMIT" \
         --max_per_config "$MAX_PER_CONFIG" --emit_mode sample \
         --wall_time "$WALL" --verbose \
         > "$dir/run.log" 2>&1
