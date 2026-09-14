@@ -171,20 +171,6 @@ variation is anyway. Change all four together with the `--canon_*` flags.
 ### What settles it
 
 Not the statistics. The exclusion list is specific to *this* frame, so test it
-with this beamer, one row deeper, with and without:
-
-```bash
-bin/E555_beamer_FixedFrame data/seed_Edge5.txt --clue_orient 0 --stop_row 12 \
-    --db_file excl.db --wall_time 1800 \
-    --exclude_pieces $(cat ff_out/stats/exclude_pieces.txt)
-```
-
-Count `filled=12` lines in each log. That number decides whether any of this was
-worth doing.
-
-### What settles it
-
-Not the statistics. The exclusion list is specific to *this* frame, so test it
 with this beamer, one row deeper, with and without — `run_fixedframe_ab.sh` does
 exactly that and `E555_ab_analyze.py` reports P(reach depth ≥ D) for each arm
 with an interval on the difference. That number decides whether any of this was
