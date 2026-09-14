@@ -168,10 +168,30 @@ one of those 24, chosen arbitrarily and then held fixed. It conditions everythin
 near the border heavily and the core barely — which is where the interesting
 variation is anyway. Change all four together with the `--canon_*` flags.
 
-### What settles it
+### What settles it, and what it settled
 
-Not the statistics. The exclusion list is specific to *this* frame, so test it
-with this beamer, one row deeper, with and without — `run_fixedframe_ab.sh` does
-exactly that and `E555_ab_analyze.py` reports P(reach depth ≥ D) for each arm
-with an interval on the difference. That number decides whether any of this was
-worth doing.
+Not the statistics. `run_fixedframe_ab.sh` runs the beamer twice in this frame,
+identical but for `--exclude_pieces`, and `E555_ab_analyze.py` compares survival
+and frontier width per row.
+
+**It came out negative, decisively.** Excluding the 12 far-side pieces dropped
+row-1 survival from 32.2 % to 7.2 % and left the row-10 frontier 0.03× as wide.
+
+**The reason is arithmetic, not statistical, and it bounds the whole technique.**
+A chain record holds five pieces and needs all five available, so the database
+shrinks as roughly the *fifth power* of the surviving piece fraction:
+
+    (1 − 12/194)⁵ = 0.73        predicted chain loss 27 %
+    2,730,016,036 → 2,137,097,200   observed loss     22 %
+
+A 6 % cut in pieces buys a 22 % cut in chains. The clue-pinned rows have the
+fewest viable chains to begin with, which is exactly where the damage lands —
+63,659 of the excluded arm's 64,210 borders died at `extinct(clue_row)`.
+
+A control arm excluding 12 pieces the corpus calls *undecided* separates "wrong
+pieces" from "wrong mechanism". See `tests/results/README.md` for the numbers.
+
+**So if you try this again**: make it a score penalty rather than a ban (costs no
+chains), or hand the prior to Stage C where there is no chain database, or use a
+dose of two or three pieces — three costs ~7 % of the database against 22 % for
+twelve.
