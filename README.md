@@ -84,7 +84,8 @@ data/           seeds, example boards, masks (see data/README.md)
 examples/       eight short scripts: one per tool, plus the whole chain end to end
 pipeline/       the full pipeline, the whirlpool and the board farm, plus a
                 Slurm wrapper: long unattended runs
-tests/          run_tests.sh: the release gate
+tests/          run_tests.sh: the release gate, plus the fixed-frame experiment
+                (see tests/README.md)
 agent/          an experimental self-driving optimisation mode: untested and just for fun
 ```
 

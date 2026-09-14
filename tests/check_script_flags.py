@@ -53,6 +53,10 @@ TOOL_SOURCES = {
     "E555_finalizer":   ["src/B_beam/E555_finalizer.c",  "src/B_beam/E555_database.c"],
     "E555_roundhouse":  ["src/B_beam/E555_roundhouse.c", "src/B_beam/E555_database.c"],
     "E555_backtracker": ["src/C_tail/E555_backtracker.c"],
+    # An experiment rather than a pipeline stage, but it has a parser and a
+    # print_cmd like the rest, so it is held to the same rule.
+    "E555_beamer_FixedFrame": ["tests/E555_beamer_FixedFrame.c",
+                               "src/B_beam/E555_database.c"],
 }
 
 SCRIPT_DIRS = ["examples", "pipeline", "tests"]

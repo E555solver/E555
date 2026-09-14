@@ -36,12 +36,17 @@ LDLIBS = -lm
 B := src/B_beam
 C := src/C_tail
 
-.PHONY: all beamer finalizer roundhouse backtracker clean FORCE
+.PHONY: all beamer finalizer roundhouse backtracker beamer_fixedframe clean FORCE
 all: beamer finalizer roundhouse backtracker
 beamer:      bin/E555_beamer
 finalizer:   bin/E555_finalizer
 roundhouse:  bin/E555_roundhouse
 backtracker: bin/E555_backtracker
+
+# An EXPERIMENT, deliberately outside `all`: tests/E555_beamer_FixedFrame.c pins
+# one clue orientation and one corner assignment so partials from separate runs
+# share a coordinate system. See tests/run_fixedframe_farm.sh.
+beamer_fixedframe: bin/E555_beamer_FixedFrame
 
 bin:
 	mkdir -p bin
@@ -63,6 +68,11 @@ bin/E555_roundhouse: $(B)/E555_roundhouse.c $(B)/E555_database.c $(B)/E555_datab
 
 bin/E555_backtracker: $(C)/E555_backtracker.c $(STAMP) | bin
 	$(CC) $(CFLAGS) $(C)/E555_backtracker.c -o $@ $(LDLIBS)
+
+# -I$(B) so the copy in tests/ finds E555_beamer.h where it lives, rather than
+# carrying a ../../ include path that breaks if the file is ever moved.
+bin/E555_beamer_FixedFrame: tests/E555_beamer_FixedFrame.c $(B)/E555_database.c $(B)/E555_database.h $(B)/E555_beamer.h $(STAMP) | bin
+	$(CC) $(CFLAGS) -I$(B) $(B)/E555_database.c tests/E555_beamer_FixedFrame.c -o $@ $(LDLIBS)
 
 clean:
 	rm -rf bin
