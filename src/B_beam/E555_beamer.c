@@ -846,6 +846,10 @@ static inline double color_term(const BeamEntry *t, int row) {
 /* -- Clue plumbing ---------------------------------------------------------- */
 
 static bool g_clue_debug  = false;   /* E555_CLUE_DEBUG=1 */
+/* --pin_clue N: 0 = off (hedge over all four frames, the default), 1..4 = pin
+   the frame whose center clue sits in that quadrant. Kept as the raw N rather
+   than the resolved orientation so --print_cmd can echo back what was typed. */
+static int  g_pin_clue    = 0;
 static uint64_t g_dbg_nA[EDGE_LEN+2], g_dbg_nB[EDGE_LEN+2], g_dbg_nC[EDGE_LEN+2], g_dbg_calls[EDGE_LEN+2];
 static int  g_clue_first[4];         /* lowest row that owes a pin, per orientation */
 static int  g_clue_last_assign = -1; /* last row at which a board may still commit */
@@ -2301,6 +2305,23 @@ static void usage(const char *a0) {
 "  --clue_corners         force the two published corner clues the beam can reach,\n"
 "                         both on row 2; the row-13 pair is only reserved, never pinned,\n"
 "                         and constrains no searched row. Clue pieces leave the database\n"
+"  --pin_clue N           search ONE of the four clue frames instead of hedging over all\n"
+"                         four. The five clues are one rigid body, so naming where the\n"
+"                         CENTRE clue sits names the whole set. Rows are 0-indexed\n"
+"                         bottom-up, and N runs anticlockwise from the lower left:\n"
+"                           0  not pinned -- all four frames at once (default)\n"
+"                           1  centre clue lower-left   (7,7)\n"
+"                           2  centre clue lower-right  (7,8)\n"
+"                           3  centre clue upper-right  (8,8)\n"
+"                           4  centre clue upper-left   (8,7)\n"
+"                         This is a simplification, not extra constraint machinery:\n"
+"                         unpinned, every clue row expands each parent once per frame\n"
+"                         and the beam carries boards from four frames at once. Pinned,\n"
+"                         it expands once and the beam is one frame throughout.\n"
+"                         Implies --clue_center and NOTHING else -- add --clue_corners\n"
+"                         yourself if you want it, since it costs four more pieces out\n"
+"                         of the chain database. Pinning alone does not, so a pinned run\n"
+"                         reuses an unpinned run's --db_file cache\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by\n"
 "                         score, FLAT across rows. Both bands are drawn from the\n"
 "                         same deduplicated pool and sum to the row width, so a\n"
@@ -2406,6 +2427,9 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (resume)           printf(" --resume");
     if (g_verbose)        printf(" --verbose");
     if (g_print_cmd)      printf(" --print_cmd");
+    if (g_pin_clue)                 printf(" --pin_clue %d", g_pin_clue);
+    /* --pin_clue turns CLUE_CENTER on itself, so printing both is not a
+       contradiction -- the line stays correct if the implication ever changes. */
     if (g_clue_mask & CLUE_CENTER)  printf(" --clue_center");
     if (g_clue_mask & CLUE_CORNERS) printf(" --clue_corners");
     if (!g_free_demand)   printf(" --no_free_demand");
@@ -2582,6 +2606,7 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--no_free_demand"))            g_free_demand = false;
         else if (!strcmp(argv[i], "--clue_center"))               g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(argv[i], "--clue_corners"))              g_clue_mask |= CLUE_CORNERS;
+        else if (!strcmp(argv[i], "--pin_clue")    && i+1 < argc) g_pin_clue = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bc_window")   && i+1 < argc) {
             unsigned nb = 0, nc = 0;
             /* Bounded above as well: b_left is B_TRY + nB - 1 as an int, so an
@@ -2669,6 +2694,28 @@ int main(int argc, char *argv[]) {
         g_num_rows = (rot_lines > g_start_row) ? rot_lines - g_start_row : 0;
     }
 
+    /* --pin_clue: narrow the search to ONE of the four clue frames.
+     *
+     * g_clue_orients has always been read by the search -- the reserve loop in
+     * beam_init_border, init_clue_tables, clue_dump_schedule, expand_clue_row,
+     * expand_row and clue_row_pinned all gate on it -- but nothing ever assigned
+     * it, so every clued run hedged over all four. Pinning is therefore a
+     * SIMPLIFICATION and not a new mechanism: expand_clue_row stops expanding
+     * each parent once per enabled orientation, and the beam stops holding
+     * boards from four different frames for the dedup hash to keep apart.
+     *
+     * It turns on the CENTER clue and nothing else. Whether to also demand the
+     * corner clues is a separate question with a separate price -- g_db_exclude
+     * is gated per clue, so --clue_corners takes four more pieces out of the
+     * chain database -- so that stays an explicit flag.
+     *
+     * Resolved here for the same reason --num_rows is, just above: the banner
+     * and --print_cmd must report the frame the run will really use. */
+    if (g_pin_clue) {
+        g_clue_mask   |= CLUE_CENTER;
+        g_clue_orients = (uint8_t)(1u << clue_orient_for_pin(g_pin_clue));
+    }
+
     printf("\n=== E555 beamer ===\n\n");
     if (g_print_cmd) print_cmd(argv[0], seed_path, csv_path, resume);
     printf("[cfg] seed_file=%s rotations_file=%s out_dir=%s\n",
@@ -2689,8 +2736,21 @@ int main(int argc, char *argv[]) {
     printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u\n",
            g_frac_rand, g_parent_cap, g_pool_factor);
     if (g_clue_mask) {
-        printf("[cfg] clue_center=%d clue_corners=%d (all 4 orientations) pinned_rows=",
+        /* Which frame, not just which clues. This used to read "(all 4
+           orientations)" unconditionally, which --pin_clue would have turned
+           into a lie -- and a run in the wrong frame looks exactly like a run
+           in the right one, so the banner is the only place it shows. */
+        printf("[cfg] clue_center=%d clue_corners=%d ",
                (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0);
+        if (g_pin_clue) {
+            int o = clue_orient_for_pin(g_pin_clue);
+            printf("(pin_clue %d: centre clue at %s, row %u col %u; orientation %d of 4) ",
+                   g_pin_clue, clue_pin_quadrant_name(g_pin_clue),
+                   g_clue[o][0].row, g_clue[o][0].col, o);
+        } else {
+            printf("(all 4 orientations) ");
+        }
+        printf("pinned_rows=");
         /* Which rows the clues actually constrain, printed because it is not
            the rows they sit on: a clue pins the row BELOW it too, to the colour
            it will stand on. --clue_corners names cells on row 2 and bites at

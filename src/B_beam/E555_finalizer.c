@@ -274,6 +274,10 @@ static uint16_t g_clue_ci[4][CLUE_N];
 static bool     g_clue_debug = false;   /* E555_CLUE_DEBUG=1 */
 static int      g_fin_orient = -1;
 static uint8_t  g_clue_orient_req = 0xF;  /* --clue_orient: allowed orientations */
+/* --pin_clue N: the quadrant form of the same choice -- 0 = off, 1..4 name the
+   quadrant the CENTRE clue sits in. Kept as the raw N so --print_cmd can echo
+   back what was typed rather than the orientation it resolved to. */
+static int      g_pin_clue = 0;
 static int      g_fin_orient_cand[4];     /* candidates for the current line */
 static int      g_fin_orient_n = 0;       /* 0 = clues off -> one pass at -1 */
 
@@ -2270,8 +2274,21 @@ static int fin_load_partial(const char *path, uint32_t want, char id_out[64]) {
     if (g_clue_mask) {
         if (orient >= 0) {
             if (!(g_clue_orient_req & (1u << orient))) {
-                printf("[skip] line %u: carries clue orientation %d, which "
-                       "--clue_orient excludes\n", want, orient);
+                /* The board has already committed to a frame; nothing above can
+                   move it, so this is a rejection and not a re-orientation. Say
+                   which frame it has and which was asked for, in the words of
+                   the flag actually given -- citing --clue_orient at someone who
+                   typed --pin_clue sends them looking for the wrong thing. */
+                if (g_pin_clue)
+                    printf("[skip] line %u: carries clue orientation %d (centre clue "
+                           "at %s, row %u col %u); --pin_clue %d asks for %s\n",
+                           want, orient,
+                           clue_pin_quadrant_name(clue_pin_for_orient(orient)),
+                           g_clue[orient][0].row, g_clue[orient][0].col,
+                           g_pin_clue, clue_pin_quadrant_name(g_pin_clue));
+                else
+                    printf("[skip] line %u: carries clue orientation %d, which "
+                           "--clue_orient excludes\n", want, orient);
                 return 0;
             }
             if (!fin_clue_viable(orient, pos, want, true)) return 0;
@@ -2282,8 +2299,13 @@ static int fin_load_partial(const char *path, uint32_t want, char id_out[64]) {
                     fin_clue_viable(o, pos, want, false))
                     g_fin_orient_cand[g_fin_orient_n++] = o;
             if (g_fin_orient_n == 0) {
-                printf("[skip] line %u: carries no clue piece, and no orientation "
-                       "--clue_orient allows survives the locked region:\n", want);
+                if (g_pin_clue)
+                    printf("[skip] line %u: carries no clue piece, and its locked "
+                           "region cannot host the centre clue at %s (--pin_clue %d):\n",
+                           want, clue_pin_quadrant_name(g_pin_clue), g_pin_clue);
+                else
+                    printf("[skip] line %u: carries no clue piece, and no orientation "
+                           "--clue_orient allows survives the locked region:\n", want);
                 for (int o = 0; o < 4; o++)
                     if (g_clue_orient_req & (1u << o))
                         (void)fin_clue_viable(o, pos, want, true);
@@ -2994,6 +3016,31 @@ static void usage(const char *a0) {
 "                         pinned re-run does not reproduce the columns the auto run\n"
 "                         gave that orientation. A board that DOES carry a clue is\n"
 "                         never re-oriented\n"
+"  --pin_clue N           the same choice, named by where the CENTRE clue sits rather\n"
+"                         than by an orientation index. The five clues are one rigid\n"
+"                         body, so naming the centre names the whole set. Rows are\n"
+"                         0-indexed bottom-up; N runs anticlockwise from the lower left:\n"
+"                           0  not pinned -- all four frames (default)\n"
+"                           1  centre clue lower-left   (7,7)\n"
+"                           2  centre clue lower-right  (7,8)\n"
+"                           3  centre clue upper-right  (8,8)\n"
+"                           4  centre clue upper-left   (8,7)\n"
+"                         Mutually exclusive with --clue_orient: both narrow the same\n"
+"                         set. Implies --clue_center and NOTHING else -- add\n"
+"                         --clue_corners yourself if you want it.\n"
+"                         WHAT IT MEANS HERE differs from the beamer, which builds\n"
+"                         boards and so can force a frame. This program is handed\n"
+"                         boards that already exist, so the pin forces only what is\n"
+"                         still to be searched:\n"
+"                           locked region carries a clue piece (the corner clues, or a\n"
+"                             centre the lock covers) -- the board has committed, its\n"
+"                             orientation is READ off, and a board from another frame\n"
+"                             is skipped with a message naming both quadrants\n"
+"                           carries no clue, lock below the centre-clue row -- the\n"
+"                             centre clue is still to be placed, so it is FORCED into\n"
+"                             the pinned cell, exactly as in the beamer\n"
+"                           carries no clue, lock already covers the centre row -- a\n"
+"                             lock that contradicts the pinned frame is skipped\n"
 "  --incomplete_top       also emit boards that reach --stop_row with only TWO of its\n"
 "                         three 5-piece segments -- 11 of the row's 16 pieces -- to a\n"
 "                         separate <...>_<stop_row>_partial.csv. All three shapes are\n"
@@ -3107,7 +3154,12 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (!g_free_demand)   printf(" --no_free_demand");
     if (g_clue_mask & CLUE_CENTER)  printf(" --clue_center");
     if (g_clue_mask & CLUE_CORNERS) printf(" --clue_corners");
-    if (g_clue_orient_req != 0xF) {          /* 0xF is 'auto', the default */
+    /* One flag or the other, never both: --pin_clue sets g_clue_orient_req, so
+       printing both would emit a line that the "give one or the other" check
+       rejects when it is copied back and re-run. */
+    if (g_pin_clue) {
+        printf(" --pin_clue %d", g_pin_clue);
+    } else if (g_clue_orient_req != 0xF) {   /* 0xF is 'auto', the default */
         char oz[16]; size_t on = 0;
         for (int o = 0; o < 4; o++)
             if (g_clue_orient_req & (1u << o))
@@ -3147,6 +3199,7 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--clue_center"))               g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(argv[i], "--clue_corners"))              g_clue_mask |= CLUE_CORNERS;
         else if (!strcmp(argv[i], "--clue_orient")  && i+1 < argc) g_clue_orient_req = parse_clue_orient(argv[++i]);
+        else if (!strcmp(argv[i], "--pin_clue")     && i+1 < argc) g_pin_clue = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--incomplete_top"))            g_incomplete_top = true;
         else if (!strcmp(argv[i], "--beam_width")  && i+1 < argc) g_beam_width = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--stop_row")    && i+1 < argc) g_stop_row = (uint32_t)atoi(argv[++i]);
@@ -3210,6 +3263,34 @@ int main(int argc, char *argv[]) {
                    ? csv_lines - g_start_row : 0;
     }
 
+    /* --pin_clue: the quadrant form of --clue_orient, and the same thing
+     * underneath -- it narrows g_clue_orient_req to one bit.
+     *
+     * What it MEANS here is not what it means in the beamer, and the difference
+     * is worth knowing. The beamer builds boards, so a pin FORCES the frame. The
+     * finalizer is handed boards that already exist, so the pin can only force
+     * the part still to be searched:
+     *
+     *   locked region already carries a clue piece -- corner clues, or a centre
+     *     clue the lock covers -- the board has committed and its orientation is
+     *     READ OFF. The pin can only reject a board from another frame.
+     *   carries no clue and the lock sits below the centre-clue row -- the
+     *     centre clue is still to be placed, so the pin forces it, as in the
+     *     beamer.
+     *   carries no clue but the lock already covers the centre row -- a lock
+     *     that contradicts the pinned frame is rejected.
+     *
+     * All three already exist in fin_load_partial; this only supplies the single
+     * bit that drives them. Resolved before the banner for the same reason
+     * --num_rows is, just above. */
+    if (g_pin_clue) {
+        if (g_clue_orient_req != 0xF)
+            fatal("--pin_clue and --clue_orient both choose which clue frames to "
+                  "search; give one or the other, not both");
+        g_clue_mask      |= CLUE_CENTER;      /* NOT CLUE_CORNERS: ask for those yourself */
+        g_clue_orient_req = (uint8_t)(1u << clue_orient_for_pin(g_pin_clue));
+    }
+
     printf("\n=== E555 finalizer ===\n\n");
     if (g_print_cmd) print_cmd(argv[0], seed_path, csv_path, rot_path);
     printf("[cfg] seed_file=%s partials_file=%s out_dir=%s\n",
@@ -3234,6 +3315,13 @@ int main(int argc, char *argv[]) {
         printf("[cfg] clue_center=%d clue_corners=%d clue_orient=%s (read off a clued "
                "board, chosen from these when it carries none)\n",
                (g_clue_mask & CLUE_CENTER) ? 1 : 0, (g_clue_mask & CLUE_CORNERS) ? 1 : 0, oz);
+        if (g_pin_clue) {
+            int o = clue_orient_for_pin(g_pin_clue);
+            printf("[cfg] pin_clue=%d: centre clue at %s, row %u col %u -- a board "
+                   "already carrying another frame's clue is skipped, not re-oriented\n",
+                   g_pin_clue, clue_pin_quadrant_name(g_pin_clue),
+                   g_clue[o][0].row, g_clue[o][0].col);
+        }
     }
     if (g_clue_orient_req != 0xF && !g_clue_mask)
         fatal("--clue_orient needs --clue_center or --clue_corners: with clues off "

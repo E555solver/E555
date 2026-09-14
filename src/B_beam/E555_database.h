@@ -320,6 +320,15 @@ extern const ClueCell g_clue[4][CLUE_N];
 extern uint32_t g_clue_mask;
 extern uint8_t  g_clue_orients;
 
+/* --pin_clue N: name the clue frame by the quadrant its CENTER clue sits in,
+   rather than by an orientation index nobody can read off a board. N = 0 means
+   unpinned and returns -1; 1..4 run anticlockwise from the lower left and
+   return the matching index into g_clue. The full table, and why N-1 is NOT
+   that index, is beside g_clue in E555_database.c. */
+int         clue_orient_for_pin(int n);
+int         clue_pin_for_orient(int o);   /* the inverse; 0 if o is not 0..3 */
+const char *clue_pin_quadrant_name(int n);
+
 extern int g_top_border_inner_count[NUM_COLORS_TOTAL];
 extern int g_inner_color_total[NUM_COLORS_TOTAL];
 
