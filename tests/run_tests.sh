@@ -75,6 +75,7 @@ ALL_STEPS=(
     "rotate|a quarter-turn preserves every measure, four turns are the identity"
     "sink|--sink drops N rows, frees the frame it broke, and keeps the core intact"
     "distiller|per-board windows differ, masks cover every break, --plan runs"
+    "consensus|four turns of one board score identically, and --border_out runs"
     "annealer|Stage A short run: BEST lines and a beamer-format --out CSV"
     "finalizer_synth|REGRESSION: rediscovers the synthetic solution from row 10"
     "finalizer_rotations|re-imposes a matching rotations row's side assignment"
@@ -500,6 +501,125 @@ EOF
 
 # --verbose: the BEST lines grepped below are verbose-only, the default being
 # one summary line per restart.
+# The consensus ranker pools boards across the four clue frames, so the error
+# that matters is a wrong canonicalisation: it would leave every number
+# plausible and every ranking meaningless. The test is an identity. One board
+# and its three quarter-turns are the SAME board once canonicalised, so they
+# have to score bit for bit alike -- and the band --best_top picks has to be
+# the band rotate_cell actually sends the top rows to, checked against the map
+# rather than against the tool's own table.
+step_consensus() {
+    python3 - data/best_463.csv "$OUT/cons_clued.csv" <<'EOF' || exit 1
+import sys, csv
+sys.path.insert(0, "tools")
+import E555_viewer as V
+# data/ ships no clued board, and this tool reads nothing else. Piece 138 and
+# cell (7,7) are both interior, so planting the centre clue by swapping leaves
+# every frame piece where it was and the board frame-legal.
+w = csv.writer(open(sys.argv[2], "w", newline=""), lineterminator="\n")
+n = 0
+for raw in csv.reader(open(sys.argv[1], newline="")):
+    rec = V.parse_row(raw)
+    if rec is None:
+        continue
+    cid, sol, pos, rot = rec
+    cell, piece, spin = 7 * 16 + 7, 138, 0
+    other = next((p for p, c in enumerate(pos) if c == cell), None)
+    if other is not None and other != piece:
+        pos[other], pos[piece] = pos[piece], cell
+        rot[other], rot[piece] = rot[piece], spin
+    # Two rows of best_463.csv share a config_id, and the identity below
+    # groups the four turns of one board by id -- so number them here.
+    w.writerow([f"{cid}_c{n}", sol] + pos + rot)
+    n += 1
+assert n == 7, n
+EOF
+    : > "$OUT/cons_corpus.csv"
+    for k in 0 1 2 3; do
+        python3 tools/E555_rotate.py "$OUT/cons_clued.csv" $k \
+            --out "$OUT/cons_rot$k.csv" > /dev/null
+        cat "$OUT/cons_rot$k.csv" >> "$OUT/cons_corpus.csv"
+    done
+    n=$(python3 tools/E555_extract_consensus.py "$OUT/cons_corpus.csv" --count)
+    [ "$n" = "28" ] || fail "--count saw $n clued boards, want 28"
+
+    python3 tools/E555_extract_consensus.py "$OUT/cons_corpus.csv" \
+        --seed_file data/seed_Edge5.txt --csv --quiet > "$OUT/cons_rank.csv"
+    python3 - "$OUT/cons_rank.csv" <<'EOF' || exit 1
+import sys, csv, collections
+rows = list(csv.DictReader(open(sys.argv[1])))
+assert len(rows) == 28, len(rows)
+# The identity: a board and its three turns canonicalise to one board, so the
+# four have to agree on every measure. Grouped by the id the turns share.
+by = collections.defaultdict(list)
+for r in rows:
+    by[r["id"]].append(r)
+assert len(by) == 7, sorted(by)
+for cid, group in by.items():
+    assert len(group) == 4, (cid, len(group))
+    assert sorted(int(r["orient"]) for r in group) == [0, 1, 2, 3], cid
+    for k in ("lift", "logp", "rank", "top1", "cells"):
+        vals = {r[k] for r in group}
+        assert len(vals) == 1, f"{cid}: {k} differs across turns: {vals}"
+print("ok: each board and its three quarter-turns score identically")
+EOF
+
+    # --out is verbatim, in the input's own un-rotated frame: the same bytes back.
+    python3 tools/E555_extract_consensus.py "$OUT/cons_corpus.csv" --quiet \
+        --out "$OUT/cons_emit.csv"
+    cmp -s <(sort "$OUT/cons_corpus.csv") <(sort "$OUT/cons_emit.csv") \
+        || fail "--out did not reproduce the input rows verbatim"
+
+    # The band --best_top scores against must be the band the rotation map
+    # really sends the top rows to, for each of the four clue frames.
+    python3 tools/E555_extract_consensus.py "$OUT/cons_corpus.csv" \
+        --best_top --csv --quiet > "$OUT/cons_top.csv"
+    python3 - "$OUT/cons_top.csv" <<'EOF' || exit 1
+import sys, csv
+sys.path.insert(0, "tools")
+import E555_rotate as RT
+NAMES = ("TOP", "RIGHT", "BOTTOM", "LEFT")
+def band_of(k):
+    """Where rows 11..15 land after k quarter-turns clockwise, from the map."""
+    dst = {divmod(RT.rotate_cell(r * 16 + c, k), 16)
+           for r in range(11, 16) for c in range(16)}
+    rows, cols = {a for a, _ in dst}, {b for _, b in dst}
+    if len(rows) == 5:
+        return "TOP" if min(rows) == 11 else "BOTTOM"
+    return "RIGHT" if min(cols) == 11 else "LEFT"
+for r in csv.DictReader(open(sys.argv[1])):
+    o = int(r["orient"])
+    want = band_of((4 - o) % 4)          # the turn that canonicalises it
+    assert r["band"] == want, (o, r["band"], want)
+print("ok: --best_top scores each clue frame against the band the map gives it")
+EOF
+
+    # --border_out must produce a row the rest of the toolkit accepts as a
+    # border: the 14/14/14/14-plus-four-corners partition E555_database.c's
+    # classify_deal_from_rotations demands. Two seconds of search is enough to
+    # reach a legal partition; the trail floor is not the point here.
+    python3 tools/E555_extract_consensus.py "$OUT/cons_corpus.csv" \
+        --border_out "$OUT/cons_border.csv" --border_time 2 --min_trails 1 \
+        --quiet > "$OUT/cons_border.log" 2>&1
+    rows=$(grep -c '^c0,' "$OUT/cons_border.csv")
+    [ "$rows" = "1" ] || fail "--border_out wrote $rows border rows, want 1"
+    python3 tools/E555_rotate.py --rotations "$OUT/cons_border.csv" 0 \
+        --out "$OUT/cons_border_rot.csv" > "$OUT/cons_border_rot.log"
+    grep -q "1 border row(s) turned" "$OUT/cons_border_rot.log" \
+        || { cat "$OUT/cons_border_rot.log"; fail "the emitted border is not a legal 14/14/14/14 partition"; }
+    echo "ok: --border_out wrote a border the rotations reader accepts"
+
+    # A corpus with no centre clue is refused, loudly and nonzero: the whole
+    # tool rests on being able to read a board's clue frame.
+    if python3 tools/E555_extract_consensus.py data/best_463.csv \
+            > "$OUT/cons_unclued.log" 2>&1; then
+        fail "an unclued corpus was accepted"
+    fi
+    grep -q "no board in the input carries the centre clue" "$OUT/cons_unclued.log" \
+        || fail "the unclued corpus failed for the wrong reason"
+    echo "ok: an unclued corpus is refused"
+}
+
 step_annealer() {
     python3 -u src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
         --restarts 2 --steps 3000 --rng_seed 42 --verbose \
