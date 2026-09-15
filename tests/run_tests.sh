@@ -594,20 +594,128 @@ for r in csv.DictReader(open(sys.argv[1])):
 print("ok: --best_top scores each clue frame against the band the map gives it")
 EOF
 
-    # --border_out must produce a row the rest of the toolkit accepts as a
-    # border: the 14/14/14/14-plus-four-corners partition E555_database.c's
-    # classify_deal_from_rotations demands. Two seconds of search is enough to
-    # reach a legal partition; the trail floor is not the point here.
+    # --border_out must produce rows the rest of the toolkit accepts as borders:
+    # the 14/14/14/14-plus-four-corners partition E555_database.c's
+    # classify_deal_from_rotations demands. --BL/--BR/--TR/--TL pin all four
+    # corners, which leaves exactly ONE corner class and so exactly one row.
+    # Two seconds of search reaches a legal partition; the trail floor is not
+    # the point here.
     python3 tools/E555_extract_consensus.py "$OUT/cons_corpus.csv" \
         --border_out "$OUT/cons_border.csv" --border_time 2 --min_trails 1 \
+        --BL 1 --BR 2 --TR 0 --TL 3 --min_corner_boards 1 \
         --quiet > "$OUT/cons_border.log" 2>&1
     rows=$(grep -c '^c0,' "$OUT/cons_border.csv")
-    [ "$rows" = "1" ] || fail "--border_out wrote $rows border rows, want 1"
+    [ "$rows" = "1" ] || fail "--border_out with all four corners pinned wrote $rows rows, want 1"
     python3 tools/E555_rotate.py --rotations "$OUT/cons_border.csv" 0 \
         --out "$OUT/cons_border_rot.csv" > "$OUT/cons_border_rot.log"
     grep -q "1 border row(s) turned" "$OUT/cons_border_rot.log" \
         || { cat "$OUT/cons_border_rot.log"; fail "the emitted border is not a legal 14/14/14/14 partition"; }
     echo "ok: --border_out wrote a border the rotations reader accepts"
+
+    # THE FAIRNESS TEST. Scoring each board on its own placed cells ranks a
+    # pool largely BY STOP ROW: the higher rows carry less consensus, so every
+    # extra placed cell drags a board's mean down. Measured on this exact
+    # fixture, all seven row-10 copies outranked all seven row-11 copies of the
+    # SAME boards. --cells common must make the twins identical -- and --cells
+    # placed must still separate them, or the flag has quietly stopped working
+    # and a one-sided test would not notice.
+    python3 - "$OUT/cons_clued.csv" "$OUT/cons_twins.csv" <<'EOF' || exit 1
+import sys, csv
+sys.path.insert(0, "tools")
+import E555_viewer as V
+w = csv.writer(open(sys.argv[2], "w", newline=""), lineterminator="\n")
+n = 0
+for idx, cid, sol, pos, rot in V.iter_records(sys.argv[1]):
+    for stop in (10, 11):
+        p = [c if c != 999 and c // 16 <= stop else 999 for c in pos]
+        r = [rot[i] if p[i] != 999 else 0 for i in range(256)]
+        w.writerow([f"b{n // 2}@{stop}", sol] + p + r)
+        n += 1
+assert n == 14, n
+EOF
+    for mode in common placed; do
+        python3 tools/E555_extract_consensus.py "$OUT/cons_twins.csv" \
+            --cells $mode --csv --quiet > "$OUT/cons_twins_$mode.csv"
+    done
+    python3 - "$OUT/cons_twins_common.csv" "$OUT/cons_twins_placed.csv" <<'EOF' || exit 1
+import sys, csv, collections
+def twins(path):
+    by = collections.defaultdict(dict)
+    for r in csv.DictReader(open(path)):
+        name, stop = r["id"].split("@")
+        by[name][stop] = r
+    assert len(by) == 7, sorted(by)
+    return by
+common, placed = twins(sys.argv[1]), twins(sys.argv[2])
+for name, pair in common.items():
+    assert pair["10"]["lift"] == pair["11"]["lift"], \
+        f"--cells common: {name} scored {pair['10']['lift']} at row 10 and " \
+        f"{pair['11']['lift']} at row 11; the stop row still reaches the score"
+    assert pair["10"]["cells"] == pair["11"]["cells"], name
+assert any(p["10"]["lift"] != p["11"]["lift"] for p in placed.values()), \
+    "--cells placed no longer separates the stop rows, so the common-cell " \
+    "test above is proving nothing"
+print("ok: --cells common makes a board's stop row invisible to the score, "
+      "and --cells placed still does not")
+EOF
+
+    # --border_out emits one row per corner class, and each row has to SEAT the
+    # corners its own comment claims. Get that mapping wrong -- CLI order BL BR
+    # TR TL against the annealer's TL TR BR BL -- and every number downstream
+    # still looks healthy while the border is wrong.
+    python3 tools/E555_extract_consensus.py "$OUT/cons_corpus.csv" \
+        --border_out "$OUT/cons_classes.csv" --min_corner_boards 4 \
+        --border_time 6 --min_trails 1 --quiet > "$OUT/cons_classes.log" 2>&1
+    python3 tools/E555_rotate.py --rotations "$OUT/cons_classes.csv" 0 \
+        --out "$OUT/cons_classes_rot.csv" > "$OUT/cons_classes_rot.log"
+    grep -q "border row(s) turned" "$OUT/cons_classes_rot.log" \
+        || { cat "$OUT/cons_classes_rot.log"; fail "an emitted class row is not a legal partition"; }
+    python3 - "$OUT/cons_classes.csv" <<'EOF' || exit 1
+import sys, re
+sys.path.insert(0, "tools")
+import E555_viewer as V
+seed = V.load_seed("data/seed_Edge5.txt")
+N, E, S, W = 0, 1, 2, 3
+WHERE = {frozenset((S, W)): "BL", frozenset((S, E)): "BR",
+         frozenset((N, E)): "TR", frozenset((N, W)): "TL"}
+claims, rows = [], []
+for line in open(sys.argv[1]):
+    if line.startswith("#"):
+        m = re.match(r"#  (BL=\d+ BR=\d+ TR=\d+ TL=\d+)", line)
+        if m:
+            claims.append({k: int(v) for k, v in
+                           (kv.split("=") for kv in m.group(1).split())})
+    elif line.strip():
+        rows.append([int(x) for x in line.split(",")[1:]])
+assert rows and len(rows) == len(claims), (len(rows), len(claims))
+for i, (claim, spins) in enumerate(zip(claims, rows)):
+    seat = {}
+    for pid, e in enumerate(seed):
+        shown = V.rotate_edges(e, spins[pid])
+        grey = frozenset(d for d in range(4) if shown[d] == 0)
+        if len(grey) == 2:
+            seat[WHERE[grey]] = pid
+    assert seat == claim, f"row {i}: claimed {claim}, seated {seat}"
+print(f"ok: {len(rows)} corner-class row(s), each seating the corners it claims")
+EOF
+
+    # No class can clear the default bar on a 28-board fixture, and that must be
+    # a refusal with the largest count named -- not a border built from noise.
+    if python3 tools/E555_extract_consensus.py "$OUT/cons_corpus.csv" \
+            --border_out "$OUT/cons_noise.csv" > "$OUT/cons_noise.log" 2>&1; then
+        fail "--border_out emitted a border with no class clearing --min_corner_boards"
+    fi
+    grep -q "no corner class has the --min_corner_boards" "$OUT/cons_noise.log" \
+        || { tail -3 "$OUT/cons_noise.log"; fail "the min_corner_boards refusal did not fire"; }
+
+    # The corner filter selects in the canonical frame, and an unplaced corner
+    # cannot contradict it.
+    python3 tools/E555_extract_consensus.py "$OUT/cons_corpus.csv" --BL 1 --BR 2 \
+        --csv --quiet > "$OUT/cons_bl.csv"
+    kept=$(($(wc -l < "$OUT/cons_bl.csv") - 1))
+    [ "$kept" -gt 0 ] && [ "$kept" -lt 28 ] \
+        || fail "--BL/--BR kept $kept of 28 boards, expected a proper subset"
+    echo "ok: corner classes, the seating check, and the corner filter"
 
     # A corpus with no centre clue is refused, loudly and nonzero: the whole
     # tool rests on being able to read a board's clue frame.
