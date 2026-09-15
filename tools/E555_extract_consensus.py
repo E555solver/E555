@@ -74,11 +74,37 @@ SCORING A BOARD  (--metric, default `lift`)
     --no_loo turns the correction off; --consensus_in makes it unnecessary,
     since the table then comes from boards that are not being scored.
 
-    Two guards keep the mean honest. --min_support drops cells too thin to
-    mean anything (default 2 boards), and the `cells` column is always
-    printed: a board scored on 140 cells and one scored on 250 are not making
-    the same claim. --box restricts scoring to a rectangle, in CANONICAL
-    coordinates.
+WHICH CELLS SCORE  (--cells, default `common`)
+
+    A mean over a board's own placed cells looks fair and is not. Cells differ
+    in how much consensus they carry, the higher rows of a Stage B pool carry
+    less of it, and so every extra placed cell drags a board's mean DOWN.
+    Measured, on one pool holding the same seven boards cut at rows 10 and 11:
+
+        positions of the row-10 boards: [1, 2, 3, 4, 5, 6, 7]
+        positions of the row-11 boards: [8, 9, 10, 11, 12, 13, 14]
+        mean lift   stop 10 +1.4019    stop 11 +1.2782
+
+    A clean separation, on the SAME seven boards. The 0.124-bit gap between
+    stop rows is larger than the 0.073-bit spread within either group, so a
+    ranking like that is reporting the stop row and nothing else.
+
+    `--cells common`, the default, scores only the cells the whole corpus
+    placed. Every board is then compared on identical ground, the twins above
+    score bit for bit alike, and a board with more placed pieces is neither
+    rewarded nor punished for it. `--common_frac` relaxes "the whole corpus" to
+    a fraction of it; 1.0, the default, is the only exactly fair setting.
+
+    `--cells placed` restores the per-board set, which is right when the pool is
+    already uniform and wrong the moment it is not.
+
+    The shared ground can be small, and then the run says so. Two things shrink
+    it: boards stopped at very different rows, and boards in DIFFERENT CLUE
+    FRAMES, whose canonical regions overlap only near the centre -- four frames
+    of row-10 partials share 36 cells of 256. Ranking within one frame or one
+    stop row restores it. Two further guards: --min_support drops cells too thin
+    to mean anything (default 2 boards), and the `cells` column is always
+    printed. --box restricts scoring to a rectangle, in CANONICAL coordinates.
 
 THE BAG THAT IS LEFT  (--best_top, --best_bottom)
 
@@ -128,6 +154,34 @@ OUTPUT
     original, un-rotated frame with their unplaced rows intact. The canonical
     copy exists only inside the scoring and is never written.
 
+CORNER CLASSES  (--BL --BR --TR --TL, and the report)
+
+    A side of the frame is a directed multigraph whose Euler trails are the
+    orderings Stage B can enumerate, and the two corners bounding that side fix
+    where the trail must start and end. Across the 24 ways of seating the four
+    corner pieces, each side sees EIGHT distinct (start, end) endpoint pairs. So
+    a pool that mixes corner assignments is not merely blurred -- it is an
+    average over problems that do not share their boundary conditions, and a
+    border distilled from it belongs to none of them.
+
+    Every run therefore prints the canonical corner histogram, with the command
+    that would select each pattern, whether or not you asked. --BL/--BR/--TR/
+    --TL then keep only the boards that match, taking the same 0-based
+    corner-piece numbering `bin/E555_beamer --BL` takes.
+
+    They select in the CANONICAL frame -- the corner cell after the board is
+    turned so its centre clue sits at the lower-left quadrant. That is the only
+    frame in which the filter makes the consensus coherent, because
+    border-relative-to-clue is the hypothesis. One consequence worth knowing: a
+    run that pinned corners in the BOARD frame while hedging over clue
+    orientations shows up here as four canonical classes, which is the real
+    information rather than an artefact.
+
+    A board whose corner cell is UNPLACED cannot contradict a constraint and is
+    kept. That is not leniency: a bottom-up partial places row 0 but not row 15,
+    so canonically only two of the four corners are ever filled, and demanding
+    all four would empty the pool. The report counts the two cases separately.
+
 THE BORDER THE CORPUS IMPLIES  (--border_out FILE)
 
     The consensus knows which of the 56 edge pieces the corpus keeps putting
@@ -165,6 +219,19 @@ THE BORDER THE CORPUS IMPLIES  (--border_out FILE)
     border it has, warning loudly if a side is still short of the floor. It
     cannot hang.
 
+    ONE ROW PER CORNER CLASS. Since the corners decide each side's endpoints,
+    there is no single answer to distil unless the corners are pinned -- so the
+    file carries a row for every one of the 24 corner assignments the pool
+    supports (fewer as --BL/--BR/--TR/--TL pin them, one when all four are).
+    Each class gets its OWN consensus table, built from the boards compatible
+    with it; a board typically joins two of them, since it shows only two
+    corners, and both classes are entitled to its evidence. Rows come out
+    most-backed first and each carries its board count, so "this border rests on
+    5,200 boards, that one on 140" is a number you can read off the file.
+    --min_corner_boards (default 100) is the guard against distilling a
+    confident-looking border out of a handful of boards, and --border_time is
+    then the TOTAL budget, split evenly across the classes being searched.
+
     The row is written in the annealer's own format -- a `#` comment carrying
     the four trail counts, then `id, spin[0..255]` -- and is verified with
     E555_rotate.classify_border, the same 14/14/14/14-plus-four-corners test
@@ -181,7 +248,10 @@ USAGE
     python3 tools/E555_extract_consensus.py pool.csv --best_bottom --band_rows 4
     python3 tools/E555_extract_consensus.py big.csv --consensus_out cons.txt --top 1
     python3 tools/E555_extract_consensus.py new.csv --consensus_in cons.txt --top 50
-    python3 tools/E555_extract_consensus.py pool.csv --border_out border.csv --top 1
+    python3 tools/E555_extract_consensus.py pool.csv --cells placed --top 50
+    python3 tools/E555_extract_consensus.py pool.csv --BL 3 --BR 2 --top 50
+    python3 tools/E555_extract_consensus.py pool.csv --border_out border.csv
+    python3 tools/E555_extract_consensus.py pool.csv --border_out b.csv --border_time 900
     python3 tools/E555_extract_consensus.py pool.csv --border_out b3.csv --border_pin 3
 
     Then, on a border it wrote:
@@ -190,6 +260,7 @@ USAGE
 """
 from __future__ import annotations
 import argparse, csv, heapq, itertools, math, random, sys, time
+from collections import namedtuple
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -219,6 +290,55 @@ CELL_K = tuple(KIND_K[k] for k in CELL_KIND)
 
 # The four board corners as cells, in the annealer's Corner order (TL TR BR BL).
 CORNER_CELLS = ((SIDE - 1) * SIDE, N_PIECES - 1, SIDE - 1, 0)
+
+# The same four, in the order --BL --BR --TR --TL names them, which is the order
+# every corner tuple in this file is written in. CORNER_TO_ANNEALER maps one to
+# the other; getting it wrong would put a corner piece in the wrong corner and
+# every downstream number would still look healthy.
+CLI_CORNER_NAMES = ("BL", "BR", "TR", "TL")
+CLI_CORNER_CELLS = (0, SIDE - 1, N_PIECES - 1, (SIDE - 1) * SIDE)
+CORNER_TO_ANNEALER = (3, 2, 1, 0)          # BL->Corner.BL, BR->BR, TR->TR, TL->TL
+CORNER_INDEX = {cell: i for i, cell in enumerate(CLI_CORNER_CELLS)}
+
+
+def corner_obs(canon_pos, corner_pieces):
+    """Which corner piece sits in each canonical corner: (BL, BR, TR, TL).
+
+    `None` where the cell is unplaced, and that is the normal case, not an edge
+    case: a bottom-up partial places row 0 but not row 15, so canonically only
+    TWO of the four corners are ever filled. Measured on a pool of partials,
+    every board showed exactly 2. A board therefore cannot name one of the 24
+    corner assignments -- it is COMPATIBLE with several, which is what
+    corner_compatible() below is for.
+
+    Only the four corner pieces can occupy a corner cell, so this reads four
+    entries of `canon_pos` rather than scanning all 256."""
+    at = [None] * 4
+    for piece in corner_pieces:
+        i = CORNER_INDEX.get(canon_pos[piece])
+        if i is not None:
+            at[i] = piece
+    return tuple(at)
+
+
+def corner_compatible(seen, want):
+    """Does an observed corner tuple contradict a wanted one?
+
+    An unplaced corner contradicts nothing. Requiring equality instead would
+    throw away every partial for lacking a corner it could not have placed."""
+    return all(w is None or s is None or s == w for s, w in zip(seen, want))
+
+
+def corner_flags(want):
+    """A corner tuple as the command line that would select it."""
+    return " ".join(f"--{CLI_CORNER_NAMES[i]} {v}"
+                    for i, v in enumerate(want) if v is not None)
+
+
+def corner_text(seen):
+    """A corner tuple for the histogram: `?` where the cell was unplaced."""
+    return " ".join(f"{CLI_CORNER_NAMES[i]}={'?' if v is None else v}"
+                    for i, v in enumerate(seen))
 
 # Bands, in the annealer's Side order: TOP RIGHT BOTTOM LEFT. One clockwise
 # turn carries each to the next, which is the whole reason the four exist --
@@ -330,6 +450,24 @@ class Consensus:
                            for d in self.count]
         return self._modes
 
+    def common(self, frac):
+        """The cells at least `frac` of the corpus placed.
+
+        This is what makes two boards comparable. Scoring each board on its own
+        placed cells looks fair and is not: cells differ in how much consensus
+        they carry, the higher rows of a Stage B pool carry less of it, and a
+        mean over unequal cells therefore reports the stop row. Measured on one
+        pool holding the same seven boards cut at rows 10 and 11, all seven
+        row-10 copies ranked above all seven row-11 copies -- a 0.124-bit gap
+        against a 0.073-bit spread within either group. Restricted to the cells
+        every board placed, the same comparison gives 0.0000.
+
+        At frac == 1.0 with a consensus built from the boards being scored,
+        every board placed every cell in this set, so all of them are scored on
+        an identical set and the stop row cannot reach the score at all."""
+        need = frac * self.boards
+        return frozenset(c for c in range(N_PIECES) if self.placed[c] >= need)
+
     def ranks(self):
         """cell -> {piece: 0-based position in that cell's frequency order}.
 
@@ -412,6 +550,44 @@ class Consensus:
         return self
 
 
+class ConsensusSet:
+    """One consensus table per corner class -- the whole point of --border_out.
+
+    A side's Euler trails are bounded by the endpoint colours its two corners
+    expose, and the 24 corner assignments give each side 8 distinct (start,
+    end) pairs. So a table pooled across corner assignments is an average over
+    problems that do not share their boundary conditions, and a border distilled
+    from it belongs to none of them.
+
+    A board joins every class it does not contradict, which is usually more than
+    one: a bottom-up partial shows only two of the four canonical corners, so it
+    pins BL and BR and leaves the two top corners free, making it compatible
+    with two of the 24. That is not a defect to be resolved -- the board really
+    does not distinguish them -- and both classes are entitled to its evidence.
+    """
+
+    def __init__(self, classes, band_rows):
+        self.classes = list(classes)
+        self.tables = {c: Consensus(band_rows=band_rows) for c in self.classes}
+        self._memo = {}
+
+    def classes_for(self, corners):
+        """The classes an observed corner tuple is compatible with, memoised:
+        a corpus holds few distinct patterns however many boards it holds."""
+        got = self._memo.get(corners)
+        if got is None:
+            got = tuple(c for c in self.classes if corner_compatible(corners, c))
+            self._memo[corners] = got
+        return got
+
+    def add(self, canon_pos, corners):
+        for c in self.classes_for(corners):
+            self.tables[c].add(canon_pos)
+
+    def counts(self):
+        return {c: self.tables[c].boards for c in self.classes}
+
+
 # =============================================================================
 # Reading boards, and canonicalising them
 # =============================================================================
@@ -435,17 +611,29 @@ def canonicalise(pos, rot):
     return orient, k, [p if p == UNPLACED else RT.rotate_cell(p, k) for p in pos]
 
 
-def iter_boards(paths, stats, progress_every=0):
-    """Yield (path, row, id, line, orient, turn, canon_pos, pos) for every clued row.
+BoardRec = namedtuple("BoardRec",
+                      "path row id line orient turn canon pos corners")
 
-    `pos` is the board's OWN, un-turned placement. --best_top and --best_bottom
-    name their band in that frame, so both have to travel together.
+
+def iter_boards(paths, stats, corner_pieces, want=None, progress_every=0):
+    """Yield a BoardRec for every clued row the corner filter keeps.
+
+    `canon` is the board turned to clue orientation 0; `pos` is its own
+    un-turned placement, which --best_top and --best_bottom need because they
+    name their band in the board's own frame. Both travel together.
 
     `stats` accumulates what was skipped and why, so one report can be printed
     after the pass instead of a line per board. A row that fails to parse as a
     board is passed over exactly as E555_rank.py passes over it; a row that
     parses but carries no centre clue is counted separately, because that is a
-    filter working, not an input problem."""
+    filter working, not an input problem.
+
+    `want` is the --BL/--BR/--TR/--TL constraint, in the CANONICAL frame: the
+    corner cell after the turn, which is the frame the consensus and the border
+    both live in. A board is kept when it does not CONTRADICT the constraint,
+    so a partial that never placed a corner is kept and counted separately --
+    the report says how many were kept because they matched and how many
+    because they could not disagree."""
     for path in paths:
         idx = 0
         with open(path, newline="") as fh:
@@ -470,16 +658,27 @@ def iter_boards(paths, stats, progress_every=0):
                     idx += 1
                     continue
                 orient, turn, canon = c
+                corners = corner_obs(canon, corner_pieces)
+                stats["corners"][corners] = stats["corners"].get(corners, 0) + 1
+                if want is not None:
+                    if not corner_compatible(corners, want):
+                        stats["corner_cut"] += 1
+                        idx += 1
+                        continue
+                    if any(w is not None and s is None
+                           for s, w in zip(corners, want)):
+                        stats["corner_unknown"] += 1
                 stats["orient"][orient] += 1
                 stats["kept"] += 1
                 if progress_every and stats["kept"] % progress_every == 0:
                     print(f"[cons] {stats['kept']} clued boards", file=sys.stderr)
-                yield (path, idx, cid, line, orient, turn, canon, pos)
+                yield BoardRec(path, idx, cid, line, orient, turn, canon, pos, corners)
                 idx += 1
 
 
 def new_stats():
-    return {"seen": 0, "kept": 0, "unclued": 0, "bad": 0, "orient": [0, 0, 0, 0]}
+    return {"seen": 0, "kept": 0, "unclued": 0, "bad": 0, "orient": [0, 0, 0, 0],
+            "corners": {}, "corner_cut": 0, "corner_unknown": 0}
 
 
 # =============================================================================
@@ -488,13 +687,25 @@ def new_stats():
 
 METRICS = ("lift", "logp", "rank", "top1")
 
-def score_cells(cons, canon_pos, alpha, loo, min_support, box=None):
+# Below this many common cells a ranking rests on too little to mean much, and
+# the run says so rather than printing a confident table. 64 is a quarter of the
+# board: a pool of partials in ONE clue frame shares far more than that, so the
+# warning fires on the two cases that really do shrink the shared ground --
+# boards stopped at very different rows, and boards in different clue frames,
+# whose canonical regions overlap only near the centre.
+SMALL_COMMON = 64
+
+def score_cells(cons, canon_pos, alpha, loo, min_support, cells=None):
     """The four per-cell measures of one canonicalised board.
 
     Every measure is a MEAN over the cells actually scored, and `cells` is
     returned with them: a board scored on 140 cells and one scored on 250 are
     not making the same claim, and nothing downstream can tell them apart
     without that number.
+
+    `cells`, when given, is the set of cells allowed to score -- the common set
+    under `--cells common`, intersected with `--box`. Without it every placed
+    cell scores, which is `--cells placed`.
 
     `loo` subtracts the board's own vote before reading the frequency, which
     is the whole of the self-bias a corpus scored against itself carries. It
@@ -509,7 +720,7 @@ def score_cells(cons, canon_pos, alpha, loo, min_support, box=None):
     for piece, cell in enumerate(canon_pos):
         if cell == UNPLACED:
             continue
-        if box is not None and cell not in box:
+        if cells is not None and cell not in cells:
             continue
         placed = cons.placed[cell]
         c = cons.count[cell].get(piece, 0)
@@ -735,38 +946,29 @@ def hungarian(cost):
     return out
 
 
-def assignment_optimum(rew_e, rew_c, edge_ids, corner_ids, A):
-    """The affinity ceiling: the best side assignment ignoring Euler trails.
+def edge_optimum(rew_e, edge_ids, A):
+    """The affinity ceiling for the 56 edges: the best side assignment ignoring
+    Euler trails.
 
-    Exact. 56 edges to four sides of 14 is a transportation problem, solved
-    here by replicating each side 14 times into a square matrix; the four
-    corners are 24 permutations, brute-forced. Neither result is usable on its
-    own -- that is what the search below is for -- but both are printed, so
-    the price feasibility charges is a number and not a feeling."""
+    Exact. 56 edges to four sides of 14 is a transportation problem, solved here
+    by replicating each side 14 times into a square matrix. The result is not
+    usable on its own -- that is what the search below is for -- but it is
+    printed, so the price feasibility charges is a number and not a feeling.
+
+    The corners are NOT optimised here any more: with --border_out emitting one
+    border per corner class, the corner assignment IS the class."""
     cols = [s for s in range(4) for _ in range(SIDE - 2)]
     cost = [[-rew_e[pid - 1][s] for s in cols] for pid in edge_ids]
     pick = hungarian(cost)
     edge_side = {pid: A.Side(cols[pick[i]]) for i, pid in enumerate(edge_ids)}
-    edge_aff = sum(rew_e[pid - 1][int(s)] for pid, s in edge_side.items())
-
-    best = None
-    for perm in itertools.permutations(range(4)):
-        val = sum(rew_c[corner_ids[i] - 1][perm[i]] for i in range(4))
-        if best is None or val > best[0]:
-            best = (val, perm)
-    corner_pos = {corner_ids[i]: A.Corner(best[1][i]) for i in range(4)}
-    return edge_side, corner_pos, edge_aff + best[0]
+    return edge_side, sum(rew_e[pid - 1][int(s)] for pid, s in edge_side.items())
 
 
-def _random_assignment(A, edge_ids, corner_ids, rng):
+def _random_assignment(A, edge_ids, rng):
     ids = list(edge_ids)
     rng.shuffle(ids)
     per = SIDE - 2
-    edge_side = {pid: A.Side(i // per) for i, pid in enumerate(ids)}
-    perm = list(range(4))
-    rng.shuffle(perm)
-    corner_pos = {corner_ids[i]: A.Corner(perm[i]) for i in range(4)}
-    return edge_side, corner_pos
+    return {pid: A.Side(i // per) for i, pid in enumerate(ids)}
 
 
 def _perturb(edge_side, n, rng):
@@ -778,32 +980,35 @@ def _perturb(edge_side, n, rng):
     return out
 
 
-def search_border(A, rew_e, rew_c, seed_path, args, log):
-    """Find a border that matches the consensus AND that Stage B can lay.
+class BorderContext:
+    """Everything the border search needs that does not change between classes:
+    the pieces, the two boundary id lists and the annealer config. Loaded once,
+    because --border_out now runs the search up to 24 times."""
 
-    Seeded from the exact affinity optimum, then walked with the annealer's own
-    move set -- try_edge_swap does the arcs, the Euler recount and the
-    inventory check; only its score is replaced, because the objective here is
-    not the annealer's. Bounded by the clock: whatever exists when the budget
-    runs out is what comes back, so this cannot hang."""
-    pieces = A.read_pieces(str(seed_path))
-    pieces_by_id = {p.id: p for p in pieces}
-    corner_ids, edge_ids = A.classify_boundary_pieces(pieces)
-    inner_cap = A.build_inner_capacity(pieces)
-    cfg = A.AnnealingConfig()
+    def __init__(self, A, seed_path):
+        self.A = A
+        self.pieces = A.read_pieces(str(seed_path))
+        self.by_id = {p.id: p for p in self.pieces}
+        self.corner_ids, self.edge_ids = A.classify_boundary_pieces(self.pieces)
+        self.inner_cap = A.build_inner_capacity(self.pieces)
+        self.cfg = A.AnnealingConfig()
 
-    opt_edge, opt_corner, ceiling = assignment_optimum(rew_e, rew_c, edge_ids,
-                                                       corner_ids, A)
-    log(f"[border] affinity ceiling {ceiling:+.2f} bits over 60 pieces "
-        f"({ceiling / 60:+.3f} a piece), ignoring Euler feasibility")
+
+def search_border(ctx, rew_e, rew_c, corner_pos, budget, args, log):
+    """Find a border that matches one class's consensus AND that Stage B can lay.
+
+    The corners are FIXED by the class, so this searches the edge assignment
+    only: it is seeded from the exact affinity optimum and walked with the
+    annealer's own move set -- try_edge_swap does the arcs, the Euler recount
+    and the inventory check; only its score is replaced, because the objective
+    here is not the annealer's. Bounded by `budget` seconds, and whatever exists
+    when that runs out is what comes back, so this cannot hang."""
+    A = ctx.A
+    opt_edge, edge_ceiling = edge_optimum(rew_e, ctx.edge_ids, A)
+    fixed_aff = sum(rew_c[pid - 1][int(c)] for pid, c in corner_pos.items())
+    ceiling = edge_ceiling + fixed_aff
 
     w_c, w_t, floor_at = args.w_consensus, args.w_trails, args.min_trails
-
-    def edge_aff(es):
-        return sum(rew_e[pid - 1][int(s)] for pid, s in es.items())
-
-    def corner_aff(cp):
-        return sum(rew_c[pid - 1][int(c)] for pid, c in cp.items())
 
     def composite(aff, evals, hard):
         trails = floor_pen = 0.0
@@ -817,8 +1022,8 @@ def search_border(A, rew_e, rew_c, seed_path, args, log):
 
     def snapshot(state, aff, score, restart, step):
         counts = {int(s): state.evals[s].euler_count for s in A.Side}
-        at_floor = all(v >= floor_at for v in counts.values())
-        return dict(score=score, aff=aff, counts=counts, at_floor=at_floor,
+        return dict(score=score, aff=aff, counts=counts,
+                    at_floor=all(v >= floor_at for v in counts.values()),
                     feasible=all(state.evals[s].feasible for s in A.Side),
                     edge_side=dict(state.edge_side), corner_pos=dict(state.corner_pos),
                     restart=restart, step=step)
@@ -827,11 +1032,10 @@ def search_border(A, rew_e, rew_c, seed_path, args, log):
         return (rec["at_floor"], rec["score"])
 
     def signature(rec):
-        return (tuple(sorted((p, int(s)) for p, s in rec["edge_side"].items())),
-                tuple(sorted((p, int(c)) for p, c in rec["corner_pos"].items())))
+        return tuple(sorted((p, int(sd)) for p, sd in rec["edge_side"].items()))
 
     t0 = time.monotonic()
-    deadline = t0 + args.border_time
+    deadline = t0 + budget
     rng = random.Random(args.border_seed)
     found = {}                       # signature -> the best record carrying it
     cap = 32 * args.border_rows      # bound on `found`, so a long run cannot grow
@@ -870,15 +1074,17 @@ def search_border(A, rew_e, rew_c, seed_path, args, log):
         if args.border_restarts and restart >= args.border_restarts:
             break
         if restart == 0:
-            es, cp = dict(opt_edge), dict(opt_corner)
+            es = dict(opt_edge)
         elif restart % 2:
-            es, cp = _perturb(opt_edge, 6 + 2 * restart, rng), dict(opt_corner)
+            es = _perturb(opt_edge, 6 + 2 * restart, rng)
         else:
-            es, cp = _random_assignment(A, edge_ids, corner_ids, rng)
+            es = _random_assignment(A, ctx.edge_ids, rng)
 
-        state = A._build_run_state(pieces_by_id, es, cp, inner_cap, cfg)
-        aff = edge_aff(state.edge_side) + corner_aff(state.corner_pos)
-        hard = A.hard_penalty(state.evals, state.inward_tally, inner_cap, cfg)
+        state = A._build_run_state(ctx.by_id, es, dict(corner_pos),
+                                   ctx.inner_cap, ctx.cfg)
+        aff = fixed_aff + sum(rew_e[pid - 1][int(sd)]
+                              for pid, sd in state.edge_side.items())
+        hard = A.hard_penalty(state.evals, state.inward_tally, ctx.inner_cap, ctx.cfg)
         cur = composite(aff, state.evals, hard)
         state.score = cur
         harvest(state, aff, cur, restart, -1)
@@ -891,47 +1097,27 @@ def search_border(A, rew_e, rew_c, seed_path, args, log):
                 break
             steps_done += 1
             temp *= ratio
-            # Corner moves change every side's endpoints at once, so they are
-            # the expensive move and the one that matters early: they are what
-            # lets a state that cannot balance escape. Confined to the first
-            # third of a restart, as in the annealer.
-            if rng.random() < 0.05 and step < n // 3:
-                a, b = rng.sample(corner_ids, 2)
-                r = A.try_corner_swap(state, pieces_by_id, a, b, inner_cap, cfg)
-                new_cp = dict(state.corner_pos)
-                new_cp[a], new_cp[b] = new_cp[b], new_cp[a]
-                new_aff = edge_aff(state.edge_side) + corner_aff(new_cp)
-                h = A.hard_penalty(r.new_evals, state.inward_tally, inner_cap, cfg)
-                new = composite(new_aff, r.new_evals, h)
-                if new > cur or rng.random() < math.exp(min(0.0, (new - cur) / temp)):
-                    A.commit_corner_swap(state, a, b, r)
-                    state.score = cur = new
-                    aff = new_aff
-            else:
-                a, b = rng.sample(edge_ids, 2)
-                sa, sb = state.edge_side[a], state.edge_side[b]
-                if sa == sb:
-                    continue
-                r = A.try_edge_swap(state, pieces_by_id, a, b, inner_cap, cfg)
-                if r is None:
-                    continue
-                d = (rew_e[a - 1][int(sb)] + rew_e[b - 1][int(sa)]
-                     - rew_e[a - 1][int(sa)] - rew_e[b - 1][int(sb)])
-                new_aff = aff + d
-                new_evals = {**state.evals, r.side_a: r.new_se_a, r.side_b: r.new_se_b}
-                new = composite(new_aff, new_evals, r.hard)
-                if new > cur or rng.random() < math.exp(min(0.0, (new - cur) / temp)):
-                    A.commit_edge_swap(state, a, b, r)
-                    state.score = cur = new
-                    aff = new_aff
-
+            a, b = rng.sample(ctx.edge_ids, 2)
+            sa, sb = state.edge_side[a], state.edge_side[b]
+            if sa == sb:
+                continue
+            r = A.try_edge_swap(state, ctx.by_id, a, b, ctx.inner_cap, ctx.cfg)
+            if r is None:
+                continue
+            d = (rew_e[a - 1][int(sb)] + rew_e[b - 1][int(sa)]
+                 - rew_e[a - 1][int(sa)] - rew_e[b - 1][int(sb)])
+            new_aff = aff + d
+            new_evals = {**state.evals, r.side_a: r.new_se_a, r.side_b: r.new_se_b}
+            new = composite(new_aff, new_evals, r.hard)
+            if new > cur or rng.random() < math.exp(min(0.0, (new - cur) / temp)):
+                A.commit_edge_swap(state, a, b, r)
+                state.score = cur = new
+                aff = new_aff
             harvest(state, aff, cur, restart, step)
         restart += 1
 
-    log(f"[border] {restart} restart(s), {steps_done} step(s), "
-        f"{time.monotonic() - t0:.1f}s of {args.border_time:g}s budget")
     ranked = sorted(found.values(), key=key, reverse=True)
-    return ranked, ceiling, pieces_by_id, inner_cap, cfg
+    return ranked, ceiling, restart, steps_done, time.monotonic() - t0
 
 
 def key_cheap(state, score, floor_at, A):
@@ -939,69 +1125,130 @@ def key_cheap(state, score, floor_at, A):
     return (all(state.evals[s].euler_count >= floor_at for s in A.Side), score)
 
 
-def emit_border(path, records, args, A, pieces_by_id, inner_cap, cfg,
-                seed, ceiling, cons, sources, log):
-    """Write the rotations CSV, in the annealer's own format.
+def emit_border(path, rows, args, ctx, seed, cons_boards, sources, log):
+    """Write the rotations CSV, in the annealer's own format, one row per corner
+    class most-backed first.
 
     Every row is rebuilt from its assignment with _build_run_state rather than
     carried out of the search, so the trail counts in the comment are recounted
     from the border actually being written, and then validated with
     E555_rotate.classify_border -- the 14/14/14/14-plus-four-corners test
-    classify_deal_from_rotations applies in E555_database.c. A row that fails
-    it is a bug here, and the file is not written at all rather than handed to
-    the beamer to die on."""
+    classify_deal_from_rotations applies in E555_database.c. A row that fails it
+    is a bug here, and the file is not written at all rather than handed to the
+    beamer to die on."""
+    A = ctx.A
     turn = ORIENT_OF_PIN[args.border_pin]
-    rows = []
-    for i, rec in enumerate(records[:args.border_rows]):
-        state = A._build_run_state(pieces_by_id, dict(rec["edge_side"]),
-                                   dict(rec["corner_pos"]), inner_cap, cfg)
-        counts = {int(s): state.evals[s].euler_count for s in A.Side}
+    built = []
+    for i, (klass, support, rec, ceiling) in enumerate(rows):
+        state = A._build_run_state(ctx.by_id, dict(rec["edge_side"]),
+                                   dict(rec["corner_pos"]), ctx.inner_cap, ctx.cfg)
+        counts = {int(sd): state.evals[sd].euler_count for sd in A.Side}
         if counts != rec["counts"]:
-            raise SystemExit("[ERROR] a border's trail counts did not survive the "
-                             f"rebuild: {rec['counts']} became {counts}")
-        full = list(A.rotation_vector(pieces_by_id, state, 60)) + [0] * (N_PIECES - 60)
+            raise SystemExit("[ERROR] a border's trail counts did not survive "
+                             f"the rebuild: {rec['counts']} became {counts}")
+        full = list(A.rotation_vector(ctx.by_id, state, 60)) + [0] * (N_PIECES - 60)
         if turn:
             # Only the 60 pieces with a grey side carry a meaningful spin; the
             # same map E555_rotate.py --rotations applies, for the same reason.
             for pid in range(60):
                 full[pid] = (full[pid] + 3 * turn) % 4
         cls = RT.classify_border(seed, full)
-        sizes = [len(cls[s]) for s in RT.SIDE_NAMES]
+        sizes = [len(cls[sd]) for sd in RT.SIDE_NAMES]
         if len(cls["corner"]) != 4 or any(n != SIDE - 2 for n in sizes):
             raise SystemExit(f"[ERROR] row {i} is not a legal 14/14/14/14 border "
                              f"partition ({sizes}, {len(cls['corner'])} corners); "
                              "nothing written")
-        rows.append((rec, counts, full))
+        built.append((klass, support, rec, ceiling, counts, full))
 
     with open(path, "w", newline="") as fh:
-        fh.write("# E555_extract_consensus.py: the border implied by %d clued board(s)\n"
-                 % cons.boards)
+        fh.write("# E555_extract_consensus.py: the border(s) implied by %d clued "
+                 "board(s)\n" % cons_boards)
         fh.write("# from %s\n" % ", ".join(sources))
         fh.write("# frame: centre clue at the %s quadrant -- use with --pin_clue %d\n"
                  % (PIN_NAMES[args.border_pin], args.border_pin))
-        fh.write("# affinity ceiling %+.2f bits (no Euler constraint); floor "
-                 "--min_trails %d\n" % (ceiling, args.min_trails))
+        fh.write("# one row per corner class, most-backed first. The corners are "
+                 "part of the row:\n"
+                 "# a row's spins already pin each corner piece to its corner, so "
+                 "the beamer needs no --BL/--BR/--TL/--TR.\n")
         w = csv.writer(fh, lineterminator="\n")
-        for i, (rec, counts, full) in enumerate(rows):
-            tag = "  ".join("%s=%d" % (A.SIDE_NAMES[A.Side(s)], counts[s])
-                            for s in range(4))
-            fh.write("#  %s  Affinity=%+.2f  Score=%.4f\n" % (tag, rec["aff"], rec["score"]))
+        for i, (klass, support, rec, ceiling, counts, full) in enumerate(built):
+            tag = "  ".join("%s=%d" % (A.SIDE_NAMES[A.Side(sd)], counts[sd])
+                            for sd in range(4))
+            fh.write("#  %s  %s  Boards=%d  Affinity=%+.2f/%+.2f  Score=%.4f\n"
+                     % (corner_text(klass), tag, support, rec["aff"], ceiling,
+                        rec["score"]))
             w.writerow(["c%d" % i] + [str(v) for v in full])
 
-    for i, (rec, counts, _) in enumerate(rows):
-        tag = "  ".join("%s=%d" % (A.SIDE_NAMES[A.Side(s)], counts[s]) for s in range(4))
-        short = min(counts.values())
-        mark = "" if short >= args.min_trails else "   <-- BELOW --min_trails"
-        log("[border] row %d  %s  affinity %+.2f of %+.2f bits%s"
-            % (i, tag, rec["aff"], ceiling, mark))
-    worst = min((min(c.values()) for _, c, _ in rows), default=0)
-    if worst < args.min_trails:
+    short = []
+    for i, (klass, support, rec, ceiling, counts, _) in enumerate(built):
+        tag = "  ".join("%s=%d" % (A.SIDE_NAMES[A.Side(sd)], counts[sd])
+                        for sd in range(4))
+        worst = min(counts.values())
+        mark = "" if worst >= args.min_trails else "   <-- BELOW --min_trails"
+        log("[border] row %d  %s  %s  boards=%d  affinity %+.2f of %+.2f%s"
+            % (i, corner_text(klass), tag, support, rec["aff"], ceiling, mark))
+        if worst < args.min_trails:
+            short.append(i)
+    if short:
         # To stderr, and not through `log`: a border Stage B cannot lay well is
         # the one thing --quiet must not be able to hide.
-        print("[border] WARNING: the budget ran out before every side reached "
-              "--min_trails %d (worst side %d). Raise --border_time, or accept "
-              "a less flexible border." % (args.min_trails, worst), file=sys.stderr)
-    log("[emit] %d border row(s) -> %s" % (len(rows), path))
+        print("[border] WARNING: row(s) %s did not reach --min_trails %d before "
+              "their share of the budget ran out. Raise --border_time, pin "
+              "corners to leave fewer classes to search, or accept a less "
+              "flexible border."
+              % (", ".join(map(str, short)), args.min_trails), file=sys.stderr)
+    log("[emit] %d border row(s) -> %s" % (len(built), path))
+
+
+def run_border(args, cset, ctx, seed, stats, sources, log):
+    """Drive the per-class border search and write the file.
+
+    One row per corner class the pool actually supports. Which classes exist is
+    not the user's to know in advance -- a run with no corners pinned has up to
+    24 -- so they are enumerated here, filtered by --min_corner_boards so a
+    class with almost no evidence behind it does not get distilled into a
+    confident-looking border, and ordered by support so row 0 is the one with
+    the most boards behind it."""
+    A = ctx.A
+    counts = cset.counts()
+    live = [(c, n) for c, n in counts.items() if n >= args.min_corner_boards]
+    if not live:
+        best = max(counts.values(), default=0)
+        raise SystemExit(
+            f"[ERROR] no corner class has the --min_corner_boards {args.min_corner_boards} "
+            f"boards needed to distil a border; the largest has {best}.\n"
+            f"        Lower --min_corner_boards, or pin corners with "
+            f"--BL/--BR/--TR/--TL to pool the evidence into fewer classes.")
+    live.sort(key=lambda cn: (-cn[1], cn[0]))
+    share = args.border_time / len(live)
+    log(f"[border] {len(live)} corner class(es) of {len(counts)} clear "
+        f"--min_corner_boards {args.min_corner_boards}; "
+        f"{share:.1f}s each of the {args.border_time:g}s budget")
+
+    rows = []
+    for klass, support in live:
+        table = cset.tables[klass]
+        rew_e, rew_c, seen_e, seen_c = border_affinity(table, args.alpha)
+        # The class IS the corner assignment. Piece ids go 0-based -> the
+        # annealer's 1-based here, and the CLI corner order (BL BR TR TL) ->
+        # the annealer's Corner order; both conversions happen only here.
+        corner_pos = {klass[i] + 1: A.Corner(CORNER_TO_ANNEALER[i])
+                      for i in range(4)}
+        ranked, ceiling, restarts, steps, took = search_border(
+            ctx, rew_e, rew_c, corner_pos, share, args, log)
+        log(f"[border] {corner_text(klass)}  boards={support}  "
+            f"edges seen {seen_e}/56  {restarts} restart(s), {steps} step(s), "
+            f"{took:.1f}s")
+        if not ranked:
+            log(f"[border] {corner_text(klass)}: nothing found in its share of "
+                f"the budget; skipped")
+            continue
+        for rec in ranked[:args.border_rows]:
+            rows.append((klass, support, rec, ceiling))
+    if not rows:
+        raise SystemExit("[ERROR] the border search produced nothing at all; "
+                         "raise --border_time")
+    emit_border(args.border_out, rows, args, ctx, seed, stats["kept"], sources, log)
 
 
 # =============================================================================
@@ -1055,6 +1302,7 @@ def report_corpus(cons, stats, log):
         log("[cons] clue quadrants: "
             + "  ".join(f"{PIN_NAMES[pin_of[o]]}={stats['orient'][o]}"
                         for o in range(4)))
+    report_corners(stats, log)
     log("[cons] band coverage (boards that filled each canonical band, and "
         "boards that merely touched it):\n"
         + "       " + "  ".join(f"{BAND_NAMES[b]}={cons.band_boards[b]}"
@@ -1110,6 +1358,22 @@ def print_table(records, args, band_mode):
         print((f"{r['file']:<{fw}} " if multi else "") + f"{r['row']:>5}  " + cid +
               "  ".join(f"{cell_text(k, r[k]):>{max(6, len(k))}}" for k in cols))
 
+    lo = min(r["cells"] for r in records)
+    hi = max(r["cells"] for r in records)
+    if lo != hi:
+        print(f"note: these boards were scored on {lo}..{hi} cells, so their "
+              f"means are not exactly comparable -- the ones scored on fewer "
+              f"cells are both noisier and measured on easier ground. "
+              f"--cells common (the default) makes the count identical.")
+
+    if band_mode:
+        blo = min(r["bag"] for r in records)
+        bhi = max(r["bag"] for r in records)
+        if blo != bhi:
+            print(f"note: bag sizes run {blo}..{bhi}. A bag is 80 pieces unless "
+                  f"the board has holes outside the band, and a larger bag is "
+                  f"pulled toward the average piece -- compare within one size.")
+
     b = records[0]
     if band_mode:
         print(f"best: {b['id']}  bits={b['bits']:+.3f} band={b['band']} "
@@ -1117,6 +1381,39 @@ def print_table(records, args, band_mode):
     else:
         print(f"best: {b['id']}  lift={b['lift']:+.3f} top1={b['top1']:.3f} "
               f"cells={b['cells']} placed={b['placed']}")
+
+
+def report_corners(stats, log, top=6):
+    """What corner assignments the pool actually holds.
+
+    Printed on every run, not only when the flags are given: a pool that mixes
+    corner assignments is mixing problems whose sides do not share the same
+    Euler endpoints (the 24 assignments give each side 8 distinct start/end
+    pairs), and that is not something the user should have to know to ask about
+    before they can discover it. Each line carries the command that would
+    select it, so acting on the report is a copy and a paste."""
+    hist = stats["corners"]
+    if not hist:
+        return
+    # An unplaced corner is None, which does not order against an int, so the
+    # tie-break maps it to -1 rather than sorting the raw tuple.
+    rows = sorted(hist.items(),
+                  key=lambda kv: (-kv[1], tuple(-1 if v is None else v for v in kv[0])))
+    known = sum(n for c, n in rows if all(v is not None for v in c))
+    total = sum(hist.values())
+    log(f"[corners] {len(rows)} distinct canonical corner pattern(s) over "
+        f"{total} board(s); {known} board(s) show all four")
+    for seen, n in rows[:top]:
+        flags = corner_flags(seen)
+        log(f"[corners]   {n:>7}  {corner_text(seen)}"
+            + (f"   {flags}" if flags else ""))
+    if len(rows) > top:
+        log(f"[corners]   ... {len(rows) - top} more pattern(s), "
+            f"{sum(n for _, n in rows[top:])} board(s)")
+    if stats["corner_cut"] or stats["corner_unknown"]:
+        log(f"[corners] filter: {stats['corner_cut']} board(s) contradicted it "
+            f"and were dropped; {stats['corner_unknown']} were kept because the "
+            f"corner they would have to match is unplaced")
 
 
 def main():
@@ -1141,6 +1438,18 @@ def main():
                          "inputs, off for --consensus_in)")
     ap.add_argument("--min_support", type=int, default=2, metavar="N",
                     help="skip cells fewer than N boards placed (default 2)")
+    ap.add_argument("--cells", choices=("common", "placed"), default="common",
+                    help="which cells score. common (default): only cells the "
+                         "whole corpus placed, so every board is compared on "
+                         "identical ground and a board with more placed pieces "
+                         "is neither rewarded nor punished. placed: every cell "
+                         "the board placed -- the mean is then over cells of "
+                         "unequal informativeness, and a pool mixing stop rows "
+                         "is ranked largely BY stop row")
+    ap.add_argument("--common_frac", type=float, default=1.0, metavar="F",
+                    help="with --cells common, the fraction of the corpus that "
+                         "must have placed a cell for it to score (default 1.0 "
+                         "= all of them, the only setting that is exactly fair)")
     ap.add_argument("--box", metavar="R0:R1,C0:C1",
                     help="score only this inclusive rectangle, in CANONICAL "
                          "coordinates (centre clue at the lower left)")
@@ -1160,6 +1469,21 @@ def main():
                          "not enough -- a pool of bottom-up partials touches "
                          "the side bands with every board while covering half "
                          "of each. 0 disables the guard.")
+
+    ap.add_argument("--BL", type=int, default=None, metavar="N",
+                    help="keep only boards whose CANONICAL bottom-left corner "
+                         "holds seed piece N -- the same 0-based corner-piece "
+                         "numbering bin/E555_beamer --BL takes. Canonical means "
+                         "after the board is turned so its centre clue sits at "
+                         "the lower-left quadrant, which is the frame the "
+                         "consensus and the border live in. A board whose "
+                         "corner cell is unplaced cannot contradict the "
+                         "constraint and is kept. See --border_out, which "
+                         "emits one border per surviving corner class")
+    for name, where in (("BR", "bottom-right"), ("TR", "top-right"),
+                        ("TL", "top-left")):
+        ap.add_argument(f"--{name}", type=int, default=None, metavar="N",
+                        help=f"the same for the canonical {where} corner")
 
     ap.add_argument("--top", type=int, default=0, help="show only the best N boards")
     ap.add_argument("--out", metavar="FILE",
@@ -1195,7 +1519,12 @@ def main():
                          "1 = lower-left (default, the canonical frame), "
                          "2 = lower-right, 3 = upper-right, 4 = upper-left")
     ap.add_argument("--border_rows", type=int, default=1, metavar="N",
-                    help="emit the N best distinct borders (default 1)")
+                    help="emit the N best distinct borders PER CORNER CLASS "
+                         "(default 1)")
+    ap.add_argument("--min_corner_boards", type=int, default=100, metavar="N",
+                    help="emit a border for a corner class only when at least "
+                         "N boards are compatible with it (default 100). The "
+                         "guard against distilling a border out of noise")
     ap.add_argument("--min_trails", type=int, default=1000, metavar="N",
                     help="floor on every side's Euler-trail count (default "
                          "1000), charged at 200 points a decade below it")
@@ -1230,15 +1559,32 @@ def main():
         raise SystemExit("[ERROR] --border_rows must be at least 1")
     if args.alpha <= 0:
         raise SystemExit("[ERROR] --alpha must be positive")
+    if not 0.0 < args.common_frac <= 1.0:
+        raise SystemExit("[ERROR] --common_frac is a fraction of the corpus, "
+                         "0 < F <= 1")
 
     log = (lambda s: None) if args.quiet else (lambda s: print(s))
     band_mode = args.best_top or args.best_bottom
     box = frozenset(R.parse_box(args.box)) if args.box else None
+    scored_cells = None            # settled once the consensus is built
     seed = V.load_seed(V.find_seed(args.seed_file))
+
+    corner_pieces = [p for p, e in enumerate(seed) if sum(1 for v in e if v == 0) == 2]
+    want = tuple(getattr(args, n) for n in CLI_CORNER_NAMES)
+    given = [v for v in want if v is not None]
+    for i, v in enumerate(want):
+        if v is not None and v not in corner_pieces:
+            raise SystemExit(f"[ERROR] --{CLI_CORNER_NAMES[i]} {v} is not a corner "
+                             f"piece; the seed's corners are {corner_pieces}")
+    if len(set(given)) != len(given):
+        raise SystemExit("[ERROR] the same corner piece was given for two "
+                         "corners; each sits in exactly one")
+    if not given:
+        want = None
 
     stats = new_stats()
     if args.count:
-        for _ in iter_boards(args.inputs, stats, 0):
+        for _ in iter_boards(args.inputs, stats, corner_pieces, want):
             pass
         print(stats["kept"])
         return 1 if stats["bad"] else 0
@@ -1246,6 +1592,7 @@ def main():
     check_memory(args.inputs, args)
 
     # -- pass 1: the consensus ------------------------------------------------
+    cset = None
     if args.consensus_in:
         cons = Consensus.read(args.consensus_in)
         if cons.band_rows != args.band_rows and band_mode:
@@ -1256,8 +1603,19 @@ def main():
         loo = args.loo == "on"
     else:
         cons = Consensus(band_rows=args.band_rows)
-        for rec in iter_boards(args.inputs, stats, args.progress_every):
-            cons.add(rec[6])
+        # The per-class tables are built in the SAME pass, because a second pass
+        # over a multi-GB pool costs more than the tables do. They are only
+        # built when a border is wanted: a board joins every class it does not
+        # contradict, which is two of the 24 for a typical partial.
+        if args.border_out:
+            classes = [c for c in itertools.permutations(corner_pieces)
+                       if want is None or corner_compatible(c, want)]
+            cset = ConsensusSet(classes, args.band_rows)
+        for rec in iter_boards(args.inputs, stats, corner_pieces, want,
+                               args.progress_every):
+            cons.add(rec.canon)
+            if cset is not None:
+                cset.add(rec.canon, rec.corners)
         cons.sources = [Path(p).name for p in args.inputs]
         report_corpus(cons, stats, log)
         if not cons.boards:
@@ -1268,19 +1626,34 @@ def main():
         cons.write(args.consensus_out)
         log(f"[emit] consensus of {cons.boards} board(s) -> {args.consensus_out}")
 
-    # -- the border, which needs only the consensus ---------------------------
+    if args.cells == "common":
+        scored_cells = cons.common(args.common_frac)
+        if box is not None:
+            scored_cells &= box
+        share = "every board" if args.common_frac >= 1.0 else \
+                f"{args.common_frac:.0%} of them"
+        log(f"[cells] scoring the {len(scored_cells)} cell(s) {share} placed"
+            + (" inside --box" if box is not None else ""))
+        if len(scored_cells) < SMALL_COMMON:
+            print(f"[cells] WARNING: only {len(scored_cells)} of 256 cells are "
+                  "common to the whole corpus, so the ranking rests on little "
+                  "ground. Two things shrink it: boards stopped at very "
+                  "different rows, and boards in different clue frames, whose "
+                  "canonical regions overlap only near the centre. Ranking "
+                  "within one frame or one stop row restores it; --cells placed "
+                  "keeps every cell but is then ranking partly by how much of "
+                  "the board is filled.", file=sys.stderr)
+    else:
+        scored_cells = box
+
+    # -- the border, one row per corner class ---------------------------------
     if args.border_out:
-        A = load_annealer()
-        rew_e, rew_c, seen_e, seen_c = border_affinity(cons, args.alpha)
-        log(f"[border] {seen_e} of 56 edge pieces and {seen_c} of 4 corner "
-            f"pieces were observed on the frame; the rest read flat")
-        ranked, ceiling, pieces_by_id, inner_cap, cfg = search_border(
-            A, rew_e, rew_c, V.find_seed(args.seed_file), args, log)
-        if not ranked:
-            raise SystemExit("[ERROR] the border search produced nothing at all; "
-                             "raise --border_time")
-        emit_border(args.border_out, ranked, args, A, pieces_by_id, inner_cap,
-                    cfg, seed, ceiling, cons, cons.sources, log)
+        if cset is None:
+            raise SystemExit("[ERROR] --border_out needs the per-class tables, "
+                             "which --consensus_in does not carry; build the "
+                             "consensus from the boards instead")
+        ctx = BorderContext(load_annealer(), V.find_seed(args.seed_file))
+        run_border(args, cset, ctx, seed, stats, cons.sources, log)
 
     # -- pass 2: score ---------------------------------------------------------
     base = BAND_TOP if args.best_top else BAND_BOTTOM
@@ -1288,9 +1661,11 @@ def main():
     stats2 = new_stats()
 
     def stream():
-        for path, idx, cid, line, orient, turn, canon, pos in iter_boards(
-                args.inputs, stats2, args.progress_every):
-            m = score_cells(cons, canon, args.alpha, loo, args.min_support, box)
+        for rec in iter_boards(args.inputs, stats2, corner_pieces, want,
+                               args.progress_every):
+            orient, canon, pos = rec.orient, rec.canon, rec.pos
+            m = score_cells(cons, canon, args.alpha, loo, args.min_support,
+                            scored_cells)
             m["placed"] = sum(1 for c in canon if c != UNPLACED)
             m["orient"] = orient
             if band_mode:
@@ -1306,7 +1681,8 @@ def main():
                          bits=bits, sort=bits)
             else:
                 m.update(band="-", bag=0, known=0, bits=0.0, sort=m[args.metric])
-            yield dict(file=Path(path).name, row=idx, id=cid, line=line, **m)
+            yield dict(file=Path(rec.path).name, row=rec.row, id=rec.id,
+                       line=rec.line, **m)
 
     records = collect(stream(), args.top)
     if band_mode and thin[0]:

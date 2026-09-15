@@ -2162,6 +2162,20 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   scoring one corpus against another's table. `--metric logp|rank|top1` offers
   the plain cross-entropy, a non-parametric rank score and the readable
   mode-hit rate; all four are printed whichever one sorts.
+  **Which cells score is the other half of making that fair**, and a mean over
+  each board's own placed cells is not. Cells differ in how much consensus they
+  carry, the higher rows of a Stage B pool carry less, and so every extra placed
+  cell drags a board's mean down. Measured on one pool holding the same seven
+  boards cut at rows 10 and 11, all seven row-10 copies ranked above all seven
+  row-11 copies -- a 0.124-bit gap against a 0.073-bit spread within either
+  group, so the ranking was reporting the stop row and nothing else. `--cells
+  common`, the default, scores only the cells the whole corpus placed: the twins
+  then score bit for bit alike and a fuller board is neither rewarded nor
+  punished. `--cells placed` restores the per-board set for a pool already
+  uniform. When the shared ground is small the run says so -- boards stopped at
+  very different rows shrink it, and so do boards in different clue frames,
+  whose canonical regions overlap only near the centre (four frames of row-10
+  partials share 36 cells of 256).
   `--best_top` and `--best_bottom` ask the question that decides which partial
   to hand to the finalizer: never mind where this board's pieces are, is the bag
   it has LEFT the right bag for the rows it has left? Position inside the band is
@@ -2172,9 +2186,26 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   there, so a pool of one orientation leaves three bands empty and
   `--min_band_support` refuses them rather than scoring noise. A pool mixing all
   four `--pin_clue` frames is the case it works on.
+  **Corner classes.** A side's Euler trails are bounded by the endpoint colours
+  its two corners expose, and across the 24 seatings of the four corner pieces
+  each side sees eight distinct `(start, end)` pairs -- so a pool mixing corner
+  assignments is averaging over problems that do not share their boundary
+  conditions. Every run therefore prints the canonical corner histogram with the
+  command that selects each pattern, and `--BL/--BR/--TR/--TL` filter on it, in
+  the canonical frame, with the same 0-based corner-piece numbering
+  `bin/E555_beamer --BL` takes. A board whose corner cell is unplaced cannot
+  contradict a constraint and is kept: a bottom-up partial places row 0 but not
+  row 15, so canonically only two of the four corners are ever filled, and
+  demanding all four would empty the pool.
   `--border_out` turns the same table into Stage A output: the side each edge
   piece belongs on, and the corner each corner piece belongs in, as a rotations
-  CSV the beamer reads. The unconstrained best assignment is exact (Hungarian
+  CSV the beamer reads. It emits **one row per corner class** the pool supports
+  -- up to 24, one when all four corners are pinned -- each from its own
+  consensus table built from the boards compatible with it, ordered most-backed
+  first and carrying its board count, so "this border rests on 5,200 boards,
+  that one on 140" is readable off the file. `--min_corner_boards` (default 100)
+  refuses to distil a border out of a handful of boards, and `--border_time` is
+  the total budget split across the classes being searched. The unconstrained best assignment is exact (Hungarian
   over 56x56, plus the 24 corner permutations) and is reported as the ceiling --
   but it is almost never usable, because a side's Euler trails *are* the
   orderings Stage B enumerates and an assignment picked for affinity alone
@@ -2303,7 +2334,7 @@ tools to the same-seed-same-threads contract.
 | `src/C_tail/E555_ender.py` | CP-SAT closer: adaptive portfolio of focused then broad neighbourhoods, driven by `--profile` and a true `--board_time_limit`. |
 | `tools/E555_viewer.py` | Board viewer/differ + bucas URL. |
 | `tools/E555_rank.py` | Ranks/sorts board CSVs by compactness, solidity, clean rows; `--rescore` rewrites them canonically; `--diverse K` picks independent roots. |
-| `tools/E555_extract_consensus.py` | Pools clued partials into one clue frame and ranks them by agreement with the resulting piece-by-cell consensus; `--best_top`/`--best_bottom` score the bag of pieces still to be placed; `--border_out` distils the table into a Stage A rotations row. |
+| `tools/E555_extract_consensus.py` | Pools clued partials into one clue frame and ranks them by agreement with the resulting piece-by-cell consensus, on the cells the whole corpus placed so the stop row cannot drive the ranking; `--best_top`/`--best_bottom` score the bag of pieces still to be placed; `--border_out` distils the table into Stage A rotations rows, one per corner class. |
 | `tools/E555_rotate.py` | Turns every board in a CSV by a quarter-turn multiple, losslessly; `--sink N` drops the board N rows so the bad rows fall out of it. |
 | `data/` | Seeds, known synthetic solution, example boards, masks (see `data/README.md`). |
 | `examples/` | One small script per tool: read these first. |
