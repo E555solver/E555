@@ -2139,6 +2139,58 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   orientation as well as a cell, and a translation moves the cell while leaving
   the spin alone, so any non-zero sink breaks a clue that was already right: the
   filter selects boards the sink puts right, which are rare. Off by default.
+- **`tools/E555_extract_consensus.py`** -- ranks a pool of CLUED partials by how
+  well each one matches what the pool as a whole agrees on. Every other ranker
+  here reads one board in isolation, which is why they stop discriminating above
+  the entropy floor; this one reads the corpus.
+  The clue symmetry is what makes that legal. `g_clue[4][CLUE_N]` is the whole
+  configuration space, so a clued board's orientation is readable rather than
+  guessable, and a board of orientation `o` turned `k` quarter-turns clockwise
+  has orientation `(o+k)%4` -- so `k = (4-o)%4` brings any of them to
+  orientation 0, the centre clue on (7,7), which is `--pin_clue 1`. Boards
+  without the centre clue are dropped and counted; the corner clues and the
+  corner pieces are deliberately not checked, so a board Stage C has been over
+  still counts.
+  One pass then builds a 256x256 piece-by-cell table -- the *consensus* -- and a
+  board is scored on the mean over its placed cells of
+  `log2(P(piece|cell) x K)`, in bits above chance, where `K` is 4, 56 or 196:
+  the pool of pieces the frame rule allows on a corner, border or interior cell.
+  The null model is what puts the three kinds of cell on one scale; without it a
+  board with more of its frame placed outscores a better board with less of it.
+  `P` is leave-one-out, so a board is never rewarded for being in its own
+  corpus, and `--consensus_out`/`--consensus_in` remove the question entirely by
+  scoring one corpus against another's table. `--metric logp|rank|top1` offers
+  the plain cross-entropy, a non-parametric rank score and the readable
+  mode-hit rate; all four are printed whichever one sorts.
+  `--best_top` and `--best_bottom` ask the question that decides which partial
+  to hand to the finalizer: never mind where this board's pieces are, is the bag
+  it has LEFT the right bag for the rows it has left? Position inside the band is
+  integrated out -- only membership counts -- and the band is chosen per board,
+  because `k` clockwise turns carry the top rows to TOP, RIGHT, BOTTOM, LEFT for
+  `k = 0,1,2,3`. That is also the measure's limit, and the run prints it: a
+  canonical band is only *filled* by boards whose own solved region landed
+  there, so a pool of one orientation leaves three bands empty and
+  `--min_band_support` refuses them rather than scoring noise. A pool mixing all
+  four `--pin_clue` frames is the case it works on.
+  `--border_out` turns the same table into Stage A output: the side each edge
+  piece belongs on, and the corner each corner piece belongs in, as a rotations
+  CSV the beamer reads. The unconstrained best assignment is exact (Hungarian
+  over 56x56, plus the 24 corner permutations) and is reported as the ceiling --
+  but it is almost never usable, because a side's Euler trails *are* the
+  orderings Stage B enumerates and an assignment picked for affinity alone
+  routinely leaves a side with none. So the optimum is only the seed: from there
+  the tool reuses `src/A_border/E555_edge_annealer.py`'s own move set and Euler
+  counting to buy feasibility back, under a floor of `--min_trails` (default
+  1000) a side charged at 200 points a decade. The search is bounded by the
+  clock, not by convergence -- `--border_time` (default 120s) -- and emits the
+  best border it has with a warning if a side is still short, so it cannot hang.
+  Measured on a 28-board corpus: ceiling +44.8 bits, a feasible border at +20.4
+  bits with 3456/1440/1152/2304 trails, and the beamer's own
+  `bottoms=1152  left-cols=2304` confirms those counts are Stage B's real option
+  space. `--border_pin N` turns the row to pair with any of the four
+  `--pin_clue` frames, and nothing is written until
+  `E555_rotate.classify_border` confirms the 14/14/14/14-plus-four-corners
+  partition `classify_deal_from_rotations` demands.
 
 ---
 
@@ -2251,6 +2303,7 @@ tools to the same-seed-same-threads contract.
 | `src/C_tail/E555_ender.py` | CP-SAT closer: adaptive portfolio of focused then broad neighbourhoods, driven by `--profile` and a true `--board_time_limit`. |
 | `tools/E555_viewer.py` | Board viewer/differ + bucas URL. |
 | `tools/E555_rank.py` | Ranks/sorts board CSVs by compactness, solidity, clean rows; `--rescore` rewrites them canonically; `--diverse K` picks independent roots. |
+| `tools/E555_extract_consensus.py` | Pools clued partials into one clue frame and ranks them by agreement with the resulting piece-by-cell consensus; `--best_top`/`--best_bottom` score the bag of pieces still to be placed; `--border_out` distils the table into a Stage A rotations row. |
 | `tools/E555_rotate.py` | Turns every board in a CSV by a quarter-turn multiple, losslessly; `--sink N` drops the board N rows so the bad rows fall out of it. |
 | `data/` | Seeds, known synthetic solution, example boards, masks (see `data/README.md`). |
 | `examples/` | One small script per tool: read these first. |
