@@ -105,6 +105,54 @@ const ClueCell g_clue[4][CLUE_N] = {
 uint32_t g_clue_mask    = 0;
 uint8_t  g_clue_orients = 0xF;
 
+/* --pin_clue N -> the orientation index whose CENTER clue sits in quadrant N.
+ *
+ * The five clues are one rigid body: the table above has exactly four rows, and
+ * choosing a row fixes every cell, piece and spin. So naming where the center
+ * clue sits names the whole clue set, which is the whole point of the flag --
+ * a quadrant is something you can see on a board, an orientation index is not.
+ *
+ * Rows are 0-indexed BOTTOM-UP (row 0 is the bottom border), so entry 0 of each
+ * row above puts the center clue at
+ *
+ *     orientation 0  (7,7)  lower-left      orientation 1  (8,7)  upper-left
+ *     orientation 2  (8,8)  upper-right     orientation 3  (7,8)  lower-right
+ *
+ * and N runs ANTICLOCKWISE from the lower left:
+ *
+ *     N = 0   not pinned (all four orientations)   -> -1
+ *     N = 1   lower-left   (7,7)                   -> 0
+ *     N = 2   lower-right  (7,8)                   -> 3
+ *     N = 3   upper-right  (8,8)                   -> 2
+ *     N = 4   upper-left   (8,7)                   -> 1
+ *
+ * N-1 is therefore NOT the orientation index, and this is the one place that
+ * inversion is allowed to live. Getting it wrong does not fail: it searches a
+ * perfectly healthy run in the wrong frame. */
+int clue_orient_for_pin(int n) {
+    static const int ORIENT_OF_QUADRANT[5] = { -1, 0, 3, 2, 1 };
+    if (n < 0 || n > 4)
+        fatal("--pin_clue takes 0..4 (0 = off, 1 = lower-left, 2 = lower-right, "
+              "3 = upper-right, 4 = upper-left), not %d", n);
+    return ORIENT_OF_QUADRANT[n];
+}
+
+/* The inverse: which --pin_clue value names this orientation. Needed wherever an
+   orientation is READ off a board and has to be reported back in the same words
+   the flag uses -- the finalizer's skip messages, mostly. */
+int clue_pin_for_orient(int o) {
+    for (int n = 1; n <= 4; n++)
+        if (clue_orient_for_pin(n) == o) return n;
+    return 0;
+}
+
+/* The quadrant a --pin_clue value names, for banners and skip messages. */
+const char *clue_pin_quadrant_name(int n) {
+    static const char *NAMES[5] = { "unpinned", "lower-left", "lower-right",
+                                    "upper-right", "upper-left" };
+    return (n >= 0 && n <= 4) ? NAMES[n] : "?";
+}
+
 int g_top_border_inner_count[NUM_COLORS_TOTAL];
 int g_inner_color_total[NUM_COLORS_TOTAL];
 
