@@ -232,6 +232,30 @@ THE BORDER THE CORPUS IMPLIES  (--border_out FILE)
     confident-looking border out of a handful of boards, and --border_time is
     then the TOTAL budget, split evenly across the classes being searched.
 
+    A LAID-OUT FRAME COMES WITH IT. The rotations row says which side each
+    piece belongs on; it does not say in what ORDER, and the order is a choice
+    among the very Euler trails counted above. So alongside `border.csv` the
+    tool writes `border_frame.csv`: the same border with all 60 pieces actually
+    placed on their cells, in the beamer's board format, inner pieces left at
+    999. The ordering is the maximum-weight Euler trail per side under the same
+    consensus -- exact, by a subset DP over one side's 14 arcs -- and it is
+    worth having: measured on a 55,712-board corpus, the chosen layout scored
+    +46.5 bits against +9.9 for an average legal trail.
+
+    That file is a finalizer input, and a complete 60-cell frame is exactly what
+    puts the finalizer into FIXED-SIDES mode:
+
+        bin/E555_finalizer seed.txt border_frame.csv --finalize_from 0 \
+            --stop_row 12 --pin_clue 1
+
+    locks row 0, holds the other three sides fixed, and grows the board from row
+    1 up. Note the cost of --finalize_from 0: almost nothing is locked, so the
+    finalizer rebuilds nearly the whole inner database (~70s) on every run.
+
+    Every frame is re-scored before it is written and must come out at exactly
+    60 placed cells and 60 matched junctions, because a side laid out backwards
+    would otherwise pass every structural check and still be a broken border.
+
     The row is written in the annealer's own format -- a `#` comment carrying
     the four trail counts, then `id, spin[0..255]` -- and is verified with
     E555_rotate.classify_border, the same 14/14/14/14-plus-four-corners test
@@ -253,6 +277,11 @@ USAGE
     python3 tools/E555_extract_consensus.py pool.csv --border_out border.csv
     python3 tools/E555_extract_consensus.py pool.csv --border_out b.csv --border_time 900
     python3 tools/E555_extract_consensus.py pool.csv --border_out b3.csv --border_pin 3
+
+    --border_out border.csv also writes border_frame.csv, the laid-out frame:
+
+    bin/E555_finalizer data/seed_Edge5.txt border_frame.csv --finalize_from 0 \
+        --stop_row 12 --pin_clue 1
 
     Then, on a border it wrote:
 
@@ -863,6 +892,127 @@ def side_cells():
     return (top, right, bottom, left)
 
 
+def frame_trail_cells():
+    """Each side's cells in the order its Euler trail traverses them.
+
+    NOT the same as side_cells(): the left and right columns are walked TOP
+    DOWN, because the annealer builds those arcs as (top face -> bottom face)
+    and corner_endpoints() starts them at the upper corner. Getting this
+    backwards would still produce a legal-looking 14/14/14/14 file whose sides
+    are laid out in reverse, which is why emit_frame re-scores the finished
+    board and refuses to write anything but a clean 60."""
+    top = tuple((SIDE - 1) * SIDE + c for c in range(1, SIDE - 1))      # left -> right
+    right = tuple(r * SIDE + (SIDE - 1) for r in range(SIDE - 2, 0, -1))  # top -> bottom
+    bottom = tuple(c for c in range(1, SIDE - 1))                       # left -> right
+    left = tuple(r * SIDE for r in range(SIDE - 2, 0, -1))              # top -> bottom
+    return (top, right, bottom, left)                # annealer Side order
+
+
+def cell_weight(cons, cell, piece, alpha):
+    """The consensus lift of one piece on one cell, in bits; 0 where the corpus
+    never placed anything on that cell, so an unobserved side costs nothing and
+    steers nothing."""
+    placed = cons.placed[cell]
+    if placed <= 0:
+        return 0.0
+    k = CELL_K[cell]
+    return math.log((cons.count[cell].get(piece, 0) + alpha) /
+                    (placed + alpha * k) * k) / LOG2
+
+
+def best_trail(arcs, start, end, weights):
+    """The maximum-weight Euler trail of one side, exactly.
+
+    `arcs` is [(piece_id, source_colour, target_colour)], `weights[i][p]` the
+    score of putting arc i at position p along the side. Returns the ordered
+    piece ids and the total, or None if the side admits no trail at all.
+
+    Subset DP: best[used_mask][colour] is the best score having laid exactly
+    those arcs and arrived at that interface colour. Position is popcount(mask),
+    so it needs no state of its own. A side has 14 arcs, which bounds this at
+    2^14 x 22 states with at most 14 moves each however many trails the side
+    actually admits -- the LEFT side of a real border can have 20160 of them and
+    this still runs in milliseconds. Ties go to the lower piece id, so one
+    corpus always yields one frame."""
+    n = len(arcs)
+    layer = {(0, start): 0.0}
+    parent = {}
+    for pos in range(n):
+        nxt = {}
+        for (mask, node), sc in layer.items():
+            for i, (pid, src, dst) in enumerate(arcs):
+                if src != node or mask & (1 << i):
+                    continue
+                key = (mask | (1 << i), dst)
+                val = sc + weights[i][pos]
+                old = nxt.get(key)
+                if old is None or val > old[0] + 1e-12 or \
+                        (abs(val - old[0]) <= 1e-12 and i < old[1]):
+                    nxt[key] = (val, i, (mask, node))
+        if not nxt:
+            return None
+        layer = {k: v[0] for k, v in nxt.items()}
+        parent.update({k: (v[1], v[2]) for k, v in nxt.items()})
+    key = ((1 << n) - 1, end)
+    if key not in layer:
+        return None
+    total = layer[key]
+    order = []
+    while key[0]:
+        i, prev = parent[key]
+        order.append(arcs[i][0])
+        key = prev
+    order.reverse()
+    return order, total
+
+
+def layout_frame(state, table, rotvec, ctx, alpha):
+    """Lay the 60 border pieces onto their cells: (pos, rot) in the CANONICAL
+    frame, or None if some side admits no trail.
+
+    Spins are taken from `rotvec`, the very vector written into the rotations
+    row, so the frame and the row can never disagree about a piece's
+    orientation. Only the ORDER along each side is decided here, and it is
+    decided by the consensus."""
+    A = ctx.A
+    cells_of = frame_trail_cells()
+    pos = [UNPLACED] * N_PIECES
+    rot = [0] * N_PIECES
+    for pid, corner in state.corner_pos.items():
+        pos[pid - 1] = CORNER_CELLS[int(corner)]
+        rot[pid - 1] = rotvec[pid - 1]
+    bits = 0.0
+    # How many of the 56 side cells the corpus has ANY observation for. Where it
+    # has none every ordering scores the same and the trail that comes back is
+    # arbitrary -- the run says so rather than implying a considered choice.
+    decided = 0
+    for sd in A.Side:
+        cells = cells_of[int(sd)]
+        decided += sum(1 for c in cells if table.placed[c] > 0)
+        arcs = [(a.piece_id, a.source_color, a.target_color)
+                for a in state.arcs[sd].values()]
+        if len(arcs) != len(cells):
+            return None
+        weights = [[cell_weight(table, cells[p], pid - 1, alpha)
+                    for p in range(len(cells))] for pid, _, _ in arcs]
+        got = best_trail(arcs, *state.endpoints[sd], weights)
+        if got is None:
+            return None
+        order, total = got
+        bits += total
+        for p, pid in enumerate(order):
+            pos[pid - 1] = cells[p]
+            rot[pid - 1] = rotvec[pid - 1]
+    return pos, rot, bits, decided
+
+
+def frame_path(border_path):
+    """The frame file's name, derived from --border_out: no second flag to
+    forget, and the two files sort next to each other."""
+    p = Path(border_path)
+    return p.with_name(p.stem + "_frame" + (p.suffix or ".csv"))
+
+
 def border_affinity(cons, alpha):
     """reward[piece][side] and reward[piece][corner] in bits, 0-based pieces.
 
@@ -1139,14 +1289,19 @@ def emit_border(path, rows, args, ctx, seed, cons_boards, sources, log):
     A = ctx.A
     turn = ORIENT_OF_PIN[args.border_pin]
     built = []
-    for i, (klass, support, rec, ceiling) in enumerate(rows):
+    for i, (klass, support, rec, ceiling, table) in enumerate(rows):
         state = A._build_run_state(ctx.by_id, dict(rec["edge_side"]),
                                    dict(rec["corner_pos"]), ctx.inner_cap, ctx.cfg)
         counts = {int(sd): state.evals[sd].euler_count for sd in A.Side}
         if counts != rec["counts"]:
             raise SystemExit("[ERROR] a border's trail counts did not survive "
                              f"the rebuild: {rec['counts']} became {counts}")
-        full = list(A.rotation_vector(ctx.by_id, state, 60)) + [0] * (N_PIECES - 60)
+        rotvec = list(A.rotation_vector(ctx.by_id, state, 60))
+        # The frame is laid out in the CANONICAL frame from these same spins and
+        # turned afterwards with the board rotation, so the two files stay in
+        # step whatever --border_pin asks for.
+        laid = layout_frame(state, table, rotvec, ctx, args.alpha)
+        full = rotvec + [0] * (N_PIECES - 60)
         if turn:
             # Only the 60 pieces with a grey side carry a meaningful spin; the
             # same map E555_rotate.py --rotations applies, for the same reason.
@@ -1158,7 +1313,7 @@ def emit_border(path, rows, args, ctx, seed, cons_boards, sources, log):
             raise SystemExit(f"[ERROR] row {i} is not a legal 14/14/14/14 border "
                              f"partition ({sizes}, {len(cls['corner'])} corners); "
                              "nothing written")
-        built.append((klass, support, rec, ceiling, counts, full))
+        built.append((klass, support, rec, ceiling, counts, full, laid))
 
     with open(path, "w", newline="") as fh:
         fh.write("# E555_extract_consensus.py: the border(s) implied by %d clued "
@@ -1171,7 +1326,7 @@ def emit_border(path, rows, args, ctx, seed, cons_boards, sources, log):
                  "# a row's spins already pin each corner piece to its corner, so "
                  "the beamer needs no --BL/--BR/--TL/--TR.\n")
         w = csv.writer(fh, lineterminator="\n")
-        for i, (klass, support, rec, ceiling, counts, full) in enumerate(built):
+        for i, (klass, support, rec, ceiling, counts, full, _laid) in enumerate(built):
             tag = "  ".join("%s=%d" % (A.SIDE_NAMES[A.Side(sd)], counts[sd])
                             for sd in range(4))
             fh.write("#  %s  %s  Boards=%d  Affinity=%+.2f/%+.2f  Score=%.4f\n"
@@ -1180,7 +1335,7 @@ def emit_border(path, rows, args, ctx, seed, cons_boards, sources, log):
             w.writerow(["c%d" % i] + [str(v) for v in full])
 
     short = []
-    for i, (klass, support, rec, ceiling, counts, _) in enumerate(built):
+    for i, (klass, support, rec, ceiling, counts, _f, _l) in enumerate(built):
         tag = "  ".join("%s=%d" % (A.SIDE_NAMES[A.Side(sd)], counts[sd])
                         for sd in range(4))
         worst = min(counts.values())
@@ -1198,6 +1353,71 @@ def emit_border(path, rows, args, ctx, seed, cons_boards, sources, log):
               "flexible border."
               % (", ".join(map(str, short)), args.min_trails), file=sys.stderr)
     log("[emit] %d border row(s) -> %s" % (len(built), path))
+    emit_frame(frame_path(path), built, args, ctx, seed, cons_boards, sources, log)
+
+
+def emit_frame(path, built, args, ctx, seed, cons_boards, sources, log):
+    """Write the laid-out 60-piece frames, in the beamer's own board format.
+
+    One board row per rotations row, same order and same ids, so the two files
+    line up. A board carrying all 60 frame cells is what puts the finalizer into
+    fixed-sides mode (fin_pos_border_complete in E555_finalizer.c), which is the
+    point of the file: --finalize_from 0 then locks row 0, holds the other 44
+    border pieces as the fixed sides, and grows the board from row 1 up.
+
+    Every frame is re-scored before it is written. A frame-only board has
+    exactly 60 internal junctions with a piece on both sides -- 15 along each of
+    the four lines -- and an Euler trail joined to its own corners matches all of
+    them. Anything but 60 means the side traversal order is wrong, and a
+    reversed side is precisely the failure that would pass every structural
+    check and still hand Stage C a broken border. So it is fatal here.
+    """
+    turn = ORIENT_OF_PIN[args.border_pin]
+    rows = []
+    for i, (klass, support, rec, ceiling, counts, _full, laid) in enumerate(built):
+        if laid is None:
+            log("[frame] row %d (%s): a side admits no Euler trail, so it cannot "
+                "be laid out; skipped" % (i, corner_text(klass)))
+            continue
+        pos, rot, bits, decided = laid
+        if turn:
+            pos, rot = RT.rotate_board(pos, rot, turn)
+        placed = sum(1 for c in pos if c != UNPLACED)
+        sc = RT.score(pos, rot, seed)
+        if placed != 60 or sc != 60:
+            raise SystemExit(
+                "[ERROR] frame row %d came out with %d placed cell(s) and %d "
+                "matched junction(s), not 60 and 60: the side traversal order is "
+                "wrong and nothing was written" % (i, placed, sc))
+        rows.append((i, klass, support, counts, bits, decided, pos, rot))
+
+    if not rows:
+        log("[frame] no frame could be laid out")
+        return
+
+    with open(path, "w", newline="") as fh:
+        fh.write("# E555_extract_consensus.py: laid-out border frame(s) from %d "
+                 "clued board(s)\n" % cons_boards)
+        fh.write("# from %s\n" % ", ".join(sources))
+        fh.write("# centre clue at the %s quadrant -- use with --pin_clue %d\n"
+                 % (PIN_NAMES[args.border_pin], args.border_pin))
+        fh.write("# 60 border pieces placed, 196 inner pieces left unplaced (999).\n")
+        fh.write("# bin/E555_finalizer SEED THIS.csv --finalize_from 0 --stop_row N\n")
+        fh.write("#   locks row 0, fixes the other three sides, grows from row 1.\n")
+        w = csv.writer(fh, lineterminator="\n")
+        for i, klass, support, counts, bits, decided, pos, rot in rows:
+            tag = "  ".join("%s=%d" % (ctx.A.SIDE_NAMES[ctx.A.Side(sd)], counts[sd])
+                            for sd in range(4))
+            fh.write("#  %s  %s  Boards=%d  Layout=%+.2f bits over %d/56 "
+                     "observed cell(s)\n"
+                     % (corner_text(klass), tag, support, bits, decided))
+            w.writerow(["c%d" % i, 60] + [str(v) for v in pos] + [str(v) for v in rot])
+    log("[emit] %d laid-out frame(s) -> %s" % (len(rows), path))
+    thin = [i for i, _k, _s, _c, _b, dec, _p, _r in rows if dec < SIDE - 2]
+    if thin:
+        log("[frame] row(s) %s rest on fewer than %d observed side cells, so much "
+            "of their ordering is arbitrary rather than chosen"
+            % (", ".join(map(str, thin)), SIDE - 2))
 
 
 def run_border(args, cset, ctx, seed, stats, sources, log):
@@ -1244,7 +1464,7 @@ def run_border(args, cset, ctx, seed, stats, sources, log):
                 f"the budget; skipped")
             continue
         for rec in ranked[:args.border_rows]:
-            rows.append((klass, support, rec, ceiling))
+            rows.append((klass, support, rec, ceiling, table))
     if not rows:
         raise SystemExit("[ERROR] the border search produced nothing at all; "
                          "raise --border_time")
