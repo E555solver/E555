@@ -699,6 +699,35 @@ for i, (claim, spins) in enumerate(zip(claims, rows)):
 print(f"ok: {len(rows)} corner-class row(s), each seating the corners it claims")
 EOF
 
+    # --border_out also lays the 60 border pieces onto their cells, as a board
+    # the finalizer can lock. The rotations row only says which SIDE each piece
+    # belongs on; turning that into a frame means choosing one Euler trail per
+    # side, and a side walked backwards would still pass every structural check
+    # while handing Stage C a broken border. rank.py is the independent judge:
+    # border==60 is only reachable when all 60 cells are placed, frame-legal,
+    # and every one of the 60 seams matches.
+    frame="$OUT/cons_border_frame.csv"
+    [ -s "$frame" ] || fail "--border_out wrote no companion frame file"
+    for field in border score placed; do
+        got=$(python3 tools/E555_rank.py "$frame" --field "$field")
+        [ "$got" = "60" ] || fail "the laid-out frame has $field=$got, want 60"
+    done
+    nb=$(grep -c '^c' "$OUT/cons_border.csv")
+    nf=$(grep -c '^c' "$frame")
+    [ "$nb" = "$nf" ] || fail "$nb border row(s) but $nf frame row(s); they must correspond"
+    fields=$(grep -v '^#' "$frame" | head -1 | awk -F, '{print NF}')
+    [ "$fields" = "514" ] || fail "frame row has $fields fields, want 514"
+
+    # The finalizer itself is NOT run here. --finalize_from 0 locks only row 0,
+    # so it rebuilds essentially the whole 6.44 GB inner database -- 68 of the
+    # 80 seconds that invocation costs, for an assertion this check already
+    # makes: fin_pos_border_complete() tests exactly that row 0, row 15, column
+    # 0 and column 15 are occupied, and border==60 above is strictly stronger
+    # (it needs those 60 cells placed, frame-legal AND every seam matched).
+    # The end-to-end run was done by hand and reported mode=fixed, lock rows
+    # 0..0, 145053 boards grown from row 1.
+    echo "ok: the laid-out frame is a clean 60-seam border, 1:1 with the rotations rows"
+
     # No class can clear the default bar on a 28-board fixture, and that must be
     # a refusal with the largest count named -- not a border built from noise.
     if python3 tools/E555_extract_consensus.py "$OUT/cons_corpus.csv" \

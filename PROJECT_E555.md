@@ -2222,6 +2222,25 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   `--pin_clue` frames, and nothing is written until
   `E555_rotate.classify_border` confirms the 14/14/14/14-plus-four-corners
   partition `classify_deal_from_rotations` demands.
+  **A laid-out frame comes with it.** A rotations row names each piece's side
+  but not its ORDER along that side, and the order is a choice among the very
+  Euler trails the search counts. So `--border_out border.csv` also writes
+  `border_frame.csv`: the same border with all 60 pieces placed on their cells,
+  in the beamer's board format with the 196 inner pieces left at 999. The
+  ordering is the maximum-weight Euler trail per side under the same consensus,
+  exact by a subset DP over one side's 14 arcs -- `2^14 x 22` states however
+  many trails the side admits, so a side with 20,160 of them still resolves in
+  milliseconds. It is worth choosing: on a 55,712-board corpus the chosen layout
+  scored **+46.5 bits against +9.9 for an average legal trail**.
+  That file is a finalizer input, because a complete 60-cell frame is precisely
+  what `fin_pos_border_complete()` looks for to select **fixed-sides mode** --
+  `--finalize_from 0` then locks row 0, holds the other three sides, and grows
+  from row 1 (measured: `mode=fixed`, `lock rows 0..0`, 145,053 boards reaching
+  row 3). Locking only row 0 has a price: the finalizer rebuilds nearly the
+  whole 6.4 GB inner database on every run. Every frame is re-scored before it
+  is written and must come out at exactly 60 placed cells and 60 matched
+  junctions -- a side laid out backwards would otherwise pass every structural
+  check and still hand Stage C a broken border.
 
 ---
 
@@ -2334,7 +2353,7 @@ tools to the same-seed-same-threads contract.
 | `src/C_tail/E555_ender.py` | CP-SAT closer: adaptive portfolio of focused then broad neighbourhoods, driven by `--profile` and a true `--board_time_limit`. |
 | `tools/E555_viewer.py` | Board viewer/differ + bucas URL. |
 | `tools/E555_rank.py` | Ranks/sorts board CSVs by compactness, solidity, clean rows; `--rescore` rewrites them canonically; `--diverse K` picks independent roots. |
-| `tools/E555_extract_consensus.py` | Pools clued partials into one clue frame and ranks them by agreement with the resulting piece-by-cell consensus, on the cells the whole corpus placed so the stop row cannot drive the ranking; `--best_top`/`--best_bottom` score the bag of pieces still to be placed; `--border_out` distils the table into Stage A rotations rows, one per corner class. |
+| `tools/E555_extract_consensus.py` | Pools clued partials into one clue frame and ranks them by agreement with the resulting piece-by-cell consensus, on the cells the whole corpus placed so the stop row cannot drive the ranking; `--best_top`/`--best_bottom` score the bag of pieces still to be placed; `--border_out` distils the table into Stage A rotations rows, one per corner class, plus a laid-out 60-piece frame the finalizer locks as fixed sides. |
 | `tools/E555_rotate.py` | Turns every board in a CSV by a quarter-turn multiple, losslessly; `--sink N` drops the board N rows so the bad rows fall out of it. |
 | `data/` | Seeds, known synthetic solution, example boards, masks (see `data/README.md`). |
 | `examples/` | One small script per tool: read these first. |
