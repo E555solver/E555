@@ -106,11 +106,36 @@ pass puts a different side at the bottom. On `borders_annealed_fix12.csv` row 1:
 | 2 | 46,080 | 2% |
 | 3 | 432 | 18% |
 
-Passes 0 and 3 exhaust their pools after a few hundred bottoms and cannot be improved by
-raising the flag; passes 1 and 2 are starved by it and want tens of thousands. So set
-`--top_bottoms` past the largest pool (50000 covers this file) and let each pass take
-what it has. The learning summary prints the per-pass configuration counts and says
-`raise --top_bottoms` when the thinnest pass is under a quarter of the fattest.
+Passes 1 and 2 are starved by the flag and want tens of thousands. Passes 0 and 3 exhaust
+their pools after a few hundred bottoms — and for those, **learning goes round the pool
+again** rather than stopping, until `--top_bottoms` samples have been taken. So set
+`--top_bottoms` past the largest pool (50000 covers this file) and every pass returns the
+same number of samples.
+
+A second lap is not a re-run. The beam's whole random stream comes from `cfg_hash`, which
+is derived from the configuration id, and from the column-ranking stream, which is keyed by
+the sample counter — the id carries the lap number and the counter keeps rising, so each
+lap draws a fresh `--frac_rand` band and explores a different interior from the same
+border. Measured: of the configurations that reached `--stop_row 9` on both laps, **36 of
+36 in pass 0 and 38 of 38 in pass 3 arrived with a different beam width**, so every one of
+them took a different route. Were the stream not fresh the lap would be bit-identical, and
+the point of the exercise is that it is not.
+
+Two things to keep in mind about laps.
+
+They are not independent evidence. A lap shares its border with the lap before it, so it
+sharpens that border's estimate rather than adding a new one. The effective sample size
+does not know this, so treat it as an upper bound — which is why the learning summary and
+the table file both record the pool size and the lap count beside the configuration count.
+
+They also repeat the failures. On border row 1 only 22 of pass 0's 480 bottoms get past
+the corner-clue row at all, so about 96% of each lap is spent re-deriving deterministic
+extinctions that cannot come out differently — the randomness never gets a chance to
+matter before the clue row kills them. Skipping bottoms whose first lap died before the
+clue row would recover nearly all of that, and is the obvious next optimisation.
+
+Search mode is unaffected: it still stops at the pool, so the fork's byte-for-byte
+agreement with the stock beamer holds.
 
 ## Why four passes
 

@@ -29,17 +29,20 @@ THREADS=4
 RNG_SEED=12345          # determinism is this AND --threads, never this alone
 
 LEARN=1                 # 0 = keep the table at $TABLE and only search
-LEARN_BOTTOMS=50000     # bottom rows per pass. Set past the largest pool so no
-                        # pass starves: the four are very uneven (480 / 25920 /
-                        # 46080 / 432 on border row 1) and survivors are spread
-                        # evenly through the ranking, so there is no useful
-                        # "top N". This is the table's sample size.
+LEARN_BOTTOMS=50000     # bottom samples per pass. Set past the largest pool so
+                        # every pass returns the same number: the four are very
+                        # uneven (480 / 25920 / 46080 / 432 on border row 1), and
+                        # a pass whose pool runs out goes round it again with a
+                        # fresh random stream rather than stopping short.
 LEARN_COLUMNS=5         # left columns per bottom. Keep this small: columns
                         # sharing a bottom are correlated, so they add votes
                         # faster than they add information.
-LEARN_STOP_ROW=8        # 8 already covers all 247 free cells, because passes 0
-                        # and 2 alone cover the board once this is >= 7. Deeper
-                        # buys overlap, not coverage, and costs survivors.
+LEARN_STOP_ROW=10       # only boards that get this high are counted -- getting
+                        # near the top is the evidence that a partial is worth
+                        # something rather than pieces that merely match. 9 is
+                        # the floor for cheap tests; never below it. (7 is all
+                        # that full cell coverage needs, but coverage is not the
+                        # point: the boards have to be good.)
 LEARN_BEAM=20000
 LEARN_WALL=0            # seconds for the learning phase, 0 = unlimited
 

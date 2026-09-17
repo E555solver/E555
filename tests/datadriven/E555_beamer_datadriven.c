@@ -144,7 +144,9 @@ static bool     g_resume_active = false;
 
 static const BottomOrder *g_cur_bottom = NULL;
 static const LeftOrder   *g_cur_left   = NULL;
-static char     g_config_id_str[64] = "c0";
+/* Wide enough that snprintf cannot truncate the longest id the sweep can build
+   ("r<row>b<bottom>#<lap>l<column>"), which -Wformat-truncation checks. */
+static char     g_config_id_str[96] = "c0";
 
 /* Emit dedup table (open addressing, power-of-2; emission is serial). */
 static uint64_t  *g_emit_htable = NULL;
@@ -1061,6 +1063,8 @@ static double *g_pcnt[FREQ_NPASS];   /* per-pass weighted counts */
 static double *g_pwcell[FREQ_NPASS]; /* per-pass weight covering each cell */
 static double *g_pwsq[FREQ_NPASS];   /* per-pass sum of squared weight (ESS) */
 static size_t  g_pconfigs[FREQ_NPASS];   /* configurations that contributed */
+static size_t  g_ppool[FREQ_NPASS];      /* bottoms the pass had to draw from */
+static size_t  g_preps[FREQ_NPASS];      /* times it cycled that pool */
 static double *g_cfgcnt = NULL;      /* one configuration's raw counts */
 static size_t  g_cfg_boards = 0;     /* boards counted for the live config */
 static int     g_pass = 0;           /* which pass is running */
@@ -1517,8 +1521,13 @@ static void freq_write(const char *path, const char *seed_path, const char *rot_
             g_stop_row, g_beam_width, g_nthreads, g_master_seed);
     fprintf(f, "top_bottoms %ld top_columns %ld cap_per_config %d\n",
             g_top_bottoms, g_top_columns, LEARN_CAP_PER_CONFIG);
+    /* pool and reps are provenance: 400 configurations drawn from 432 distinct
+       bottoms is not the same evidence as 400 from 25920, and the file has to say
+       which it was. Readers that only want the count still parse the first four
+       fields. */
     for (int j = 0; j < FREQ_NPASS; j++)
-        fprintf(f, "pass %d configs %zu\n", j, g_pconfigs[j]);
+        fprintf(f, "pass %d configs %zu pool %zu reps %zu\n",
+                j, g_pconfigs[j], g_ppool[j], g_preps[j]);
     /* The free sets, so the file describes its own blocks. Coverage alone cannot
        recover them: a free cell no pass ever reached carries no count, yet it is
        still part of the square block the estimator balances, holding pure
@@ -3875,8 +3884,38 @@ int main(int argc, char *argv[]) {
         size_t nb = g_bottom_n, nl = g_left_n;
         size_t run_b = (g_top_bottoms >= 1 && (size_t)g_top_bottoms < nb) ? (size_t)g_top_bottoms : nb;
         size_t cap_l = (g_top_columns >= 1 && (size_t)g_top_columns < nl) ? (size_t)g_top_columns : nl;
-        printf("[sweep] bottoms=%zu (run %zu)  left-cols=%zu enumerated, up to %zu per bottom\n",
-               nb, run_b, nl, cap_l); fflush(stdout);
+        /* LEARNING TAKES THE NUMBER OF SAMPLES IT ASKED FOR, EVEN FROM A SMALL POOL.
+         *
+         * An annealed border is rich in Euler trails on some sides and poor on
+         * others, and each pass puts a different side at the bottom: 480 / 25920 /
+         * 46080 / 432 on borders_annealed_fix12.csv row 1. Stopping at the pool
+         * therefore hands the two poor sides a fraction of the evidence of the two
+         * rich ones -- and the poor sides are the interesting ones, because a piece
+         * that fits where there is little freedom is a piece that really has to go
+         * there. So when the pool is smaller than --top_bottoms, go round it again.
+         *
+         * A second lap is not a re-run. Everything that makes one configuration's
+         * beam differ from another's comes from cfg_hash, which is derived from the
+         * configuration id string, and from lrng, which is keyed by the loop counter
+         * -- and the id carries the lap number while the counter keeps rising. So
+         * each lap draws a fresh --frac_rand band and, at --tau_columns > 0, a fresh
+         * column ordering, and explores a different interior from the same border.
+         * Without that the repeat would be bit-identical, every board would be
+         * dropped by the per-row dedup, and the configuration would not even be
+         * counted -- which is exactly what makes the fresh stream the whole point.
+         *
+         * Search mode is untouched: it still stops at the pool, so the fork's
+         * byte-for-byte agreement with the stock beamer is unaffected. */
+        if (g_learning && g_top_bottoms >= 1 && (size_t)g_top_bottoms > nb)
+            run_b = (size_t)g_top_bottoms;
+        if (g_learning) {
+            g_ppool[g_pass] = nb;
+            g_preps[g_pass] = nb ? (run_b + nb - 1) / nb : 0;
+        }
+        printf("[sweep] bottoms=%zu (run %zu%s)  left-cols=%zu enumerated, up to %zu per bottom\n",
+               nb, run_b,
+               run_b > nb ? " -- pool cycled with fresh random streams" : "",
+               nl, cap_l); fflush(stdout);
         if (nb == 0 || nl == 0) fatal("no border configs for row %u", cur_row);
 
         htable_init();
@@ -3910,18 +3949,28 @@ int main(int argc, char *argv[]) {
 
         bool pass_done = false;
         for (size_t bi = start_bi; bi < run_b && !g_stop && !pass_done; bi++) {
+            /* bi is the sample SLOT, which may exceed the pool; b_idx is the
+               bottom it selects and b_rep the lap. Keying the streams on bi rather
+               than b_idx is what gives each lap its own randomness, and costs
+               nothing on the first lap, where the two are equal. */
+            const size_t b_idx = bi % nb;
+            const size_t b_rep = bi / nb;
+            char blab[56];
+            if (b_rep) snprintf(blab, sizeof blab, "r%ub%zu#%zu", cur_row, b_idx, b_rep);
+            else       snprintf(blab, sizeof blab, "r%ub%zu", cur_row, b_idx);
+
             /* A column's rank is conditional on the bottom (left_rank_of), so the
                ranking belongs here, not once per border row. Its stream is keyed
-               by bi so each bottom draws its own and --resume re-derives the same
+               by bi so each sample draws its own and --resume re-derives the same
                ordering for the bottom it re-enters. */
             RNG lrng = rng_for(g_master_seed, cur_row + (uint32_t)g_pass * 65536u, 0x1EF7C015u, (uint32_t)bi);
             size_t distinct = 0;
             size_t viable = (g_freq_on && g_freq_border_ok)
-                ? freq_rank_lefts(&g_bottoms[bi], g_tau_columns, &lrng, &distinct)
-                : rank_lefts(&g_bottoms[bi], g_tau_columns, &lrng, &distinct);
+                ? freq_rank_lefts(&g_bottoms[b_idx], g_tau_columns, &lrng, &distinct)
+                : rank_lefts(&g_bottoms[b_idx], g_tau_columns, &lrng, &distinct);
             size_t run_l = viable < cap_l ? viable : cap_l;
-            printf("[rank] r%ub%zu: columns %zu -> %zu viable, %zu distinct rank(s), run %zu\n",
-                   cur_row, bi, nl, viable, distinct, run_l); fflush(stdout);
+            printf("[rank] %s: columns %zu -> %zu viable, %zu distinct rank(s), run %zu\n",
+                   blab, nl, viable, distinct, run_l); fflush(stdout);
             if (run_l == 0) {                /* no column completes row 1 with it */
                 if (!g_learning) write_checkpoint(ckpath, cur_row, (uint32_t)(bi+1), 0);
                 continue;
@@ -3935,9 +3984,9 @@ int main(int argc, char *argv[]) {
                     pass_done = true; break;
                 }
                 if (partials_budget_spent()) { partials_budget_announce(); break; }
-                g_cur_bottom = &g_bottoms[bi];
+                g_cur_bottom = &g_bottoms[b_idx];
                 g_cur_left   = &g_lefts[li];
-                snprintf(g_config_id_str, sizeof g_config_id_str, "r%ub%zul%zu", cur_row, bi, li);
+                snprintf(g_config_id_str, sizeof g_config_id_str, "%sl%zu", blab, li);
                 uint64_t cfg_hash = splitmix64(g_master_seed
                                     ^ (fnv1a_str(g_config_id_str) * 0x9E3779B97F4A7C15ULL));
                 if (g_learning)     /* the four passes must not share a stream */
@@ -3953,7 +4002,7 @@ int main(int argc, char *argv[]) {
                 if (g_learning) freq_close_config();
                 /* emitted/partials are this config's unique boards; sol_total and
                    part_total are the run totals written so far. */
-                { char grp[64]; snprintf(grp, sizeof grp, "r%ub%zu", cur_row, bi);
+                { char grp[64]; snprintf(grp, sizeof grp, "%s", blab);
                   sweep_report(grp, (long)li, &br, omp_get_wtime()-tc0); }
                 if (g_completions_fp) fflush(g_completions_fp);
                 if (g_partial_fp)     fflush(g_partial_fp);
@@ -3962,8 +4011,8 @@ int main(int argc, char *argv[]) {
                 barren = (g_emit_count + g_partial_count > 0) ? 0 : barren + 1;
                 if (g_bail_columns && barren >= g_bail_columns) {
                     sweep_flush();
-                    printf("[bail] r%ub%zu: %u column(s) in a row emitted nothing, "
-                           "moving to the next bottom\n", cur_row, bi, barren);
+                    printf("[bail] %s: %u column(s) in a row emitted nothing, "
+                           "moving to the next bottom\n", blab, barren);
                     fflush(stdout);
                     /* Point the checkpoint at the next bottom, not at the column
                        we stopped on -- otherwise --resume walks back into the
@@ -4000,6 +4049,16 @@ int main(int argc, char *argv[]) {
         printf("\n[learn] passes:");
         for (int j = 0; j < FREQ_NPASS; j++) printf(" p%d=%zu", j, g_pconfigs[j]);
         printf(" configurations\n");
+        for (int j = 0; j < FREQ_NPASS; j++) {
+            if (!g_ppool[j]) continue;
+            printf("[learn]   pass %d: %zu configurations from a pool of %zu bottoms",
+                   j, g_pconfigs[j], g_ppool[j]);
+            if (g_preps[j] > 1)
+                printf(", cycled %zu times -- laps share a border, so they sharpen "
+                       "each border's estimate rather than adding independent ones",
+                       g_preps[j]);
+            printf("\n");
+        }
         printf("[learn] cells covered %zu of %d free (%zu backed by fewer than 30 "
                "independent configurations)\n", covered, (int)nfree, thin);
         printf("[learn] pass balance: the thinnest pass carries %.0f%% of the "
