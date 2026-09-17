@@ -340,6 +340,46 @@ different representatives each run. This contradicts the determinism contract in
 depends on it — learning reads the stop-row ranking, which is stable — and it is left
 alone as out of scope, but it is worth fixing in `src/`.
 
+## borders_stageAx6.csv
+
+A second rotations file, six rows, annealed with `--w_top 1 --w_right 1 --w_bottom 1
+--w_left 1 --target_scale 0`. Verified: the beamer parses all six, and the enumerated
+pools match the header exactly — `bottoms` = BOTTOM, `left-cols` = LEFT — so the header
+tells you the pass pools without running anything (pass 0 puts BOTTOM at the bottom,
+pass 1 RIGHT, pass 2 TOP, pass 3 LEFT).
+
+| row | id | TOP | RIGHT | BOTTOM | LEFT | tightest side | search starts (B) |
+|---|---|---|---|---|---|---|---|
+| 0 | r27182 | **483840** | 2880 | 5760 | 11232 | 2880 | 5760 |
+| 1 | r7067 | 103680 | 17280 | 77760 | 14400 | 14400 | 77760 |
+| 2 | r5788 | 57600 | 120960 | 3744 | 2304 | 2304 | 3744 |
+| 3 | r14839 | **4320** | 77760 | **3744** | 69120 | 3744 | 3744 |
+| 4 | r16178 | 181440 | 4320 | 34560 | 2880 | 2880 | 34560 |
+| 5 | r11937 | 60480 | 25920 | **32** | 1152 | 32 | 32 |
+
+**Row 3 (r14839) is the tight-opposite-sides case**: TOP 4320 against BOTTOM 3744, with
+both sides loose at 69120 and 77760. Grow from a tight bottom into a tight top with room
+in between — the configuration to test first if constraint is what sharpens the table.
+
+**Row 5 (r11937) is the tightest thing available**: 32 bottoms, so a whole pass 0 is 32 ×
+`--top_columns` configurations. Its two tight sides (BOTTOM 32, LEFT 1152) are *adjacent*,
+not opposite. This is the row the pool-cycling logic was written for.
+
+**Row 0 (r27182) is the least informative for learning** despite the headline 483840 top:
+a top that flexible is the diffuse case, and a rich top (46080 on
+`borders_annealed_fix12.csv` row 1) already failed to rescue the search. Its use is
+throughput — pass 2 draws from a 483840 pool.
+
+**Row 1 (r7067) is the loosest row in the file**, not a constrained one: every side is
+≥ 14400, where `borders_annealed_fix12.csv` row 1 had a minimum of 432. Best pure-search
+candidate (77760 starts, 103680 ways to close the top), but nothing in it is tight enough
+to separate pieces by side.
+
+Note that the annealer's own `Score` ranks these inversely to their interest here —
+r7067 highest (10.5357), r11937 lowest (8.8650). With flat weights and `--target_scale 0`
+it rewards balanced bulk, which is the opposite of what the constraint idea wants; getting
+more r14839- and r11937-shaped rows needs a per-side *target*, not a flat weight.
+
 ## Files
 
 | file | role |
@@ -348,6 +388,7 @@ alone as out of scope, but it is worth fixing in `src/`.
 | `Makefile` | builds into `bin/`, links `../../src/B_beam/E555_database.c` |
 | `freq_view.py` | self-contained HTML report on a table; `--text`, `--check` |
 | `run_datadriven.sh` | both phases in order; `LEARN=0` reuses the table |
+| `borders_stageAx6.csv` | six-row rotations file; see above |
 | `runs/` | scratch: tables, logs, the cached chain database (gitignored) |
 
 `freq_view.py` re-implements the estimator independently. That is deliberate: it lets
