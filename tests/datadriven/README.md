@@ -51,7 +51,7 @@ disk.
 |---|---|
 | `--learn PATH` | learning phase. Grows the board from all four sides in turn, counts where each piece lands in the canonical frame, writes the table to `PATH`. **Emits no boards.** |
 | `--table PATH` | search phase. Ranks the beam — and the bottom row and left column — by whole-board fit to `PATH`. Emission is unchanged. |
-| `--freq_alpha A` | shrinkage toward the piece-by-row prior, in pseudo-configurations (default 20). The one knob. |
+| `--freq_alpha A` | shrinkage toward the piece-by-row prior, in pseudo-configurations (default 20). The one knob. Swept: anything from 2 to 50 is indistinguishable, 200 is clearly too much (26 configurations reaching the stop row against 35–38). The default is left at 20 because the differences below 50 are inside the noise. |
 
 Both phases need a rotations file and `--pin_clue 1..4`; without a pinned clue frame a
 board's orientation is not readable and the four passes cannot be folded into one table.
