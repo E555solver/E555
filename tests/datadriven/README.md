@@ -268,6 +268,19 @@ no difference to either.** The four-pass machinery, the estimator and the plumbi
 work and are verified; what is missing is evidence that a piece-by-cell prior is the
 signal the beam is short of.
 
+### The likeliest reason it is neutral
+
+The table is learned from the beam's own output. Every board it counts was produced by the
+stock beam, growing from a border, surviving to `--stop_row 8` — so the distribution it
+measures is the distribution the beam already draws from. Handing that back to the beam as
+a prior tells it what it is already doing. It reinforces the existing bias instead of
+correcting it, which is exactly why the lift can be real (+0.88 nats/cell, honestly held
+out) while the search outcome does not move: the table predicts the beam's boards well,
+and the beam's boards are the problem.
+
+That reading also predicts what would break the tie, and it is not a better estimator or a
+better alpha. It is a **better source of boards** — ones the beam cannot reach on its own.
+
 ### Why it might still be worth pursuing
 
 The table itself is not empty — held-out lift is **+0.82 to +0.88 nats/cell** over hundreds

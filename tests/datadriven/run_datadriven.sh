@@ -29,7 +29,7 @@ THREADS=4
 RNG_SEED=12345          # determinism is this AND --threads, never this alone
 
 LEARN=1                 # 0 = keep the table at $TABLE and only search
-LEARN_BOTTOMS=2000      # bottom rows per pass. The table's sample size.
+LEARN_BOTTOMS=50000      # bottom rows per pass. Set past the largest pool so no
 LEARN_COLUMNS=5         # left columns per bottom
 LEARN_STOP_ROW=10       # how high learning grows. Higher = better top-row
                         # coverage, fewer surviving configurations.
