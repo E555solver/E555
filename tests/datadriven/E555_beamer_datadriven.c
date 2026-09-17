@@ -1034,13 +1034,25 @@ static inline bool pass_time_spent(void)
     return g_pass_deadline > 0.0 && omp_get_wtime() >= g_pass_deadline;
 }
 static bool        g_freq_debug = false;  /* E555_FREQ_DEBUG=1 */
-/* E555_FREQ_MIX=1 keeps the library's own measure inside the guided score
-   instead of replacing it. Position says where a piece belongs; the fan-out
+/* The guided score KEEPS the library's own measure and adds position to it,
+   rather than replacing it. Position says where a piece belongs; the fan-out
    lookahead says whether ANY row fits above the one being committed. Those are
-   different questions, and dropping the second could walk a positionally
-   handsome board straight into a dead end. Both are in nats, so the mix is a
-   sum. Which one wins is measured, not assumed -- see the README. */
-static bool        g_freq_mix   = false;
+   different questions, and measurement settled it: replacing the lookahead
+   reaches the same depth but emits less than half the boards getting there
+   (496 against 1117 at --stop_row 10), because a positionally handsome row that
+   nothing can sit on top of is still a dead end. Both terms are in nats, so the
+   combination is a sum with no weight to tune -- a weight was swept over
+   0.1..1.0 and changed nothing.
+
+   E555_FREQ_PURE=1 restores the position-only score. It exists because the
+   E555_FREQ_DEBUG whole-board assertion is only meaningful there: with the
+   library's per-row terms mixed in, the running total is no longer a sum over
+   placed cells.
+
+   E555_FREQ_NOBORDER=1 drops the border block and leaves the bottom row and
+   left column to the library's ranking, so the beam score can be measured on
+   its own. */
+static bool        g_freq_pure  = false;
 
 #define FREQ_TSZ ((size_t)NUM_PIECES * NUM_PIECES)   /* [piece*256 + cell] */
 
@@ -1593,6 +1605,7 @@ static void freq_load(const char *path, const char *seed_path, const char *rot_p
                 rot_name, rot_row, rot_path ? rot_path : "-", g_start_row);
     }
 
+    if (getenv("E555_FREQ_NOBORDER")) g_freq_border_ok = false;
     double err = freq_build(cnt, wcell);
     /* E555_FREQ_DUMP=PATH writes the processed weights out so freq_view.py
        --check can compare them against its own, independent implementation of
@@ -1785,12 +1798,13 @@ static inline float score_scanned(const BeamEntry *t, int row,
        that spent a top-loving piece on a low row keeps the deficit for life and
        loses the moment the pool overflows, which is the point: the stock score
        is recomputed fresh each row and carries no history at all. */
-    if (g_freq_on && !g_freq_mix)     /* position alone: the colour ledger and the
+    if (g_freq_on && g_freq_pure)     /* position alone: the colour ledger and the
                                          fan-out lookahead are not even computed */
         return (float)((double)parent_acc + freq_row_term(mv, row));
     double s = log((double)nA * (1.0 + (double)fB) * (1.0 + (double)fC))
                + color_term(t, row);
-    if (g_freq_on) return (float)((double)parent_acc + freq_row_term(mv, row) + s);
+    if (g_freq_on)
+        return (float)((double)parent_acc + freq_row_term(mv, row) + s);
     return (float)s;
 }
 
@@ -1801,7 +1815,7 @@ static inline float score_stop(const BeamEntry *t, const BeamEntry *parent,
                                int row, const RowChoice *mv) {
     if (g_freq_on)
         return (float)((double)parent->score + freq_row_term(mv, row)
-                       + (g_freq_mix ? color_term(t, row) : 0.0));
+                       + (g_freq_pure ? 0.0 : color_term(t, row)));
     return (float)color_term(t, row);
 }
 
@@ -2712,7 +2726,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
                                                    ? (int)(pe->flags & FLAG_ORIENT_MASK) : -1,
                                                g_emit_lines + (size_t)k * EMIT_LINE_MAX);
         }
-        if (g_freq_debug && g_freq_on && !g_freq_mix)
+        if (g_freq_debug && g_freq_on && g_freq_pure)
             for (uint32_t k = 0; k < tile; k++) {
                 const PoolEntry *pe = &ctx->pool[ctx->keep[base + k]];
                 RowChoice rows[EDGE_LEN];
@@ -3584,7 +3598,7 @@ int main(int argc, char *argv[]) {
         fatal("--freq_alpha must be > 0 (it is what keeps every log finite)");
     g_learning   = (g_learn_path != NULL);
     g_freq_debug = (getenv("E555_FREQ_DEBUG") != NULL);
-    g_freq_mix   = (getenv("E555_FREQ_MIX") != NULL);
+    g_freq_pure  = (getenv("E555_FREQ_PURE") != NULL);
 
     printf("\n=== E555 beamer (data-driven fork) ===\n\n");
     if (g_print_cmd) print_cmd(argv[0], seed_path, csv_path, resume);

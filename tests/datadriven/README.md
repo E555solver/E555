@@ -177,37 +177,118 @@ stale but wrong, while the interior table is about the puzzle and still steers.
 
 ## What the search does with it
 
-The score becomes the **whole board, carried forward**: a sum over every placed cell, which
-is the same number as "the parent's total plus this row", so the cheap form is used and
-`BeamEntry.score` — which the stock beamer writes and never reads — becomes that running
-total at no cost. A board that spent a top-loving piece on a low row keeps the deficit for
-life and loses when the pool overflows. The stock score is recomputed fresh each row and
-carries no history at all. `E555_FREQ_DEBUG=1` asserts the running total equals a
-from-scratch sum over every placed cell.
+The frequency term is **added to** the library's own colour and fan-out measure, not
+substituted for it, and it is **carried forward**: the parent's running total plus this
+row. A board that spent a top-loving piece on a low row keeps the deficit for life and
+loses when the pool overflows, where the stock score is recomputed fresh each row and
+carries no history at all. `BeamEntry.score` — which the stock beamer writes and never
+reads — becomes that running total at no cost.
+
+Adding rather than replacing is a measured choice, not a hedge: position says where a
+piece belongs, while the fan-out lookahead says whether *any* row fits above the one being
+committed, and dropping the second halves the boards reaching a given depth (see below).
+
+Three environment variables exist for checking the machinery, not for tuning it.
+`E555_FREQ_PURE=1` restores the position-only score; `E555_FREQ_DEBUG=1` then asserts that
+the running total equals a from-scratch sum over every placed cell (it is only meaningful
+under `PURE`, since the library's per-row terms are not a sum over cells), and a
+deliberately broken build does trip it. `E555_FREQ_NOBORDER=1` drops the border block so
+the beam score can be measured on its own. `E555_FREQ_DUMP=PATH` writes the processed
+weights for `freq_view.py --check`.
 
 The border ranking adds the same weights to the library's own fan-out measure; both are in
 nats, so `--tau_bottoms` / `--tau_columns` keep their exact meaning — the orderings are
 still drawn in proportion to `exp(rank/τ)`, now with the learned frequencies inside the rank.
 
-## Measured so far — and what it does not show
+## Measured: it does not work yet
 
-On `seed_Edge5` / `borders_annealed_fix12.csv` row 1, `--stop_row 4`, a small budget:
+**On this seed and this border file, the data-driven steering is neutral. It does not
+beat the stock beamer, and an earlier result suggesting otherwise was an artefact.**
 
-- **The fork is the stock beamer when unsteered.** With no `--table` it reproduces
-  `bin/E555_beamer` byte-for-byte on a 28,439-board completions file.
-- **Held-out lift `+1.00` nats/cell over 49,000 boards**, scored leave-one-configuration-out
-  (a board is measured against a table holding only configurations that closed before its
-  own). Sinkhorn balance error `4.8e-14`.
-- **Guided vs baseline at the same budget, searching one row deeper than the table was
-  learned: 101 configurations reached the stop row against 2**, 193,649 boards against 4,963.
+The artefact is worth stating plainly because it is easy to reproduce and easy to
+believe. An early run showed guided search reaching the stop row on 101 configurations
+against the baseline's 2. That run used `--top_bottoms 40`, so each arm searched the
+*first forty* bottoms of its own ranking — and the guided arm's table had been learned
+from boards grown on that same border, so its ranking was substantially recall of which
+bottoms had already worked. Search the **whole** pool instead, and both arms see the same
+configurations; the gap disappears.
 
-**That last number is not independent evidence, and should not be reported as if it were.**
-The table was learned from boards grown on this same rotations row, so the border ranking is
-substantially *recall* — it remembers which bottoms worked — rather than generalisation. A
-cross-row test (learn row 1, search row 2) was attempted and is **inconclusive**: row 2
-yields no survivors in either arm at any budget tried, though both arms showing identical
-extinction profiles does confirm the border-mismatch guard behaves. The decisive experiment
-is a production-scale A/B with `tools/E555_compare_sweeps.py`, and it has not been run.
+Isolating the two halves of the idea at `--stop_row 10` on border row 1, 480 bottoms
+(the full pool) × 5 columns, beam 20000, equal wall:
+
+| arm | configs reaching row 10 | boards emitted |
+|---|---|---|
+| baseline | 48 | 1117 |
+| beam score only, position added to the library's measure | 48 | 935 |
+| beam score only, position *replacing* it | 47 | 496 |
+| beam score only, position at 0.1 and 0.3 strength | 47 | 1091 / 1041 |
+| border ranking only, stock beam score | 40 | 1199 |
+
+Two things fall out. The **beam score is neutral** — every variant reaches the same depth,
+so the piece-by-cell table is neither helping nor hurting the search. And **replacing the
+fan-out lookahead is strictly worse than adding to it**: same depth, less than half the
+boards, because a positionally handsome row that nothing can sit on top of is still a dead
+end. That is now the default, and the weight between the two terms was swept over 0.1–1.0
+and changed nothing, so there is no weight to tune.
+
+The border ranking's apparent 40-against-48 is itself a truncation artefact: that arm was
+cut off by the wall clock mid-sweep, so its *ordering* decided which configurations got
+tried. Run to completion on border row 3 below, the border ranking is neutral too.
+
+### Row 12
+
+Not reached, by either arm, anywhere in this file.
+
+Sweeping all 12 border rows at `--stop_row 12` (beam 20000, full bottom pools): 215
+configurations died at row 11, exactly one died at row 12, and **none completed row 12**.
+Eight of the twelve borders die at row 2, on the corner clues. The three that go deep are
+rows 1, 8 and 11, and the best by a distance is **row 3**: 120 of its 456 configurations
+reach row 10 or beyond.
+
+Taking border row 3, learning its own table, and running `--stop_row 12` at beam 200000 —
+ten times the width, every configuration searched to exhaustion so no ordering artefact is
+possible:
+
+| arm | completed row 12 | configs reaching row 11 |
+|---|---|---|
+| baseline | 0 | 115 |
+| guided, beam score only | 0 | 117 |
+| guided, beam score and border ranking | 0 | 117 |
+
+At `--stop_row 11` the same border does produce boards, and they are the same boards by
+every measure `tools/E555_rank.py` reports:
+
+| arm | configs reaching row 11 | boards | score | solid edges | placed |
+|---|---|---|---|---|---|
+| baseline | 3 | 7 | 356 | 176 | 194 |
+| guided | 4 | 7 | 356 | 176 | 194 |
+
+So the honest summary: **rows 0–11 are reachable here, row 12 is not, and the table makes
+no difference to either.** The four-pass machinery, the estimator and the plumbing all
+work and are verified; what is missing is evidence that a piece-by-cell prior is the
+signal the beam is short of.
+
+### Why it might still be worth pursuing
+
+The table itself is not empty — held-out lift is **+0.82 to +0.88 nats/cell** over hundreds
+of thousands of boards, leave-one-configuration-out, so the positional structure is real
+and measurable. The sorted piece-by-row panel in `freq_view.py` shows the most opinionated
+pieces preferring rows 12–14, which is exactly the region a bottom-up beam is blind to.
+The signal exists; it simply does not change which boards survive.
+
+Three things would test that further, in rough order of cost:
+
+1. **Score the top rows, not the whole board.** The table is applied to every placed cell,
+   so its opinion about rows 1–4 — where the beam is already doing fine — dilutes its
+   opinion about rows 11–14. Weighting the term by row, or applying it only above some
+   row, is a small change.
+2. **Judge by extendability, not depth.** Every comparison here counts boards reaching a
+   row. The actual complaint is that row-12 boards have unfinishable *tops*, which is a
+   question for `E555_finalizer` or `E555_roundhouse` run over both arms' output. That is
+   the measurement this experiment still lacks.
+3. **Learn from a deeper source.** Everything here learns at `--stop_row 8`. A table learned
+   from genuinely deep boards — Stage C output, or a previous run's best — would carry
+   information about the top rows that no bottom-up pass can supply.
 
 ## Unrelated bug found while building this
 
@@ -228,6 +309,7 @@ alone as out of scope, but it is worth fixing in `src/`.
 | `E555_beamer_datadriven.c` | the fork: learning phase, estimator, guided search |
 | `Makefile` | builds into `bin/`, links `../../src/B_beam/E555_database.c` |
 | `freq_view.py` | self-contained HTML report on a table; `--text`, `--check` |
+| `run_datadriven.sh` | both phases in order; `LEARN=0` reuses the table |
 | `runs/` | scratch: tables, logs, the cached chain database (gitignored) |
 
 `freq_view.py` re-implements the estimator independently. That is deliberate: it lets
