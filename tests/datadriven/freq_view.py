@@ -371,6 +371,66 @@ def piece_row_matrix(tab, w):
     return pr
 
 
+ALPHA_GRID = [2, 5, 10, 20, 50, 100, 200, 500]
+
+
+def alpha_sweep(tab):
+    """How the table's opinions change with the one knob.
+
+    Cheap because the file holds RAW counts: each point is one re-estimate, not
+    another learning run. Two separate charts rather than one with two y-scales --
+    a dual axis would let the eye read a crossing that is an artefact of the
+    scaling."""
+    rows = []
+    for a in ALPHA_GRID:
+        wa = build(tab, float(a))
+        v = list(wa.values())
+        if not v:
+            continue
+        mean_abs = sum(abs(x) for x in v) / len(v)
+        near = sum(1 for x in v if abs(x) < 0.5) / len(v)
+        rows.append((a, mean_abs, near))
+    return rows
+
+
+def line_chart(rows, yi, title, note, unit, fmt):
+    """One series over alpha, alpha spaced by log. No legend: the title names it."""
+    W, H, PAD = 430, 150, 30
+    xs = [math.log(r[0]) for r in rows]
+    ys = [r[yi] for r in rows]
+    x0, x1 = min(xs), max(xs)
+    y1 = max(ys) or 1.0
+    px = lambda x: PAD + (x - x0) / ((x1 - x0) or 1) * (W - PAD - 12)
+    py = lambda y: H - 22 - (y / y1) * (H - 40)
+    pts = [(px(x), py(y)) for x, y in zip(xs, ys)]
+    path = 'M' + ' L'.join(f'{a:.1f},{b:.1f}' for a, b in pts)
+    marks, labels = [], []
+    for (a, b), r in zip(pts, rows):
+        marks.append(f'<circle cx="{a:.1f}" cy="{b:.1f}" r="4.5" fill="var(--seq-5)" '
+                     f'stroke="var(--surface)" stroke-width="2" tabindex="0" '
+                     f'data-t="alpha {r[0]} - {fmt(r[yi])} {unit}"/>')
+        labels.append(f'<text x="{a:.1f}" y="{H-7}" text-anchor="middle" '
+                      f'font-size="9.5" fill="var(--muted)">{r[0]}</text>')
+    # only the endpoints get a value label; a number on every point is noise
+    for idx in (0, len(rows) - 1):
+        a, b = pts[idx]
+        labels.append(f'<text x="{a:.1f}" y="{b-9:.1f}" text-anchor="middle" '
+                      f'font-size="10.5" fill="var(--ink2)">{fmt(rows[idx][yi])}</text>')
+    return (f'<figure class="panel"><figcaption><h3>{html.escape(title)}</h3>'
+            f'<p class="note">{note}</p></figcaption><div class="scroll">'
+            f'<svg viewBox="0 0 {W} {H}" width="{W}" height="{H}">'
+            f'<line x1="{PAD}" y1="{H-22}" x2="{W-12}" y2="{H-22}" '
+            f'stroke="var(--rule)" stroke-width="1"/>'
+            f'<path d="{path}" fill="none" stroke="var(--seq-5)" stroke-width="2" '
+            f'stroke-linejoin="round" stroke-linecap="round"/>'
+            + ''.join(marks) + ''.join(labels) +
+            # the axis maximum, unless the first point already carries that value
+            (f'<text x="2" y="14" font-size="9.5" fill="var(--muted)">{fmt(y1)}</text>'
+             if abs(y1 - ys[0]) > 0.02 * (y1 or 1) else '') +
+            f'</svg></div><div class="legend"><span>--freq_alpha</span>'
+            f'<em>{unit}</em></div></figure>')
+
+
 def render(tab, w, alpha, src):
     rows = list(range(1, SIDE - 1))
     ip = [p for p in tab.pieces if cell_kind_of_piece(tab, p) == 0]
@@ -401,8 +461,9 @@ def render(tab, w, alpha, src):
                f'<em>over {lift_n:,} boards</em></div>'
              + tile(f'{ncov}<span style="font-size:15px;color:var(--muted)"> / '
                     f'{len(tab.free_cells)}</span>', 'free cells measured',
-                    f'{thin} with sample size < 30')
-             + tile(f'{mean_ess:,.0f}', 'mean effective sample size', 'per measured cell')
+                    f'{thin} under 30 configurations')
+             + tile(f'{mean_ess:,.1f}', 'mean effective sample size',
+                    'independent configurations per cell')
              + tile('<span style="font-size:19px">'
                     + ' &middot; '.join(f'{n:,}' for _, n in sorted(tab.passes.items()))
                     + '</span>',
@@ -444,8 +505,10 @@ def render(tab, w, alpha, src):
                      'Weighted configurations that placed anything here. Blank cells '
                      'were never reached; they hold pure backoff.', 'configurations')
              + board(tab.ess, 'Effective sample size',
-                     'Sum of weights squared over sum of weights. Low means one '
-                     'configuration is doing the talking.', 'boards')
+                     'Independent border configurations behind each cell, not boards: '
+                     'a configuration\u2019s boards are near-copies, so they vote once '
+                     'between them. Under about 30 the cell is one or two borders\u2019 '
+                     'opinion.', 'configurations')
              + board(lambda c: max((w[(p, c)] for p in tab.pieces if (p, c) in w),
                                    default=0.0),
                      'Decisiveness',
@@ -506,6 +569,27 @@ def render(tab, w, alpha, src):
                  f'<div class="legend"><span>{lo:+.1f}</span>'
                  f'<span style="margin-left:auto">{hi:+.1f} nats</span></div></figure>')
 
+    # --- the one knob -----------------------------------------------------
+    sw = alpha_sweep(tab)
+    if len(sw) > 1:
+        P.append('<h2>What --freq_alpha does to this table</h2>')
+        P.append('<p class="note">Alpha is shrinkage toward the piece-by-row prior, '
+                 'measured in pseudo-configurations, and it is the only knob. The '
+                 'file holds raw counts, so every point here is a re-estimate that '
+                 'costs milliseconds &mdash; not another learning run. Low alpha '
+                 'trusts the cell table and commits hard; high alpha falls back on '
+                 '&ldquo;low pieces low, top pieces top&rdquo;.</p>')
+        P.append('<div class="row">'
+                 + line_chart(sw, 1, 'How opinionated',
+                              'Mean absolute log weight over every free piece-cell '
+                              'pair. Falls as alpha pulls the table toward its prior.',
+                              'nats', lambda v: f'{v:.2f}')
+                 + line_chart(sw, 2, 'How much is shrunk away',
+                              'Share of pairs within half a nat of chance &mdash; the '
+                              'part of the table that has stopped expressing a '
+                              'preference.', 'share', lambda v: f'{v*100:.0f}%')
+                 + '</div>')
+
     # --- per-piece explorer ----------------------------------------------
     bypiece = defaultdict(list)
     for (q, c), v in w.items():
@@ -559,8 +643,8 @@ def text_summary(tab, w, alpha):
     print(f"held-out lift  {lift:+.4f} nats/cell over {lift_n:,} boards"
           + ("   <-- NO SIGNAL" if lift <= 0 else ""))
     print(f"free cells     {len(tab.free_cells)}  ({len(tab.covered)} measured, "
-          f"{sum(1 for e in ess if e < 30)} with sample size < 30)")
-    print(f"mean ESS       {sum(ess)/len(ess) if ess else 0:,.1f}")
+          f"{sum(1 for e in ess if e < 30)} under 30 configurations)")
+    print(f"mean ESS       {sum(ess)/len(ess) if ess else 0:,.1f} configurations/cell")
     print("configs/pass   " + "  ".join(f"p{j}={n:,}" for j, n in sorted(tab.passes.items())))
     vals = sorted(w.values())
     if vals:

@@ -1007,7 +1007,8 @@ static void clue_dump_schedule(void) {
 #define SINKHORN_ITERS       400
 #define SINKHORN_TOL         1e-13
 #define FREQ_CENTRE_CELL     119   /* (7,7): where canonicalising must land 138 */
-#define FREQ_TABLE_MAGIC     "E555 datadriven counts v1"
+#define FREQ_TABLE_MAGIC     "E555 datadriven counts v2"
+#define FREQ_TABLE_VERSION   2   /* v1 pre-dates the merge and ESS fixes */
 
 static const char *g_learn_path = NULL;   /* --learn PATH */
 static const char *g_table_path = NULL;   /* --table PATH */
@@ -1020,7 +1021,26 @@ static bool        g_freq_on    = false;  /* a table is loaded and steering */
    They are dropped rather than applied, and the interior table -- which is about
    the puzzle, not the border -- keeps steering. */
 static bool        g_freq_border_ok = true;
+
+/* --wall_time is the budget for the WHOLE run, so in learning mode it is split
+   evenly across the four passes. Spending it all on pass 0 would leave passes
+   1..3 empty, and those are the ones that cover the canonical top rows -- a
+   time-boxed learn would then be worse than useless, because it would look like
+   a table while carrying none of the information it exists to carry. */
+static double      g_pass_deadline = 0.0;    /* absolute; 0 = no limit */
+
+static inline bool pass_time_spent(void)
+{
+    return g_pass_deadline > 0.0 && omp_get_wtime() >= g_pass_deadline;
+}
 static bool        g_freq_debug = false;  /* E555_FREQ_DEBUG=1 */
+/* E555_FREQ_MIX=1 keeps the library's own measure inside the guided score
+   instead of replacing it. Position says where a piece belongs; the fan-out
+   lookahead says whether ANY row fits above the one being committed. Those are
+   different questions, and dropping the second could walk a positionally
+   handsome board straight into a dead end. Both are in nats, so the mix is a
+   sum. Which one wins is measured, not assumed -- see the README. */
+static bool        g_freq_mix   = false;
 
 #define FREQ_TSZ ((size_t)NUM_PIECES * NUM_PIECES)   /* [piece*256 + cell] */
 
@@ -1219,11 +1239,13 @@ static void freq_close_config(void)
             tot   += g_cfgcnt[i] * w;
             g_cfgcnt[i] = 0.0;
         }
-        /* tot is 1 for a cell every board of the configuration placed. The
-           squared weight is n*(1/n)^2 = 1/n, which is the effective sample size
-           this configuration is worth here -- reported so a thin region of the
-           table is visible rather than merely suspected. */
-        if (tot > 0.0) { pw[x] += tot; pq[x] += tot * tot / (double)g_cfg_boards; }
+        /* tot is 1 for a cell every board of the configuration placed, so the
+           weights being squared here are CONFIGURATION weights, not board
+           weights. That is the unit that votes: a configuration's 500 boards are
+           near-copies of each other and counting them as 500 independent
+           samples would report an effective sample size in the tens of
+           thousands for evidence that is really a few dozen borders. */
+        if (tot > 0.0) { pw[x] += tot; pq[x] += tot * tot; }
     }
     g_pconfigs[g_pass]++;
     g_cfg_boards = 0;
@@ -1332,24 +1354,36 @@ static double block_balance_error(const double *m, int n)
  * productive pass dominates the band it shares with the others AND the bands
  * only it covers, which would bend the table spatially rather than merely
  * favour one pass. */
+/* Merge the four passes: one configuration, one vote, and no per-pass rescaling.
+ *
+ * An earlier version scaled each pass to the same total weight, on the theory
+ * that a productive pass should not dominate. Measured, that is the wrong
+ * correction and it fails in the dangerous direction: passes come out as uneven
+ * as 48/1/10/78, so equalising multiplies the single-configuration pass by
+ * thirty-odd and the shrinkage denominator W then claims thirty configurations
+ * of evidence where one exists. W is what --freq_alpha is denominated in, so
+ * that is not a cosmetic distortion -- it silently switches off the backoff
+ * exactly where the backoff is all there is.
+ *
+ * Unequal coverage needs no correction here. It is real information: a quadrant two
+ * thin passes cover really is less well known, shrinkage should be stronger
+ * there, and Sinkhorn already removes coverage bias from the final matrix. The
+ * cure for an uneven pass count is more --top_bottoms, which is reported. */
 static void freq_merge(double *cnt, double *wcell, double *wsq)
 {
-    double cbar = 0.0; int live = 0;
-    for (int j = 0; j < FREQ_NPASS; j++)
-        if (g_pconfigs[j]) { cbar += (double)g_pconfigs[j]; live++; }
+    int live = 0;
+    for (int j = 0; j < FREQ_NPASS; j++) if (g_pconfigs[j]) live++;
     if (!live) fatal("--learn: no configuration produced a board -- nothing to learn from");
-    cbar /= (double)live;
 
     memset(cnt, 0, FREQ_TSZ * sizeof(double));
     memset(wcell, 0, NUM_PIECES * sizeof(double));
     memset(wsq, 0, NUM_PIECES * sizeof(double));
     for (int j = 0; j < FREQ_NPASS; j++) {
         if (!g_pconfigs[j]) continue;
-        const double s = cbar / (double)g_pconfigs[j];
-        for (size_t i = 0; i < FREQ_TSZ; i++) cnt[i] += g_pcnt[j][i] * s;
+        for (size_t i = 0; i < FREQ_TSZ; i++) cnt[i] += g_pcnt[j][i];
         for (int x = 0; x < NUM_PIECES; x++) {
-            wcell[x] += g_pwcell[j][x] * s;
-            wsq[x]   += g_pwsq[j][x]   * s * s;
+            wcell[x] += g_pwcell[j][x];
+            wsq[x]   += g_pwsq[j][x];
         }
     }
 }
@@ -1463,7 +1497,7 @@ static void freq_write(const char *path, const char *seed_path, const char *rot_
     fprintf(f, "# %s\n", FREQ_TABLE_MAGIC);
     fprintf(f, "# canonical frame: clue orientation 0, centre clue on (7,7) = --pin_clue 1\n");
     fprintf(f, "# rows are 0-indexed bottom-up; cell = row*16 + col\n");
-    fprintf(f, "version 1\n");
+    fprintf(f, "version %d\n", FREQ_TABLE_VERSION);
     fprintf(f, "seed %s %" PRIu64 "\n", seed_path, seed_hash());
     fprintf(f, "rotations %s %u\n", rot_path ? rot_path : "-", g_start_row);
     fprintf(f, "clue_mask %u pin %d\n", g_clue_mask, g_pin_clue);
@@ -1519,7 +1553,14 @@ static void freq_load(const char *path, const char *seed_path, const char *rot_p
         if (line[0] == '#' || line[0] == '\n') continue;
         int p, x, j; double v, w;  size_t n;
         if (!strncmp(line, "version ", 8)) {
-            if (atoi(line + 8) != 1) fatal("--table %s: version %d, expected 1", path, atoi(line + 8));
+            int v = atoi(line + 8);
+            /* v1 stored per-pass-equalised counts and a board-based effective
+               sample size. Both were wrong, and a v1 table read here would be
+               scaled differently and would report an ESS in the thousands for
+               evidence worth a few dozen borders. Re-learn rather than guess. */
+            if (v != FREQ_TABLE_VERSION)
+                fatal("--table %s: version %d, this build writes and reads %d -- "
+                      "re-run the learning phase", path, v, FREQ_TABLE_VERSION);
             seen_version = true;
         } else if (sscanf(line, "seed %255s %" SCNu64, seed_name, &want_seed) == 2) {
         } else if (sscanf(line, "rotations %255s %u", rot_name, &rot_row) == 2) {
@@ -1663,6 +1704,12 @@ static double freq_left_rank(const LeftOrder *l, const BottomOrder *bot)
     return s;
 }
 
+static int cmp_rank_asc(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
 static int freq_cmp_bottom(const void *a, const void *b)
 {
     const BottomOrder *x = a, *y = b;
@@ -1695,12 +1742,12 @@ static size_t freq_rank_lefts(const BottomOrder *bot, double tau, RNG *rng, size
         g_lefts[i].rank = gumbel_key(r, tau, rng);
     }
     if (raw) {
-        size_t d = 0;
-        for (size_t i = 0; i < g_left_n; i++) {
-            bool seen = false;
-            for (size_t k = 0; k < i && !seen; k++) seen = (raw[k] == raw[i]);
-            if (!seen) d++;
-        }
+        /* Sort and count runs. The obvious nested scan is quadratic, and
+           g_left_n reaches 46080 on a trail-rich side, which is 1.1e9 compares
+           per bottom row for a number that only appears in a progress line. */
+        qsort(raw, g_left_n, sizeof(double), cmp_rank_asc);
+        size_t d = g_left_n ? 1 : 0;
+        for (size_t i = 1; i < g_left_n; i++) if (raw[i] != raw[i-1]) d++;
         *distinct = d;
         free(raw);
     }
@@ -1738,9 +1785,12 @@ static inline float score_scanned(const BeamEntry *t, int row,
        that spent a top-loving piece on a low row keeps the deficit for life and
        loses the moment the pool overflows, which is the point: the stock score
        is recomputed fresh each row and carries no history at all. */
-    if (g_freq_on) return (float)((double)parent_acc + freq_row_term(mv, row));
+    if (g_freq_on && !g_freq_mix)     /* position alone: the colour ledger and the
+                                         fan-out lookahead are not even computed */
+        return (float)((double)parent_acc + freq_row_term(mv, row));
     double s = log((double)nA * (1.0 + (double)fB) * (1.0 + (double)fC))
                + color_term(t, row);
+    if (g_freq_on) return (float)((double)parent_acc + freq_row_term(mv, row) + s);
     return (float)s;
 }
 
@@ -1749,7 +1799,9 @@ static inline float score_scanned(const BeamEntry *t, int row,
    same running whole-board total. */
 static inline float score_stop(const BeamEntry *t, const BeamEntry *parent,
                                int row, const RowChoice *mv) {
-    if (g_freq_on) return (float)((double)parent->score + freq_row_term(mv, row));
+    if (g_freq_on)
+        return (float)((double)parent->score + freq_row_term(mv, row)
+                       + (g_freq_mix ? color_term(t, row) : 0.0));
     return (float)color_term(t, row);
 }
 
@@ -2660,7 +2712,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
                                                    ? (int)(pe->flags & FLAG_ORIENT_MASK) : -1,
                                                g_emit_lines + (size_t)k * EMIT_LINE_MAX);
         }
-        if (g_freq_debug && g_freq_on)
+        if (g_freq_debug && g_freq_on && !g_freq_mix)
             for (uint32_t k = 0; k < tile; k++) {
                 const PoolEntry *pe = &ctx->pool[ctx->keep[base + k]];
                 RowChoice rows[EDGE_LEN];
@@ -3509,10 +3561,30 @@ int main(int argc, char *argv[]) {
        to, instead of needing a phase-qualified twin. */
     if (g_learn_path && g_table_path)
         fatal("--learn and --table are separate runs: pass one or the other");
+    /* A table is a calibration for ONE border. These three would each corrupt it
+       silently rather than loudly, which is the only reason they are checked
+       here instead of being left to the user. */
+    if (g_learn_path && g_num_rows != 1)
+        fatal("--learn needs --num_rows 1: the table records one rotations row as "
+              "its provenance and its border block is keyed by which side that row "
+              "deals each edge to, so folding several rows into one table would "
+              "mix incompatible side assignments (--num_rows 0, the default, means "
+              "every remaining row of the file)");
+    if (g_learn_path && resume)
+        fatal("--resume cannot resume a --learn run: the checkpoint stores "
+              "(border row, bottom, column) but not which of the four passes wrote "
+              "it, so resuming would restart at pass 0 and re-skip bottoms in every "
+              "pass. Re-run the learning phase from the start; it writes no boards, "
+              "so it is cheap to repeat");
+    if (g_learn_path && g_free_edges)
+        fatal("--learn cannot use --free_edges: the border block assumes each edge "
+              "piece has a fixed side, which is exactly what a rotations row "
+              "decides and --free_edges releases");
     if (!(g_freq_alpha > 0.0))
         fatal("--freq_alpha must be > 0 (it is what keeps every log finite)");
     g_learning   = (g_learn_path != NULL);
     g_freq_debug = (getenv("E555_FREQ_DEBUG") != NULL);
+    g_freq_mix   = (getenv("E555_FREQ_MIX") != NULL);
 
     printf("\n=== E555 beamer (data-driven fork) ===\n\n");
     if (g_print_cmd) print_cmd(argv[0], seed_path, csv_path, resume);
@@ -3764,6 +3836,14 @@ int main(int argc, char *argv[]) {
         rot_row_turn(spins, g_pass);
         if (g_clue_mask) g_clue_orients = (uint8_t)(1u << ((g_orient_base + g_pass) & 3));
         memcpy(g_spin, spins, sizeof g_spin);
+        /* Search mode keeps the stock meaning exactly -- measured from t_start,
+           so the database build counts against it as it always has. */
+        g_pass_deadline = (g_max_wall_sec <= 0.0) ? 0.0
+            : (g_learning ? omp_get_wtime() + g_max_wall_sec / FREQ_NPASS
+                          : t_start + g_max_wall_sec);
+        if (g_learning && g_max_wall_sec > 0.0)
+            printf("[sweep] pass %d has %.0fs of the %.0fs budget\n",
+                   g_pass, g_max_wall_sec / FREQ_NPASS, g_max_wall_sec);
 
         classify_deal_from_rotations();
         build_top_border_demands();
@@ -3814,7 +3894,8 @@ int main(int argc, char *argv[]) {
         if (g_resume_active && cur_row == g_start_row) { start_bi = g_resume_bi; start_li = g_resume_li; g_solution_idx = g_resume_sol_idx; }
         else g_solution_idx = 0;
 
-        for (size_t bi = start_bi; bi < run_b && !g_stop; bi++) {
+        bool pass_done = false;
+        for (size_t bi = start_bi; bi < run_b && !g_stop && !pass_done; bi++) {
             /* A column's rank is conditional on the bottom (left_rank_of), so the
                ranking belongs here, not once per border row. Its stream is keyed
                by bi so each bottom draws its own and --resume re-derives the same
@@ -3828,12 +3909,17 @@ int main(int argc, char *argv[]) {
             printf("[rank] r%ub%zu: columns %zu -> %zu viable, %zu distinct rank(s), run %zu\n",
                    cur_row, bi, nl, viable, distinct, run_l); fflush(stdout);
             if (run_l == 0) {                /* no column completes row 1 with it */
-                write_checkpoint(ckpath, cur_row, (uint32_t)(bi+1), 0);
+                if (!g_learning) write_checkpoint(ckpath, cur_row, (uint32_t)(bi+1), 0);
                 continue;
             }
             uint32_t barren = 0;            /* consecutive columns that emitted nothing */
             for (size_t li = (bi == start_bi ? start_li : 0); li < run_l && !g_stop; li++) {
-                if (g_max_wall_sec > 0.0 && omp_get_wtime() - t_start >= g_max_wall_sec) { printf("[sweep] max_wall reached.\n"); g_stop = 1; break; }
+                if (pass_time_spent()) {
+                    printf("[sweep] %s reached.\n",
+                           g_learning ? "pass wall budget" : "max_wall");
+                    if (!g_learning) g_stop = 1;
+                    pass_done = true; break;
+                }
                 if (partials_budget_spent()) { partials_budget_announce(); break; }
                 g_cur_bottom = &g_bottoms[bi];
                 g_cur_left   = &g_lefts[li];
@@ -3847,7 +3933,7 @@ int main(int argc, char *argv[]) {
                 if (g_incomplete_top) { g_partial_count = 0; memset(g_partial_htable, 0, g_partial_htable_sz*sizeof(uint64_t)); }
                 double tc0 = omp_get_wtime();
                 double slice_end = tc0 + g_config_time_sec;
-                if (g_max_wall_sec > 0.0) { double ge = t_start + g_max_wall_sec; if (ge < slice_end) slice_end = ge; }
+                if (g_pass_deadline > 0.0 && g_pass_deadline < slice_end) slice_end = g_pass_deadline;
 
                 BeamResult br = beam_search_config(&ctx, scratch, cfg_hash, slice_end);
                 if (g_learning) freq_close_config();
@@ -3858,7 +3944,7 @@ int main(int argc, char *argv[]) {
                 if (g_completions_fp) fflush(g_completions_fp);
                 if (g_partial_fp)     fflush(g_partial_fp);
                 partials_budget_announce();
-                write_checkpoint(ckpath, cur_row, (uint32_t)bi, (uint32_t)(li+1));
+                if (!g_learning) write_checkpoint(ckpath, cur_row, (uint32_t)bi, (uint32_t)(li+1));
                 barren = (g_emit_count + g_partial_count > 0) ? 0 : barren + 1;
                 if (g_bail_columns && barren >= g_bail_columns) {
                     sweep_flush();
@@ -3868,7 +3954,7 @@ int main(int argc, char *argv[]) {
                     /* Point the checkpoint at the next bottom, not at the column
                        we stopped on -- otherwise --resume walks back into the
                        bottom we just abandoned and undoes the saving. */
-                    write_checkpoint(ckpath, cur_row, (uint32_t)(bi+1), 0);
+                    if (!g_learning) write_checkpoint(ckpath, cur_row, (uint32_t)(bi+1), 0);
                     break;
                 }
             }
@@ -3884,17 +3970,27 @@ int main(int argc, char *argv[]) {
         double *wsq   = xmalloc(NUM_PIECES * sizeof(double));
         freq_merge(cnt, wcell, wsq);
         freq_write(g_learn_path, seed_path, csv_path, cnt, wcell, wsq);
-        size_t covered = 0, thin = 0;
+        size_t covered = 0, thin = 0, nfree = 0;
+        size_t cmin = (size_t)-1, cmax = 0;
+        for (int j = 0; j < FREQ_NPASS; j++) {
+            if (g_pconfigs[j] < cmin) cmin = g_pconfigs[j];
+            if (g_pconfigs[j] > cmax) cmax = g_pconfigs[j];
+        }
+        if (!cmax) cmax = 1;
+        for (int x = 0; x < NUM_PIECES; x++) nfree += g_cell_free[x] ? 1 : 0;
         for (int x = 0; x < NUM_PIECES; x++) {
             if (wcell[x] <= 0.0) continue;
             covered++;
-            if (wcell[x] * wcell[x] / wsq[x] < 30.0) thin++;
+            if (wcell[x] * wcell[x] / wsq[x] < 30.0) thin++;   /* configurations */
         }
         printf("\n[learn] passes:");
         for (int j = 0; j < FREQ_NPASS; j++) printf(" p%d=%zu", j, g_pconfigs[j]);
         printf(" configurations\n");
-        printf("[learn] cells covered %zu of %d (%zu with effective sample size < 30)\n",
-               covered, NUM_PIECES, thin);
+        printf("[learn] cells covered %zu of %d free (%zu backed by fewer than 30 "
+               "independent configurations)\n", covered, (int)nfree, thin);
+        printf("[learn] pass balance: the thinnest pass carries %.0f%% of the "
+               "configurations of the fattest%s\n", 100.0 * (double)cmin / (double)cmax,
+               (cmin * 4 < cmax) ? "  <-- raise --top_bottoms" : "");
         /* The one number that says whether any of this carries signal. Scored
            leave-one-configuration-out: a board is measured against a table that
            holds only configurations finished before its own. */

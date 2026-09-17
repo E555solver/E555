@@ -27,10 +27,25 @@ tends to sit at cell *x*" is a real geometric statement about this seed and this
 row's columns, so only positional information can tell two orderings apart. A piece-by-cell
 table is exactly that, which is why it ranks the border here too.
 
-## Two phases, two separate runs
+## Yes, it is two runs
 
-Keeping them separate is deliberate: every other flag then keeps the meaning it already
-has, instead of needing a phase-qualified twin.
+Learning and searching are separate invocations, and that is deliberate: every
+other flag then keeps the meaning it already has in whichever phase it is passed
+to, instead of needing a phase-qualified twin. `run_datadriven.sh` runs them in
+order:
+
+```bash
+bash tests/datadriven/run_datadriven.sh                       # learn, then search
+bash tests/datadriven/run_datadriven.sh THREADS=16 ALPHA=50   # override anything
+bash tests/datadriven/run_datadriven.sh LEARN=0               # reuse the table
+```
+
+`LEARN=0` is the one you want when tuning: the table holds **raw counts**, so
+re-reading it at another `--freq_alpha` costs milliseconds, while learning again
+costs an hour. Learning writes no boards at all, so only the search phase needs
+disk.
+
+### The three new flags
 
 | flag | meaning |
 |---|---|
@@ -40,6 +55,11 @@ has, instead of needing a phase-qualified twin.
 
 Both phases need a rotations file and `--pin_clue 1..4`; without a pinned clue frame a
 board's orientation is not readable and the four passes cannot be folded into one table.
+Learning additionally refuses `--num_rows` other than 1 (the default, 0, means *every
+remaining row of the file*, which would fold incompatible borders into one table),
+`--resume` (the checkpoint records no pass number) and `--free_edges` (the border block
+assumes a fixed side per edge piece). Each of those would corrupt a table quietly rather
+than loudly, which is the only reason they are checked.
 
 ```bash
 # learn (writes no boards, so it is cheap on disk)
@@ -58,6 +78,39 @@ bin/E555_beamer_datadriven ../../data/seed_Edge5.txt ../../data/borders_annealed
 python3 freq_view.py runs/table.txt --out runs/table.html
 python3 freq_view.py runs/table.txt --text
 ```
+
+## Choosing the learning settings
+
+**`--stop_row 8` is enough, and cheaper than it looks.** Pass 0 covers canonical rows
+`0..S` and pass 2 covers rows `(15-S)..15`, so the two of them alone cover the whole
+board as soon as `S >= 7`; passes 1 and 3 then cover the same ground by column and give
+the overlap. Measured on `borders_annealed_fix12.csv` row 1, `--stop_row 8` reaches
+**all 247 free cells** (the other 9 of 256 are the four corners and the five clue cells,
+excluded by design). Going deeper buys overlap, not coverage, and costs survivors.
+
+**Raise `--top_bottoms` until the passes stop being starved, and leave `--top_columns`
+small.** The two knobs are not interchangeable. A configuration is one vote, and the
+configurations sharing a bottom row differ only in their left column, so they are
+correlated: more columns per bottom inflates the vote count faster than it adds
+information, and the reported effective sample size does not know that. More *bottoms* is
+real independence. Keep `--top_columns` at about 5 and spend the budget on bottoms.
+
+**How many bottoms is "enough" depends on the side, and the pools are wildly uneven.**
+An annealed border is rich in Euler trails on some sides and poor on others, and each
+pass puts a different side at the bottom. On `borders_annealed_fix12.csv` row 1:
+
+| pass | bottoms in the pool | survival to row 8 |
+|---|---|---|
+| 0 | 480 | 10% |
+| 1 | 25,920 | 0.2% |
+| 2 | 46,080 | 2% |
+| 3 | 432 | 18% |
+
+Passes 0 and 3 exhaust their pools after a few hundred bottoms and cannot be improved by
+raising the flag; passes 1 and 2 are starved by it and want tens of thousands. So set
+`--top_bottoms` past the largest pool (50000 covers this file) and let each pass take
+what it has. The learning summary prints the per-pass configuration counts and says
+`raise --top_bottoms` when the thinnest pass is under a quarter of the fattest.
 
 ## Why four passes
 
@@ -83,9 +136,16 @@ satisfies every edge but not the clue, so it is checked rather than commented."
 ## How a count becomes a weight
 
 1. **One configuration, one vote.** Boards grown from one border are near-copies of each
-   other, so a configuration's boards are divided by their own number. Each pass is then
-   scaled to the same total weight, so a productive pass does not bend the table toward the
-   bands only it covers.
+   other, so a configuration's boards are divided by their own number. The passes are
+   **not** rescaled against each other. An earlier version equalised them, and measurement
+   showed that to be the wrong correction failing in the dangerous direction: passes come
+   out as uneven as 48/1/10/78, so equalising multiplies a single-configuration pass by
+   thirty-odd, and the shrinkage denominator then claims thirty configurations of evidence
+   where one exists. That denominator is exactly what `--freq_alpha` is denominated in, so
+   the effect is to switch off the backoff precisely where the backoff is all there is.
+   Uneven coverage needs no correction: a quadrant that two thin passes cover really is
+   less well known, shrinkage *should* be stronger there, and Sinkhorn removes the coverage
+   bias from the final matrix anyway. The cure for an uneven pass count is more bottoms.
 2. **Backoff.** `P(piece | row)` from the piece-by-row marginals — about 16× better sampled
    than the cell table, and the level the whole idea rests on: low pieces low, top pieces top.
 3. **Shrinkage.** `P̂ = (N + α·P_row) / (W + α)`. Large `α` is the robust row prior, small
@@ -98,6 +158,12 @@ satisfies every edge but not the clue, so it is checked rather than commented."
    piece's mass and every cell's mass 1 removes that and the coverage bias in one step.
 5. **Weights.** `log(K·Q)` nats: zero at chance, additive, and in the same units as the
    fan-out terms they sit beside.
+
+Effective sample size is reported in **configurations, not boards**. A configuration's
+500 boards are near-copies, so counting them as 500 independent samples reports tens of
+thousands of samples for evidence worth a few dozen borders — which is what an earlier
+version did. Treat the figure as an upper bound even now: configurations sharing a bottom
+row are still correlated (see *Choosing the learning settings*).
 
 The file on disk holds **raw counts**, not processed weights, so `--freq_alpha` can be
 retuned on the next search in milliseconds instead of by learning again. It is
