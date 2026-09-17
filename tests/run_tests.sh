@@ -77,6 +77,7 @@ ALL_STEPS=(
     "distiller|per-board windows differ, masks cover every break, --plan runs"
     "consensus|four turns of one board score identically, and --border_out runs"
     "annealer|Stage A short run: BEST lines and a beamer-format --out CSV"
+    "sort_rotations|both comment forms sort alike, and --max_top turns every row onto its own best side"
     "finalizer_synth|REGRESSION: rediscovers the synthetic solution from row 10"
     "finalizer_rotations|re-imposes a matching rotations row's side assignment"
     "finalizer_determinism|one seed re-run reproduces the search exactly"
@@ -774,6 +775,86 @@ for l in rows:
     assert spins[60:] == [0]*196, "inner pads must be zero"
 print("ok: 2 beamer-format rotation rows")
 EOF
+}
+
+# The tool reads a score and four trail counts out of the annealer's PROSE, and
+# it can now turn each row by its own angle. Both halves fail silently: an
+# unreadable comment sorts the row last and degenerates the order to the input's
+# (which is what data/borders_annealed_fix12.csv's older comma form did to every
+# one of its rows), and a relabelled comment looks perfectly plausible whatever
+# the spins actually did. So this checks the numbers against a second reader and
+# the spins against the tool that already owns rotations turns.
+step_sort_rotations() {
+    src=data/borders_annealed_fix12.csv
+    SR="python3 tools/E555_sort_rotations.py"
+
+    # The same 12 borders with their comments rewritten into the annealer's `=`
+    # form. Two readers, one set of numbers: the orders have to agree.
+    sed -E 's/Score,([0-9.]+)/Score=\1/; s/(TOP|RIGHT|BOTTOM|LEFT),([0-9]+)/\1=\2/g' \
+        "$src" > "$OUT/sr_eq.csv"
+    grep -q 'TOP=' "$OUT/sr_eq.csv" || fail "the = fixture was not rewritten"
+
+    # Without --out the file goes to stdout -- it used to go nowhere at all,
+    # taking --top with it -- and stdout must stay free of diagnostics.
+    $SR "$src" > "$OUT/sr_comma.csv" 2>/dev/null || fail "sort to stdout exited nonzero"
+    n=$(grep -cv '^ *#' "$OUT/sr_comma.csv")
+    [ "$n" = "12" ] || fail "stdout carried $n row(s), expected 12"
+    n=$($SR "$src" --top 4 2>/dev/null | grep -cv '^ *#')
+    [ "$n" = "4" ] || fail "--top 4 kept $n row(s) on stdout"
+
+    for f in "$src" "$OUT/sr_eq.csv"; do
+        $SR "$f" > /dev/null 2>"$OUT/sr.err"
+        grep -q 'no readable' "$OUT/sr.err" && fail "$f: a comment went unread"
+    done
+    $SR "$OUT/sr_eq.csv" 2>/dev/null | grep -v '^ *#' > "$OUT/sr_eq_out.csv"
+    cmp -s <(grep -v '^ *#' "$OUT/sr_comma.csv") "$OUT/sr_eq_out.csv" \
+        || fail "the two comment forms sorted the same borders differently"
+
+    # --max_top must leave every row showing its own largest count on top, with
+    # the four numbers only permuted; --sort min_side must invert the file.
+    $SR "$OUT/sr_eq.csv" --max_top --seed_file data/seed_Edge5.txt \
+        -o "$OUT/sr_maxtop.csv" 2>/dev/null || fail "--max_top exited nonzero"
+    n=$(grep -cv '^ *#' "$OUT/sr_maxtop.csv")
+    [ "$n" = "12" ] || fail "--max_top dropped rows: $n of 12 survived"
+    python3 - "$OUT/sr_eq.csv" "$OUT/sr_maxtop.csv" <<'EOF' || exit 1
+import re, subprocess, sys
+KEY = re.compile(r'(TOP|RIGHT|BOTTOM|LEFT)=(\d+)')
+def sides(p):
+    return [dict((k, int(v)) for k, v in KEY.findall(l))
+            for l in open(p) if l.lstrip().startswith('#') and 'TOP=' in l]
+src, turned = sides(sys.argv[1]), sides(sys.argv[2])
+assert len(src) == len(turned) == 12, (len(src), len(turned))
+for v in turned:
+    assert v['TOP'] == max(v.values()), f"largest count is not on top: {v}"
+assert sorted(tuple(sorted(v.values())) for v in src) == \
+       sorted(tuple(sorted(v.values())) for v in turned), \
+       "the turned counts are not a permutation of the originals"
+# --sort min_side asks the opposite question from --sort score, so on a file
+# the annealer built to score well it has to come back in a different order.
+def ids(*flags):
+    out = subprocess.run(["python3", "tools/E555_sort_rotations.py", sys.argv[1], *flags],
+                         capture_output=True, text=True, check=True).stdout
+    return [l.split(",")[0] for l in out.splitlines() if not l.lstrip().startswith("#")]
+by_score, by_tight = ids("--sort", "score"), ids("--sort", "min_side")
+assert sorted(by_score) == sorted(by_tight), "a sort key lost or invented a row"
+assert by_score != by_tight, "--sort min_side reproduced the score order"
+print(f"ok: 12 borders turned onto their own best side, {len(set(by_score))} ids intact")
+EOF
+
+    # The spins, not just the prose: four quarter-turns by the tool that owns
+    # rotations turns must bring the turned file back to itself.
+    prev="$OUT/sr_maxtop.csv"
+    for t in 1 2 3 4; do
+        python3 tools/E555_rotate.py "$prev" 1 --rotations \
+            --seed_file data/seed_Edge5.txt --out "$OUT/sr_t$t.csv" > /dev/null \
+            || fail "rotating the turned file failed at turn $t"
+        prev="$OUT/sr_t$t.csv"
+    done
+    grep -v '^ *#' "$OUT/sr_maxtop.csv" | tr -d ' ' > "$OUT/sr_a.spins"
+    grep -v '^ *#' "$OUT/sr_t4.csv"     | tr -d ' ' > "$OUT/sr_b.spins"
+    cmp -s "$OUT/sr_a.spins" "$OUT/sr_b.spins" \
+        || fail "four turns of the --max_top file did not return its own spins"
+    echo "ok: both comment forms agree, --max_top permutes the counts, four turns are the identity"
 }
 
 # The strongest correctness proof in the repo: the beam machinery, the database,

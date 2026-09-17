@@ -2139,6 +2139,49 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   orientation as well as a cell, and a translation moves the cell while leaving
   the spin alone, so any non-zero sink breaks a clue that was already right: the
   filter selects boards the sink puts right, which are rare. Off by default.
+- **`tools/E555_sort_rotations.py`** -- orders a Stage A rotations file, and
+  orients it. Stage B reads borders in file order and `--num_rows N` takes the
+  first `N`, so this file's order decides which borders get searched at all;
+  and a border *is* four Euler-trail counts on four sides, so which side carries
+  which count decides how the beam meets it. The beam grows bottom-up: a row's
+  BOTTOM count is how many starts it offers, its TOP count how many ways it can
+  be closed.
+  The score and the counts live in the annealer's **comment**, one line above
+  each row, which is the whole reason this is a tool and not an inline `awk`:
+  `FS = "Score="` mis-pairs a comment with the wrong row the moment any other
+  comment appears, and the annealer now writes a `# run` provenance marker.
+  Two comment forms are read, `TOP=4320 ... Score=9.7510` as the annealer writes
+  it today and `TOP,4320 ... Score,9.3108` as older files including
+  `data/borders_annealed_fix12.csv` do. Reading only the first form scored every
+  row of that file `-inf` and silently degenerated the sort to input order.
+  `--sort` takes comma-separated keys, best board first, `--sort=-KEY` to invert
+  one, as `E555_rank.py` does. `score` and the four side names are magnitudes and
+  sort largest first. The three derived keys answer the opposite question --
+  which border is *constrained*, not which is big -- and so sort
+  constraint-first: `min_side` puts the tightest side first, `max_side` the
+  tightest maximum, and `spread`, `ln(max side) - ln(min side)`, the most
+  lopsided row. That inversion is the point: the annealer's own `Score` ranks a
+  balanced row above a lopsided one, and a side with few continuations is the
+  one that forces a piece choice.
+  `--max_top`, `--max_right`, `--max_bottom`, `--max_left` and the four `--min_`
+  forms turn **each row by its own angle** so that row's largest (or smallest)
+  count lands on the named side; at most one of the eight, and a tie takes the
+  fewest turns, so a row already oriented is left alone. A turn is
+  `spin += 3n mod 4` on every piece with a grey face, the same arithmetic and the
+  same two validations as `E555_rotate.py --rotations` (a legal 14/14/14/14
+  partition with four corners, and the side *sets* following the turn); a row
+  failing either is dropped, as it would be there. The four counts are relabelled
+  in place, keeping each row's own separator, and a `Turn=270(--max_top)` note is
+  appended -- per row, including `Turn=0` for a row that needed no turn, so the
+  file says what was asked of it.
+  `Score=` is deliberately **not** rewritten. It is the annealer's weighted
+  objective, its weights are not in the file, and under asymmetric weights it is
+  not rotation-invariant: a turned row keeps the score it was found with, and the
+  `Turn=` note is what makes the scored orientation recoverable.
+  With no `-o/--out` the rotations file goes to **stdout** and every diagnostic
+  to stderr, so the tool pipes. It used to compute the whole result and discard
+  it, `--top` included. `--seed_file` is read only when a turn is asked for:
+  plain sorting needs no seed.
 - **`tools/E555_extract_consensus.py`** -- ranks a pool of CLUED partials by how
   well each one matches what the pool as a whole agrees on. Every other ranker
   here reads one board in isolation, which is why they stop discriminating above
@@ -2355,6 +2398,7 @@ tools to the same-seed-same-threads contract.
 | `tools/E555_rank.py` | Ranks/sorts board CSVs by compactness, solidity, clean rows; `--rescore` rewrites them canonically; `--diverse K` picks independent roots. |
 | `tools/E555_extract_consensus.py` | Pools clued partials into one clue frame and ranks them by agreement with the resulting piece-by-cell consensus, on the cells the whole corpus placed so the stop row cannot drive the ranking; `--best_top`/`--best_bottom` score the bag of pieces still to be placed; `--border_out` distils the table into Stage A rotations rows, one per corner class, plus a laid-out 60-piece frame the finalizer locks as fixed sides. |
 | `tools/E555_rotate.py` | Turns every board in a CSV by a quarter-turn multiple, losslessly; `--sink N` drops the board N rows so the bad rows fall out of it. |
+| `tools/E555_sort_rotations.py` | Orders a Stage A rotations file by score or by any side measure (`--sort min_side`, `spread`), and turns each row onto its own best side (`--max_top` .. `--min_left`); stdout by default. |
 | `data/` | Seeds, known synthetic solution, example boards, masks (see `data/README.md`). |
 | `examples/` | One small script per tool: read these first. |
 | `pipeline/` | The full pipeline, the board farm and the topper sweeps -- long unattended runs. |

@@ -123,6 +123,15 @@ The script anneals **four times** as many borders as the beamer will use and
 keeps the best quarter with `E555_sort_rotations.py --top`: Stage A is cheap and
 the beam is not, so it pays to be picky.
 
+That tool also decides *which way up* each border is handed over, which matters
+because the beam grows bottom-up: a row's BOTTOM count is how many starts it
+offers and its TOP count how many ways it can be closed. `--max_bottom` turns
+each row onto its richest side to get the most starts, `--min_bottom` onto its
+poorest to make the opening rows commit, and `--sort min_side` or `--sort spread`
+rank by how *constrained* a border is rather than how high the annealer scored
+it. Run it without `-o` to see what a file holds before committing beam time to
+it.
+
 **`STEPS` has a floor of 250000.** Below it the annealer is not merely weaker --
 it often fails to place a legal border at all. Measured on the real seed: 8
 restarts x 3000 steps found 2 feasible borders, and 2 x 2000 returned one border
