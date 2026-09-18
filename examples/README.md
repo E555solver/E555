@@ -123,6 +123,31 @@ The script anneals **four times** as many borders as the beamer will use and
 keeps the best quarter with `E555_sort_rotations.py --top`: Stage A is cheap and
 the beam is not, so it pays to be picky.
 
+That tool also decides *which way up* each border is handed over, which matters
+because the beam grows bottom-up: a row's BOTTOM count is how many starts it
+offers and its TOP count how many ways it can be closed. `--max_bottom` turns
+each row onto its richest side to get the most starts, `--min_bottom` onto its
+poorest to make the opening rows commit, and `--sort min_side` or `--sort spread`
+rank by how *constrained* a border is rather than how high the annealer scored
+it. Run it without `-o` to see what a file holds before committing beam time to
+it.
+
+Once a row in that pool has the shape you want, you do not have to re-roll the
+dice to get more like it. Hand it straight back to Stage A:
+
+```bash
+python3 tools/E555_sort_rotations.py rotations.csv --sort min_side | head -4
+python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
+    --input rotations.csv --row 3 --restarts 8 --steps 500000 --out refined.csv
+```
+
+`--row` counts data rows from 0, the same numbering the beamer's `--start_row`
+uses, so the row you picked is the row you get. Every restart starts from that
+same border and refines it, the weights you use now need not be the ones that
+produced the file, and the run cannot come back worse than what you handed it.
+Prefer more `--steps` to more `--restarts` here: the restarts share a starting
+point, so extra ones buy less than extra depth does.
+
 **`STEPS` has a floor of 250000.** Below it the annealer is not merely weaker --
 it often fails to place a legal border at all. Measured on the real seed: 8
 restarts x 3000 steps found 2 feasible borders, and 2 x 2000 returned one border
