@@ -76,7 +76,8 @@ ALL_STEPS=(
     "sink|--sink drops N rows, frees the frame it broke, and keeps the core intact"
     "distiller|per-board windows differ, masks cover every break, --plan runs"
     "consensus|four turns of one board score identically, and --border_out runs"
-    "annealer|Stage A short run: BEST lines and a beamer-format --out CSV"
+    "annealer|Stage A short run: BEST lines, a beamer-format --out CSV, and spins that match their comment"
+    "annealer_refine|Stage A warm start: every shipped row round-trips, and refining one cannot lose ground"
     "sort_rotations|both comment forms sort alike, and --max_top turns every row onto its own best side"
     "finalizer_synth|REGRESSION: rediscovers the synthetic solution from row 10"
     "finalizer_rotations|re-imposes a matching rotations row's side assignment"
@@ -759,6 +760,7 @@ EOF
 }
 
 step_annealer() {
+    rm -f "$OUT/rotations.csv"
     python3 -u src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
         --restarts 2 --steps 3000 --rng_seed 42 --verbose \
         --out "$OUT/rotations.csv" > "$OUT/annealer.log"
@@ -774,6 +776,147 @@ for l in rows:
     assert all(0 <= s <= 3 for s in spins), "spin out of range"
     assert spins[60:] == [0]*196, "inner pads must be zero"
 print("ok: 2 beamer-format rotation rows")
+EOF
+
+    # The spins are the deliverable and the comment is the only description of
+    # them, so they have to agree: reconstruct each row's border from its spins
+    # alone and recompute the four counts. This is what catches a best recorded
+    # from a CANDIDATE swap whose rotation vector was assembled wrongly -- the
+    # counts would still look plausible, and Stage B would search a border
+    # nobody scored. Corner swaps and edge swaps both take that path.
+    python3 - "$OUT/rotations.csv" <<'EOF' || exit 1
+import re, sys
+sys.path.insert(0, "src/A_border")
+import E555_edge_annealer as A
+
+pieces = A.read_pieces("data/seed_Edge5.txt")
+pbi    = {p.id: p for p in pieces}
+cap    = A.build_inner_capacity(pieces)
+cfg    = A.AnnealingConfig()
+rows   = A.read_rotations(sys.argv[1])
+assert len(rows) == 2, f"expected 2 rows, got {len(rows)}"
+for i, (spins, comment, lineno) in enumerate(rows):
+    state = A._build_run_state(pbi, *A.border_from_spins(pbi, spins), cap, cfg)
+    got  = {A.SIDE_NAMES[s]: state.evals[s].euler_count for s in A.Side}
+    want = A.counts_in_comment(comment)
+    assert want == got, f"row {i} (line {lineno}): comment {want} != spins {got}"
+print("ok: both rows' spins reproduce the counts their comments claim")
+EOF
+}
+
+# --input hands the annealer a border it did not find itself, which means two
+# things can now go wrong silently. A row reconstructed against the wrong seed
+# file would anneal a different board than the one named -- so the four trail
+# counts are recomputed from the spins and checked against the comment, and
+# that check is what this step exercises on every shipped row. And a warm run
+# that came back WORSE than its input would quietly poison a refined pool: the
+# starting border is seeded as the restart's first best precisely so it cannot,
+# and the run summary states the count, so the guarantee is asserted, not
+# assumed. Uses data/borders_annealed_fix12.csv, which is shipped (so this step
+# consumes no other step's artifacts) and carries the older comma comment form,
+# so the two-form comment reader is covered here too.
+step_annealer_refine() {
+    local IN=data/borders_annealed_fix12.csv
+    local A=src/A_border/E555_edge_annealer.py
+    rm -f "$OUT/refined.csv"
+
+    python3 - "$IN" <<'EOF' || exit 1
+import sys
+sys.path.insert(0, "src/A_border")
+import E555_edge_annealer as A
+
+pieces = A.read_pieces("data/seed_Edge5.txt")
+pbi    = {p.id: p for p in pieces}
+cap    = A.build_inner_capacity(pieces)
+cfg    = A.AnnealingConfig()
+rows   = A.read_rotations(sys.argv[1])
+assert len(rows) == 12, f"expected 12 data rows, got {len(rows)}"
+for i, (spins, comment, lineno) in enumerate(rows):
+    edge_side, corner_pos = A.border_from_spins(pbi, spins)
+    per = {s: sum(1 for v in edge_side.values() if v == s) for s in A.Side}
+    assert all(per[s] == A.EDGE_PER_SIDE for s in A.Side), f"row {i}: {per}"
+    assert len(set(corner_pos.values())) == 4, f"row {i}: corners {corner_pos}"
+    state = A._build_run_state(pbi, edge_side, corner_pos, cap, cfg)
+    got  = {A.SIDE_NAMES[s]: state.evals[s].euler_count for s in A.Side}
+    want = A.counts_in_comment(comment)
+    assert want is not None, f"row {i} (line {lineno}): comma-form counts not read"
+    assert want == got, f"row {i} (line {lineno}): comment {want} != recomputed {got}"
+    assert A.hard_penalty(state.evals, state.inward_tally, cap, cfg) == 0.0, \
+        f"row {i}: reconstructed border is not feasible"
+print(f"ok: {len(rows)} legacy-form rows round-trip through their spins")
+EOF
+
+    # Naming a row that is not there, and naming the corners twice, are both
+    # refusals -- a warm start that silently fell back to row 0 or to random
+    # corners would be worse than no warm start at all.
+    python3 -u "$A" data/seed_Edge5.txt --input "$IN" --row 99 \
+        --restarts 1 --steps 1 > "$OUT/refine_row99.log" 2>&1 \
+        && fail "--row 99 was accepted"
+    grep -q "12 data row" "$OUT/refine_row99.log" \
+        || fail "--row out of range did not say how many rows the file holds"
+    python3 -u "$A" data/seed_Edge5.txt --input "$IN" --fix_corners 1 \
+        --restarts 1 --steps 1 > "$OUT/refine_clash.log" 2>&1 \
+        && fail "--fix_corners together with --input was accepted"
+    python3 -u "$A" data/seed_Edge5.txt --row 2 \
+        --restarts 1 --steps 1 > "$OUT/refine_norow.log" 2>&1 \
+        && fail "--row without --input was accepted"
+
+    # The schedule is probed once in the parent, so it must depend on
+    # --rng_seed alone: same seed, same sigma, whatever the thread count.
+    for t in 1 2; do
+        python3 -u "$A" data/seed_Edge5.txt --input "$IN" --row 1 --rng_seed 42 \
+            --threads "$t" --restarts 1 --steps 1 2>&1 | grep "move scale sigma"
+    done > "$OUT/refine_sigma.txt"
+    [ "$(sort -u "$OUT/refine_sigma.txt" | wc -l)" = "1" ] \
+        || { cat "$OUT/refine_sigma.txt"; fail "the probe is not reproducible"; }
+    grep -q "polishing:" "$OUT/refine_sigma.txt" \
+        || { cat "$OUT/refine_sigma.txt"; fail "a row already suited to these weights did not get the polishing schedule"; }
+
+    # The same row, scored against targets it was never annealed for, is not a
+    # refinement target any more and must get the cold schedule instead. This
+    # is the one branch the polish/search rule exists to make: a cool schedule
+    # here sat stuck 35 points below what a hot one reached.
+    python3 -u "$A" data/seed_Edge5.txt --input "$IN" --row 1 --restarts 1 --steps 1 \
+        --target_scale 250 --w_top 60 --w_right 20 --w_bottom 20 --w_left 1 \
+        > "$OUT/refine_search.log" 2>&1 || { cat "$OUT/refine_search.log"; fail "target-mode warm start failed"; }
+    grep -q "schedule: searching:" "$OUT/refine_search.log" \
+        || { grep schedule "$OUT/refine_search.log"; fail "a row far from these weights still got the polishing schedule"; }
+
+    python3 -u "$A" data/seed_Edge5.txt --input "$IN" --row 1 \
+        --restarts 3 --steps 4000 --rng_seed 42 --threads 2 \
+        --out "$OUT/refined.csv" > "$OUT/refine.log" 2>&1 \
+        || { cat "$OUT/refine.log"; fail "the refine run failed"; }
+    grep -q "3/3 restarts matched or beat the input row" "$OUT/refine.log" \
+        || { cat "$OUT/refine.log"; fail "a refinement lost ground against its input"; }
+
+    python3 - "$OUT/refined.csv" "$IN" <<'EOF' || exit 1
+import sys
+sys.path.insert(0, "src/A_border")
+import E555_edge_annealer as A
+
+pieces = A.read_pieces("data/seed_Edge5.txt")
+pbi    = {p.id: p for p in pieces}
+cap    = A.build_inner_capacity(pieces)
+cfg    = A.AnnealingConfig()
+src    = A.read_rotations(sys.argv[2])
+base   = A._build_run_state(pbi, *A.border_from_spins(pbi, src[1][0]), cap, cfg).score
+
+rows = A.read_rotations(sys.argv[1])
+assert len(rows) == 3, f"expected 3 refined rows, got {len(rows)}"
+raw = [l.rstrip("\n") for l in open(sys.argv[1]) if l.lstrip().startswith("#")]
+assert any("input=" in l and "row=1" in l for l in raw), "the # run marker lost --input/--row"
+for i, (spins, comment, lineno) in enumerate(rows):
+    assert "From=" in comment and ":row1" in comment, f"row {i}: no provenance: {comment}"
+    assert spins[60:] == [0] * 196, f"row {i}: inner pads must stay zero"
+    state = A._build_run_state(pbi, *A.border_from_spins(pbi, spins), cap, cfg)
+    assert A.hard_penalty(state.evals, state.inward_tally, cap, cfg) == 0.0, \
+        f"row {i}: emitted an unusable border"
+    got  = {A.SIDE_NAMES[s]: state.evals[s].euler_count for s in A.Side}
+    want = A.counts_in_comment(comment)
+    assert want == got, f"row {i}: comment {want} != recomputed {got}"
+    assert state.score >= base - 1e-12, \
+        f"row {i}: scored {state.score:.4f} below its input's {base:.4f}"
+print(f"ok: 3 refined rows, all provenant and none below the input's {base:.4f}")
 EOF
 }
 

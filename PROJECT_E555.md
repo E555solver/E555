@@ -184,10 +184,145 @@ starve three sides (weakest side seen: 128). Target mode lands every side
 within about 2x of its target -- and gives up almost nothing in total richness
 to do it: its best log-sum value is 8.17 against log-sum's own 8.51.
 
-Use **log-sum** to explore what the piece set can do at all, or to push one
-side as hard as possible and genuinely not care about the rest. Use
-**`--target_scale`** for anything feeding Stage B, where a bottom that is too
-rich is just as unhelpful as a top that is too poor.
+**Log-sum with all four weights at `+1` is the default**, and it is the right
+first thing to run: it asks every side to be as rich as it will go and makes no
+claim about how big any of them should be. Reach for signed weights when you
+want one side rich and the rest starved, and for **`--target_scale`** when a
+side that is too rich is as unhelpful as one that is too poor -- but note that
+targets are a claim about sizes you have to already believe.
+
+One live caveat about the shipped runners: `pipeline/run_pipeline.sh`,
+`pipeline/run_farm.py` and `examples/01_beamer_quickstart.sh` all pass
+`--w_bottom 0 --w_left 1 --w_right 3 --w_top 2`. A weight of **zero** drops that
+side out of the objective entirely -- so Stage A optimizes nothing at all about
+the bottom, which is the side the beam grows *from* and whose count is exactly
+the number of starts the sweep gets. That is a deliberate shaping choice inside
+those scripts, not the tool's default, and it is worth re-deriving before
+trusting it.
+
+### Refining a border you already have
+
+`--input rotations.csv --row N` takes one row of Stage A's own output as the
+starting border for every restart, so a border with the shape you want can be
+refined rather than rediscovered. Pick the row with
+`tools/E555_sort_rotations.py` (`--sort min_side`, `--sort spread`), then hand
+it back:
+
+```bash
+python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
+    --input rotations.csv --row 3 --restarts 8 --steps 500000 --out refined.csv
+```
+
+- **`--row` counts data rows from 0**, with `#`/`%` comments and blank lines
+  skipped and not counted -- the same numbering `E555_beamer`'s `--start_row`
+  uses, so one row number means one row in both tools.
+- **The weights need not match the ones that produced the file.** Nothing
+  checks, deliberately: a row found under one objective is a fine starting
+  point for another. The header prints the row's score under the weights now in
+  force *and* the score its comment records, which is how you see the
+  difference.
+- **The row is cross-checked against the seed file for free.** The four trail
+  counts are recomputed from the reconstructed border and compared with the
+  row's comment (both the `TOP=4320` and the older `TOP,4320` form are read). A
+  disagreement is fatal, because it means the row and the piece set do not
+  belong together and annealing on would optimize a different board. All 18
+  rows shipped in `data/` and `tests/datadriven/` reconstruct to 14/14/14/14
+  with four corners and counts identical to their comments.
+- **Corners are kept as given and never swapped.** The row was chosen for the
+  border it is, and its four corners set every side's endpoints; `--fix_corners`
+  together with `--input` is a hard error, since both claim to place them.
+- **A refinement cannot lose ground.** The starting border is itself eligible to
+  be a restart's best, so every restart hands back that row or something better,
+  and the run summary states the count.
+- **Prefer more `--steps` to more `--restarts`.** The restarts share a starting
+  border and diverge only through their RNG. Perturbing the row first was tried
+  and rejected: two random swaps before each restart found the single best score
+  seen, but left 8 of 12 restarts with no feasible border at all, because a kick
+  can break the degree balance or the colour inventory and a refinement
+  temperature never climbs back out.
+
+Each appended comment carries `From=<file>:row<N>`, and the `# run` marker
+records the input and row, so a refined pool still says what it came from.
+
+### Temperature
+
+`--T0/--Tf` are normally left unset: the schedule is resolved from the starting
+state at startup, reported in the header, and an explicit `--T0/--Tf` always
+wins.
+
+What the temperature has to straddle is the **feasibility cliff**, not the
+objective. Best borders are harvested from every candidate *evaluated*, not
+only from accepted ones -- but only a feasible candidate is eligible, and an
+infeasible state scores at least `infeasible_band + 2*balance_penalty_weight` =
+45 points worse than a feasible one. So `T0` decides how much of a run is spent
+below that cliff harvesting nothing, and that turns out to be the whole effect.
+Swept at 16 restarts x 60k steps x 2 master seeds (32 samples a cell), mean
+best-per-restart score by `T0`, averaged over `Tf` in {8, 2, 0.5}:
+
+| `T0` | log-sum `+1` | log-sum `+9/-2/-5/-2` | `--target_scale 250` |
+|---|---|---|---|
+| **1000** (shipped before) | **7.74** | **0.98** | **81.70** |
+| 100 | 7.87 | 1.11 | 81.94 |
+| **20** | **7.99** | **1.22** | **86.28** |
+| 5 | 7.82 | 0.81 | 79.49 |
+
+A finer 16-cell sweep on the default objective puts the optimum plateau at
+`T0` in [10, 20] with `Tf` in [8, 12] -- best cell `(10, 10)` at mean 8.267
+against 7.600 for the old `(1000, 8)`, which was the *worst* cell tested. The
+same `T0` region wins in all three objectives, and that the winner is the same
+**absolute** temperature in modes whose move sizes differ 40x is what says the
+cliff sets it, not the objective. Hence the cold anchor: `T0 = cliff/4`,
+`Tf = cliff/5`, expressed as ratios so they follow the penalty constants if
+those are ever retuned.
+
+Re-checked at the depth real runs use -- 16 restarts x **500k** steps, the
+`run_pipeline.sh` default -- where the anchor is the best of the four cells
+tried, so the 60k tuning did not just fit the short runs:
+
+| `T0` | `Tf` | mean | best | |
+|---|---|---|---|---|
+| **11.25** | **9** | **8.6901** | **9.2374** | `cliff/4`, `cliff/5` -- the anchor |
+| 10 | 10 | 8.5862 | 8.8442 | best 60k cell |
+| 20 | 8 | 8.5670 | 8.9254 | top-five 60k cell |
+| 1000 | 8 | 8.1791 | 8.8072 | what used to ship |
+
+**A warm start needs a different schedule, and which one does not follow from
+the scoring mode.** It follows from how far the starting border already sits
+from what the weights in force are asking for:
+
+- *Polishing.* The row is near a local optimum, and heat only destroys it.
+  Refining a row scored 9.7601 at the cold schedule left **0 of 12** restarts
+  even matching their own input (mean 7.58, two points *below* the row they
+  were handed). At `T0 = 0.5*sigma`, 12 of 12 matched or beat it, mean 9.92,
+  best 10.06. Swept over three rows, `0.5*sigma` won on the mean at 9.556
+  against 9.39 for every hotter or wider schedule -- and widening the span
+  instead of lowering `T0` does not help, so it is the heat that matters.
+- *Searching.* The row is a long way from what these weights want, so it is not
+  a refinement target at all and wants the cold schedule. The same three rows
+  scored under `--target_scale 250`, which they were never annealed for,
+  preferred hot by a wide margin (83.9 against 60.9), and one sat stuck at
+  exactly 48.81 for every cool setting tried.
+
+The startup probe separates the two cleanly. Of the neighbours that keep the
+border feasible, the share that **improve** it was 1.4 %, 2.8 % and 15.7 % on
+the three rows that wanted polishing, against 30.6 %, 43.5 % and 59.1 % on the
+three that wanted searching -- a gap with nothing in it. The threshold sits in
+that gap, nearer its top, because mistaking a polish for a search is the
+destructive error while the reverse merely under-explores. Checked end to end,
+the rule reaches the swept optimum exactly on all three polishing rows, and
+86.06 against a swept best of 86.28 on the searching ones, avoiding the
+25-point trap the cool schedule falls into.
+
+`sigma` itself is the standard deviation of the score change over the sampled
+feasible moves. Three other estimators were tried and rejected for being
+noisier than the thing they measure: a median over the same moves varies
+65-137 % across probe seeds (against 1.4-10.1 % for this one), a median over
+the worsening ones came back *empty* on a real row whose every feasible
+neighbour improved, and solving for a target acceptance rate has no solution at
+all much of the time, since ~92 % of candidates fall off the cliff and the mean
+acceptance is pinned by the improving fraction rather than by `T`. From a cold
+random start no estimator can work -- **0 of 300** sampled moves land feasible
+-- which is exactly why that case falls back to the cliff anchor.
 
 **Output.** With `--out FILE` each restart's best border is appended to a
 rotations CSV that the beamer reads directly: a `#` comment with the per-side
@@ -215,9 +350,11 @@ worker per restart. Measured on an 8-thread laptop the gain is ~3x (8 restarts x
 steps from ~14 min to ~5.
 
 Key options: `--restarts`, `--steps`, `--rng_seed`, `--threads`, `--verbose`,
-`--T0/--Tf`, `--w_top/right/bottom/left` (per-side target multipliers with
-`--target_scale`, and signed weights in log-sum mode, where a negative weight
-minimizes a side), `--tabu`, `--fix_corners {0,1,2}`, `--target_scale`, `--out`.
+`--input/--row` (refine an existing border), `--T0/--Tf` (normally left unset,
+see above), `--w_top/right/bottom/left` (all `+1` by default; per-side target
+multipliers with `--target_scale`, and signed weights in log-sum mode, where a
+negative weight minimizes a side), `--tabu`, `--fix_corners {0,1,2}`,
+`--target_scale`, `--out`.
 
 ---
 
