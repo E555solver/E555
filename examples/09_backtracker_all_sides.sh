@@ -17,22 +17,25 @@
 # cells wherever no exact piece fits.
 #
 #   #  flags                          leads from        order_key
-#   1  --order rowmajor               bottom, L->R      r*16 + c
-#   2  --order rowmajor --reverse     same rows, R->L   r*16 + (15-c)
-#   3  --order colmajor               left              c*16 + r
-#   4  --order colmajor --reverse     right, downward   (15-c)*16 + (15-r)
-#   5  --order spiral                 outer ring in     min(r,15-r,c,15-c)
+#   1  --order spiral                 outer ring in     min(r,15-r,c,15-c)
+#   2  --order rowmajor               bottom, L->R      r*16 + c
+#   3  --order rowmajor --reverse     same rows, R->L   r*16 + (15-c)
+#   4  --order colmajor               left              c*16 + r
+#   5  --order colmajor --reverse     right, downward   (15-c)*16 + (15-r)
 #   6  --order 4sides    FOURSIDES=1  all four sides    literal side sequence
 #
 # Passes 1..5 are exhaustive EXACT completion attempts: each either closes the
 # board, proves no zero-break completion exists from its starting board, or
 # times out, and the board it emits is the deepest node it reached.
 #
-# Pass 5 is why spiral is here at all: no LINEAR order leads from the top. Every
-# one keys on r ascending or on c, and --reverse on rowmajor only flips the
-# within-row walk, so 1..4 lead from the bottom, bottom, left and right. spiral
-# keys on the ring distance to the nearest border, so the whole outer ring --
-# top row included -- comes before anything inward.
+# spiral goes first because it is the only order here that leads from the top,
+# and because it is the strongest: no LINEAR order can lead from the top at all.
+# Every one keys on r ascending or on c, and --reverse on rowmajor only flips
+# the within-row walk, so 2..5 lead from the bottom, bottom, left and right.
+# spiral keys on the ring distance to the nearest border, so the whole outer
+# ring -- top row included -- comes before anything inward. It also earns the
+# place on results: see MEASURED below. Since commitments are permanent, the
+# strongest pass should be the one that commits first.
 #
 # THE CHAIN EARNS ITS KEEP ON TIME-OUTS. A pass that runs to exhaustion has
 # proved no completion exists from its board; later passes start from a strictly
@@ -55,15 +58,19 @@
 #   4sides is a side-growth order, and side growth sets SOFT completion by
 #   construction: all three completion prunes (zero-domain, remaining
 #   feasibility, Hall) are skipped, and a cell with no candidate is stepped over
-#   instead of forcing a backtrack. Nothing ever refutes a subtree, so the
-#   search has no natural end -- it runs until --time_limit, on every board,
-#   every time. That is the whole cost: measured on the shipped default at
-#   --time_limit 20, passes 1..5 together finish in well under a second (spiral
-#   exhausts its space in 0.003 s, proving no completion exists from there),
-#   while 4sides alone burns all 20 s. It does buy something -- 242 pieces
-#   against spiral's 226, because stepping over a dead cell is exactly how you
-#   grow past one -- so it is the best-partial finisher and belongs last. Turn
-#   it on when you want the biggest break-free partial and will pay for it:
+#   instead of forcing a backtrack. Nothing ever refutes a subtree, so the only
+#   way it finishes is by exhausting its sweep along every branch -- and that
+#   cost grows with the number of open cells it can still put something in. It
+#   is the one pass that can run out the clock, and how badly depends entirely
+#   on how full the board already is. On the shipped default, measured:
+#     48 cells open (raw input)      20 s, timed out, reaching 242 pieces
+#     29 cells open (after 1..5)     0.12 s, space exhausted, reaching 245
+#   The other five passes together finish in well under a second either way,
+#   so on a board with room 4sides alone sets the wall clock -- which is what
+#   a first run should not have to pay for. It does buy real pieces, because
+#   stepping over a dead cell is exactly how you grow past one, so it is the
+#   best-partial finisher and belongs last, after the exact passes have filled
+#   what they can. Turn it on when you want the biggest break-free partial:
 #     bash examples/09_backtracker_all_sides.sh FOURSIDES=1 TIME_LIMIT=3600
 #
 # CLUES=1 -- force the published hint pieces on first
@@ -88,7 +95,7 @@
 #                     the shipped default that is 22 cells, and the run ends
 #                     with all 5 clues placed. The passes that follow refill
 #                     what they can, but rarely all of it -- you buy the clues
-#                     with score, 431 down to 364 here.
+#                     with score, 435 down to 364 here.
 #     upstream        cheapest by far: bin/E555_beamer --clue_center
 #                     --clue_corners builds the board with three of the five
 #                     already in place, and then there is nothing to evict.
@@ -99,6 +106,14 @@
 #   data/synth_seed.txt would force pieces into cells its solution does not use
 #   and make that board uncompletable -- it is a fixture for a different puzzle.
 #
+# SHORT_ID=1 trims the config_id of the FINAL file. Each pass appends the
+# board's connected-edge count to the id it was given, so five passes turn
+# r0c669 into r0c669_0_390_395_395_395 and only the last number describes what
+# is in the file. The trim drops the components the chain added and keeps the
+# final one, leaving r0c669_395. Set SHORT_ID=0 to keep the full trail, which
+# records what each pass reached. Either way the intermediates carry the long
+# form, so the config_id length guard below still applies to long input ids.
+#
 # THE MASK APPLIES ONCE, to the first step only. --holes REOPENS cells, so
 # giving it to every pass would re-empty that region each time and discard
 # whatever the previous pass had put there.
@@ -106,17 +121,16 @@
 # MEASURED, on data/board_partial_row12.csv (208 pieces in), TIME_LIMIT=20,
 # 4 threads, ARCH=generic:
 #   --order spiral alone         226 placed, score 405, 0.003 s, space exhausted
-#   passes 1..5 chained          214 placed, score 395, under 1 s in total
-#   passes 1..6, FOURSIDES=1     242 placed, score 431, 20 s, all of it in 4sides
+#   passes 1..5 chained          227 placed, score 406, under 1 s in total
+#   passes 1..6, FOURSIDES=1     244 placed, score 435, still under a second
 #   CLUES=1, 22-cell mask, 1..6  224 placed, score 364, 5 of 5 clues
 #
-# Read the first two lines together: here the chain scores BELOW a single spiral
-# pass, because rowmajor goes first and its commitments are permanent -- spiral
-# then inherits a board it cannot use as well as the original. That is the
-# honest cost of a portfolio whose members cannot undo one another, and it is
-# why PASSES is one editable string: on a board like this, lead with spiral.
-# What the chain reliably buys is the 4sides finisher, which wants the fullest
-# board it can be given and so belongs at the end.
+# The order of PASSES is worth more than it looks. Leading with rowmajor instead
+# of spiral gave 214 pieces on this board -- WORSE than a single spiral pass --
+# because commitments are permanent and spiral then inherited a board it could
+# not use as well as the original. Leading with the strongest pass instead has
+# it commit first, and the chain now beats it. The corollary: if you change
+# PASSES, put the order you trust most at the front, not at the end.
 #
 # Only $OUT is left behind: the per-pass files are deleted however the run ends.
 set -euo pipefail
@@ -137,9 +151,10 @@ FOURSIDES=0             # 1 = append the 4sides best-partial pass (see above;
                         # it always burns the whole TIME_LIMIT)
 CLUES=0                 # 1 = force the published hint pieces on first (see above)
 CLUE_ORIENT=0           # which of the four orientations, for an unclued board
+SHORT_ID=1              # 1 = trim the chained config_id down to base_<final>
 TOP=5                   # rows in the closing rank.py report
 QUIET=1                 # 1 = hide the backtracker's own output; 0 = show it
-PASSES="--order rowmajor|--order rowmajor --reverse|--order colmajor|--order colmajor --reverse|--order spiral"
+PASSES="--order spiral|--order rowmajor|--order rowmajor --reverse|--order colmajor|--order colmajor --reverse"
 # -----------------------------------------------------------------------------
 for arg in "$@"; do
     case "$arg" in
@@ -263,6 +278,27 @@ for n in $(seq 1 "$NSTEP"); do
     fi
     src="$dst"
 done
+
+# Every pass appends _<connected-edge count> to the config_id it was handed, so
+# a chain leaves r0c669_0_390_395_395_395 where only the last number says
+# anything about this board. The chain added exactly NSTEP components -- one per
+# step, including for a record a pass dropped and wrote through unchanged, which
+# is why the count is NSTEP and not "however many the searches emitted" -- so
+# dropping the last NSTEP and putting the final one back is exact, and awk does
+# it in one pass. A row carrying fewer components than that was not written by
+# this chain and is left alone. The trim is the LAST thing done: the
+# intermediates keep their full ids, so the length guard above still applies.
+if [ "$SHORT_ID" = "1" ] && [ -s "$OUT" ]; then
+    awk -v n="$NSTEP" -F, 'BEGIN { OFS = "," }
+        /^#/     { print; next }
+        NF < 514 { print; next }
+        { k = split($1, a, "_")
+          if (k <= n) { print; next }
+          id = a[1]
+          for (i = 2; i <= k - n; i++) id = id "_" a[i]
+          $1 = id "_" a[k]
+          print }' "$OUT" > "$OUT.pass_short" && mv "$OUT.pass_short" "$OUT"
+fi
 
 echo
 echo "Wrote $OUT"
