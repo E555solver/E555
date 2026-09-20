@@ -37,11 +37,29 @@
 # place on results: see MEASURED below. Since commitments are permanent, the
 # strongest pass should be the one that commits first.
 #
-# THE CHAIN EARNS ITS KEEP ON TIME-OUTS. A pass that runs to exhaustion has
-# proved no completion exists from its board; later passes start from a strictly
-# smaller space and mostly re-prove it in milliseconds. On an easy board passes
-# 2..5 are near no-ops. TIME_LIMIT is what turns this into a portfolio of
-# attempts rather than one search repeated.
+# EXPECT MOST PASSES TO ADD NOTHING, AND KNOW WHY. A hard exact pass cannot skip
+# a cell: at --breaks 0 it walks its own order, and the first empty cell that no
+# piece fits exactly kills the search there and then -- children=0 at depth 0
+# means the pass ends having added zero pieces. Worse, if the remaining-piece
+# relaxation can already prove no break-free completion exists, the root gate
+# refuses to start at all and prints ROOT-INFEASIBLE.
+#
+# The first pass takes the cells that could be filled exactly. What it leaves is
+# precisely the set of cells nothing fits -- so the orders after it walk straight
+# into those and stop. Measured on the shipped default, per pass:
+#     spiral +18, rowmajor +0, rowmajor --reverse +0, colmajor +0,
+#     colmajor --reverse +1, 4sides +17
+# That is not a malfunction and it is not this script mis-wiring the tool; it is
+# what an exhaustive exact search means. The chain still earns its keep when a
+# pass TIMES OUT, because then the order decides which part of the space was
+# explored and the next order explores elsewhere. On a board small enough to
+# exhaust in milliseconds, it cannot.
+#
+# WHAT DOES GROW SUCH A BOARD is a SOFT pass, which steps over a dead cell
+# instead of stopping at it. 4sides is the only soft order here (--jump is the
+# other soft mode, and is deliberately not used). So a run where most passes add
+# nothing and FOURSIDES=0 has switched off the one pass that could have helped:
+# the script says so at the end, and re-running with FOURSIDES=1 is the answer.
 #
 # And commitments are permanent: nothing downstream can undo a piece an earlier
 # pass placed, and the deepest node of an exact search can be a fluke of the
@@ -96,6 +114,13 @@
 #                     with all 5 clues placed. The passes that follow refill
 #                     what they can, but rarely all of it -- you buy the clues
 #                     with score, 435 down to 364 here.
+#
+#                     PAIR CLUES=1 WITH FOURSIDES=1. The freed cells are exactly
+#                     the ones no piece fits exactly any more, so all five exact
+#                     passes add nothing: measured, the clue step drops 208 to
+#                     193 pieces, passes 2..6 add zero between them, and 4sides
+#                     alone brings it back to 224. Without it a clue run just
+#                     hands you a board 15 pieces poorer.
 #     upstream        cheapest by far: bin/E555_beamer --clue_center
 #                     --clue_corners builds the board with three of the five
 #                     already in place, and then there is nothing to evict.
@@ -203,6 +228,17 @@ fi
 # nothing would otherwise look like a record.
 count_rows() { grep -v '^#' "$1" 2>/dev/null | grep -c . || true; }
 
+# Placed pieces over every record in a file. Readers take the LAST 512 fields as
+# pos+rot, so pos is fields NF-511..NF-256 and 999 means unplaced -- the same
+# rule every tool in the repo uses, and it survives the 514/515-field variants.
+# This is what makes a no-op pass visible: without it a pass that added nothing
+# still reports "1 board(s)" and looks like it worked.
+count_placed() {
+    awk -F, '/^#/ { next }
+             NF >= 512 { for (i = NF - 511; i <= NF - 256; i++) if ($i != 999) n++ }
+             END { print n + 0 }' "$1" 2>/dev/null || echo 0
+}
+
 echo "=== E555 backtracker, all sides ==="
 echo "  seed   : $SEED"
 echo "  input  : $BOARDS ($(count_rows "$BOARDS") board(s))"
@@ -215,6 +251,8 @@ echo "  passes : $NSTEP, --breaks 0, ${TIME_LIMIT}s each, $THREADS thread(s)$(
 echo
 
 src="$BOARDS"
+before=$(count_placed "$BOARDS")   # so pass 1 reports a delta too
+stalled=0                          # passes that added nothing: see the note below
 for n in $(seq 1 "$NSTEP"); do
     step=()
     if [ "$CLUES" = "1" ] && [ "$n" -eq 1 ]; then
@@ -258,7 +296,16 @@ for n in $(seq 1 "$NSTEP"); do
         exit "$rc"
     fi
     rows=$(count_rows "$dst")
-    echo "$rows board(s), $((SECONDS - t0))s"
+    now=$(count_placed "$dst")
+    printf '%s board(s), %d placed (%+d), %ds\n' \
+           "$rows" "$now" "$((now - before))" "$((SECONDS - t0))"
+    # Step 1 with a mask legitimately ENDS with fewer pieces than it started --
+    # --holes reopens cells -- so it is not a stalled pass and must not be
+    # counted as one, or a clue run would always accuse itself.
+    if [ "$now" -le "$before" ] && { [ "$n" -gt 1 ] || [ -z "$HOLES" ]; }; then
+        stalled=$((stalled + 1))
+    fi
+    before=$now
     # An empty file fed forward would fail the next pass with a far less useful
     # message than this one. A clue step that empties it means every board was
     # dropped unwritten for a clue conflict, which has its own remedies.
@@ -305,4 +352,24 @@ echo "Wrote $OUT"
 if [ -s "$OUT" ]; then
     echo
     python3 tools/E555_rank.py "$OUT" --seed_file "$SEED" --top "$TOP"
+fi
+
+# A pass that adds nothing is normal here and is explained at the top, but it is
+# invisible unless someone reads the tool's own output -- "1 board(s)" looks
+# identical either way. Say it plainly, and name the one lever that changes it.
+# A board with no empty cell left has nothing to add, so every pass "stalling"
+# on it is the correct answer, not a diagnosis worth printing.
+empty_left=$(( $(count_rows "$OUT") * 256 - $(count_placed "$OUT") ))
+if [ "$stalled" -gt 0 ] && [ "$empty_left" -gt 0 ]; then
+    echo
+    echo "Note: $stalled of $NSTEP pass(es) added nothing."
+    echo "  A hard exact pass cannot skip a cell no piece fits: it stops at the first"
+    echo "  one in its order, or is refused at the root (ROOT-INFEASIBLE) when no"
+    echo "  break-free completion exists at all. The first pass takes the exact fills,"
+    echo "  so the later orders meet exactly those dead cells. This is the search"
+    echo "  being exhaustive, not the chain being broken."
+    if [ "$FOURSIDES" != "1" ]; then
+        echo "  4sides is the only pass here that steps OVER a dead cell and keeps"
+        echo "  growing. Re-run with FOURSIDES=1 to let it."
+    fi
 fi
