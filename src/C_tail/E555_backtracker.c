@@ -19,6 +19,22 @@
  *     index plus per-cell exact-fit domains (FcState) make MRV counts and
  *     candidate enumeration a few word ops per cell instead of a 256x4 rescan,
  *     and give an immediate cutoff when a neighbour's domain empties.
+ *   - Break placements are counted by the same bitsets rather than tested one
+ *     at a time: a candidate breaks one edge per placed neighbour it fails to
+ *     match, so a bit-sliced sum over at most four fit masks classifies all
+ *     1024 orientations at once (break_class_masks).  Where the budget reaches
+ *     the neighbour count -- always, for a greedy dive -- the count MRV needs
+ *     is just the frame-legal unused total minus the exact fits, two counters
+ *     FcState already keeps, and no scan runs at all.  Enumerating by ascending
+ *     break class also lands candidates in (breaks, pid, spin) order, so no
+ *     sort is needed.  This is where the mismatch engines spend their speed:
+ *     the scan it replaced was 79% of all instructions in the exhaustive engine
+ *     and about 35% in the dive engine.
+ *   - FcState carries the empty cells as a list, so the per-place domain update
+ *     touches only those rather than sweeping all 256 and skipping the filled
+ *     ones.  That sweep was a further 28% of the dive engine, and worse the
+ *     deeper a DFS went.  Together the two are 3.3x-3.7x on dives and 4.1x-6.8x
+ *     on single-threaded exhaustive search, at identical output.
  *   - Classic mode (--jump off, except 2sides/4sides) applies three sound
  *     completion prunes: a global empty-domain lower bound, incremental
  *     color/type accounting, and a Hall/deficiency bipartite-matching bound.
@@ -26,6 +42,18 @@
  *     --hall controls the policy.  With --jump on, or with an exact side-growth
  *     order, an impossible cell is deferred so independent gaps can keep
  *     growing and completion-only prunes are disabled.
+ *   - --clue_center / --clue_corners force the published Eternity II hint
+ *     pieces onto their cells before the DFS starts, so they constrain the
+ *     search rather than being something it must rediscover, and the emitted
+ *     board carries them.  They go on after --rotate, --holes and the duplicate
+ *     pass: a holes mask that frees a clue's cell or its stranded piece is what
+ *     makes the clue placeable, and any break the clues create counts as an
+ *     input break, so --breaks governs it unchanged.  Orientation is read off
+ *     the board (this tool fills empty cells, it cannot move placed ones, so a
+ *     board carrying a clue has already committed); --clue_orient 0..3 is
+ *     consulted only for a board carrying none, and names the CSV frame.  A
+ *     board whose clue cell is taken, or whose clue piece sits elsewhere, is
+ *     dropped with a message and is NOT written to the output.
  *   - --breaks K allows up to K broken internal edges in the finished
  *     board (default 0 = exact).  K is an ABSOLUTE ceiling: breaks already in
  *     the input count against it, and an input that already exceeds K is
@@ -67,7 +95,12 @@
  *   gcc -Wall -Wextra -O3 -march=native -fopenmp \
  *       E555_backtracker.c -o E555_backtracker -lm
  *   (debug self-checks: -DVERIFY_AVAIL for the availability counters,
- *    -DVERIFY_INDEX for the bitset-index candidate enumeration.)
+ *    -DVERIFY_INDEX for the bitset-index candidate enumeration,
+ *    -DVERIFY_BREAKCOUNT to recompute every break count and every emitted
+ *    candidate list with the per-candidate scan the bit arithmetic replaced,
+ *    and abort on any disagreement.  Each costs roughly an order of magnitude.)
+ *   -march matters here: the break classification is popcount-heavy, and a
+ *   `generic` build calls libgcc for it -- about a quarter of the profile.
  *
  * RUN
  *   ./E555_backtracker seed.txt completions.csv output.csv [options]
@@ -131,7 +164,21 @@
  * on a laptop the scheduler is not what is limiting you.
  */
 #define SPLIT_TASKS_PER_THREAD 16
-#define CONFIG_ID_LEN 64       /* max length of config-id string */
+/*
+ * Max length of a config-id string, the read side included: parse_csv_line()
+ * rejects a row whose id is this long or longer.
+ *
+ * It has to leave room for CHAINING, because every board this tool writes is
+ * named "<input id>_<sol_id>" and the toolkit's whole CSV contract is that any
+ * tool's output feeds any tool's input, its own included.  Each pass therefore
+ * grows the id by about five characters, and at 64 a real Stage-B id of 47 --
+ * RUN_2026-06-19_lowB_Mahalanobis3_r9c436_104_457, from data/board_example_462.csv
+ * -- survived five passes of examples/09_backtracker_all_sides.sh and became
+ * unreadable on the sixth, losing the board mid-chain.  256 leaves room for a
+ * long id and forty passes.  The cost is one CsvRecord field, so it is linear in
+ * the input row count and nothing else.
+ */
+#define CONFIG_ID_LEN 256
 
 /* -- Inline RNG (xoroshiro128++ + splitmix64) ---------------------------------- *
  * Mirrors the Stage B generator in E555_database.h so the two halves of the
@@ -202,6 +249,17 @@ static int g_pieces_by_zero_n[3];
 
 static int  g_holes[NUM_PIECES];
 static bool g_holes_active = false;
+
+/* -- Clue pieces -------------------------------------------------------------- *
+ * The table itself lives beside the board-geometry helpers below; these are the
+ * two mask bits and the flag state, which print_cmd() needs before that point.
+ * The bit values match CLUE_CENTER/CLUE_CORNERS in src/B_beam/E555_database.h. */
+
+#define CLUE_CENTER   0x1u
+#define CLUE_CORNERS  0x2u
+
+static uint32_t g_clue_mask   = 0;   /* --clue_center | --clue_corners            */
+static int      g_clue_orient = -1;  /* --clue_orient, in the CSV frame; -1 = auto */
 
 /* -- Global configuration ----------------------------------------------------- */
 
@@ -431,6 +489,9 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_jump)         printf(" --jump");
     if (g_with_frame)   printf(" --with_frame");
     if (g_write_status) printf(" --status");
+    if (g_clue_mask & CLUE_CENTER)  printf(" --clue_center");
+    if (g_clue_mask & CLUE_CORNERS) printf(" --clue_corners");
+    if (g_clue_orient >= 0)         printf(" --clue_orient %d", g_clue_orient);
     printf(g_dedup ? " --dedup" : " --no_dedup");
     if (g_parallel_mode == PAR_SEARCH) printf(" --all_for_one");
     if (holes_path)     printf(" --holes %s", holes_path);
@@ -476,6 +537,7 @@ static uint64_t g_total_solutions    = 0;
 static uint64_t g_records_processed  = 0;
 static uint64_t g_cnt_invalid        = 0;
 static uint64_t g_cnt_dropped        = 0;   /* input_breaks already exceed --breaks */
+static uint64_t g_cnt_clue_conflict  = 0;   /* clue cell taken, or clue piece stranded */
 static uint64_t g_cnt_duplicate      = 0;   /* post-holes board repeats an earlier row */
 static uint64_t g_cnt_infeasible     = 0;
 static uint64_t g_cnt_hall_infeasible= 0;
@@ -890,6 +952,94 @@ static void inverse_rotation_k(Board *dst, const Board *src, int k) {
 }
 
 /* -- Seed loading ------------------------------------------------------------- */
+
+/* -- Eternity II clue pieces -------------------------------------------------- *
+ * The five published hint pieces, copied verbatim from g_clue[4][CLUE_N] in
+ * src/B_beam/E555_database.c, which is the single source of truth.  This tool is
+ * standalone and does not link that translation unit, so the table is repeated
+ * here the way the RNG primitives above are; rows are bottom-up and spins are
+ * counter-clockwise, which is already this file's convention, so nothing is
+ * converted.
+ *
+ * Entry 0 is the centre clue, 1..4 the corner clues.  A bottom-up beam can only
+ * ever reach entries 1..2, so the beamer's --clue_corners means those two and
+ * merely reserves the pair on row 13.  This tool sees the whole board, so
+ * --clue_corners here means all four -- the same choice E555_topper.py and
+ * E555_ender.py make, and the reason Stage C is where those two are first
+ * enforced rather than held.
+ *
+ * Orientation o is the hypothesis that our row 0 is the puzzle side reached by
+ * rotating the published board o quarter-turns clockwise.  Our border is chosen
+ * by our own search, so which physical side is "the bottom" is free: a solution
+ * turned 90 degrees still satisfies every edge rule but moves the clues, so all
+ * four orientations are legitimate and a board commits to one the moment it
+ * carries a single clue.
+ */
+#define CLUE_N        5
+#define CLUE_ORIENTS  4
+
+typedef struct { uint8_t row, col; uint16_t piece; uint8_t spin; } ClueCell;
+
+static const ClueCell g_clue[CLUE_ORIENTS][CLUE_N] = {
+    { { 7, 7,138,0}, { 2, 2,180,0}, { 2,13,248,3}, {13, 2,207,3}, {13,13,254,1} },  /*   0 deg */
+    { { 8, 7,138,3}, { 2, 2,248,2}, { 2,13,254,0}, {13, 2,180,3}, {13,13,207,2} },  /*  90 deg */
+    { { 8, 8,138,2}, { 2, 2,254,3}, { 2,13,207,1}, {13, 2,248,1}, {13,13,180,2} },  /* 180 deg */
+    { { 7, 8,138,1}, { 2, 2,207,0}, { 2,13,180,1}, {13, 2,254,2}, {13,13,248,0} },  /* 270 deg */
+};
+
+/* Entry 0 follows --clue_center, the rest --clue_corners. */
+static inline bool clue_entry_enabled(int k) {
+    return (k == 0) ? (g_clue_mask & CLUE_CENTER) != 0
+                    : (g_clue_mask & CLUE_CORNERS) != 0;
+}
+
+/*
+ * --rotate turns the board before the search, so the clue set turns with it.
+ * The table is closed under that turn, which is what lets --clue_orient name an
+ * orientation in the CSV frame -- the frame the user reads a board in and the
+ * frame the output is written back to -- and be carried into the search frame
+ * by subtraction.
+ */
+static inline int clue_orient_in_search_frame(int csv_orient, int k) {
+    return ((csv_orient - k) % CLUE_ORIENTS + CLUE_ORIENTS) % CLUE_ORIENTS;
+}
+
+/*
+ * Prove that closure rather than trust the arithmetic: turning orientation o's
+ * five entries k quarter-turns the way apply_rotation_k() turns a board must
+ * land exactly on orientation clue_orient_in_search_frame(o, k)'s entries, same
+ * pieces and same spins.  A sign error here would silently impose the wrong
+ * clue set under --rotate, which no other check would notice.
+ */
+static void clue_selfcheck(void) {
+    for (int o = 0; o < CLUE_ORIENTS; o++) {
+        for (int e = 0; e < CLUE_N; e++)
+            if (g_clue[o][e].piece >= NUM_PIECES)
+                fatal("internal error: clue piece %u is out of range",
+                      (unsigned)g_clue[o][e].piece);
+        for (int k = 1; k < CLUE_ORIENTS; k++) {
+            int target = clue_orient_in_search_frame(o, k);
+            for (int e = 0; e < CLUE_N; e++) {
+                int nr = g_clue[o][e].row, nc = g_clue[o][e].col;
+                for (int q = 0; q < k; q++) {
+                    int tr = nc, tc = PUZZLE_SIDE - 1 - nr;
+                    nr = tr; nc = tc;
+                }
+                int ns = ((int)g_clue[o][e].spin + k) & 3;
+                bool found = false;
+                for (int f = 0; f < CLUE_N && !found; f++)
+                    found = g_clue[target][f].row   == nr &&
+                            g_clue[target][f].col   == nc &&
+                            g_clue[target][f].piece == g_clue[o][e].piece &&
+                            g_clue[target][f].spin  == ns;
+                if (!found)
+                    fatal("internal error: clue orientation %d turned %d quarter-turn(s) "
+                          "does not land on orientation %d (piece %u -> r=%d c=%d spin=%d)",
+                          o, k, target, (unsigned)g_clue[o][e].piece, nr, nc, ns);
+            }
+        }
+    }
+}
 
 static void load_seed(const char *path) {
     FILE *f = fopen(path, "r");
@@ -1333,16 +1483,19 @@ static bool frame_zero_rule_ok(int row, int col, const Oriented *o) {
     return true;
 }
 
+#if defined(VERIFY_INDEX) || defined(VERIFY_BREAKCOUNT)
 /*
- * v6 mismatch-aware fit.  Returns the number of *broken internal edges* that
- * placing `o` at (row,col) would create against ALREADY-PLACED neighbours, or
- * -1 if the gray-0 frame rule is violated (a hard structural reject that is
- * never treated as a mismatch).
+ * Mismatch-aware fit, one candidate at a time: the number of *broken internal
+ * edges* placing `o` at (row,col) would create against ALREADY-PLACED
+ * neighbours, or -1 if the gray-0 frame rule is violated (a hard structural
+ * reject, never a mismatch).
  *
- * Each internal edge is shared by two cells and is evaluated exactly once - at
- * the moment the SECOND of the two cells is filled - so summing this count over
- * a DFS path yields the exact number of broken edges with no double-counting.
- * An empty neighbour contributes nothing (its edge is decided later).
+ * This is the REFERENCE implementation.  The search itself no longer calls it:
+ * cell_fit_masks() and break_class_masks() compute the same number for all 1024
+ * orientations at once, in word arithmetic, and the -1 case cannot arise there
+ * because the candidates come from the cell-base bitset, which IS the frame
+ * rule.  It survives as the oracle the VERIFY_ builds check that arithmetic
+ * against, so it must stay a literal transcription of the definition.
  */
 static int piece_break_count(const Board *b, int row, int col, const Oriented *o) {
     if (!frame_zero_rule_ok(row, col, o)) return -1;
@@ -1365,6 +1518,7 @@ static int piece_break_count(const Board *b, int row, int col, const Oriented *o
     }
     return breaks;
 }
+#endif  /* VERIFY_INDEX || VERIFY_BREAKCOUNT */
 
 /* -- E555: bitset forward-checking engine ---------------------------------------- */
 /*
@@ -1372,7 +1526,8 @@ static int piece_break_count(const Board *b, int row, int col, const Oriented *o
  * placements.  Two static tables are built once after the seed loads:
  *   g_fit_side[s][k] = orientations whose side s (0=top,1=right,2=bottom,3=left)
  *                      shows color k;
- *   g_cellbase[r][c] = orientations satisfying the gray-0 frame rule at (r,c)
+ *   g_cellbase_cls[k] = orientations satisfying the gray-0 frame rule in cell
+ *                      class k, one of the nine (row, column) edge cases;
  *                      (this implicitly encodes the inner/edge/corner type).
  * The per-search FcState then keeps, for every EMPTY cell, the AND of its base
  * mask with the fit masks demanded by its already-placed neighbours (nbmask),
@@ -1388,16 +1543,39 @@ static int piece_break_count(const Board *b, int row, int col, const Oriented *o
 typedef struct { uint64_t w[OMASK_WORDS]; } OMask;
 
 static OMask g_fit_side[4][NUM_COLORS];
-static OMask g_cellbase[PUZZLE_SIDE][PUZZLE_SIDE];
+
+/*
+ * The gray-0 frame rule reads the cell only through whether its row and its
+ * column are the first, the last, or neither, so g_cellbase has exactly NINE
+ * distinct values on a 16x16 board.  Keeping the nine instead of 256 copies
+ * leaves the table the hot break scans read at about 1.1 kB -- L1 resident --
+ * instead of 32 kB, and build_fit_index() asserts the nine really do reproduce
+ * frame_zero_rule_ok() at every cell before anything relies on it.
+ */
+#define CELL_CLASSES 9
+static OMask g_cellbase_cls[CELL_CLASSES];
+
+static inline int cell_class(int row, int col) {
+    return ((row == 0) ? 1 : (row == PUZZLE_SIDE-1) ? 2 : 0) * 3
+         + ((col == 0) ? 1 : (col == PUZZLE_SIDE-1) ? 2 : 0);
+}
+static inline const OMask *cellbase(int row, int col) {
+    return &g_cellbase_cls[cell_class(row, col)];
+}
 
 static inline void omask_set(OMask *m, int bit) { m->w[bit >> 6] |= 1ULL << (bit & 63); }
 static inline void omask_and(OMask *dst, const OMask *src) {
     for (int i = 0; i < OMASK_WORDS; i++) dst->w[i] &= src->w[i];
 }
+static inline int omask_popcount(const OMask *m) {
+    int n = 0;
+    for (int i = 0; i < OMASK_WORDS; i++) n += __builtin_popcountll(m->w[i]);
+    return n;
+}
 
 static void build_fit_index(void) {
     memset(g_fit_side, 0, sizeof(g_fit_side));
-    memset(g_cellbase, 0, sizeof(g_cellbase));
+    memset(g_cellbase_cls, 0, sizeof(g_cellbase_cls));
     for (int pid = 0; pid < NUM_PIECES; pid++) {
         for (int spin = 0; spin < 4; spin++) {
             if ((g_piece_spin_mask[pid] & (1u << spin)) == 0) continue;
@@ -1410,7 +1588,26 @@ static void build_fit_index(void) {
             for (int r = 0; r < PUZZLE_SIDE; r++)
                 for (int c = 0; c < PUZZLE_SIDE; c++)
                     if (frame_zero_rule_ok(r, c, &o))
-                        omask_set(&g_cellbase[r][c], bit);
+                        omask_set(&g_cellbase_cls[cell_class(r, c)], bit);
+        }
+    }
+
+    /* The nine classes are only sound if they agree with the predicate at every
+     * cell.  Prove it once here rather than assume it in three hot loops. */
+    for (int pid = 0; pid < NUM_PIECES; pid++) {
+        for (int spin = 0; spin < 4; spin++) {
+            if ((g_piece_spin_mask[pid] & (1u << spin)) == 0) continue;
+            Oriented o = make_oriented(pid, spin);
+            int bit = pid * 4 + spin;
+            for (int r = 0; r < PUZZLE_SIDE; r++)
+                for (int c = 0; c < PUZZLE_SIDE; c++) {
+                    bool want = frame_zero_rule_ok(r, c, &o);
+                    bool have = (cellbase(r, c)->w[bit >> 6] >> (bit & 63)) & 1ULL;
+                    if (want != have)
+                        fatal("internal error: cell class %d disagrees with the frame "
+                              "rule at (r=%d,c=%d) for pid=%d spin=%d",
+                              cell_class(r, c), r, c, pid, spin);
+                }
         }
     }
 }
@@ -1423,12 +1620,49 @@ typedef struct {
     OMask nbmask[PUZZLE_SIDE][PUZZLE_SIDE];
     OMask unused4;
     uint16_t dom_count[PUZZLE_SIDE][PUZZLE_SIDE];
+    /*
+     * How many frame-legal orientations of still-unused pieces exist in each
+     * cell class, i.e. popcount(g_cellbase_cls[k] & unused4).  It depends on the
+     * pool alone, never on a neighbour, so nine counters cover all 256 cells and
+     * they move only where unused4 moves.  With it, "how many placements here
+     * break at least one edge" is base_avail[class] - dom_count[r][c], which is
+     * what makes the MRV break count O(1) instead of a full candidate scan.
+     */
+    int32_t base_avail[CELL_CLASSES];
+    /*
+     * The still-empty cells as row*16+col, with each cell's index into that list
+     * so a removal is a swap with the last entry.  fc_adjust_piece_support() runs
+     * over it on every place and unplace; sweeping all 256 cells and skipping the
+     * filled ones instead cost 28% of the dive engine's instructions on a 67-cell
+     * region, and more as a DFS goes deeper and the region shrinks.  The order is
+     * not meaningful -- every reader only accumulates over the list -- which is
+     * what makes the swap legal.
+     */
+    uint8_t empty_list[NUM_PIECES];
+    uint8_t empty_pos[NUM_PIECES];
+    int16_t n_empty;
     int16_t zero_domains;       /* empty cells with no exact-fit orientation */
     int16_t required_color[NUM_COLORS];
     int16_t need_type[3];
 } FcState;
 
 #define DOM_PLACED UINT16_MAX
+
+_Static_assert(NUM_PIECES <= 256, "the empty-cell list stores a cell index in a uint8_t");
+
+static inline void fc_empty_add(FcState *fc, int r, int c) {
+    int cell = r * PUZZLE_SIDE + c;
+    fc->empty_pos[cell] = (uint8_t)fc->n_empty;
+    fc->empty_list[fc->n_empty++] = (uint8_t)cell;
+}
+
+static inline void fc_empty_remove(FcState *fc, int r, int c) {
+    int cell = r * PUZZLE_SIDE + c;
+    int at   = fc->empty_pos[cell];
+    int last = fc->empty_list[--fc->n_empty];
+    fc->empty_list[at]  = (uint8_t)last;
+    fc->empty_pos[last] = (uint8_t)at;
+}
 
 static const int g_dr[4] = { 1, 0,-1, 0 };
 static const int g_dc[4] = { 0, 1, 0,-1 };
@@ -1466,7 +1700,7 @@ static void fc_compute_cell(const Board *b, FcState *fc, int r, int c) {
     uint16_t old = fc->dom_count[r][c];
     if (old != DOM_PLACED && old == 0) fc->zero_domains--;
 
-    OMask m = g_cellbase[r][c];
+    OMask m = *cellbase(r, c);
     if (r+1 < PUZZLE_SIDE) {
         const Oriented *nb = &b->cell[r+1][c];
         if (nb->piece_id != EMPTY_PIECE) omask_and(&m, &g_fit_side[0][nb->bottom]);
@@ -1504,10 +1738,16 @@ static void fc_init(FcState *fc, const Board *b) {
         if (!used_test(b->used, pid))
             fc->unused4.w[(pid * 4) >> 6] |=
                 (uint64_t)g_piece_spin_mask[pid] << ((pid * 4) & 63);
+    for (int k = 0; k < CELL_CLASSES; k++) {
+        OMask m = g_cellbase_cls[k];
+        omask_and(&m, &fc->unused4);
+        fc->base_avail[k] = omask_popcount(&m);
+    }
 
     for (int r = 0; r < PUZZLE_SIDE; r++) {
         for (int c = 0; c < PUZZLE_SIDE; c++) {
             if (b->cell[r][c].piece_id != EMPTY_PIECE) continue;
+            fc_empty_add(fc, r, c);
             fc_compute_cell(b, fc, r, c);
             fc->need_type[cell_frame_degree(r, c)]++;
             for (int dir = 0; dir < 4; dir++) {
@@ -1529,25 +1769,30 @@ static void fc_init(FcState *fc, const Board *b) {
  * 64-bit word containing that piece's four orientation bits.  Maintaining the
  * counts this way makes MRV O(cells), not O(cells*16 words), and gives a global
  * zero-domain forward check essentially for free. */
-static inline void fc_adjust_piece_support(const Board *b, FcState *fc,
-                                           int pid, int sign) {
+static inline void fc_adjust_piece_support(FcState *fc, int pid, int sign) {
     int wi = (pid * 4) >> 6;
     uint64_t bits = (uint64_t)g_piece_spin_mask[pid] << ((pid * 4) & 63);
-    for (int r = 0; r < PUZZLE_SIDE; r++) {
-        for (int c = 0; c < PUZZLE_SIDE; c++) {
-            if (b->cell[r][c].piece_id != EMPTY_PIECE) continue;
-            uint16_t old = fc->dom_count[r][c];
-            if (old == DOM_PLACED) continue; /* newly emptied/selected cell */
-            int delta = __builtin_popcountll(fc->nbmask[r][c].w[wi] & bits);
-            if (delta == 0) continue;
-            int next = (int)old + sign * delta;
-            if (next < 0 || next > NUM_PIECES * 4)
-                fatal("FC domain-count corruption at (r=%d,c=%d): %u %+d",
-                      r, c, (unsigned)old, sign * delta);
-            if (old == 0) fc->zero_domains--;
-            fc->dom_count[r][c] = (uint16_t)next;
-            if (next == 0) fc->zero_domains++;
-        }
+
+    /* One piece occupies one word of the orientation bitset, so the nine class
+     * counters move by nine popcounts of that single word -- the same place, and
+     * the same sign, as the per-cell domain counts below. */
+    for (int k = 0; k < CELL_CLASSES; k++)
+        fc->base_avail[k] += sign * __builtin_popcountll(g_cellbase_cls[k].w[wi] & bits);
+
+    for (int i = 0; i < fc->n_empty; i++) {
+        int cell = fc->empty_list[i];
+        int r = cell / PUZZLE_SIDE, c = cell % PUZZLE_SIDE;
+        uint16_t old = fc->dom_count[r][c];
+        if (old == DOM_PLACED) continue; /* emptied by unplace, not recomputed yet */
+        int delta = __builtin_popcountll(fc->nbmask[r][c].w[wi] & bits);
+        if (delta == 0) continue;
+        int next = (int)old + sign * delta;
+        if (next < 0 || next > NUM_PIECES * 4)
+            fatal("FC domain-count corruption at (r=%d,c=%d): %u %+d",
+                  r, c, (unsigned)old, sign * delta);
+        if (old == 0) fc->zero_domains--;
+        fc->dom_count[r][c] = (uint16_t)next;
+        if (next == 0) fc->zero_domains++;
     }
 }
 
@@ -1571,6 +1816,42 @@ static void fc_verify_state(const Board *b, const FcState *fc, const char *where
     }
     if (zeros != fc->zero_domains)
         fatal("%s: zero_domains cached=%d actual=%d", where, fc->zero_domains, zeros);
+    for (int k = 0; k < CELL_CLASSES; k++) {
+        OMask m = g_cellbase_cls[k];
+        omask_and(&m, &fc->unused4);
+        int n = omask_popcount(&m);
+        if (n != fc->base_avail[k])
+            fatal("%s: base_avail[%d] cached=%d actual=%d", where, k,
+                  fc->base_avail[k], n);
+    }
+
+    /* The empty-cell list must hold every empty cell exactly once, and its
+     * position index must point back at the entry, or the swap-remove drops a
+     * cell out of every future domain update without anything else noticing. */
+    {
+        int seen[NUM_PIECES];
+        memset(seen, 0, sizeof(seen));
+        for (int i = 0; i < fc->n_empty; i++) {
+            int cell = fc->empty_list[i];
+            if (seen[cell]++)
+                fatal("%s: cell %d appears twice in the empty list", where, cell);
+            if (fc->empty_pos[cell] != i)
+                fatal("%s: empty_pos[%d]=%u but it sits at %d", where, cell,
+                      (unsigned)fc->empty_pos[cell], i);
+        }
+        int n_empty = 0;
+        for (int r = 0; r < PUZZLE_SIDE; r++)
+            for (int c = 0; c < PUZZLE_SIDE; c++)
+                if (b->cell[r][c].piece_id == EMPTY_PIECE) {
+                    n_empty++;
+                    if (!seen[r * PUZZLE_SIDE + c])
+                        fatal("%s: empty cell (%d,%d) missing from the list",
+                              where, r, c);
+                }
+        if (n_empty != fc->n_empty)
+            fatal("%s: empty list holds %d cells, board has %d", where,
+                  (int)fc->n_empty, n_empty);
+    }
 }
 #endif
 
@@ -1588,6 +1869,7 @@ static inline void dfs_place(Board *b, FcState *fc, int r, int c, int pid, int s
 
     if (fc->dom_count[r][c] == 0) fc->zero_domains--;
     fc->dom_count[r][c] = DOM_PLACED;
+    fc_empty_remove(fc, r, c);
 
     fc->need_type[cell_frame_degree(r, c)]--;
     for (int dir = 0; dir < 4; dir++) {
@@ -1603,7 +1885,7 @@ static inline void dfs_place(Board *b, FcState *fc, int r, int c, int pid, int s
 
     board_place(b, r, c, pid, spin);
     fc->unused4.w[(pid * 4) >> 6] &= ~(0xFULL << ((pid * 4) & 63));
-    fc_adjust_piece_support(b, fc, pid, -1);
+    fc_adjust_piece_support(fc, pid, -1);
 
     for (int dir = 0; dir < 4; dir++) {
         int nr = r + g_dr[dir], nc = c + g_dc[dir];
@@ -1627,10 +1909,11 @@ static inline void dfs_unplace(Board *b, FcState *fc, int r, int c) {
     }
 
     board_unplace(b, r, c);
+    fc_empty_add(fc, r, c);
     if (pid >= 0)
         fc->unused4.w[(pid * 4) >> 6] |=
             (uint64_t)g_piece_spin_mask[pid] << ((pid * 4) & 63);
-    if (pid >= 0) fc_adjust_piece_support(b, fc, pid, +1);
+    if (pid >= 0) fc_adjust_piece_support(fc, pid, +1);
 
     fc->need_type[cell_frame_degree(r, c)]++;
     for (int dir = 0; dir < 4; dir++) {
@@ -3013,6 +3296,12 @@ static int fixed_side_score(const Board *b, int r, int c) {
     return score;
 }
 
+#ifdef VERIFY_BREAKCOUNT
+/*
+ * The order collect_candidates() used to reach by sorting, and now reaches by
+ * construction.  Kept as the predicate VERIFY_BREAKCOUNT asserts that ordering
+ * against, so that "the classes come out sorted" is checked rather than argued.
+ */
 static int candidate_cmp(const void *pa, const void *pb) {
     const Candidate *a = (const Candidate *)pa;
     const Candidate *b = (const Candidate *)pb;
@@ -3020,25 +3309,139 @@ static int candidate_cmp(const void *pa, const void *pb) {
     if (a->pid    != b->pid)    return (int)a->pid    - (int)b->pid;
     return (int)a->spin - (int)b->spin;
 }
+#endif
 
-/* Count frame-legal BREAK placements (1..budget) at a cell.  The cell-base
- * bitset already removes wrong piece types, wrong border rotations and used
- * pieces, so mismatch modes no longer rescan type lists and reject three of
- * four edge-piece rotations. */
-static int count_break_candidates_scan(const Board *b, const FcState *fc,
-                                       int row, int col, int budget) {
-    (void)b;
+#ifdef VERIFY_BREAKCOUNT
+/*
+ * The per-candidate scan the bit arithmetic below replaced, kept verbatim as an
+ * oracle.  Every fast-path answer is recomputed this way and any disagreement is
+ * fatal, which is how the class masks and the base_avail counters were proved to
+ * reproduce the old engine rather than merely to agree with it on some runs.
+ * Costs roughly an order of magnitude in speed, so it is a debug build only.
+ */
+static int break_count_reference(const Board *b, const FcState *fc,
+                                 int row, int col, int budget) {
     int n = 0;
     for (int wi = 0; wi < OMASK_WORDS; wi++) {
-        uint64_t w = g_cellbase[row][col].w[wi] & fc->unused4.w[wi];
+        uint64_t w = cellbase(row, col)->w[wi] & fc->unused4.w[wi];
         while (w) {
             int bit = wi * 64 + __builtin_ctzll(w);
             w &= w - 1;
-            int pid = bit >> 2, spin = bit & 3;
-            int br = piece_break_count(b, row, col, &g_oriented[pid][spin]);
+            int br = piece_break_count(b, row, col, &g_oriented[bit >> 2][bit & 3]);
             if (br >= 1 && br <= budget) n++;
         }
     }
+    return n;
+}
+#endif
+
+/*
+ * The fit masks of (row,col)'s ALREADY-PLACED neighbours, in the same order and
+ * from the same table fc_compute_cell() uses.  An orientation lies in mask k
+ * exactly when it matches that neighbour, so it breaks that edge when it does
+ * not -- which is what turns a break count into bit arithmetic.  The return
+ * value is the number of placed neighbours, and equals placed_neighbor_count().
+ *
+ * Only PLACED neighbours are listed, which is what keeps the break accounting
+ * exact: an internal edge is shared by two cells and is charged exactly once, at
+ * the moment the SECOND of them is filled, so summing break counts along a DFS
+ * path gives the board's broken-edge total with no double counting.  An empty
+ * neighbour contributes no mask, and its edge is decided later.
+ */
+static inline int cell_fit_masks(const Board *b, int row, int col,
+                                 const OMask *fit[4]) {
+    int d = 0;
+    if (row+1 < PUZZLE_SIDE) { const Oriented *nb = &b->cell[row+1][col];
+        if (nb->piece_id != EMPTY_PIECE) fit[d++] = &g_fit_side[0][nb->bottom]; }
+    if (col+1 < PUZZLE_SIDE) { const Oriented *nb = &b->cell[row][col+1];
+        if (nb->piece_id != EMPTY_PIECE) fit[d++] = &g_fit_side[1][nb->left]; }
+    if (row > 0)             { const Oriented *nb = &b->cell[row-1][col];
+        if (nb->piece_id != EMPTY_PIECE) fit[d++] = &g_fit_side[2][nb->top]; }
+    if (col > 0)             { const Oriented *nb = &b->cell[row][col-1];
+        if (nb->piece_id != EMPTY_PIECE) fit[d++] = &g_fit_side[3][nb->right]; }
+    return d;
+}
+
+/*
+ * Split `base` into out[0..d]: the orientations breaking exactly j of the cell's
+ * d placed neighbours.  A placement's break count is d minus the number of fit
+ * masks containing it, so a bit-sliced sum of the (at most four) masks -- three
+ * bit planes, a half-adder chain -- classifies every one of the 1024 orientations
+ * in a few word operations, where the old scan called piece_break_count() once
+ * per candidate.  out[j] for j > d is not written; callers clamp to d.
+ *
+ * out[0] is by construction the exact-fit domain, nbmask & unused4, which is what
+ * VERIFY_BREAKCOUNT cross-checks against fc->dom_count.
+ */
+static inline void break_class_masks(const OMask *base, const OMask *const fit[4],
+                                     int d, OMask out[5]) {
+    for (int wi = 0; wi < OMASK_WORDS; wi++) {
+        uint64_t b = base->w[wi];
+        uint64_t s0 = 0, s1 = 0, s2 = 0;      /* bit planes of the match count */
+        for (int k = 0; k < d; k++) {
+            uint64_t x  = fit[k]->w[wi];
+            uint64_t c0 = s0 & x;  s0 ^= x;   /* half adder into plane 0 */
+            uint64_t c1 = s1 & c0; s1 ^= c0;  /* carry into plane 1 */
+            s2 |= c1;                          /* d <= 4, so plane 2 never carries */
+        }
+        for (int j = 0; j <= d; j++) {
+            int m = d - j;                     /* matches that mean j breaks */
+            uint64_t eq = b;
+            eq &= (m & 1) ? s0 : ~s0;
+            eq &= (m & 2) ? s1 : ~s1;
+            eq &= (m & 4) ? s2 : ~s2;
+            out[j].w[wi] = eq;
+        }
+    }
+}
+
+/*
+ * Count frame-legal BREAK placements (1..budget) at a cell.
+ *
+ * A candidate can break at most one edge per placed neighbour, so when the
+ * budget reaches that many, "breaks between 1 and budget" is simply every
+ * frame-legal unused orientation that is not an exact fit -- two counters the
+ * forward-checking state already maintains, and no scan at all.  That is the
+ * common case: greedy dives always qualify (DIVE_BREAK_CAP is 4, and a cell has
+ * at most four neighbours), and so does any DFS node with four of its budget
+ * left.  It matters because pick_next_cell() calls this for EVERY remaining cell
+ * at EVERY node: at 79% of all instructions, the scan it replaces was the single
+ * largest cost in the exhaustive engine.
+ *
+ * A tighter budget still has to distinguish the break classes, and does it with
+ * break_class_masks() rather than per-candidate tests.
+ *
+ * (row,col) must be EMPTY: the fast path subtracts dom_count, which reads
+ * DOM_PLACED on a filled cell.  Both callers walk the remaining-cell list, so it
+ * always is; VERIFY_BREAKCOUNT would catch a caller that stopped doing so.
+ */
+static int count_break_candidates_scan(const Board *b, const FcState *fc,
+                                       int row, int col, int budget) {
+    if (budget <= 0) return 0;
+
+    const OMask *fit[4];
+    int d = cell_fit_masks(b, row, col, fit);
+
+    int n;
+    if (budget >= d) {
+        n = fc->base_avail[cell_class(row, col)] - (int)fc->dom_count[row][col];
+    } else {
+        OMask base = *cellbase(row, col);
+        omask_and(&base, &fc->unused4);
+        OMask cls[5];
+        break_class_masks(&base, fit, d, cls);
+        n = 0;
+        for (int j = 1; j <= budget; j++) n += omask_popcount(&cls[j]);
+    }
+
+#ifdef VERIFY_BREAKCOUNT
+    {
+        int chk = break_count_reference(b, fc, row, col, budget);
+        if (chk != n)
+            fatal("VERIFY_BREAKCOUNT: (r=%d,c=%d) budget=%d placed_nb=%d fast=%d scan=%d",
+                  row, col, budget, d, n, chk);
+    }
+#endif
     return n;
 }
 
@@ -3113,27 +3516,66 @@ static int collect_candidates(const Board *b, const FcState *fc,
 #endif
 
     if (remaining_budget > 0 && (exact == 0 || want_breaks_if_exact)) {
-        int first_break = n;
-        for (int wi = 0; wi < OMASK_WORDS; wi++) {
-            uint64_t w = g_cellbase[row][col].w[wi] & fc->unused4.w[wi];
-            while (w) {
-                int bit = wi * 64 + __builtin_ctzll(w);
-                w &= w - 1;
-                int pid = bit >> 2, spin = bit & 3;
-                if (st) { st->piece_tests[depth]++; st->rotation_tests[depth]++; }
-                int br = piece_break_count(b, row, col, &g_oriented[pid][spin]);
-                if (br < 1 || br > remaining_budget) continue;
-                if (n < out_cap) {
-                    out[n].pid = (uint16_t)pid;
-                    out[n].spin = (uint8_t)spin;
-                    out[n].breaks = (uint8_t)br;
-                    n++;
+        const OMask *fit[4];
+        int d = cell_fit_masks(b, row, col, fit);
+
+        OMask base = *cellbase(row, col);
+        omask_and(&base, &fc->unused4);
+
+        /* The scan this replaced counted one piece test per frame-legal unused
+         * orientation, whether or not it ended up admissible.  That is exactly
+         * popcount(base), so the reported statistics are unchanged. */
+        if (st) {
+            int seen = omask_popcount(&base);
+            st->piece_tests[depth]    += (uint64_t)seen;
+            st->rotation_tests[depth] += (uint64_t)seen;
+        }
+
+        OMask cls[5];
+        break_class_masks(&base, fit, d, cls);
+
+        /* Ascending break class, and within a class the words run low to high
+         * and __builtin_ctzll low to high, so the bits arrive in ascending
+         * pid*4+spin -- that is candidate_cmp()'s (breaks, pid, spin) order
+         * already, and the sort the old path needed is simply gone.
+         *
+         * out_cap is NUM_PIECES*4, the total number of orientation bits, and the
+         * exact and break classes are disjoint subsets of it, so the guard below
+         * can never fire; it is kept because nothing else enforces the bound. */
+        int jmax = d < remaining_budget ? d : remaining_budget;
+        for (int j = 1; j <= jmax; j++) {
+            for (int wi = 0; wi < OMASK_WORDS; wi++) {
+                uint64_t w = cls[j].w[wi];
+                while (w) {
+                    int bit = wi * 64 + __builtin_ctzll(w);
+                    w &= w - 1;
+                    if (n < out_cap) {
+                        out[n].pid    = (uint16_t)(bit >> 2);
+                        out[n].spin   = (uint8_t)(bit & 3);
+                        out[n].breaks = (uint8_t)j;
+                        n++;
+                    }
                 }
             }
         }
-        if (n - first_break > 1)
-            qsort(out + first_break, (size_t)(n - first_break), sizeof(out[0]),
-                  candidate_cmp);
+
+#ifdef VERIFY_BREAKCOUNT
+        {   /* out[0] must be the exact-fit domain, and the admissible break
+             * candidates must be exactly what the old scan produced. */
+            if (omask_popcount(&cls[0]) != (int)fc->dom_count[row][col])
+                fatal("VERIFY_BREAKCOUNT: (r=%d,c=%d) class 0 has %d bits, dom_count %u",
+                      row, col, omask_popcount(&cls[0]),
+                      (unsigned)fc->dom_count[row][col]);
+            int chk = break_count_reference(b, fc, row, col, remaining_budget);
+            if (chk != n - exact)
+                fatal("VERIFY_BREAKCOUNT: (r=%d,c=%d) emitted %d break candidates, scan %d",
+                      row, col, n - exact, chk);
+            for (int i = exact + 1; i < n; i++)
+                if (candidate_cmp(&out[i-1], &out[i]) > 0)
+                    fatal("VERIFY_BREAKCOUNT: (r=%d,c=%d) break candidates out of order at %d",
+                          row, col, i);
+        }
+#endif
     }
 
     if (exact_count) *exact_count = exact;
@@ -3216,7 +3658,7 @@ static inline bool hall_should_run(const FcState *fc, const Cell *cells,
  * flow with the exhaustive search, and keeping the two apart means a change here
  * can never perturb the proof engines.
  *
- * WHY IT ALWAYS COMPLETES.  g_cellbase[r][c] restricts a cell to pieces of its
+ * WHY IT ALWAYS COMPLETES.  cellbase(r,c) restricts a cell to pieces of its
  * required frame type, and the type counts are exactly balanced (4 corners, 56
  * edges, 196 inner).  Every placement consumes one piece of the cell's own type,
  * so the number of unused pieces of type T always equals the number of unfilled
@@ -3375,6 +3817,14 @@ static void run_greedy_restarts(const Board *base, const Cell *seq, int n_seq,
     int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
     if ((long long)nt > n_want) nt = (int)n_want;
 
+    /* Every restart starts from the same board, so its forward-checking state is
+     * the same too.  Build it once and copy: fc_init() clears ~35 kB and then
+     * recomputes a domain mask per empty cell, which was about 3.7% of the dive
+     * engine spent rediscovering a constant.  FcState holds no pointers into the
+     * board, so the copy is exact. */
+    FcState fc_proto;
+    fc_init(&fc_proto, base);
+
     #pragma omp parallel num_threads(nt)
     {
         Board b;
@@ -3390,7 +3840,7 @@ static void run_greedy_restarts(const Board *base, const Cell *seq, int n_seq,
 
             RNG rng = rng_for(g_rng_master, rec_index, (uint64_t)i);
             b = *base;
-            fc_init(&fc, &b);
+            fc = fc_proto;
             greedy_dive(&b, &fc, seq, n_seq, &rng);
 
             /* The type-balance argument says a dive cannot fail to fill every
@@ -4223,6 +4673,101 @@ static void run_search_at_k(Board *base, const SearchCtx *cx,
 
 /* -- Per-record processing ---------------------------------------------------- */
 
+/* -- Forcing the clues on ------------------------------------------------------ */
+
+typedef enum {
+    CLUE_APPLY_OK = 0,
+    CLUE_APPLY_NO_ORIENT,   /* unclued board and no --clue_orient to fall back on */
+    CLUE_APPLY_CONFLICT     /* a cell is taken, or a clue piece is stranded elsewhere */
+} ClueApplyResult;
+
+/* Where a placed piece currently sits, for the diagnostic on the error path. */
+static bool clue_find_piece(const Board *b, int pid, int *row, int *col) {
+    for (int r = 0; r < PUZZLE_SIDE; r++)
+        for (int c = 0; c < PUZZLE_SIDE; c++)
+            if (b->cell[r][c].piece_id == (int16_t)pid) { *row = r; *col = c; return true; }
+    return false;
+}
+
+/*
+ * Put every enabled clue of this board's orientation onto its cell, in the
+ * SEARCH frame (the board has already been turned by --rotate).
+ *
+ * Choosing the orientation is not a free choice.  This tool only ever fills
+ * empty cells -- it cannot move or re-spin a piece that is already placed -- so
+ * a board that already carries a clue has committed to that orientation, and
+ * --clue_orient cannot overrule it without making the board unsatisfiable.  The
+ * centre clue settles it alone, because its cell differs across all four
+ * orientations; the corner clues share the same four cells and differ only in
+ * which piece sits where, so they decide only when the centre is absent or not
+ * enabled.  An unclued board is equally compatible with all four, and that is
+ * the one case where --clue_orient has to supply the answer.
+ *
+ * Anything that cannot be satisfied is a conflict, never a silent skip: the
+ * whole point of the flags is that the finished board carries the clues.
+ */
+static ClueApplyResult clue_apply(Board *b, int *n_placed, int *orient_out,
+                                  int *added_out, int *already_out,
+                                  char *why, size_t why_sz) {
+    *orient_out = -1; *added_out = 0; *already_out = 0;
+
+    int hit[CLUE_ORIENTS] = {0, 0, 0, 0};
+    int centre_orient = -1;
+    for (int o = 0; o < CLUE_ORIENTS; o++) {
+        for (int k = 0; k < CLUE_N; k++) {
+            if (!clue_entry_enabled(k)) continue;
+            const ClueCell *cc = &g_clue[o][k];
+            const Oriented *cell = &b->cell[cc->row][cc->col];
+            if (cell->piece_id == (int16_t)cc->piece && cell->rotation == cc->spin) {
+                hit[o]++;
+                if (k == 0) centre_orient = o;
+            }
+        }
+    }
+
+    int orient = centre_orient;
+    if (orient < 0) {
+        int best = 0;
+        for (int o = 0; o < CLUE_ORIENTS; o++)
+            if (hit[o] > best) { best = hit[o]; orient = o; }
+    }
+    if (orient < 0) {
+        if (g_clue_orient < 0) return CLUE_APPLY_NO_ORIENT;
+        orient = clue_orient_in_search_frame(g_clue_orient, g_rotation);
+    }
+    *orient_out = orient;
+
+    for (int k = 0; k < CLUE_N; k++) {
+        if (!clue_entry_enabled(k)) continue;
+        const ClueCell *cc = &g_clue[orient][k];
+        int r = cc->row, c = cc->col, pid = (int)cc->piece, spin = (int)cc->spin;
+        const Oriented *cell = &b->cell[r][c];
+
+        if (cell->piece_id == (int16_t)pid && cell->rotation == (uint8_t)spin) {
+            (*already_out)++;
+            continue;
+        }
+        if (cell->piece_id != EMPTY_PIECE) {
+            snprintf(why, why_sz,
+                     "clue cell (r=%d,c=%d) must hold piece %d spin %d but holds piece %d spin %u",
+                     r, c, pid, spin, (int)cell->piece_id, (unsigned)cell->rotation);
+            return CLUE_APPLY_CONFLICT;
+        }
+        if (used_test(b->used, pid)) {
+            int pr = -1, pc = -1;
+            clue_find_piece(b, pid, &pr, &pc);
+            snprintf(why, why_sz,
+                     "clue piece %d belongs at (r=%d,c=%d) but is already placed at (r=%d,c=%d)",
+                     pid, r, c, pr, pc);
+            return CLUE_APPLY_CONFLICT;
+        }
+        board_place(b, r, c, pid, spin);
+        (*n_placed)++;
+        (*added_out)++;
+    }
+    return CLUE_APPLY_OK;
+}
+
 static void process_line(const char *config_id_str, long long sol_id,
                          const int pos[NUM_PIECES], const int rot[NUM_PIECES]) {
     double t0 = omp_get_wtime();
@@ -4258,7 +4803,47 @@ static void process_line(const char *config_id_str, long long sol_id,
         return;
     }
 
-    /* -- Save initial board (after holes, in rotated frame) for verbose display -- */
+    /* -- Force the published clue pieces on -------------------------------------
+     *
+     * Deliberately placed here: after --rotate, after --holes (which may have
+     * just freed a clue piece and so made it placeable) and after main's
+     * duplicate pass, but before the break count, the validator, the budget
+     * check and the search sequence.  That ordering is what makes a break the
+     * clues themselves create behave exactly like an input break -- same
+     * warning, same budget, same drop -- and what turns the clue cells into
+     * constraints on the DFS rather than cells it has to fill. */
+    int clue_orient_used = -1, clues_added = 0, clues_already = 0;
+    if (g_clue_mask) {
+        ClueApplyResult cr = clue_apply(&base, &n_placed, &clue_orient_used,
+                                        &clues_added, &clues_already, why, sizeof(why));
+        if (cr != CLUE_APPLY_OK) {
+            #pragma omp atomic
+            g_cnt_clue_conflict++;
+            appendf(rec_buf, sizeof(rec_buf), &rec_off,
+                    "[cfg=%s sol=%lld] DROPPED (clues): %s; not searched, not written.\n",
+                    config_id_str, sol_id,
+                    cr == CLUE_APPLY_NO_ORIENT
+                      ? "board carries no clue, so its orientation cannot be read off it"
+                        " -- pass --clue_orient 0..3"
+                      : why);
+            #pragma omp critical(stdout_print)
+            { fputs(rec_buf, stdout); fflush(stdout); }
+            DfsStats st0; stats_init(&st0);
+            FeasIssue fi0; memset(&fi0,0,sizeof(fi0)); fi0.code=FEAS_OK;
+            write_status_csv(config_id_str, sol_id, false, "clue_conflict",
+                             n_placed, 0, holes_applied, omp_get_wtime()-t0, 0,
+                             &fi0, &st0, NULL, 0, n_placed, 0, 0, -1, -1, 0);
+            return;
+        }
+        appendf(rec_buf, sizeof(rec_buf), &rec_off,
+                "[cfg=%s sol=%lld] clues: orientation %d, %d placed, %d already in place.\n",
+                config_id_str, sol_id,
+                (clue_orient_used + g_rotation) % CLUE_ORIENTS, clues_added, clues_already);
+        #pragma omp critical(stdout_print)
+        { fputs(rec_buf, stdout); fflush(stdout); rec_off = 0; rec_buf[0] = '\0'; }
+    }
+
+    /* -- Save initial board (after holes and clues, in rotated frame) -- */
     Board initial_board = base;
     int initial_n_placed = n_placed;
 
@@ -4891,6 +5476,27 @@ static void usage(const char *prog) {
         "  --no_dedup             Search every selected input row independently.\n\n",
         stderr);
     fputs(
+        "Clue pieces (the published Eternity II hints):\n"
+        "  --clue_center          Force piece 138 onto the centre clue cell, at its spin.\n"
+        "  --clue_corners         Force all four corner clues.  The beamer can only reach\n"
+        "                         the two on row 2 and merely reserves the pair on row 13;\n"
+        "                         this tool sees the whole board and enforces all four.\n"
+        "  --clue_orient N        Which of the four board orientations the clues follow,\n"
+        "                         named in the CSV frame (--rotate is applied for you).\n"
+        "                         Only consulted for a board carrying no clue at all: a\n"
+        "                         board that already holds one has committed to its\n"
+        "                         orientation, and this tool fills empty cells rather than\n"
+        "                         moving placed ones, so what the board says wins.\n"
+        "                         The centre clue settles it alone; the corner clues share\n"
+        "                         their cells across orientations and decide only without it.\n"
+        "  Clues go on after --rotate, --holes and the duplicate pass, and before the\n"
+        "  search: a hole that frees a clue piece therefore makes it placeable.  Any break\n"
+        "  they create counts as an input break, so --breaks governs it as usual.  A board\n"
+        "  whose clue cell is taken, or whose clue piece is stranded elsewhere, is dropped\n"
+        "  with a message and is NOT written to the output.\n"
+        "  Refused with --stop_row/--stop_column: the clue cells lie outside the band.\n\n",
+        stderr);
+    fputs(
         "Search order and pruning:\n"
         "  --order MODE           mrv (default), rowmajor, colmajor, snake, spiral,\n"
         "                         centerout, spiralout, 2sides, 4sides.\n"
@@ -5089,6 +5695,16 @@ int main(int argc, char **argv) {
             g_dedup = false;
         } else if (strcmp(argv[i], "--status") == 0) {
             g_write_status = true;
+        } else if (strcmp(argv[i], "--clue_center") == 0) {
+            g_clue_mask |= CLUE_CENTER;
+        } else if (strcmp(argv[i], "--clue_corners") == 0) {
+            g_clue_mask |= CLUE_CORNERS;
+        } else if (strcmp(argv[i], "--clue_orient") == 0 && i+1 < argc) {
+            char *end = NULL; errno = 0;
+            long v = strtol(argv[++i], &end, 10);
+            if (errno || end == argv[i] || *end || v < 0 || v > 3)
+                fatal("--clue_orient expects 0, 1, 2, or 3; got '%s'", argv[i]);
+            g_clue_orient = (int)v;
         } else if (strcmp(argv[i], "--rotate") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
@@ -5202,10 +5818,26 @@ int main(int argc, char **argv) {
         if (g_jump)
             fatal("--stop_%s requires --jump off: jumping leaves dead cells empty, "
                   "so the band can never complete", g_stop_isrow ? "row" : "column");
+        /* A band line is written from the band cells alone and is fed straight to
+         * the finalizer.  Clue cells sit at rows 2, 7/8 and 13, so most of them
+         * fall outside any useful band: forcing them on would either put pieces
+         * into a band line that the finalizer does not expect there, or take them
+         * out of the pool the band is enumerated from.  Refuse rather than emit a
+         * band that quietly means something else. */
+        if (g_clue_mask)
+            fatal("--stop_%s cannot be combined with --clue_center/--clue_corners: "
+                  "the clue cells lie outside the band, so they would either "
+                  "contaminate the emitted band or be cut from it",
+                  g_stop_isrow ? "row" : "column");
     } else if (g_with_frame) {
         fatal("--with_frame widens a stop band, so it needs one: add --stop_row N "
               "or --stop_column N");
     }
+
+    if (g_clue_orient >= 0 && !g_clue_mask)
+        fatal("--clue_orient only means something with --clue_center and/or "
+              "--clue_corners: on its own there is no clue to orient");
+    if (g_clue_mask) clue_selfcheck();
 
     /* Literal side-growth orders use exact placements only.  They have their
      * own dead-cell deferral semantics, so the generic --jump switch remains
@@ -5582,6 +6214,7 @@ int main(int argc, char **argv) {
     printf("\n  By status:\n");
     printf("    invalid              = %" PRIu64 "\n", g_cnt_invalid);
     printf("    dropped(input>budget)= %" PRIu64 "\n", g_cnt_dropped);
+    printf("    dropped(clue conflict)= %" PRIu64 "\n", g_cnt_clue_conflict);
     printf("    duplicate(post-holes)= %" PRIu64 "\n", g_cnt_duplicate);
     printf("    initially_infeasible = %" PRIu64 "\n", g_cnt_infeasible);
     printf("    hall_root_infeasible = %" PRIu64 "\n", g_cnt_hall_infeasible);
@@ -5624,7 +6257,7 @@ int main(int argc, char **argv) {
             printf("    PURE     #1: cfg=%s sol=%lld  pieces=%d (added %d)  connected=%d  broken=0  deepest=(r=%d,c=%d)\n",
                    bp->record_id, bp->sol_id_num, bp->n_total, bp->n_added,
                    bp->n_connected, bp->deepest_row, bp->deepest_col);
-            char title[220];
+            char title[CONFIG_ID_LEN + 160];
             snprintf(title, sizeof(title),
                      "=== Best PURE #1: cfg=%s sol=%lld  pieces=%d (added %d)  connected=%d  broken=0 ===",
                      bp->record_id, bp->sol_id_num, bp->n_total, bp->n_added, bp->n_connected);
@@ -5635,7 +6268,7 @@ int main(int argc, char **argv) {
             printf("    MISMATCH #1: cfg=%s sol=%lld  pieces=%d (added %d)  connected=%d  broken=%d  deepest=(r=%d,c=%d)\n",
                    bp->record_id, bp->sol_id_num, bp->n_total, bp->n_added,
                    bp->n_connected, bp->n_broken, bp->deepest_row, bp->deepest_col);
-            char title[220];
+            char title[CONFIG_ID_LEN + 160];
             snprintf(title, sizeof(title),
                      "=== Best MISMATCH #1: cfg=%s sol=%lld  pieces=%d (added %d)  connected=%d  broken=%d "
                      "($ marks broken edges) ===",

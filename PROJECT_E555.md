@@ -1957,6 +1957,57 @@ sound completion prunes (global empty-domain lower bound, incremental
 color/type accounting, Hall/deficiency bipartite bound). `--holes` reopens a
 masked region of a complete board.
 
+**Break placements are counted, not enumerated.** A candidate breaks one edge per
+placed neighbour it fails to match, so its break count is the number of placed
+neighbours minus how many of their fit masks contain it -- which a bit-sliced sum
+over at most four masks resolves for all 1024 orientations at once. Two
+consequences carry the mismatch engines. Counting "how many placements here break
+between 1 and *budget* edges", which MRV asks of *every* remaining cell at *every*
+node, needs no scan at all once the budget reaches the neighbour count: it is the
+frame-legal unused total minus the exact fits, and both are counters the
+forward-checking state already maintains (nine of them suffice for all 256 cells,
+because the gray-0 frame rule distinguishes only nine kinds of cell). And
+enumerating candidates by ascending break class yields them in `(breaks, pid,
+spin)` order by construction, so the per-node sort is gone.
+
+**The domain update walks the empty cells, not the board.** Placing or removing a
+piece changes every empty cell's exact-fit count in one 64-bit word, so
+`fc_adjust_piece_support()` runs on every place and unplace -- and it used to
+sweep all 256 cells and skip the filled ones, which on a 67-cell region was 28% of
+the dive engine's instructions and grew worse as a DFS went deeper and the region
+shrank. `FcState` now carries the empty cells as a list with each cell's index
+into it, so a removal is a swap with the last entry and the sweep is O(cells that
+are actually empty).
+
+That replaced a per-candidate scan that profiling put at **79% of all instructions**
+in the exhaustive engine and about 35% in the dive engine, a quarter of which was
+re-testing the gray-0 frame rule on candidates drawn from the bitset that *is*
+that rule. Measured on a 4-core machine over the 67-cell TR region, against the
+same source built the same way:
+
+| | greedy dives (4 thr) | exhaustive DFS (1 thr) | exhaustive DFS (4 thr) |
+|---|---|---|---|
+| before | 28.8k dives/s | 688k nodes / 20 s | 2.36M nodes / 20 s |
+| break classes only | 68.3k (2.38x) | 1.87M (2.71x) | 4.37M (1.85x) |
+| and the empty-cell list, `ARCH=generic` | 94.3k (**3.28x**) | 2.85M (**4.14x**) | 5.20M (**2.20x**) |
+| and the empty-cell list, with `POPCNT` | 107.0k (**3.72x**) | 4.65M (**6.76x**) | -- |
+
+What is left is flat: place 26%, unplace 26%, `fc_compute_cell` 20%, the break
+count 9%, cell choice 8%, Hall 4%. There is no hot spot left to attack, only the
+incremental forward-checking itself -- the obvious remaining idea being to trail
+the four neighbour domains on a place and restore them on the unplace instead of
+recomputing them, which would halve the `fc_compute_cell` calls at the cost of a
+per-depth undo stack.
+
+Output is unchanged throughout -- identical boards, node counts and per-depth
+statistics -- which is checked two ways: the `backtracker_breakcount` gate step
+rebuilds the solver with `-DVERIFY_BREAKCOUNT`, so every fast-path answer is
+recomputed by the scan it replaced and any disagreement is fatal, and a 16-run
+differential battery compares every artifact against a build of the original
+code. `-DVERIFY_AVAIL` additionally checks that the empty-cell list still holds
+exactly the empty cells, since a dropped entry would silently freeze one cell's
+domain count.
+
 `--break_mode` selects between two very different engines, and the distinction
 matters more than any other parameter here:
 
@@ -1967,7 +2018,9 @@ matters more than any other parameter here:
   cannot fail. `--restarts N` (default 100 000, ~5-10 s on four cores) runs
   N randomized dives and keeps the best. Divergence comes from random tie-breaking
   alone, and that is ample: a 200 000-dive batch produced 200 000 distinct boards.
-  Throughput is ~9k-18k dives/s on four cores, so N in the millions is practical.
+  Throughput was ~9k-18k dives/s on four cores before the rewrites above, which
+  together measured 3.3x-3.7x on this engine depending on `ARCH`, so N in the
+  millions is comfortable.
   This mode **proves nothing** -- it never establishes
   that a board cannot be completed with fewer breaks. Expect it to land well
   above a well-optimized incumbent (~28 breaks best-of-200k on a 74-cell region
@@ -2037,13 +2090,74 @@ run that emits nothing is diagnosable. Under `--rotate` the band is defined in
 the original frame, the one the CSV is written in, unlike `--holes`, which is
 read in the rotated frame.
 
+**`--clue_center` / `--clue_corners` / `--clue_orient N` -- forcing the hints on.**
+The published Eternity II hint pieces are put on their cells *before* the DFS
+starts, so they constrain the search instead of being something it has to
+rediscover, and the board that comes out carries them. `--clue_corners` here
+means **all four** corner clues, as in the topper and the ender: the beamer can
+only reach the two on row 2 and merely reserves the pair on row 13, and Stage C
+is the first place all four can be enforced.
+
+They go on after `--rotate`, after `--holes` and after the duplicate pass, and
+before the break count. Three things follow from that ordering, and all three are
+the point rather than a side effect:
+
+- a `--holes` mask that frees a clue's cell, or the cell its piece is stranded
+  on, is what *makes* the clue placeable -- so reopening a region is the normal
+  way to impose clues on a board that does not have them;
+- a break the clues themselves create is counted as an input break, so
+  `--breaks` governs it exactly as usual: within budget the search continues,
+  over budget the board is dropped *and still written* as a partial, clues
+  included, which is usually what you want to look at;
+- the clue cells are filled before the search sequence is built, so the DFS
+  never tries to fill them and prunes against them from the first node.
+
+**Orientation is read off the board, not chosen.** This tool only fills empty
+cells -- it cannot move or re-spin a placed piece -- so a board already carrying
+a clue has committed to that orientation, and what it carries wins over
+`--clue_orient`. The centre clue settles it alone, its cell being different in
+all four orientations; the corner clues share their four cells and differ only in
+which piece sits where, so they decide only when the centre is absent or not
+enabled. `--clue_orient N` is consulted **only** for a board carrying no clue at
+all, and names the orientation in the CSV frame -- the frame you read a board in
+and the frame the output is written back to -- with `--rotate` applied for you.
+The clue table is closed under quarter-turns, which is what makes that carry
+well-defined, and a startup assertion proves it rather than assuming it. A board
+with no clue and no `--clue_orient` is dropped, naming the flag.
+
+**A board that cannot take its clues is dropped and not written.** Either the
+clue cell holds a different piece, or the clue piece is already placed somewhere
+else; both are reported on stdout with the cell, the piece and where it actually
+sits, counted under `dropped(clue conflict)`, and kept out of the output file --
+because a board silently written *without* its clues is the one outcome these
+flags exist to prevent. Refused outright with `--stop_row`/`--stop_column`: the
+clue cells lie outside any useful band, so forcing them would either contaminate
+the emitted band or be cut from it.
+
+The clue table is a verbatim copy of `g_clue[4][CLUE_N]` in
+`src/B_beam/E555_database.c` -- this tool is standalone and links nothing -- so
+the `backtracker_clues` gate step drives all four orientations through the flag
+and checks the result against the third copy, the one in `tools/E555_viewer.py`.
+That is what would catch the copies drifting apart.
+
 Parallelism is automatic: one record per thread, or every thread on one record's
 search when there are no more records than threads (`--all_for_one` forces the
 latter). Note that this search is memory-system bound, not scheduling bound -- on
 a 4-core laptop, four *independent* single-threaded runs already slow each other
 to 2.44x aggregate, and the threaded search achieves 2.37x, so there is little
-left for tuning to recover. Crash-safe: appends an improving checkpoint line per
-record; output is re-feedable.
+left for tuning to recover. The break-class rewrite shows the same wall from the
+other side: they bought 4.14x single-threaded but only 2.20x on four threads,
+because a faster thread reaches the bandwidth limit sooner, and the gap widens
+as the thread gets faster still. Crash-safe: appends an improving
+checkpoint line per record; output is re-feedable.
+
+One build note follows from it: the engine now leans on `popcount`, so `ARCH`
+matters more than it used to. `native`, `v3` and `v2` all emit the instruction;
+`generic` calls into libgcc for it, where it accounts for a quarter of the
+profile and costs about 12% of dive throughput and, now that nothing else
+dominates, **39%** of the DFS node rate (the last two rows of the table above).
+Prefer a non-generic `ARCH` wherever the CPU allows -- `generic` is for CI and
+containers, not for a real run.
 
 ### E555_ender.py -- the closer, two neighbourhoods ( power tool)
 

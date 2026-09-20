@@ -330,8 +330,10 @@ other setting.
 
 **`MODE=stuck` (default) -- greedy dives, for triage.** Each dive takes an exact
 fit where one exists and a minimal break where none does, never backtracks, and
-therefore always reaches 256 pieces. ~10k complete boards per second. Cheap
-enough to run over a whole batch to see which partials deserve a long run. It
+therefore always reaches 256 pieces. ~10k complete boards per second when that
+figure was taken, and about 3.3x-3.7x that since the forward-checking rewrites
+(`PROJECT_E555.md`, Stage C). Cheap enough to run over a whole batch to see which
+partials deserve a long run. It
 **proves nothing**: it never establishes that a board cannot be completed with
 fewer breaks.
 
@@ -523,6 +525,9 @@ end-to-end run, four cores:
 | backtracker | ~100 s | 41 full boards |
 | rank + view | seconds | best **455/480**, 25 breaks in 5 rows, 218/256 solid |
 | **total** | **914 s** | `bb1_ranked.csv`, 41 rows |
+
+That run predates the forward-checking rewrites, so its backtracker row is now
+roughly 3.3x quicker; the other stages are unchanged.
 
 Four idle cores; proportionally less on more threads. Stage 1 is two thirds of
 it and is capped by its own clock, so `--wall_time` there is the dial that

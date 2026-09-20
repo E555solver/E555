@@ -91,6 +91,8 @@ ALL_STEPS=(
     "backtracker_dives|greedy dives on the example board, plus an own-output round-trip"
     "backtracker_exhaustive|exhaustive enumeration identical at 1 and 4 threads"
     "backtracker_stop_band|--stop_row/--stop_column emit exact, finalizer-shaped bands"
+    "backtracker_breakcount|break classes agree with the per-candidate scan they replaced"
+    "backtracker_clues|--clue_center/--clue_corners force the hints on, or drop the board"
     "whirlpool_lap|one whirlpool lap: turn, re-cut rows 0..5, re-grow to row 11"
     "clue_orient|a band carrying no clue is searched at all four orientations"
     "band_with_frame|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
@@ -1522,6 +1524,190 @@ step_backtracker_stop_band() {
     grep -q "requires --breaks 0" "$OUT/sbx.log" || fail "wrong error for --breaks"
 
     echo "ok: $n exact row-0 bands, thread-independent, --reverse and guards correct"
+}
+
+# The mismatch engines no longer test candidates one at a time: a placement's
+# break count is derived from the neighbour fit masks by bit arithmetic, and the
+# count MRV asks for at every cell of every node comes from two running counters.
+# That is worth about 2.4x, and it is also a class of bug the other checks cannot
+# see -- a wrong class mask or a stale availability counter changes which
+# candidates a node considers while leaving the search perfectly self-consistent,
+# so it still emits legal boards and still agrees with itself across threads.
+#
+# -DVERIFY_BREAKCOUNT rebuilds the solver with the scan that was replaced kept as
+# an oracle, recomputing every fast-path answer and aborting on disagreement.
+# This check exists to make sure that oracle still compiles, still runs, and
+# still agrees -- on both the O(1) path (a budget at or above the cell's placed
+# neighbour count, which every greedy dive takes) and the bit-sliced path below
+# it -- and that the instrumented build searches identically to the shipped one.
+step_backtracker_breakcount() {
+    bt="$OUT/bt_breakcount"
+    ${CC:-gcc} -Wall -Wextra -O2 -fopenmp -DVERIFY_BREAKCOUNT \
+        src/C_tail/E555_backtracker.c -o "$bt" -lm 2> "$OUT/btbc_build.txt" \
+        || { cat "$OUT/btbc_build.txt"; fail "VERIFY_BREAKCOUNT build failed"; }
+    if [ -s "$OUT/btbc_build.txt" ]; then
+        cat "$OUT/btbc_build.txt"; fail "VERIFY_BREAKCOUNT build emitted warnings"
+    fi
+
+    # Greedy dives: almost every placement is a break placement, and DIVE_BREAK_CAP
+    # is 4, so the budget always reaches the neighbour count -- the O(1) path.
+    "$bt" data/seed_Edge5.txt data/board_example_462.csv "$OUT/btbc_dive.csv" \
+        --holes data/holes_open_border_TR.csv --num_rows 1 --threads 2 \
+        --break_mode stuck --breaks 30 --restarts 1500 --time_limit 0 \
+        > "$OUT/btbc_dive.log" 2>&1 \
+        || { tail -3 "$OUT/btbc_dive.log"; fail "the oracle rejected a greedy dive"; }
+
+    # --breaks 3 on a region whose root Hall deficiency is 2 leaves a budget below
+    # four, so these exhaust through the bit-sliced classification instead.
+    for m in any lds; do
+        "$bt" data/seed_Edge5.txt data/board_example_462.csv "$OUT/btbc_$m.csv" \
+            --holes data/holes_open_border_TR.csv --order mrv --break_mode "$m" \
+            --lds_max 2 --breaks 3 --max_emitted 0 --threads 1 --time_limit 0 \
+            > "$OUT/btbc_$m.log" 2>&1 \
+            || { tail -3 "$OUT/btbc_$m.log"; fail "the oracle rejected --break_mode $m"; }
+        bin/E555_backtracker data/seed_Edge5.txt data/board_example_462.csv \
+            "$OUT/btbc_${m}_plain.csv" \
+            --holes data/holes_open_border_TR.csv --order mrv --break_mode "$m" \
+            --lds_max 2 --breaks 3 --max_emitted 0 --threads 1 --time_limit 0 \
+            > "$OUT/btbc_${m}_plain.log" 2>&1 \
+            || fail "the shipped build failed the --break_mode $m run"
+        cmp -s <(grep -v "^#" "$OUT/btbc_$m.csv") \
+               <(grep -v "^#" "$OUT/btbc_${m}_plain.csv") \
+            || fail "--break_mode $m differs between the instrumented and shipped builds"
+    done
+
+    echo "ok: break classes and availability counters match the scan, on both paths"
+}
+
+# --clue_center/--clue_corners force the published hint pieces onto their cells
+# before the DFS starts, so the finished board carries them.  Two things make
+# this worth a check of its own.
+#
+# The clue table is a COPY -- src/B_beam/E555_database.c holds the original and
+# tools/E555_viewer.py holds the Python one -- and the backtracker is standalone,
+# so nothing links them.  Driving all four orientations through the C flag and
+# verifying the result against the Python table is what would catch the copies
+# drifting apart; a wrong entry would otherwise just pin the wrong piece forever.
+#
+# And the failure modes are refusals, which are easy to break silently: a board
+# whose clue cell is taken, or whose clue piece is stranded elsewhere, must be
+# dropped AND must not reach the output file, because a board written without its
+# clues is exactly what the flags exist to prevent.
+step_backtracker_clues() {
+    # `local` is not decoration here: the dispatcher holds the step name in
+    # `name`, so a bare assignment would rename this check in the run summary.
+    local E=data/seed_Edge5.txt B=data/board_example_462.csv
+    local o k spec cname extra nlines
+    # The example board carries no clue at all: every clue cell holds some other
+    # piece and every clue piece sits elsewhere, so it exercises both refusals as
+    # it stands, and every placement once holes free the cells and the pieces.
+    python3 - "$OUT" <<'PY'
+import sys, os
+sys.path.insert(0, "tools"); import E555_viewer as V
+out = sys.argv[1]
+row = open("data/board_example_462.csv").readline().strip().split(",")[-512:]
+pos = [int(x) for x in row[:256]]
+def write(cells, name):
+    m = [0]*256
+    for c in cells: m[c] = 1
+    open(os.path.join(out, name), "w").write(",".join(map(str, m)) + "\n")
+def turn(cell, k):
+    r, c = divmod(cell, 16)
+    for _ in range(k): r, c = c, 15 - r
+    return r*16 + c
+for o in range(4):
+    cl = V.clue_list(o)
+    write([c for c, _p, _s in cl] + [pos[p] for _c, p, _s in cl], "clue_all_o%d.csv" % o)
+centre = V.CLUE[0][0]
+cell0 = centre[0]*16 + centre[1]
+write([cell0], "clue_cell_only.csv")                      # cell freed, piece 138 is not
+for k in range(4):                                        # --holes is read in the ROTATED frame
+    write([turn(cell0, k), turn(pos[centre[2]], k)], "clue_rot%d.csv" % k)
+PY
+
+    run_bt() { bin/E555_backtracker $E $B "$1" --num_rows 1 --threads 1 \
+                   --break_mode stuck --breaks 90 --restarts 60 --time_limit 0 "${@:2}"; }
+
+    # 1. All five clues, at each of the four orientations, must reach the output
+    #    board exactly where the shared Python table says they belong.
+    for o in 0 1 2 3; do
+        run_bt "$OUT/clue_o$o.csv" --holes "$OUT/clue_all_o$o.csv" \
+               --clue_center --clue_corners --clue_orient $o > "$OUT/clue_o$o.log" 2>&1 \
+            || { tail -3 "$OUT/clue_o$o.log"; fail "clue run at orientation $o failed"; }
+        grep -q "clues: orientation $o, 5 placed" "$OUT/clue_o$o.log" \
+            || fail "orientation $o did not place all five clues"
+        python3 - "$OUT/clue_o$o.csv" "$o" <<'PY'
+import sys
+sys.path.insert(0, "tools"); import E555_viewer as V
+path, o = sys.argv[1], int(sys.argv[2])
+for ln in open(path):
+    if ln.startswith("#") or not ln.strip(): continue
+    f = ln.strip().split(",")[-512:]
+    pos = [int(x) for x in f[:256]]; rot = [int(x) for x in f[256:]]
+    bad = [(c, p, s) for c, p, s in V.clue_list(o) if pos[p] != c or rot[p] != s]
+    assert not bad, "orientation %d: %d clue(s) missing from the output: %r" % (o, len(bad), bad)
+    print("ok")
+    sys.exit(0)
+sys.exit("no data row in %s" % path)
+PY
+    done
+
+    # 2. A board that already carries a clue has committed: what it holds must
+    #    win over --clue_orient, because this tool cannot move a placed piece.
+    bin/E555_backtracker $E "$OUT/clue_o0.csv" "$OUT/clue_back.csv" --num_rows 1 --threads 1 \
+        --break_mode stuck --breaks 90 --restarts 20 --time_limit 0 \
+        --clue_center --clue_orient 2 > "$OUT/clue_back.log" 2>&1 \
+        || fail "re-reading a clued board failed"
+    grep -q "clues: orientation 0, 0 placed, 1 already in place" "$OUT/clue_back.log" \
+        || { grep clues "$OUT/clue_back.log"; fail "--clue_orient 2 overrode a board already at orientation 0"; }
+
+    # 3. Both conflicts drop the board, and neither may reach the output file.
+    for spec in "taken:" "stranded:--holes $OUT/clue_cell_only.csv"; do
+        cname=${spec%%:*}; extra=${spec#*:}
+        run_bt "$OUT/clue_$cname.csv" $extra --clue_center --clue_orient 0 \
+            > "$OUT/clue_$cname.log" 2>&1 || fail "the $cname conflict run exited non-zero"
+        grep -q "DROPPED (clues)" "$OUT/clue_$cname.log" || fail "$cname conflict was not dropped"
+        nlines=$(grep -v '^#' "$OUT/clue_$cname.csv" | grep -c . || true)
+        [ "$nlines" = "0" ] || fail "$cname conflict wrote $nlines board(s) to the output"
+    done
+
+    # 4. An unclued board with no --clue_orient cannot be oriented; say so by name.
+    run_bt "$OUT/clue_noor.csv" --holes "$OUT/clue_all_o0.csv" --clue_center \
+        > "$OUT/clue_noor.log" 2>&1 || fail "the unoriented run exited non-zero"
+    grep -q -- "--clue_orient 0..3" "$OUT/clue_noor.log" \
+        || fail "an unclued board did not name --clue_orient"
+
+    # 5. --rotate turns the clue set with the board, so --clue_orient keeps naming
+    #    the CSV frame: the centre clue must land on the same cell and spin at all
+    #    four rotations.  A sign error here would be invisible without this.
+    for k in 0 1 2 3; do
+        run_bt "$OUT/clue_r$k.csv" --holes "$OUT/clue_rot$k.csv" --rotate $k \
+               --clue_center --clue_orient 0 > "$OUT/clue_r$k.log" 2>&1 \
+            || fail "--rotate $k with clues failed"
+        python3 - "$OUT/clue_r$k.csv" <<'PY'
+import sys
+sys.path.insert(0, "tools"); import E555_viewer as V
+cell, piece, spin = V.clue_list(0, V.CLUE_CENTER)[0]
+for ln in open(sys.argv[1]):
+    if ln.startswith("#") or not ln.strip(): continue
+    f = ln.strip().split(",")[-512:]
+    pos = [int(x) for x in f[:256]]; rot = [int(x) for x in f[256:]]
+    assert pos[piece] == cell and rot[piece] == spin, \
+        "centre clue landed at cell %d spin %d, wanted %d/%d" % (pos[piece], rot[piece], cell, spin)
+    print("ok"); sys.exit(0)
+sys.exit("no data row")
+PY
+    done
+
+    # 6. The two argument refusals.
+    bin/E555_backtracker $E $B "$OUT/clue_x1.csv" --stop_row 5 --breaks 0 --clue_center \
+        > "$OUT/clue_x1.log" 2>&1 && fail "--stop_row accepted --clue_center"
+    grep -q "cannot be combined" "$OUT/clue_x1.log" || fail "wrong error for --stop_row + clues"
+    bin/E555_backtracker $E $B "$OUT/clue_x2.csv" --clue_orient 1 \
+        > "$OUT/clue_x2.log" 2>&1 && fail "--clue_orient accepted without a clue flag"
+    grep -q "only means something with" "$OUT/clue_x2.log" || fail "wrong error for a lone --clue_orient"
+
+    echo "ok: all four orientations land, the board wins, both conflicts drop unwritten"
 }
 
 # One whirlpool lap: turn the board, re-cut rows 0..5 exactly, re-grow to row 11.
