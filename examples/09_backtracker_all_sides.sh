@@ -1,6 +1,6 @@
 #!/bin/bash
-# 09_backtracker_all_sides.sh -- one board, five exact passes, each from a
-# different direction.
+# 09_backtracker_all_sides.sh -- fill one board as far as it goes without ever
+# breaking an edge, attacking it from several directions.
 #
 #   bash examples/09_backtracker_all_sides.sh
 #   bash examples/09_backtracker_all_sides.sh BOARDS=stage_c_out/3_patched.csv
@@ -16,50 +16,77 @@
 # board in the chain is break-free, and the final board is break-free with empty
 # cells wherever no exact piece fits.
 #
-#   #  flags                          leads from        order_key
-#   1  --order spiral                 outer ring in     min(r,15-r,c,15-c)
-#   2  --order rowmajor               bottom, L->R      r*16 + c
-#   3  --order rowmajor --reverse     same rows, R->L   r*16 + (15-c)
-#   4  --order colmajor               left              c*16 + r
-#   5  --order colmajor --reverse     right, downward   (15-c)*16 + (15-r)
-#   6  --order 4sides    FOURSIDES=1  all four sides    literal side sequence
+# JUMP=1 (the default) is what makes that a FILLING run rather than a completion
+# attempt. Without it a pass walks its order and the first empty cell no piece
+# fits exactly ends the search there -- it cannot step past a dead cell, so a
+# board that cannot be completed usually gets nothing added. --jump is the
+# tool's best-partial mode: skip that cell and carry on filling the rest.
+# Measured on the shipped default, from 208 pieces, --breaks 0 throughout:
+#     --order mrv --jump        245 placed, 0 broken, 3 s, space exhausted
+#     five exact orders chained 227 placed, 0 broken (no --jump)
+#     the same plus 4sides      244 placed, 0 broken
+# Set JUMP=0 only when you want the strict question answered -- "does a
+# break-free completion exist from this board" -- rather than the fullest
+# break-free board.
 #
-# Passes 1..5 are exhaustive EXACT completion attempts: each either closes the
-# board, proves no zero-break completion exists from its starting board, or
-# times out, and the board it emits is the deepest node it reached.
+#   #  flags                          picks next cell   order_key
+#   1  --order mrv                    fewest candidates dynamic
+#   2  --order spiral                 outer ring in     min(r,15-r,c,15-c)
+#   3  --order rowmajor               bottom, L->R      r*16 + c
+#   4  --order rowmajor --reverse     same rows, R->L   r*16 + (15-c)
+#   5  --order colmajor               left              c*16 + r
+#   6  --order colmajor --reverse     right, downward   (15-c)*16 + (15-r)
+#   7  --order 4sides    FOURSIDES=1  all four sides    literal side sequence
 #
-# spiral goes first because it is the only order here that leads from the top,
-# and because it is the strongest: no LINEAR order can lead from the top at all.
-# Every one keys on r ascending or on c, and --reverse on rowmajor only flips
-# the within-row walk, so 2..5 lead from the bottom, bottom, left and right.
-# spiral keys on the ring distance to the nearest border, so the whole outer
-# ring -- top row included -- comes before anything inward. It also earns the
-# place on results: see MEASURED below. Since commitments are permanent, the
-# strongest pass should be the one that commits first.
+# mrv leads because it is the strongest, and commitments are permanent so the
+# strongest pass should commit first: it takes the most-constrained cell next,
+# which is where a wrong choice is cheapest to discover. Measured with --jump on
+# the shipped board it reaches 245 and EXHAUSTS its space in 3 s, where spiral,
+# rowmajor and colmajor reach 241, 243 and 242 and were still running at 30 s.
 #
-# EXPECT MOST PASSES TO ADD NOTHING, AND KNOW WHY. A hard exact pass cannot skip
-# a cell: at --breaks 0 it walks its own order, and the first empty cell that no
-# piece fits exactly kills the search there and then -- children=0 at depth 0
-# means the pass ends having added zero pieces. Worse, if the remaining-piece
-# relaxation can already prove no break-free completion exists, the root gate
-# refuses to start at all and prints ROOT-INFEASIBLE.
+# PASSES is ordered for the JUMP=1 default. With JUMP=0 no pass can step over a
+# dead cell, mrv exhausts almost at once and spiral is the stronger leader --
+# measured, 217 pieces with mrv first against 227 with spiral first -- so move
+# spiral to the front of PASSES if you set JUMP=0.
 #
-# The first pass takes the cells that could be filled exactly. What it leaves is
-# precisely the set of cells nothing fits -- so the orders after it walk straight
-# into those and stop. Measured on the shipped default, per pass:
-#     spiral +18, rowmajor +0, rowmajor --reverse +0, colmajor +0,
-#     colmajor --reverse +1, 4sides +17
-# That is not a malfunction and it is not this script mis-wiring the tool; it is
-# what an exhaustive exact search means. The chain still earns its keep when a
-# pass TIMES OUT, because then the order decides which part of the space was
-# explored and the next order explores elsewhere. On a board small enough to
-# exhaust in milliseconds, it cannot.
+# 2..6 are the directional orders and are what the name of this script is about.
+# Of them only spiral leads from the top: every linear order keys on r ascending
+# or on c, and --reverse on rowmajor only flips the within-row walk, so they
+# lead from the bottom, bottom, left and right. spiral keys on the ring distance
+# to the nearest border, so the whole outer ring -- top row included -- comes
+# before anything inward. 4sides is the only non-completing order: see below.
 #
-# WHAT DOES GROW SUCH A BOARD is a SOFT pass, which steps over a dead cell
-# instead of stopping at it. 4sides is the only soft order here (--jump is the
-# other soft mode, and is deliberately not used). So a run where most passes add
-# nothing and FOURSIDES=0 has switched off the one pass that could have helped:
-# the script says so at the end, and re-running with FOURSIDES=1 is the answer.
+# EXPECT MOST PASSES TO ADD NOTHING, AND KNOW WHY. Each pass reports its placed
+# count and the pieces it added, so a no-op is visible; a run of +0 lines means
+# different things depending on JUMP.
+#
+# With JUMP=1 a pass that exhausts its space has found the fullest break-free
+# board this search can reach from the one it was given, so the orders after it
+# re-derive the same board in milliseconds and add nothing. That is success,
+# not failure: on the shipped board pass 1 goes +37 to 245 and passes 2..6 all
+# report +0. The chain still earns its keep when a pass TIMES OUT, because then
+# the order decides which part of the space was explored and the next order
+# explores elsewhere.
+#
+# With JUMP=0 the +0 lines mean something worse. A pass cannot skip a cell, so
+# the first empty cell no piece fits exactly ends it at depth 0 having added
+# nothing, and if the remaining-piece relaxation already proves no break-free
+# completion exists, the root gate refuses to start at all and prints
+# ROOT-INFEASIBLE. The first pass takes the cells that could be filled and
+# leaves precisely the cells nothing fits, so the later orders walk into those
+# and stop: spiral +18, then +0, +0, +0, +1. That is what an exhaustive exact
+# search means, not a fault in the tool or in this script -- but it is also why
+# JUMP=1 is the default, and why a JUMP=0 run that stalls is told to turn it on.
+#
+# A BREAK BUDGET IS NOT A SUBSTITUTE FOR --jump. Allowing a break lets a pass
+# place a MISMATCHING piece where some piece fits; it does not let it move past
+# a cell where nothing fits at all. Measured on the shipped board:
+#     --breaks 1 --break_mode any            215 placed, 0 broken
+#     --breaks 1 --break_mode any --jump     246 placed, 1 broken, 28 s
+#     --breaks 0 --jump                      245 placed, 0 broken,  3 s
+# The budget alone is worse than plain --jump, and with --jump it buys one
+# piece for ten times the time. Raise --breaks to ask a different question, not
+# to fill more board.
 #
 # And commitments are permanent: nothing downstream can undo a piece an earlier
 # pass placed, and the deepest node of an exact search can be a fluke of the
@@ -110,17 +137,18 @@
 #                     the cell the clue piece is stranded on. A clue whose four
 #                     orthogonal neighbours are all empty cannot break anything,
 #                     since only placed neighbours are ever broken against. On
-#                     the shipped default that is 22 cells, and the run ends
-#                     with all 5 clues placed. The passes that follow refill
-#                     what they can, but rarely all of it -- you buy the clues
-#                     with score, 435 down to 364 here.
+#                     the shipped default that is 22 cells: the clue step frees
+#                     them, lands all 5 clues and refills to 229 pieces, still
+#                     with zero broken edges. You buy the clues with score, 440
+#                     down to 377 here, because the freed cells do not all come
+#                     back.
 #
-#                     PAIR CLUES=1 WITH FOURSIDES=1. The freed cells are exactly
-#                     the ones no piece fits exactly any more, so all five exact
-#                     passes add nothing: measured, the clue step drops 208 to
-#                     193 pieces, passes 2..6 add zero between them, and 4sides
-#                     alone brings it back to 224. Without it a clue run just
-#                     hands you a board 15 pieces poorer.
+#                     CLUES=1 NEEDS JUMP=1, more than anything else here does.
+#                     The cells a clue mask frees are exactly the ones no piece
+#                     fits exactly any more, so with JUMP=0 every pass stops at
+#                     the first of them: measured, the clue step leaves 193
+#                     pieces and passes 2..6 add nothing at all, 15 pieces worse
+#                     than the board you started from.
 #     upstream        cheapest by far: bin/E555_beamer --clue_center
 #                     --clue_corners builds the board with three of the five
 #                     already in place, and then there is nothing to evict.
@@ -143,12 +171,14 @@
 # giving it to every pass would re-empty that region each time and discard
 # whatever the previous pass had put there.
 #
-# MEASURED, on data/board_partial_row12.csv (208 pieces in), TIME_LIMIT=20,
-# 4 threads, ARCH=generic:
-#   --order spiral alone         226 placed, score 405, 0.003 s, space exhausted
-#   passes 1..5 chained          227 placed, score 406, under 1 s in total
-#   passes 1..6, FOURSIDES=1     244 placed, score 435, still under a second
-#   CLUES=1, 22-cell mask, 1..6  224 placed, score 364, 5 of 5 clues
+# MEASURED, on data/board_partial_row12.csv (208 pieces in), 4 threads,
+# ARCH=generic, --breaks 0 throughout so every board below is break-free:
+#   the defaults (JUMP=1)        245 placed, score 440, 3 s, all of it in pass 1
+#   the same plus FOURSIDES=1    245 placed, score 440, 4sides adds nothing
+#   CLUES=1, 22-cell mask        229 placed, score 377, 5 of 5 clues
+#   JUMP=0, mrv first            217 placed, score 397
+#   JUMP=0, spiral first         227 placed, score 406
+#   JUMP=0, spiral first, 4sides 244 placed, score 435
 #
 # The order of PASSES is worth more than it looks. Leading with rowmajor instead
 # of spiral gave 214 pieces on this board -- WORSE than a single spiral pass --
@@ -172,6 +202,8 @@ N_LINES=0               # --num_rows, first pass only; 0 = every record
 THREADS=8
 TIME_LIMIT=300          # seconds PER PASS, 0 = unlimited (an unbounded
                         # exhaustive search need never finish -- set this)
+JUMP=1                  # 1 = --jump: step over a cell nothing fits and keep
+                        # filling. 0 = strict completion search (see above).
 FOURSIDES=0             # 1 = append the 4sides best-partial pass (see above;
                         # it always burns the whole TIME_LIMIT)
 CLUES=0                 # 1 = force the published hint pieces on first (see above)
@@ -179,7 +211,7 @@ CLUE_ORIENT=0           # which of the four orientations, for an unclued board
 SHORT_ID=1              # 1 = trim the chained config_id down to base_<final>
 TOP=5                   # rows in the closing rank.py report
 QUIET=1                 # 1 = hide the backtracker's own output; 0 = show it
-PASSES="--order spiral|--order rowmajor|--order rowmajor --reverse|--order colmajor|--order colmajor --reverse"
+PASSES="--order mrv|--order spiral|--order rowmajor|--order rowmajor --reverse|--order colmajor|--order colmajor --reverse"
 # -----------------------------------------------------------------------------
 for arg in "$@"; do
     case "$arg" in
@@ -264,6 +296,12 @@ for n in $(seq 1 "$NSTEP"); do
         label="${PASS_LIST[$((n - 1 - CLUES))]}"
         read -r -a step <<< "$label"
     fi
+    # 2sides/4sides are side-growth orders: they set best-partial growth
+    # themselves and REFUSE --jump, so they must not be handed it.
+    case "$label" in
+        *2sides*|*4sides*) ;;
+        *) if [ "$JUMP" = "1" ]; then step+=(--jump); label="$label --jump"; fi ;;
+    esac
     if [ "$n" -eq "$NSTEP" ]; then dst="$OUT"; else dst="$OUT.pass$n.csv"; fi
 
     # Both the window and the mask describe the INPUT, so both apply once. The
@@ -277,7 +315,7 @@ for n in $(seq 1 "$NSTEP"); do
         hole=()
     fi
 
-    printf '[%d/%d] %-30s ' "$n" "$NSTEP" "$label"
+    printf '[%d/%d] %-38s ' "$n" "$NSTEP" "$label"
     t0=$SECONDS
     if [ "$QUIET" = "1" ]; then
         bin/E555_backtracker "$SEED" "$src" "$dst" "${hole[@]}" "${win[@]}" \
@@ -363,13 +401,16 @@ empty_left=$(( $(count_rows "$OUT") * 256 - $(count_placed "$OUT") ))
 if [ "$stalled" -gt 0 ] && [ "$empty_left" -gt 0 ]; then
     echo
     echo "Note: $stalled of $NSTEP pass(es) added nothing."
-    echo "  A hard exact pass cannot skip a cell no piece fits: it stops at the first"
-    echo "  one in its order, or is refused at the root (ROOT-INFEASIBLE) when no"
-    echo "  break-free completion exists at all. The first pass takes the exact fills,"
-    echo "  so the later orders meet exactly those dead cells. This is the search"
-    echo "  being exhaustive, not the chain being broken."
-    if [ "$FOURSIDES" != "1" ]; then
-        echo "  4sides is the only pass here that steps OVER a dead cell and keeps"
-        echo "  growing. Re-run with FOURSIDES=1 to let it."
+    if [ "$JUMP" = "1" ]; then
+        echo "  With JUMP=1 that is the expected shape: a pass that exhausts its space"
+        echo "  has found the fullest break-free board reachable from the one it was"
+        echo "  given, and the orders after it re-derive it and add nothing. Only a"
+        echo "  pass that TIMED OUT leaves room for a different order to do better."
+    else
+        echo "  With JUMP=0 a pass cannot skip a cell no piece fits: it stops at the"
+        echo "  first one in its order, or is refused at the root (ROOT-INFEASIBLE)"
+        echo "  when no break-free completion exists at all. The first pass takes the"
+        echo "  exact fills and leaves exactly the cells nothing fits."
+        echo "  To FILL the board rather than try to complete it, re-run with JUMP=1."
     fi
 fi
