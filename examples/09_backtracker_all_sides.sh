@@ -30,11 +30,14 @@
 #   - FOURSIDES=1 appends --order 4sides. It can step over a dead cell and so
 #     fills more, but it has no early exit and will spend the whole TIME_LIMIT on
 #     an open board. Off by default.
-#   - CLUES=1 prepends a call with --clue_center --clue_corners. A clue lands
-#     only in an empty cell, so a board whose clue cells are taken is dropped;
-#     give it room with HOLES=, or start from a board built by
+#   - HOLES= or CLUES=1 adds one preparation call in front, unrotated, which is
+#     where the mask and the hint pieces are applied: the tool applies --holes
+#     after --rotate, so a mask written in the CSV frame suits only an unrotated
+#     call. A clue lands only in an empty cell, so a board whose clue cells are
+#     taken is dropped; give it room with HOLES=, or start from a board built by
 #     bin/E555_beamer --clue_center --clue_corners.
-#   - HOLES and the record window apply to the first call only.
+#   - The record window (FIRST_LINE, N_LINES) applies to every call that reads
+#     BOARDS, which is all of them.
 set -euo pipefail
 
 # ---- settings: edit here, or pass NAME=value on the command line ------------
@@ -76,24 +79,31 @@ placed() { awk -F, 'NF>=512 { n=0
                               if (n>m) m=n }
                     END { print m+0 }' "$1" 2>/dev/null || echo 0; }
 
-# One backtracker call. The record window and the mask describe the INPUT, so
-# only the first call gets them.
-first=1
+# One backtracker call.
 call() {
     local src=$1 dst=$2; shift 2
-    local extra=(--start_row 0 --num_rows 0)
-    if [ "$first" = 1 ]; then
-        extra=(--start_row "$FIRST_LINE" --num_rows "$N_LINES")
-        [ -n "$HOLES" ] && extra+=(--holes "$HOLES")
-        first=0
-    fi
-    set -- bin/E555_backtracker "$SEED" "$src" "$dst" "${extra[@]}" "$@" \
+    set -- bin/E555_backtracker "$SEED" "$src" "$dst" "$@" \
            --breaks 0 --time_limit "$TIME_LIMIT" --threads "$THREADS" --print_cmd
     if [ "$QUIET" = 1 ]; then "$@" >/dev/null 2>&1; else echo; "$@"; fi ||
         { echo "call failed on $src; re-run with QUIET=0 to see why" >&2; exit 1; }
 }
 
-NCALL=$((CLUES + ${#DIR_LIST[@]} + 1 + FOURSIDES))
+# The record window selects input records, so EVERY call that reads $BOARDS
+# needs it -- the directions all read $BOARDS, they are not chained -- and the
+# calls that read this script's own output must not have it.
+window=(--start_row "$FIRST_LINE" --num_rows "$N_LINES")
+on_ours=(--start_row 0 --num_rows 0)
+
+# A mask and the clues, though, are applied ONCE, by a preparation call, and the
+# directions then read its output. The tool applies --holes after --rotate, so a
+# mask written in the CSV frame is only correct for an unrotated call, and every
+# direction here is rotated.
+prep=()
+[ -n "$HOLES" ] && prep+=(--holes "$HOLES")
+[ "$CLUES" = 1 ] &&
+    prep+=(--clue_center --clue_corners --clue_orient "$CLUE_ORIENT")
+
+NCALL=$(( (${#prep[@]} ? 1 : 0) + ${#DIR_LIST[@]} + 1 + FOURSIDES))
 n=0
 step() { n=$((n+1)); printf '[%d/%d] %-42s ' "$n" "$NCALL" "$1"; }
 
@@ -105,19 +115,24 @@ echo "  calls  : $NCALL, --breaks 0, ${TIME_LIMIT}s each, $THREADS thread(s)"
 [ -n "$HOLES" ] && echo "  holes  : $HOLES (first call only)"
 echo
 
+# -- optional: apply the mask and the clues, once, unrotated ------------------
 src="$BOARDS"
-
-# -- optional: the published hint pieces, before any direction sees the board --
-if [ "$CLUES" = 1 ]; then
-    step "clues, --order mrv"
-    call "$src" "$OUT.pass_clue.csv" \
-         --clue_center --clue_corners --clue_orient "$CLUE_ORIENT" --order mrv
-    src="$OUT.pass_clue.csv"
+if [ "${#prep[@]}" -gt 0 ]; then
+    label="prepare:"
+    [ -n "$HOLES" ]   && label="$label mask"
+    [ "$CLUES" = 1 ]  && label="$label clues"
+    step "$label --order mrv"
+    call "$BOARDS" "$OUT.pass_prep.csv" "${window[@]}" "${prep[@]}" --order mrv
+    src="$OUT.pass_prep.csv"
+    window=("${on_ours[@]}")
     echo "$(rows "$src") board(s), fullest $(placed "$src")"
-    [ "$(rows "$src")" -gt 0 ] || { echo "every board was dropped for a clue conflict:
-  a clue cell holds another piece, or a clue piece sits elsewhere on the board.
-  Free those cells with HOLES=, or start from a board built with the clues." >&2
-        exit 1; }
+    if [ "$(rows "$src")" -eq 0 ]; then
+        echo "every board was dropped: a clue cell holds another piece, or a clue" >&2
+        echo "  piece sits elsewhere on the board, and such a board is not written." >&2
+        echo "  Free those cells with HOLES=, or start from a board built with the" >&2
+        echo "  clues by bin/E555_beamer --clue_center --clue_corners." >&2
+        exit 1
+    fi
 fi
 
 # -- one call per direction, all from the same board --------------------------
@@ -125,7 +140,7 @@ fi
 for i in "${!DIR_LIST[@]}"; do
     read -r -a flags <<< "${DIR_LIST[$i]}"
     step "${DIR_LIST[$i]}"
-    call "$src" "$OUT.pass$i.csv" "${flags[@]}"
+    call "$src" "$OUT.pass$i.csv" "${window[@]}" "${flags[@]}"
     echo "fullest $(placed "$OUT.pass$i.csv")"
     grep -v '^#' "$OUT.pass$i.csv" >> "$OUT.pass_pool.csv" || true
 done
@@ -144,20 +159,20 @@ echo "        kept $(rows "$OUT.pass_best.csv") board(s), one per input board"
 # -- one more pass: the first direction over boards the others produced -------
 read -r -a flags <<< "${DIR_LIST[0]}"
 step "again: ${DIR_LIST[0]}"
-call "$OUT.pass_best.csv" "$OUT.pass_again.csv" "${flags[@]}"
+call "$OUT.pass_best.csv" "$OUT.pass_again.csv" "${on_ours[@]}" "${flags[@]}"
 cur="$OUT.pass_again.csv"
 echo "fullest $(placed "$cur")"
 
 if [ "$FOURSIDES" = 1 ]; then
     step "--order 4sides"
-    call "$cur" "$OUT.pass_4s.csv" --order 4sides
+    call "$cur" "$OUT.pass_4s.csv" "${on_ours[@]}" --order 4sides
     cur="$OUT.pass_4s.csv"
     echo "fullest $(placed "$cur")"
 fi
 
 # Each call appends _<number> to the config_id it was given. Drop the ones this
 # run added and keep the last, so r0c669_0_407_408 becomes r0c669_408.
-TRIM=$((CLUES + 2 + FOURSIDES))
+TRIM=$(( (${#prep[@]} ? 1 : 0) + 2 + FOURSIDES))
 awk -v n="$TRIM" -F, 'BEGIN { OFS="," }
     /^#/ { print; next }
     { k = split($1, a, "_")
