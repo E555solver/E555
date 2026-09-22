@@ -354,10 +354,13 @@ static BreakMode g_break_mode = BREAK_STUCK;
 static int       g_lds_max    = -1;   /* -1 = no cap beyond the break budget */
 
 /* Greedy-dive controls (stuck mode only). */
-/* Dives run at roughly 9k-18k/s on four cores depending on region size, so the
- * default is about 5-10 s of work per record.  Raise it freely; the cost is
- * linear and the boards keep coming out distinct. */
-static long long g_stuck_restarts = 100000; /* independent randomized dives per record */
+/* Value ordering costs about 2.1x per dive, so the default restart count is
+ * half what it was before --lcv existed: dives run at roughly 4k-9k/s on four
+ * cores depending on region size, which is still about 5-10 s of work per
+ * record.  Raise it freely; the cost is linear and the boards keep coming out
+ * distinct. */
+static long long g_stuck_restarts = 50000;  /* independent randomized dives per record */
+static bool      g_lcv            = true;   /* value ordering in the dive; --no_lcv */
 static uint64_t  g_rng_master     = 0;      /* seeded from the clock + pid in main() */
 
 static const char *break_mode_name(BreakMode m) {
@@ -506,6 +509,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_lds_max >= 0) printf(" --lds_max %d", g_lds_max);
     printf(" --max_emitted %" PRIu64, g_solution_limit);
     printf(" --restarts %lld", (long long)g_stuck_restarts);
+    if (!g_lcv) printf(" --no_lcv");
     if (g_hall_mode == HALL_OFF) printf(" --no_hall");
     else                         printf(" --hall %s", hall_mode_name(g_hall_mode));
     printf(" --hall_stride %d --hall_min %d", g_hall_stride, g_hall_small);
@@ -3677,15 +3681,90 @@ static inline bool hall_should_run(const FcState *fc, const Cell *cells,
  * commitment available.  This ordering matters more than anything else here; a
  * static order lands on stuck cells roughly three times as often.
  *
- * Divergence between dives comes entirely from random tie-breaking - both in the
- * cell choice and in the piece choice.  That is measurably enough on its own: a
- * 200,000-dive batch produced 200,000 distinct boards.  An earlier version also
- * injected voluntary breaks at cells that had an exact fit, on the theory that
- * ties alone might be too rare; measurement showed diversity was already total
- * and the extra breaks only made the boards worse, so it was removed.
+ * Divergence between dives comes entirely from random tie-breaking - in the cell
+ * choice, and in the piece choice among whatever lcv_pick() below ranks equal.
+ * That is measurably enough on its own: a 200,000-dive batch produced 200,000
+ * distinct boards, and 2,000,000 produced 2,000,000.  An earlier version also injected voluntary breaks at cells that
+ * had an exact fit, on the theory that ties alone might be too rare;
+ * measurement showed diversity was already total and the extra breaks only made
+ * the boards worse, so it was removed.
+ *
+ * Diversity being total is also why MORE dives buy so little: the batch is
+ * sampling the left tail of a fixed distribution, and best-of-N over a fixed
+ * distribution is logarithmic.  Measured on one tail, best breaks went 26 -> 24
+ * -> 23 -> 22 for 2k -> 20k -> 200k -> 2M dives while the MEDIAN sat at 35
+ * throughout.  Moving the median needs a better policy, not more samples, which
+ * is what lcv_pick() below is for.
  */
 #define DIVE_BREAK_CAP 4   /* a cell has at most 4 neighbours, so no placement can
                             * break more than 4 edges: this is "unlimited" here */
+
+/* Candidates scored at one cell.  4, 8 and 16 measured identical on the boards
+ * tested, so this is set at the cheap end of the plateau. */
+#define LCV_CAP 8
+
+/*
+ * Least-constraining-value ordering: which piece, once the cell is chosen.
+ *
+ * Without it the dive picks uniformly inside the best class, so two placements
+ * that both fit right now are interchangeable even when one strands a neighbour
+ * and the other does not.  Cell choice has MRV; value choice had nothing.
+ *
+ * The score is not estimated.  dfs_place()/dfs_unplace() are the same cheap
+ * primitives the DFS uses (fc_verify_state compiles out, fc_refresh_neighbors
+ * touches four cells), so each candidate is played, the forward-checking state
+ * is read back, and the move is undone.  Ranking is lexicographic, which keeps
+ * it free of weights to tune:
+ *
+ *   1. fewest broken edges          - constant inside a class, first for safety
+ *   2. fewest zero-domain cells     - did this move strand a cell
+ *   3. largest neighbour domain sum - how much room did it leave
+ *
+ * Ties break uniformly, by the same reservoir as the cell choice, so diversity
+ * across restarts survives.  Measured: about 2.1x the cost per dive, and it
+ * wins anyway on half the samples -- on seven clue-bearing row-11 beam boards
+ * (three independent beam roots) it gained 1-2 connected edges per board at
+ * equal wall time, never losing a board, and moved a batch median from 45 to 40.
+ *
+ * Two variants measured WORSE and are deliberately absent: sampling the rank
+ * with a Boltzmann temperature instead of taking the best (never beat T=0), and
+ * widening the accepted break class to min+1 (loses to plain dives outright).
+ */
+static int lcv_pick(Board *b, FcState *fc, int row, int col,
+                    const Candidate *cand, int lo, int hi, RNG *rng) {
+    const int n = hi - lo;
+    const int cap = n < LCV_CAP ? n : LCV_CAP;
+    int best = -1, b_brk = 0, b_zd = 0, b_nb = 0;
+    uint32_t ties = 0;
+
+    for (int k = 0; k < cap; k++) {
+        /* Score the whole class when it is small.  A forced break can offer
+         * hundreds of candidates; sample instead of scoring them all. */
+        const int ci = (n <= cap) ? lo + k
+                                  : lo + (int)rng_uniform(rng, (uint32_t)n);
+
+        dfs_place(b, fc, row, col, (int)cand[ci].pid, (int)cand[ci].spin);
+        int nb = 0;
+        for (int dir = 0; dir < 4; dir++) {
+            int nr = row + g_dr[dir], nc = col + g_dc[dir];
+            if (nr >= 0 && nr < PUZZLE_SIDE && nc >= 0 && nc < PUZZLE_SIDE &&
+                b->cell[nr][nc].piece_id == EMPTY_PIECE)
+                nb += (int)fc->dom_count[nr][nc];
+        }
+        const int brk = (int)cand[ci].breaks, zd = (int)fc->zero_domains;
+        dfs_unplace(b, fc, row, col);
+
+        /* Spelled out rather than subtracted: an INT_MAX sentinel would make
+         * the first comparison signed overflow. */
+        const bool better = best < 0 || brk < b_brk ||
+                            (brk == b_brk && (zd < b_zd ||
+                             (zd == b_zd && nb > b_nb)));
+        const bool same   = best >= 0 && brk == b_brk && zd == b_zd && nb == b_nb;
+        if (better) { b_brk = brk; b_zd = zd; b_nb = nb; best = ci; ties = 1; }
+        else if (same && rng_uniform(rng, ++ties) == 0) best = ci;
+    }
+    return best;
+}
 
 static void greedy_dive(Board *b, FcState *fc, const Cell *cells, int n_cells,
                         RNG *rng) {
@@ -3755,7 +3834,9 @@ static void greedy_dive(Board *b, FcState *fc, const Cell *cells, int n_cells,
         if (hi <= lo) { lo = 0; hi = n_cand; }
         if (hi <= lo) return;    /* type balance says this cannot happen */
 
-        int pick = lo + (int)rng_uniform(rng, (uint32_t)(hi - lo));
+        int pick = (g_lcv && hi - lo > 1)
+                 ? lcv_pick(b, fc, row, col, cand, lo, hi, rng)
+                 : lo + (int)rng_uniform(rng, (uint32_t)(hi - lo));
         dfs_place(b, fc, row, col, (int)cand[pick].pid, (int)cand[pick].spin);
     }
 }
@@ -5529,9 +5610,14 @@ static void usage(const char *prog) {
         "                           Fast triage for ranking partials; proves nothing.\n"
         "                         any/lds: exhaustive, iterative deepening.  An exhausted\n"
         "                           level proves no completion exists at that break count.\n"
-        "  --restarts N           Independent randomized dives per record (default 100000,\n"
+        "  --restarts N           Independent randomized dives per record (default 50000,\n"
         "                         roughly 5-10 s on four cores).\n"
         "                         Dives are sub-millisecond; N in the millions is fine.\n"
+        "  --no_lcv               Turn off value ordering in the dives.  On by default:\n"
+        "                         it costs about 2.1x per dive and still wins on half\n"
+        "                         the samples (1-2 connected edges per board, measured).\n"
+        "                         More restarts cannot substitute -- they only extend the\n"
+        "                         tail of a fixed distribution, they do not move it.\n"
         "  --lds_max N            With --break_mode lds, cap voluntary mismatch\n"
         "                         placements per root-to-leaf path.  Forced repairs\n"
         "                         at cells with no exact fit do not consume this count.\n"
@@ -5669,6 +5755,8 @@ int main(int argc, char **argv) {
             if (errno || end == argv[i] || *end || v < 1)
                 fatal("--restarts expects a positive integer, got '%s'", argv[i]);
             g_stuck_restarts = v;
+        } else if (strcmp(argv[i], "--no_lcv") == 0) {
+            g_lcv = false;
         } else if (strcmp(argv[i], "--start_row") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long long v = strtoll(argv[++i], &end, 10);
@@ -5947,8 +6035,8 @@ int main(int argc, char **argv) {
     printf("\n");
     if (greedy_run)
         printf("  engine=GREEDY DIVES (no backtracking, always completes)"
-               "  restarts=%lld  -- fast triage, proves nothing\n",
-               g_stuck_restarts);
+               "  restarts=%lld  lcv=%s  -- fast triage, proves nothing\n",
+               g_stuck_restarts, g_lcv ? "on" : "off");
     else if (g_max_mismatch > 0)
         printf("  engine=exhaustive iterative deepening -- an exhausted level is a "
                "proof that no completion exists at that break count\n");
