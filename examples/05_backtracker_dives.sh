@@ -26,7 +26,7 @@ HOLES=data/holes_open_border_TR.csv     # empty = use the board's own gaps
 MODE=stuck              # stuck = triage; any or lds = proof
 ORDER=mrv               # cell order: mrv rowmajor colmajor snake spiral ...
 MAX_MISMATCH=30         # break budget a dive may spend
-RESTARTS=200000         # stuck mode: randomized dives per board
+RESTARTS=100000         # stuck mode: randomized dives per board
 FIRST_LINE=0
 N_LINES=1
 THREADS=8

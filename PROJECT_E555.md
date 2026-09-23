@@ -2015,12 +2015,27 @@ matters more than any other parameter here:
   where one exists and a minimal break where none does, never backtracks, and
   therefore always reaches 256 pieces in one pass. Because piece-type counts are
   exactly balanced, the candidate set is never empty, so a dive is O(cells) and
-  cannot fail. `--restarts N` (default 100 000, ~5-10 s on four cores) runs
+  cannot fail. `--restarts N` (default 50 000, ~5-10 s on four cores) runs
   N randomized dives and keeps the best. Divergence comes from random tie-breaking
-  alone, and that is ample: a 200 000-dive batch produced 200 000 distinct boards.
+  alone, and that is ample: a 200 000-dive batch produced 200 000 distinct boards,
+  and 2 000 000 produced 2 000 000.
   Throughput was ~9k-18k dives/s on four cores before the rewrites above, which
   together measured 3.3x-3.7x on this engine depending on `ARCH`, so N in the
   millions is comfortable.
+
+  **Raising `--restarts` buys little, and here is why.** Total diversity means the
+  batch is sampling the left tail of a *fixed* distribution, so best-of-N is
+  logarithmic. Measured on one tail: best breaks 26 -> 24 -> 23 -> 22 for
+  2k -> 20k -> 200k -> 2M dives, while the median sat at 35 throughout. Each
+  further break costs ~10x the dives. Moving the median needs a better policy.
+  That is what value ordering (on by default, `--no_lcv` to disable) does: it
+  plays each candidate, reads the forward-checking state back, and prefers the
+  placement stranding fewest cells and leaving neighbours roomiest. It costs
+  ~2.1x per dive and wins anyway on half the samples -- 1-2 connected edges per
+  board at equal wall time, never losing a board across seven clue-bearing
+  row-11 beam boards (three independent roots), median 45 -> 40. Boltzmann-sampling the
+  ranking and widening the accepted break class to min+1 were both measured and
+  both lost.
   This mode **proves nothing** -- it never establishes
   that a board cannot be completed with fewer breaks. Expect it to land well
   above a well-optimized incumbent (~28 breaks best-of-200k on a 74-cell region
