@@ -23,7 +23,7 @@ Learning and searching are separate invocations of the same binary.
 |---|---|
 | `--learn PATH` | Grow the board from each of the four sides in turn. Count where each piece lands in the canonical frame, and write the raw counts to `PATH`. Emits no boards. |
 | `--table PATH` | Search with the table: in the beam score, and in the ranking of bottom rows and left columns. |
-| `--freq_model M` | The beam's spatial resolution. `segment` (default) pools the 5-5-5 A/B/C bins; `cell` uses exact cells. |
+| `--freq_model M` | The beam's spatial resolution. `segment` (default) pools the 5-5-5 A/B/C bins; `cell` uses exact cells. See *Choosing `--freq_model`*. |
 
 Both phases need `--clue_center`, `--pin_clue 1..4`, a rotations file and
 `--num_rows 1`. A table belongs to one seed, one clue frame and one border.
@@ -62,9 +62,29 @@ sharing a bottom row are correlated. That is why `--top_bottoms` buys more
 independent evidence than `--top_columns`.
 
 The table stores raw counts together with its provenance: seed hash, clue mask
-and pin, and a hash of the border. The learning summary reports a
-**prequential lift**: each configuration is scored against the table built from
-the configurations before it, in nats per cell above chance.
+and pin, and a hash of the border.
+
+**Units: nats.** Every weight and score here is a natural logarithm, measured in
+*nats*. A difference of 1 nat is a factor of $e \approx 2.72$ in probability
+(1 nat = 1.44 bits). So a weight of +1.0 says the table rates a placement 2.7×
+more likely than chance, −1.0 says 2.7× less likely, and 0 says it has no
+opinion. Log-scores add, which is why a board's learned score is a sum over its
+cells. They are in the same units as the fan-out lookahead, $\log$(number of
+continuations), which is why the two can be summed.
+
+**Lift.** The learning summary, and the table's `lift` line, report a
+*prequential lift*. Each configuration's boards are scored, before its own
+counts are added, against the table built from the configurations before it.
+The score is the average over placed cells of $\log(K\,\hat P(\text{true piece}\mid\text{cell}))$,
+with $\hat P$ smoothed as in step 1 below, and pooled over the A/B/C segment for
+inner cells. $\log K$ is the most a cell can score, for a table that always
+names the right piece: $\ln 191 \approx 5.25$ nats for inner cells. So
+"segment lift +0.24 nats/cell" means the table gives the piece that actually
+landed in a cell, on average, $e^{0.24} \approx 1.27$ times its chance
+probability $1/K$. That is measured on configurations it had not yet seen, and
+at segment resolution. Zero or below means the table predicts nothing; the
+summary flags it. No cell-resolution lift is reported, so this figure does not
+rank the two `--freq_model` modes.
 
 ### The estimator
 
@@ -110,6 +130,61 @@ three weight sets against the binary's own:
 E555_FREQ_DUMP=fw.txt bin/E555_beamer_datadriven SEED ROT --table T ...   # dumps, then continues
 python3 freq_view.py T --check fw.txt                                     # AGREE / DISAGREE
 ```
+
+### Choosing `--freq_model`
+
+Both modes use one table and one estimator. Only the resolution at which inner
+pieces are scored in the beam differs, so you choose at search time and never
+re-learn.
+
+- **`segment`** (default). The counts of the cells in one A/B/C bin of a row
+  (cols 1–5, 6–10, 11–14) are summed, then shared equally over its slots. The
+  table says "piece $p$ belongs in segment B of row 12", not in which column.
+- **`cell`**. Each cell keeps its own counts. The table says "piece $p$ belongs
+  at row 12, col 8".
+
+| | `segment` | `cell` |
+|---|---|---|
+| evidence per estimate | about 5× more (pooled over the bin) | one cell's counts |
+| noise on a thin table | low | high: ten configurations can put up to +3 nats on one pair |
+| position inside a segment | lost | kept |
+| near clues and corners | blurred: one sharp cell is averaged with four neutral ones | sharp |
+| strength against the fan-out term | gentler | stronger (weights about 2.4× wider on the example table) |
+| matches the beam's move | yes: the beam places a 5-piece chain at a time | finer than the move |
+
+The example table shows both effects. Its segment beam weights span −4.4 to
++3.4 nats with an SD of 0.62, and its cell weights −6.3 to +4.5 with an SD of
+1.52. Its strongest single-cell preferences, +3.8 to +4.6 nats, sit next to the
+corners and clues (e.g. piece 73 at row 14 col 1). Segment pooling dilutes
+exactly those.
+
+**Which to use.** Decide by how much evidence the table has per piece-cell pair.
+The `[freq] table …` line at startup prints `mean_ess`, in configurations per
+cell; divide it by $K = 191$.
+
+- **ESS/K of about 10 or more** (mean ESS ≳ 2 000): start with `cell`. The
+  half-count prior is then at most 5 % of the data, so cell estimates are not
+  dominated by noise, and the extra positional detail is real. The example table
+  has ESS 4 374–10 510 per cell (mean 6 595, ESS/K ≈ 35), so `cell` is the first
+  thing to try with it.
+- **ESS/K of a few or less** (mean ESS of hundreds or fewer, e.g. a short or
+  wall-limited learn): use `segment`. Cell estimates would be mostly prior and
+  noise, and pooling is what makes such a table usable.
+- **When unsure**, keep `segment`. It is the conservative choice and never
+  worse on noise.
+
+**Measuring it.** Run the search twice on the same table, border, `--rng_seed`,
+`--threads` and budget, changing only `FREQ_MODEL`. Search with a table is
+deterministic for fixed seed and threads, so every difference comes from the
+model. Compare:
+- the configurations reaching rows 11 and 12 (`[sum] extinctions by row`);
+- the completions and two-segment partials at `--stop_row 12`.
+
+If `cell` loses, look at a short `--verbose` run of each. The `[score] r… SD
+fan=… table_acc=…` lines give the spread of the fan-out term and of the learned
+sum per row. When `table_acc` grows far larger than `fan` by rows 9–12, the
+table is overriding the lookahead that keeps rows continuable. A sharper table
+makes that more likely.
 
 ## Search behaviour that differs from the stock beamer
 
