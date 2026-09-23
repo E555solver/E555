@@ -1,71 +1,107 @@
 #!/usr/bin/env python3
-"""freq_view.py -- look at a data-driven frequency table.
+"""freq_view.py -- inspect an E555 data-driven table.
 
-    python3 freq_view.py TABLE [--alpha A] [--out FILE.html] [--text]
+    python3 freq_view.py TABLE [--out FILE.html] [--text]
+    python3 freq_view.py TABLE --check DUMP
 
-Reads a table written by `E555_beamer_datadriven --learn`, applies the same
-estimator the search applies (row-marginal backoff, Dirichlet shrinkage by
-alpha, Sinkhorn balance, log weights) and writes ONE self-contained HTML file:
-inline SVG, no libraries, no fonts, nothing to install. Open it in a browser.
+Inner pieces are pooled at the beamer's A/B/C resolution (cols 1-5, 6-10,
+11-14) or kept per cell, smoothed by the Krichevsky-Trofimov half-count,
+Sinkhorn-balanced, and conditioned on the rows still unfilled. Bottom-row and
+left-column ranking uses the exact piece-by-cell location table.
 
-Two reasons it re-implements the estimator rather than reading processed
-weights out of the file. The table on disk holds RAW counts, so alpha can be
-explored here without re-learning anything -- the alpha sweep panel is the point.
-And an independent implementation is a check on the C one: --check compares the
-two and prints the largest disagreement.
-
-  --alpha A     shrinkage toward the piece-by-row prior (default 20, as the C).
-  --text        terse terminal summary instead of HTML.
-  --check DUMP  compare against the weights the C wrote via E555_FREQ_DUMP=DUMP.
+The file stores raw counts. This script re-implements the C estimator
+independently; --check compares the segment (fwseg), cell (fwcell) and border
+location (fwb) weights against an E555_FREQ_DUMP file.
 """
-import argparse, html, json, math, os, sys
+import argparse
+import html
+import json
+import math
+import os
+import sys
 from collections import defaultdict
 
-SIDE, NP = 16, 256
-BETA = 1.0                      # must match FREQ_BETA in the C
+SIDE, NP, NUM_SEG = 16, 256, 3
+KT_HALF = 0.5
 SINK_ITERS, SINK_TOL = 400, 1e-13
+SEG_NAME = ('A', 'B', 'C')
 
-
-# ---------------------------------------------------------------- the table
 
 class Table:
     def __init__(self, path):
-        self.meta, self.cnt, self.wcell, self.wsq = {}, {}, {}, {}
+        self.meta = {}
+        self.cnt, self.wcell, self.wsq = {}, {}, {}
+        self.rowcnt, self.segcnt = {}, {}
         self.passes, self.pkind, self.pside = {}, {}, {}
         self.free_cells = []
         with open(path) as f:
             for line in f:
                 if line.startswith('#') or not line.strip():
                     continue
-                f0 = line.split()
-                if f0[0] == 'cnt':
-                    self.cnt[(int(f0[1]), int(f0[2]))] = float(f0[3])
-                elif f0[0] == 'wcell':
-                    self.wcell[int(f0[1])] = float(f0[2])
-                    self.wsq[int(f0[1])] = float(f0[3])
-                elif f0[0] == 'pass':
-                    self.passes[int(f0[1])] = int(f0[3])
-                elif f0[0] == 'freep':
-                    self.pkind[int(f0[1])] = int(f0[2])
-                    self.pside[int(f0[1])] = int(f0[3])
-                elif f0[0] == 'freec':
-                    self.free_cells.append(int(f0[1]))
-                elif f0[0] == 'lift':
-                    self.meta['lift'] = (float(f0[1]), int(f0[2]))
+                a = line.split()
+                tag = a[0]
+                if tag == 'cnt':
+                    self.cnt[(int(a[1]), int(a[2]))] = float(a[3])
+                elif tag == 'wcell':
+                    self.wcell[int(a[1])] = float(a[2])
+                    self.wsq[int(a[1])] = float(a[3])
+                elif tag == 'rowcnt':
+                    self.rowcnt[(int(a[1]), int(a[2]))] = float(a[3])
+                elif tag == 'segcnt':
+                    self.segcnt[(int(a[1]), int(a[2]), int(a[3]))] = float(a[4])
+                elif tag == 'pass':
+                    self.passes[int(a[1])] = int(a[3])
+                elif tag == 'freep':
+                    self.pkind[int(a[1])] = int(a[2])
+                    self.pside[int(a[1])] = int(a[3])
+                elif tag == 'freec':
+                    self.free_cells.append(int(a[1]))
+                elif tag == 'lift':
+                    self.meta['lift'] = (float(a[1]), int(a[2]))
                 else:
-                    self.meta[f0[0]] = ' '.join(f0[1:])
+                    self.meta[tag] = ' '.join(a[1:])
         if 'version' not in self.meta:
-            sys.exit(f"{path}: not an E555 datadriven table")
+            sys.exit(f'{path}: not an E555 data-driven table')
+        self.version = int(str(self.meta['version']).split()[0])
+        if self.version != 4:
+            sys.exit(f'{path}: table version {self.version}; this viewer reads 4')
+        if self.meta.get('lift_kind') != 'segment_kt_prequential':
+            sys.exit(f"{path}: lift_kind is {self.meta.get('lift_kind', '(missing)')!r}; "
+                     "expected 'segment_kt_prequential'")
         self.pieces = sorted(self.pkind)
-        self.cells = sorted(self.free_cells)
-        if not self.pieces or not self.cells:
-            sys.exit(f"{path}: no freep/freec lines -- relearn with a build that "
-                     f"writes them (the blocks cannot be reconstructed without them)")
-        self.covered = sorted(c for c in self.free_cells if self.wcell.get(c, 0) > 0)
+        self.free_cells = sorted(self.free_cells)
+        self.free_set = set(self.free_cells)
+        if not self.pieces or not self.free_cells:
+            sys.exit(f'{path}: no freep/freec lines')
+        self.covered = [c for c in self.free_cells if self.wcell.get(c, 0.0) > 0.0]
+        self._derive_and_validate()
+
+    def _derive_and_validate(self):
+        row = defaultdict(float)
+        seg = defaultdict(float)
+        for (piece, cell), value in self.cnt.items():
+            if piece not in self.pkind or cell not in self.free_set:
+                continue
+            r = cell // SIDE
+            row[(piece, r)] += value
+            z = segment_of_cell(cell)
+            if z is not None and self.pkind.get(piece) == 0:
+                seg[(piece, z[0], z[1])] += value
+        check_aggregate('rowcnt', self.rowcnt, row)
+        check_aggregate('segcnt', self.segcnt, seg)
 
     def ess(self, cell):
         w, q = self.wcell.get(cell, 0.0), self.wsq.get(cell, 0.0)
-        return (w * w / q) if q > 0 else 0.0
+        return w * w / q if q > 0.0 else 0.0
+
+
+def check_aggregate(name, got, want):
+    if not got:
+        sys.exit(f'table declares {name} support but contains no {name} lines')
+    for key in set(got) | set(want):
+        a, b = got.get(key, 0.0), want.get(key, 0.0)
+        if abs(a - b) > 1e-7 * (1.0 + abs(b)):
+            sys.exit(f'{name} disagrees with cnt at {key}: {a} versus {b}')
 
 
 def cell_kind(cell):
@@ -73,25 +109,41 @@ def cell_kind(cell):
     return (r == 0) + (r == SIDE - 1) + (c == 0) + (c == SIDE - 1)
 
 
+def segment_of_cell(cell):
+    r, c = divmod(cell, SIDE)
+    if not (1 <= r <= 14 and 1 <= c <= 14):
+        return None
+    return r, 0 if c <= 5 else 1 if c <= 10 else 2
+
+
+def cell_side(cell):
+    r, c = divmod(cell, SIDE)
+    if r == SIDE - 1:
+        return 0
+    if c == SIDE - 1:
+        return 1
+    if r == 0:
+        return 2
+    if c == 0:
+        return 3
+    return -1
+
+
 def sinkhorn(m, n):
-    """Doubly stochastic by iterative proportional fitting -- the same balance
-    the C applies, and for the same reason: a row of the board is a permutation,
-    so an unbalanced table lets globally popular pieces be spent on the rows the
-    beam commits first."""
     ru, cu = [1.0] * n, [1.0] * n
     for _ in range(SINK_ITERS):
         worst = 0.0
         for i in range(n):
             base = i * n
-            s = sum(m[base + k] * cu[k] for k in range(n)) * ru[i]
-            if s > 0:
-                ru[i] /= s
-            worst = max(worst, abs(s - 1.0))
+            total = sum(m[base + k] * cu[k] for k in range(n)) * ru[i]
+            if total > 0.0:
+                ru[i] /= total
+            worst = max(worst, abs(total - 1.0))
         for k in range(n):
-            s = sum(m[i * n + k] * ru[i] for i in range(n)) * cu[k]
-            if s > 0:
-                cu[k] /= s
-            worst = max(worst, abs(s - 1.0))
+            total = sum(m[i * n + k] * ru[i] for i in range(n)) * cu[k]
+            if total > 0.0:
+                cu[k] /= total
+            worst = max(worst, abs(total - 1.0))
         if worst < SINK_TOL:
             break
     for i in range(n):
@@ -100,624 +152,341 @@ def sinkhorn(m, n):
     return m
 
 
-def build(tab, alpha):
-    """Counts -> log weights, block by block. Returns {(piece,cell): nats}."""
-    w = {}
-    blocks = []
-    inner_p = [p for p in tab.pieces if cell_kind_of_piece(tab, p) == 0]
-    inner_c = [c for c in tab.free_cells if cell_kind(c) == 0]
-    if inner_p and len(inner_p) != len(inner_c):
-        sys.exit(f"interior block is {len(inner_p)} pieces x {len(inner_c)} cells "
-                 f"-- not square; the table is inconsistent")
-    if inner_p:
-        blocks.append(('interior', inner_p, inner_c, True))
-    for s in range(4):
-        bp = [p for p in tab.pieces if cell_kind_of_piece(tab, p) == 1
-              and piece_side(tab, p) == s]
-        bc = [c for c in tab.free_cells if cell_kind(c) == 1 and cell_side(c) == s]
-        if bp and len(bp) == len(bc):
-            blocks.append((f'side{s}', bp, bc, False))
+def build(tab):
+    """Return (segment beam weights, cell beam weights, exact location weights)."""
+    active, cellw, location = {}, {}, {}
+    ip = [p for p in tab.pieces if tab.pkind[p] == 0]
+    ic = [c for c in tab.free_cells if cell_kind(c) == 0]
+    if len(ip) != len(ic):
+        sys.exit(f'interior block is {len(ip)} pieces x {len(ic)} cells')
+    n = len(ip)
+    cap = defaultdict(int)
+    for cell in ic:
+        cap[segment_of_cell(cell)] += 1
+    seg_total = defaultdict(float)
+    for piece in ip:
+        for r in range(1, 15):
+            for sg in range(NUM_SEG):
+                seg_total[(r, sg)] += tab.segcnt.get((piece, r, sg), 0.0)
 
-    for name, pl, cl, use_rowprior in blocks:
-        n = len(pl)
-        rowm = defaultdict(float)
-        rowt = defaultdict(float)
-        if use_rowprior:
-            for i, p in enumerate(pl):
-                for c in cl:
-                    v = tab.cnt.get((p, c), 0.0)
-                    if v:
-                        r = c // SIDE
-                        rowm[(i, r)] += v
-                        rowt[r] += v
-        m = [0.0] * (n * n)
-        for i, p in enumerate(pl):
-            for k, c in enumerate(cl):
-                if use_rowprior:
-                    r = c // SIDE
-                    prior = (rowm[(i, r)] + BETA / n) / (rowt[r] + BETA)
+    mloc = [0.0] * (n * n)
+    mseg = [0.0] * (n * n)
+    for i, piece in enumerate(ip):
+        for k, cell in enumerate(ic):
+            z = segment_of_cell(cell)
+            c = cap[z]
+            mloc[i * n + k] = ((tab.cnt.get((piece, cell), 0.0) + KT_HALF) /
+                               (tab.wcell.get(cell, 0.0) + KT_HALF * n))
+            mean_n = tab.segcnt.get((piece, z[0], z[1]), 0.0) / c
+            mean_w = seg_total[z] / c
+            mseg[i * n + k] = (mean_n + KT_HALF) / (mean_w + KT_HALF * n)
+    sinkhorn(mloc, n)
+    sinkhorn(mseg, n)
+
+    row_cells = defaultdict(list)
+    for k, cell in enumerate(ic):
+        row_cells[cell // SIDE].append(k)
+    rem_slots = {}
+    total_slots = 0
+    for r in range(14, 0, -1):
+        total_slots += len(row_cells[r])
+        rem_slots[r] = total_slots
+    for i, piece in enumerate(ip):
+        rem, reml = {}, {}
+        mass = massl = 0.0
+        for r in range(14, 0, -1):
+            mass += sum(mseg[i * n + k] for k in row_cells[r])
+            massl += sum(mloc[i * n + k] for k in row_cells[r])
+            rem[r], reml[r] = mass, massl
+        for k, cell in enumerate(ic):
+            r = cell // SIDE
+            location[(piece, cell)] = math.log(n * mloc[i * n + k])
+            active[(piece, cell)] = math.log(mseg[i * n + k] * rem_slots[r] / rem[r])
+            cellw[(piece, cell)] = math.log(mloc[i * n + k] * rem_slots[r] / reml[r])
+
+    for side in range(4):
+        bp = [p for p in tab.pieces if tab.pkind[p] == 1 and tab.pside[p] == side]
+        bc = [c for c in tab.free_cells if cell_kind(c) == 1 and cell_side(c) == side]
+        if not bp or len(bp) != len(bc):
+            continue
+        n1 = len(bp)
+        mat = [0.0] * (n1 * n1)
+        for i, piece in enumerate(bp):
+            for k, cell in enumerate(bc):
+                mat[i * n1 + k] = ((tab.cnt.get((piece, cell), 0.0) + KT_HALF) /
+                                    (tab.wcell.get(cell, 0.0) + KT_HALF * n1))
+        sinkhorn(mat, n1)
+        rows = defaultdict(list)
+        for k, cell in enumerate(bc):
+            rows[cell // SIDE].append(k)
+        rem_slots_side, total = {}, 0
+        if side in (1, 3):
+            for r in range(14, 0, -1):
+                total += len(rows[r])
+                rem_slots_side[r] = total
+        for i, piece in enumerate(bp):
+            rem = {}
+            if side in (1, 3):
+                mass = 0.0
+                for r in range(14, 0, -1):
+                    mass += sum(mat[i * n1 + k] for k in rows[r])
+                    rem[r] = mass
+            for k, cell in enumerate(bc):
+                location[(piece, cell)] = math.log(n1 * mat[i * n1 + k])
+                if side in (1, 3):
+                    r = cell // SIDE
+                    active[(piece, cell)] = math.log(
+                        mat[i * n1 + k] * rem_slots_side[r] / rem[r])
                 else:
-                    prior = 1.0 / n
-                m[i * n + k] = ((tab.cnt.get((p, c), 0.0) + alpha * prior)
-                                / (tab.wcell.get(c, 0.0) + alpha))
-        sinkhorn(m, n)
-        for i, p in enumerate(pl):
-            for k, c in enumerate(cl):
-                w[(p, c)] = math.log(n * m[i * n + k])
-    return w
-
-
-def cell_kind_of_piece(tab, p):
-    return tab.pkind.get(p, 0)
-
-
-def cell_side(cell):
-    r, c = divmod(cell, SIDE)
-    if r == SIDE - 1: return 0
-    if c == SIDE - 1: return 1
-    if r == 0:        return 2
-    if c == 0:        return 3
-    return -1
-
-
-def piece_side(tab, p):
-    return tab.pside.get(p, -1)
+                    active[(piece, cell)] = 0.0
+                cellw[(piece, cell)] = active[(piece, cell)]
+    return active, cellw, location
 
 
 # ---------------------------------------------------------------- rendering
-# Colour follows the job, not taste. The weights are signed around zero (zero is
-# chance), so they get a DIVERGING ramp: one cool hue for "favoured here", one
-# warm for "avoided here", and a neutral grey midpoint that reads as "nothing" --
-# equal step count per arm. Coverage and effective sample size are non-negative
-# magnitudes, so they get a SEQUENTIAL single-hue ramp. No rainbow anywhere, and
-# no hue at a diverging midpoint.
-# Both ramps are CSS custom properties, so the light and dark steps swap in one
-# place and the marks are written against roles. Dark is SELECTED, not flipped:
-# on a dark surface "near zero" has to sit near the surface and high has to be
-# bright, so each ramp is re-stepped from the same hue rather than inverted.
-DIV_POS = [f'var(--pos-{i})' for i in range(1, 7)]
-DIV_NEG = [f'var(--neg-{i})' for i in range(1, 7)]
-SEQ     = [f'var(--seq-{i})' for i in range(1, 8)]
-
-RAMP_CSS_LIGHT = {
-    'pos': ['#dce9fb', '#b7d3f6', '#86b6ef', '#5598e7', '#2a78d6', '#184f95'],
-    'neg': ['#fadedd', '#f4bfbe', '#eb9a99', '#e07170', '#cf4544', '#94302f'],
-    'seq': ['#e8f0fd', '#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#0d366b'],
-}
-RAMP_CSS_DARK = {
-    'pos': ['#15314f', '#184f95', '#256abf', '#3987e5', '#6da7ec', '#9ec5f4'],
-    'neg': ['#4a201f', '#7d2f2e', '#a03b39', '#cf4544', '#e07170', '#eb9a99'],
-    'seq': ['#14243a', '#0d366b', '#184f95', '#256abf', '#3987e5', '#6da7ec', '#9ec5f4'],
-}
+DIV_POS = ['#dce9fb', '#b7d3f6', '#86b6ef', '#5598e7', '#2a78d6', '#184f95']
+DIV_NEG = ['#fadedd', '#f4bfbe', '#eb9a99', '#e07170', '#cf4544', '#94302f']
+SEQ = ['#e8f0fd', '#cde2fb', '#9ec5f4', '#6da7ec', '#3987e5', '#256abf', '#0d366b']
 
 
-def ramp_vars(m):
-    return ' '.join(f'--{k}-{i+1}:{v};' for k, a in m.items() for i, v in enumerate(a))
-
-
-def robust_scale(vals, q=0.95):
-    """The colour scale is set by the 95th percentile of |value|, not the max.
-    A handful of extreme cells would otherwise compress everything else onto the
-    two palest steps and hide exactly the mid-range structure these panels exist
-    to show; values past the scale simply sit on the end step."""
+def robust_scale(vals, q=.95):
     a = sorted(abs(v) for v in vals)
-    if not a:
-        return 1.0
-    return a[min(len(a) - 1, int(q * len(a)))] or (a[-1] or 1.0)
+    return (a[min(len(a)-1, int(q * len(a)))] if a else 1.0) or 1.0
 
 
 def div_color(v, scale):
-    """Diverging: sign picks the arm, magnitude picks the step."""
-    if scale <= 0 or abs(v) < 1e-9:
-        return 'var(--mid)'
-    arm = DIV_POS if v > 0 else DIV_NEG
-    i = min(len(arm) - 1, int(abs(v) / scale * len(arm)))
-    return arm[i]
+    if abs(v) < 1e-9:
+        return '#f0efec'
+    ramp = DIV_POS if v > 0 else DIV_NEG
+    return ramp[min(len(ramp)-1, int(abs(v) / scale * len(ramp)))]
 
 
 def seq_color(v, vmax):
-    if vmax <= 0:
-        return 'var(--mid)'
-    return SEQ[min(len(SEQ) - 1, int(v / vmax * len(SEQ)))]
-
-
-def grid(cells, cols, rows, cw, ch, title, note, legend, flip_y=True):
-    """One heatmap. cells is a list of (col, row, fill, tooltip); every cell
-    carries its own hover text, so nothing is readable by colour alone."""
-    w, h = cols * cw, rows * ch
-    out = [f'<figure class="panel"><figcaption><h3>{html.escape(title)}</h3>'
-           f'<p class="note">{note}</p></figcaption>',
-           f'<div class="scroll"><svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" '
-           f'role="img" aria-label="{html.escape(title)}">']
-    for (c, r, fill, tip) in cells:
-        y = (rows - 1 - r) * ch if flip_y else r * ch
-        out.append(f'<rect x="{c*cw}" y="{y}" width="{cw-0.6:.1f}" height="{ch-0.6:.1f}" '
-                   f'rx="1" fill="{fill}" tabindex="0" data-t="{html.escape(tip)}"/>')
-    out.append('</svg></div>')
-    out.append(legend)
-    out.append('</figure>')
-    return '\n'.join(out)
-
-
-def div_legend(scale, unit='nats vs chance'):
-    sw = []
-    for i, c in enumerate(reversed(DIV_NEG)):
-        sw.append(f'<i style="background:{c}"></i>')
-    sw.append('<i style="background:var(--mid)"></i>')
-    for c in DIV_POS:
-        sw.append(f'<i style="background:{c}"></i>')
-    return (f'<div class="legend"><span>avoided</span>{"".join(sw)}'
-            f'<span>preferred</span>'
-            f'<em>&plusmn;{scale:.1f} {unit} (95th pct; beyond it sits on the end step)'
-            f'</em></div>')
-
-
-def seq_legend(vmax, unit):
-    sw = ''.join(f'<i style="background:{c}"></i>' for c in SEQ)
-    return (f'<div class="legend"><span>0</span>{sw}'
-            f'<span>{vmax:,.0f}</span><em>{unit}</em></div>')
+    return SEQ[min(len(SEQ)-1, int(v / vmax * len(SEQ)))] if vmax > 0 else '#f0efec'
 
 
 def tile(value, label, sub=''):
-    return (f'<div class="tile"><b>{value}</b><span>{html.escape(label)}</span>'
-            f'<em>{html.escape(sub)}</em></div>')
+    return f'<div class="tile"><b>{value}</b><span>{html.escape(label)}</span><em>{html.escape(sub)}</em></div>'
+
+
+def grid(cells, cols, rows, cw, ch, title, note, flip_y=True):
+    width, height = cols * cw, rows * ch
+    out = [f'<figure class="panel"><figcaption><h3>{html.escape(title)}</h3>',
+           f'<p class="note">{note}</p></figcaption><div class="scroll">',
+           f'<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}">']
+    for col, row, fill, tip in cells:
+        y = (rows - 1 - row) * ch if flip_y else row * ch
+        out.append(f'<rect x="{col*cw}" y="{y}" width="{cw-.6:.1f}" height="{ch-.6:.1f}" '
+                   f'rx="1" fill="{fill}" tabindex="0" data-t="{html.escape(tip)}"/>')
+    out.append('</svg></div></figure>')
+    return ''.join(out)
 
 
 CSS = """
-:root{color-scheme:light dark;
- --plane:#f9f9f7; --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781;
- --rule:#e1e0d9; --mid:#f0efec; --ring:rgba(11,11,11,.10); %LIGHT%}
-@media (prefers-color-scheme:dark){:root:where(:not([data-theme=light])){
- --plane:#0d0d0d; --surface:#1a1a19; --ink:#fff; --ink2:#c3c2b7; --muted:#898781;
- --rule:#2c2c2a; --mid:#383835; --ring:rgba(255,255,255,.10); %DARK%}}
-:root[data-theme=dark]{
- --plane:#0d0d0d; --surface:#1a1a19; --ink:#fff; --ink2:#c3c2b7; --muted:#898781;
- --rule:#2c2c2a; --mid:#383835; --ring:rgba(255,255,255,.10); %DARK%}
-*{box-sizing:border-box}
-body{margin:0;padding:24px 16px 72px;background:var(--plane);color:var(--ink);
- font:14px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
- font-variant-numeric:tabular-nums}
-.wrap{max-width:1180px;margin:0 auto}
-h1{font-size:23px;margin:0 0 4px;letter-spacing:-.01em}
-h2{font-size:15px;margin:36px 0 12px;color:var(--ink2);text-transform:uppercase;
- letter-spacing:.07em;font-weight:650}
-h3{font-size:15px;margin:0 0 2px;font-weight:620}
-.sub{color:var(--ink2);margin:0 0 18px}
-.note{color:var(--muted);margin:0 0 10px;font-size:12.5px;max-width:74ch}
-.tiles{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 8px}
-.tile{background:var(--surface);border:1px solid var(--ring);border-radius:10px;
- padding:11px 15px;min-width:132px}
-.tile b{display:block;font-size:25px;font-weight:660;letter-spacing:-.02em;
- white-space:nowrap}
-.tile span{display:block;color:var(--ink2);font-size:12.5px}
-.tile em{display:block;color:var(--muted);font-size:11.5px;font-style:normal}
-.panel{background:var(--surface);border:1px solid var(--ring);border-radius:12px;
- padding:15px 16px 12px;margin:0 0 16px}
-.row{display:flex;flex-wrap:wrap;gap:16px}
-.row>.panel{flex:1 1 300px;margin:0}
-.scroll{overflow-x:auto;padding-bottom:4px}
-svg rect{shape-rendering:crispEdges}
-svg rect:hover,svg rect:focus{stroke:var(--ink);stroke-width:1.2;outline:none;
- shape-rendering:geometricPrecision}
-.legend{display:flex;align-items:center;gap:7px;margin-top:9px;color:var(--muted);
- font-size:11.5px;flex-wrap:wrap}
-.legend i{width:16px;height:11px;border-radius:2px;display:inline-block;
- box-shadow:0 0 0 1px var(--ring) inset}
-.legend em{font-style:normal;margin-left:auto;color:var(--ink2)}
-#tip{position:fixed;pointer-events:none;background:var(--ink);color:var(--plane);
- padding:5px 9px;border-radius:6px;font-size:12px;opacity:0;transition:opacity .1s;
- z-index:9;max-width:280px}
-table{border-collapse:collapse;width:100%;font-size:12.5px}
-th,td{text-align:right;padding:4px 9px;border-bottom:1px solid var(--rule)}
-th:first-child,td:first-child{text-align:left}
-th{color:var(--ink2);font-weight:620}
-details{margin-top:6px}summary{cursor:pointer;color:var(--ink2);font-size:13px}
-.meta{font-size:12px;color:var(--muted);line-height:1.7;
- font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-.warn{color:#d03b3b;font-weight:600}
-button{font:inherit;background:var(--surface);color:var(--ink);cursor:pointer;
- border:1px solid var(--ring);border-radius:8px;padding:5px 11px}
-input[type=number]{font:inherit;background:var(--surface);color:var(--ink);
- border:1px solid var(--ring);border-radius:8px;padding:5px 9px;width:92px}
-.ctl{display:flex;gap:9px;align-items:center;margin-bottom:10px;color:var(--ink2)}
+:root{color-scheme:light dark;--plane:#f9f9f7;--surface:#fff;--ink:#111;--muted:#6c6a64;--rule:#ddd}
+@media(prefers-color-scheme:dark){:root{--plane:#101010;--surface:#1b1b1a;--ink:#eee;--muted:#aaa;--rule:#333}}
+*{box-sizing:border-box}body{margin:0;padding:24px 16px 70px;background:var(--plane);color:var(--ink);font:14px/1.5 system-ui,sans-serif;font-variant-numeric:tabular-nums}.wrap{max-width:1200px;margin:auto}h1{font-size:24px;margin:0}.sub,.note{color:var(--muted)}h2{margin:34px 0 12px;font-size:15px;text-transform:uppercase;letter-spacing:.06em}.tiles{display:flex;flex-wrap:wrap;gap:10px;margin:18px 0}.tile,.panel{background:var(--surface);border:1px solid var(--rule);border-radius:11px}.tile{padding:10px 14px;min-width:150px}.tile b{display:block;font-size:24px}.tile span,.tile em{display:block;color:var(--muted);font-size:12px}.tile em{font-style:normal}.panel{padding:14px;margin:0 0 15px}.panel h3{margin:0}.note{margin:3px 0 10px;max-width:82ch;font-size:12.5px}.scroll{overflow-x:auto}.row{display:flex;flex-wrap:wrap;gap:15px}.row>.panel{flex:1 1 320px}svg rect{shape-rendering:crispEdges}svg rect:hover,svg rect:focus{stroke:var(--ink);stroke-width:1.2;outline:none}#tip{position:fixed;pointer-events:none;background:var(--ink);color:var(--plane);padding:5px 8px;border-radius:6px;opacity:0;z-index:3;font-size:12px}table{border-collapse:collapse;width:100%;font-size:12.5px}th,td{text-align:right;padding:4px 8px;border-bottom:1px solid var(--rule)}th:first-child,td:first-child{text-align:left}details{margin-top:14px}.meta{font:12px/1.65 ui-monospace,monospace;color:var(--muted)}
 """
 
 JS = """
 const tip=document.getElementById('tip');
-function show(e){const t=e.target.dataset.t;if(!t)return;
- tip.textContent=t;tip.style.opacity=1;
- const r=e.target.getBoundingClientRect();
- tip.style.left=Math.min(innerWidth-300,r.left)+'px';
- tip.style.top=Math.max(4,r.top-30)+'px';}
-function hide(){tip.style.opacity=0;}
-addEventListener('mouseover',show);addEventListener('mouseout',hide);
-addEventListener('focusin',show);addEventListener('focusout',hide);
-document.getElementById('theme').onclick=()=>{
- const d=document.documentElement;
- d.dataset.theme=d.dataset.theme==='dark'?'light':'dark';};
-const PM=window.PIECEMAP||{}, PS=window.PSCALE||1, RAMP=window.RAMPS||{};
-function col(v){if(Math.abs(v)<1e-9)return'var(--mid)';
- const a=v>0?RAMP.pos:RAMP.neg;
- return a[Math.min(a.length-1,Math.floor(Math.abs(v)/PS*a.length))];}
-function drawPiece(){
- const p=+document.getElementById('pnum').value;
- const g=document.getElementById('pmap'), d=PM[p];
- document.getElementById('plabel').textContent=
-   d?('piece '+p+' -- '+d.length+' cells it was measured on'):
-     ('piece '+p+' is not a free piece in this table');
- if(!d){g.innerHTML='';return;}
- let h='';
- for(const [cell,v] of d){const r=cell>>4,c=cell&15;
-  h+='<rect x="'+(c*22)+'" y="'+((15-r)*22)+'" width="21.4" height="21.4" rx="1" fill="'
-    +col(v)+'" tabindex="0" data-t="cell '+cell+' (row '+r+', col '+c+') '
-    +(v>=0?'+':'')+v.toFixed(2)+' nats"/>';}
- g.innerHTML=h;}
-document.getElementById('pnum').oninput=drawPiece;drawPiece();
+addEventListener('mouseover',e=>{const t=e.target.dataset.t;if(!t)return;tip.textContent=t;tip.style.opacity=1;const r=e.target.getBoundingClientRect();tip.style.left=Math.min(innerWidth-310,r.left)+'px';tip.style.top=Math.max(4,r.top-29)+'px'});
+addEventListener('mouseout',()=>tip.style.opacity=0);
 """
 
 
-# ---------------------------------------------------------------- the report
-
-def piece_row_matrix(tab, w):
-    """Mean weight of each piece over each interior row -- the piece-by-row view
-    the estimator itself backs off to, and the one place the whole idea is
-    visible or not: if low pieces prefer low rows and top pieces the top, the
-    sorted matrix reads as a diagonal."""
-    pr, rows = {}, range(1, SIDE - 1)
-    for p in (q for q in tab.pieces if cell_kind_of_piece(tab, q) == 0):
-        for r in rows:
-            v = [w[(p, r * SIDE + c)] for c in rows if (p, r * SIDE + c) in w]
-            pr[(p, r)] = sum(v) / len(v) if v else 0.0
-    return pr
-
-
-ALPHA_GRID = [2, 5, 10, 20, 50, 100, 200, 500]
-
-
-def alpha_sweep(tab):
-    """How the table's opinions change with the one knob.
-
-    Cheap because the file holds RAW counts: each point is one re-estimate, not
-    another learning run. Two separate charts rather than one with two y-scales --
-    a dual axis would let the eye read a crossing that is an artefact of the
-    scaling."""
-    rows = []
-    for a in ALPHA_GRID:
-        wa = build(tab, float(a))
-        v = list(wa.values())
-        if not v:
-            continue
-        mean_abs = sum(abs(x) for x in v) / len(v)
-        near = sum(1 for x in v if abs(x) < 0.5) / len(v)
-        rows.append((a, mean_abs, near))
-    return rows
-
-
-def line_chart(rows, yi, title, note, unit, fmt):
-    """One series over alpha, alpha spaced by log. No legend: the title names it."""
-    W, H, PAD = 430, 150, 30
-    xs = [math.log(r[0]) for r in rows]
-    ys = [r[yi] for r in rows]
-    x0, x1 = min(xs), max(xs)
-    y1 = max(ys) or 1.0
-    px = lambda x: PAD + (x - x0) / ((x1 - x0) or 1) * (W - PAD - 12)
-    py = lambda y: H - 22 - (y / y1) * (H - 40)
-    pts = [(px(x), py(y)) for x, y in zip(xs, ys)]
-    path = 'M' + ' L'.join(f'{a:.1f},{b:.1f}' for a, b in pts)
-    marks, labels = [], []
-    for (a, b), r in zip(pts, rows):
-        marks.append(f'<circle cx="{a:.1f}" cy="{b:.1f}" r="4.5" fill="var(--seq-5)" '
-                     f'stroke="var(--surface)" stroke-width="2" tabindex="0" '
-                     f'data-t="alpha {r[0]} - {fmt(r[yi])} {unit}"/>')
-        labels.append(f'<text x="{a:.1f}" y="{H-7}" text-anchor="middle" '
-                      f'font-size="9.5" fill="var(--muted)">{r[0]}</text>')
-    # only the endpoints get a value label; a number on every point is noise
-    for idx in (0, len(rows) - 1):
-        a, b = pts[idx]
-        labels.append(f'<text x="{a:.1f}" y="{b-9:.1f}" text-anchor="middle" '
-                      f'font-size="10.5" fill="var(--ink2)">{fmt(rows[idx][yi])}</text>')
-    return (f'<figure class="panel"><figcaption><h3>{html.escape(title)}</h3>'
-            f'<p class="note">{note}</p></figcaption><div class="scroll">'
-            f'<svg viewBox="0 0 {W} {H}" width="{W}" height="{H}">'
-            f'<line x1="{PAD}" y1="{H-22}" x2="{W-12}" y2="{H-22}" '
-            f'stroke="var(--rule)" stroke-width="1"/>'
-            f'<path d="{path}" fill="none" stroke="var(--seq-5)" stroke-width="2" '
-            f'stroke-linejoin="round" stroke-linecap="round"/>'
-            + ''.join(marks) + ''.join(labels) +
-            # the axis maximum, unless the first point already carries that value
-            (f'<text x="2" y="14" font-size="9.5" fill="var(--muted)">{fmt(y1)}</text>'
-             if abs(y1 - ys[0]) > 0.02 * (y1 or 1) else '') +
-            f'</svg></div><div class="legend"><span>--freq_alpha</span>'
-            f'<em>{unit}</em></div></figure>')
-
-
-def render(tab, w, alpha, src):
-    rows = list(range(1, SIDE - 1))
-    ip = [p for p in tab.pieces if cell_kind_of_piece(tab, p) == 0]
-    pr = piece_row_matrix(tab, w)
-    prs = robust_scale(pr.values())
-    ws = robust_scale(w.values())
-
-    # Sort pieces by the row they most prefer, so structure (if any) is a diagonal
-    # rather than noise. Ties by the softmax centroid, which is smooth.
-    def centroid(p):
-        e = [(r, math.exp(pr[(p, r)])) for r in rows]
-        tot = sum(x for _, x in e) or 1.0
-        return (max(e, key=lambda t: t[1])[0], sum(r * x for r, x in e) / tot)
-    order = sorted(ip, key=centroid)
-
+def render(tab, active, location, src):
+    ip = [p for p in tab.pieces if tab.pkind[p] == 0]
+    av = [v for (p, _), v in active.items() if tab.pkind.get(p) == 0]
+    scale = robust_scale(av)
+    border_scale = robust_scale(v for (p, _), v in location.items() if tab.pkind.get(p) == 1)
     lift, lift_n = tab.meta.get('lift', (0.0, 0))
-    ncov = len(tab.covered)
+    lift_label = 'prequential segment lift'
+    lift_note = f'{lift_n:,} boards'
     ess = [tab.ess(c) for c in tab.covered]
-    mean_ess = sum(ess) / len(ess) if ess else 0.0
-    thin = sum(1 for e in ess if e < 30)
-    P = []
+    P = ['<div class="tiles">',
+         tile(f'{lift:+.3f}', lift_label, lift_note),
+         tile(f'{len(tab.covered)} / {len(tab.free_cells)}', 'free cells measured'),
+         tile(f'{sum(ess)/len(ess):,.1f}' if ess else '0', 'mean cell ESS', 'configuration units'),
+         tile('KT 1/2', 'smoothing', 'parameter-free'),
+         tile('A / B / C', 'beam resolution', '5-5-4 inner pieces'),
+         tile('exact cell', 'border resolution', 'bottom + left ranking'), '</div>']
 
-    # --- stat tiles -------------------------------------------------------
-    warn = ' class="warn"' if lift <= 0 else ''
-    P.append('<div class="tiles">'
-             + f'<div class="tile"><b{warn}>{lift:+.3f}</b>'
-               f'<span>held-out lift, nats/cell</span>'
-               f'<em>over {lift_n:,} boards</em></div>'
-             + tile(f'{ncov}<span style="font-size:15px;color:var(--muted)"> / '
-                    f'{len(tab.free_cells)}</span>', 'free cells measured',
-                    f'{thin} under 30 configurations')
-             + tile(f'{mean_ess:,.1f}', 'mean effective sample size',
-                    'independent configurations per cell')
-             + tile('<span style="font-size:19px">'
-                    + ' &middot; '.join(f'{n:,}' for _, n in sorted(tab.passes.items()))
-                    + '</span>',
-                    'configurations per pass (p0/p1/p2/p3)',
-                    'growing from each of the four sides')
-             + tile(f'{alpha:g}', 'alpha (shrinkage)', 'pseudo-configurations')
-             + '</div>')
-    if lift <= 0:
-        P.append('<p class="note warn">The held-out lift is not positive: this table '
-                 'carries no signal and searching with it is not worth the run.</p>')
-
-    # --- headline: piece x row -------------------------------------------
+    # Piece x segment heatmap, sorted by preferred segment centroid.
+    seg_weight = {}
+    for p in ip:
+        for r in range(1, 15):
+            for sg in range(3):
+                vals = [active[(p, cell)] for cell in tab.free_cells
+                        if tab.pkind.get(p) == 0 and segment_of_cell(cell) == (r, sg)
+                        and (p, cell) in active]
+                seg_weight[(p, r, sg)] = sum(vals) / len(vals) if vals else 0.0
+    def pref_key(p):
+        best = max(((seg_weight[p, r, sg], r, sg) for r in range(1, 15) for sg in range(3)),
+                   key=lambda x: x[0])
+        return best[1], best[2], -best[0]
+    order = sorted(ip, key=pref_key)
     cells = []
-    for i, p in enumerate(order):
-        for r in rows:
-            v = pr[(p, r)]
-            cells.append((i, r - 1, div_color(v, prs),
-                          f'piece {p} - row {r} - {v:+.2f} nats vs chance'))
-    P.append('<h2>Where each piece wants to sit</h2>')
-    P.append(grid(cells, len(order), len(rows), 6, 17,
-                  'Piece by interior row',
-                  'One column per free interior piece, sorted by the row it prefers; '
-                  'rows run bottom-up as everywhere else in this repo. A diagonal band '
-                  'means the table has learned height. A flat wash means it has not.',
-                  div_legend(prs)))
+    for y, p in enumerate(order):
+        for r in range(1, 15):
+            for sg in range(3):
+                v = seg_weight[p, r, sg]
+                x = (r - 1) * 3 + sg
+                cells.append((x, y, div_color(v, scale),
+                              f'piece {p}; row {r} segment {SEG_NAME[sg]}; {v:+.3f} nats'))
+    P.append('<h2>5-5-5 preservation map</h2>')
+    P.append(grid(cells, 42, len(order), 15, 5, 'Piece by row segment',
+                  'Columns are row 1 A/B/C through row 14 A/B/C. A strong blue top segment makes lower placement red because the score conditions on all still-unfilled rows.'))
 
-    # --- board maps -------------------------------------------------------
-    def board(fn, title, note, unit):
+    # Board measurement maps.
+    def board(fn, title, note):
         vals = {c: fn(c) for c in tab.free_cells}
         vmax = max(vals.values(), default=0.0)
-        cs = [(c % SIDE, c // SIDE, seq_color(vals[c], vmax),
-               f'cell {c} (row {c//SIDE}, col {c%SIDE}) - {vals[c]:,.1f} {unit}')
-              for c in tab.free_cells]
-        return grid(cs, SIDE, SIDE, 21, 21, title, note, seq_legend(vmax, unit))
+        cells = [(c % 16, c // 16, seq_color(vals[c], vmax),
+                  f'cell {c} row {c//16} col {c%16}: {vals[c]:,.1f}') for c in tab.free_cells]
+        return grid(cells, 16, 16, 21, 21, title, note)
+    P.append('<h2>Evidence map</h2><div class="row">')
+    P.append(board(lambda c: tab.wcell.get(c, 0.0), 'Coverage', 'Weighted configurations contributing to each cell.'))
+    P.append(board(tab.ess, 'Effective sample size', 'Configuration-level ESS; correlated bottoms make it an upper bound.'))
+    P.append('</div>')
 
-    P.append('<h2>What the board was measured from</h2>')
-    P.append('<div class="row">'
-             + board(lambda c: tab.wcell.get(c, 0.0), 'Coverage',
-                     'Weighted configurations that placed anything here. Blank cells '
-                     'were never reached; they hold pure backoff.', 'configurations')
-             + board(tab.ess, 'Effective sample size',
-                     'Independent border configurations behind each cell, not boards: '
-                     'a configuration\u2019s boards are near-copies, so they vote once '
-                     'between them. Under about 30 the cell is one or two borders\u2019 '
-                     'opinion.', 'configurations')
-             + board(lambda c: max((w[(p, c)] for p in tab.pieces if (p, c) in w),
-                                   default=0.0),
-                     'Decisiveness',
-                     'The strongest preference any piece has for this cell. High means '
-                     'the table has an opinion here.', 'nats')
-             + '</div>')
-
-    # --- border sides -----------------------------------------------------
-    names = ['top', 'right', 'bottom', 'left']
+    # Border exact location panels.
+    names = ('top', 'right', 'bottom', 'left')
     blocks = []
-    for s in range(4):
-        bp = [p for p in tab.pieces if cell_kind_of_piece(tab, p) == 1
-              and piece_side(tab, p) == s]
-        bc = [c for c in tab.free_cells if cell_kind(c) == 1 and cell_side(c) == s]
+    for side in range(4):
+        bp = [p for p in tab.pieces if tab.pkind[p] == 1 and tab.pside[p] == side]
+        bc = [c for c in tab.free_cells if cell_kind(c) == 1 and cell_side(c) == side]
         if not bp or not bc:
             continue
-        cs = [(k, i, div_color(w.get((p, c), 0.0), ws),
-               f'piece {p} - cell {c} - {w.get((p,c),0.0):+.2f} nats')
+        cs = [(k, i, div_color(location.get((p, c), 0.0), border_scale),
+               f'piece {p}; cell {c}; {location.get((p,c),0.0):+.3f} nats')
               for i, p in enumerate(bp) for k, c in enumerate(bc)]
-        blocks.append(grid(cs, len(bc), len(bp), 16, 16, f'{names[s]} side',
-                           f'{len(bp)} edge pieces against the {len(bc)} cells of this '
-                           f'side.', div_legend(ws), flip_y=False))
-    if blocks:
-        P.append('<h2>The border, side by side</h2>')
-        P.append('<p class="note">A rotations row fixes which side each edge piece '
-                 'belongs to, so the 56&times;56 border block is really four '
-                 'independent assignment problems. These weights are what the '
-                 'data-driven bottom-row and left-column ranking adds to the '
-                 'library&rsquo;s fan-out measure &mdash; and they are only valid for '
-                 'the rotations row they were learned on.</p>')
-        P.append('<div class="row">' + ''.join(blocks) + '</div>')
+        blocks.append(grid(cs, len(bc), len(bp), 16, 16, f'{names[side]} side',
+                           'Exact location weights used for border ranking.', flip_y=False))
+    P.append('<h2>Exact border-location model</h2><div class="row">' + ''.join(blocks) + '</div>')
 
-    # --- distribution -----------------------------------------------------
-    vals = sorted(w.values())
-    if vals:
-        lo, hi, nb = vals[0], vals[-1], 44
-        span = (hi - lo) or 1.0
-        hist = [0] * nb
-        for v in vals:
-            hist[min(nb - 1, int((v - lo) / span * nb))] += 1
-        hmax = max(hist) or 1
-        bw, bh = 24, 150
-        bars = []
-        for i, n in enumerate(hist):
-            h = max(1, round(n / hmax * bh))
-            c0 = lo + (i + .5) * span / nb
-            bars.append(f'<rect x="{i*bw}" y="{bh-h}" width="{bw-2}" height="{h}" rx="2" '
-                        f'fill="{div_color(c0, ws)}" tabindex="0" data-t="'
-                        f'{c0:+.2f} nats - {n:,} piece-cell pairs"/>')
-        P.append('<h2>How opinionated the table is</h2>')
-        P.append('<figure class="panel"><figcaption><h3>Distribution of log weights</h3>'
-                 '<p class="note">Every free piece-cell pair. Mass piled at zero means '
-                 'alpha is shrinking the table to its prior; long tails mean it is '
-                 'committing. This is the shape <code>--freq_alpha</code> moves.</p>'
-                 '</figcaption><div class="scroll">'
-                 f'<svg viewBox="0 0 {nb*bw} {bh}" width="{nb*bw}" height="{bh}">'
-                 + ''.join(bars) + '</svg></div>'
-                 f'<div class="legend"><span>{lo:+.1f}</span>'
-                 f'<span style="margin-left:auto">{hi:+.1f} nats</span></div></figure>')
+    # Most valuable top reservations.
+    rows = []
+    for p in ip:
+        top = max((seg_weight[p, r, sg], r, sg) for r in range(12, 15) for sg in range(3))
+        low = min(seg_weight[p, 1, sg] for sg in range(3))
+        rows.append((top[0], p, top[1], top[2], low))
+    trs = ''.join(f'<tr><td>piece {p}</td><td>{r}{SEG_NAME[sg]}</td><td>{v:+.3f}</td><td>{low:+.3f}</td></tr>'
+                  for v, p, r, sg, low in sorted(rows, reverse=True)[:30])
+    P.append('<h2>Pieces most worth preserving for the top</h2>')
+    P.append('<figure class="panel"><table><thead><tr><th>piece</th><th>best top segment</th><th>top score</th><th>worst row-1 score</th></tr></thead><tbody>' + trs + '</tbody></table></figure>')
 
-    # --- the one knob -----------------------------------------------------
-    sw = alpha_sweep(tab)
-    if len(sw) > 1:
-        P.append('<h2>What --freq_alpha does to this table</h2>')
-        P.append('<p class="note">Alpha is shrinkage toward the piece-by-row prior, '
-                 'measured in pseudo-configurations, and it is the only knob. The '
-                 'file holds raw counts, so every point here is a re-estimate that '
-                 'costs milliseconds &mdash; not another learning run. Low alpha '
-                 'trusts the cell table and commits hard; high alpha falls back on '
-                 '&ldquo;low pieces low, top pieces top&rdquo;.</p>')
-        P.append('<div class="row">'
-                 + line_chart(sw, 1, 'How opinionated',
-                              'Mean absolute log weight over every free piece-cell '
-                              'pair. Falls as alpha pulls the table toward its prior.',
-                              'nats', lambda v: f'{v:.2f}')
-                 + line_chart(sw, 2, 'How much is shrunk away',
-                              'Share of pairs within half a nat of chance &mdash; the '
-                              'part of the table that has stopped expressing a '
-                              'preference.', 'share', lambda v: f'{v*100:.0f}%')
-                 + '</div>')
+    # Exact interior cells remain in the table as a diagnostic even though the
+    # beam deliberately pools them to A/B/C. This shows whether a segment signal
+    # is broad or driven by one clue/corner-adjacent cell.
+    exact = [((p, c), v) for (p, c), v in location.items()
+             if tab.pkind.get(p) == 0 and cell_kind(c) == 0]
+    trs = ''.join(
+        f'<tr><td>piece {p}</td><td>{c}</td><td>{c//SIDE}</td><td>{c%SIDE}</td>'
+        f'<td>{SEG_NAME[segment_of_cell(c)[1]]}</td><td>{v:+.3f}</td></tr>'
+        for (p, c), v in sorted(exact, key=lambda kv: -kv[1])[:30])
+    P.append('<h2>Exact-cell diagnostic</h2>')
+    P.append('<figure class="panel"><p class="note">These are retained for inspection, '
+             'not used by the interior beam. A sharp entry still contributes its full raw '
+             'count to the corresponding A/B/C segment.</p><table><thead><tr><th>piece</th>'
+             '<th>cell</th><th>row</th><th>col</th><th>segment</th><th>location nats</th>'
+             '</tr></thead><tbody>' + trs + '</tbody></table></figure>')
 
-    # --- per-piece explorer ----------------------------------------------
-    bypiece = defaultdict(list)
-    for (q, c), v in w.items():
-        bypiece[q].append([c, round(v, 3)])
-    pmap = {str(q): sorted(v) for q, v in bypiece.items()}
-    P.append('<h2>One piece at a time</h2>')
-    P.append('<figure class="panel"><figcaption><h3 id="plabel">piece</h3>'
-             '<p class="note">The whole board as one piece sees it. Blue where the '
-             'table wants it, red where it does not.</p></figcaption>'
-             '<div class="ctl"><label for="pnum">piece id</label>'
-             f'<input type="number" id="pnum" min="0" max="255" value="{ip[0] if ip else 0}">'
-             '</div><div class="scroll"><svg viewBox="0 0 352 352" width="352" '
-             'height="352"><g id="pmap"></g></svg></div>'
-             + div_legend(ws) + '</figure>')
-
-    # --- table view -------------------------------------------------------
-    top = sorted(w.items(), key=lambda kv: -kv[1])[:40]
-    trs = ''.join(f'<tr><td>piece {p}</td><td>{c}</td><td>{c//SIDE}</td><td>{c%SIDE}</td>'
-                  f'<td>{v:+.3f}</td><td>{tab.wcell.get(c,0):,.1f}</td></tr>'
-                  for (p, c), v in top)
-    P.append('<details><summary>Table view &mdash; the 40 strongest '
-             'piece-cell preferences</summary><table><thead><tr><th>piece</th>'
-             '<th>cell</th><th>row</th><th>col</th><th>nats</th><th>coverage</th>'
-             f'</tr></thead><tbody>{trs}</tbody></table></details>')
-
-    css = (CSS.replace('%LIGHT%', ramp_vars(RAMP_CSS_LIGHT))
-              .replace('%DARK%', ramp_vars(RAMP_CSS_DARK)))
-    meta = '<br>'.join(f'{html.escape(k)} = {html.escape(str(v))}'
-                       for k, v in sorted(tab.meta.items()) if k != 'lift')
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Frequency table</title><style>{css}</style></head><body><div class="wrap">
-<div style="display:flex;align-items:start;gap:12px">
-<div style="flex:1"><h1>Data-driven frequency table</h1>
-<p class="sub">{html.escape(os.path.basename(src))} &mdash; where each piece was
-measured to sit, in the canonical clue frame.</p></div>
-<button id="theme">theme</button></div>
-{''.join(P)}
-<details><summary>Provenance &mdash; what this table was learned from</summary>
-<p class="meta">{meta}</p></details>
-</div><div id="tip"></div>
-<script>window.PIECEMAP={json.dumps(pmap)};window.PSCALE={ws:.6f};
-window.RAMPS={json.dumps({"pos": DIV_POS, "neg": DIV_NEG})};</script>
-<script>{JS}</script></body></html>"""
+    meta = '<br>'.join(f'{html.escape(k)} = {html.escape(str(v))}' for k, v in sorted(tab.meta.items()) if k != 'lift')
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>E555 frequency table</title><style>{CSS}</style></head><body><div class="wrap"><h1>E555 data-driven table</h1><p class="sub">{html.escape(os.path.basename(src))} — fixed 5-5-5 segment-preservation beam model; exact-location border model.</p>{''.join(P)}<details><summary>Provenance</summary><p class="meta">{meta}</p></details></div><div id="tip"></div><script>{JS}</script></body></html>'''
 
 
-def text_summary(tab, w, alpha):
+def text_summary(tab, active, location):
     lift, lift_n = tab.meta.get('lift', (0.0, 0))
     ess = [tab.ess(c) for c in tab.covered]
-    print(f"alpha          {alpha:g}")
-    print(f"held-out lift  {lift:+.4f} nats/cell over {lift_n:,} boards"
-          + ("   <-- NO SIGNAL" if lift <= 0 else ""))
-    print(f"free cells     {len(tab.free_cells)}  ({len(tab.covered)} measured, "
-          f"{sum(1 for e in ess if e < 30)} under 30 configurations)")
-    print(f"mean ESS       {sum(ess)/len(ess) if ess else 0:,.1f} configurations/cell")
-    print("configs/pass   " + "  ".join(f"p{j}={n:,}" for j, n in sorted(tab.passes.items())))
-    vals = sorted(w.values())
-    if vals:
-        print(f"weights        {vals[0]:+.2f} .. {vals[-1]:+.2f} nats over "
-              f"{len(vals):,} piece-cell pairs")
-    pr = piece_row_matrix(tab, w)
-    print("\nstrongest piece-cell preferences")
-    for (p, c), v in sorted(w.items(), key=lambda kv: -kv[1])[:12]:
-        print(f"  piece {p:3d}  cell {c:3d} (row {c//SIDE:2d}, col {c%SIDE:2d})  {v:+.3f}")
-    print("\nrow preference of the ten most opinionated pieces")
-    ip = [p for p in tab.pieces if cell_kind_of_piece(tab, p) == 0]
-    for p in sorted(ip, key=lambda q: -max(pr[(q, r)] for r in range(1, SIDE - 1)))[:10]:
-        best = max(range(1, SIDE - 1), key=lambda r: pr[(p, r)])
-        print(f"  piece {p:3d}  prefers row {best:2d}  ({pr[(p,best)]:+.2f} nats)")
+    print('beam model     5-5-5 segment preservation')
+    print('border model   exact location')
+    print('smoothing      Krichevsky-Trofimov 1/2 count')
+    print(f'segment lift   {lift:+.4f} nats/cell over {lift_n:,} boards')
+    print(f'free cells     {len(tab.free_cells)} ({len(tab.covered)} measured)')
+    print(f'mean ESS       {sum(ess)/len(ess) if ess else 0:,.1f} configurations/cell')
+    print('configs/pass   ' + '  '.join(f'p{j}={n:,}' for j, n in sorted(tab.passes.items())))
+    vals = [v for (p, _), v in active.items() if tab.pkind.get(p) == 0]
+    print(f'beam weights   {min(vals):+.2f} .. {max(vals):+.2f} nats' if vals else 'beam weights   none')
+    bvals = [v for (p, _), v in location.items() if tab.pkind.get(p) == 1]
+    print(f'border weights {min(bvals):+.2f} .. {max(bvals):+.2f} nats' if bvals else 'border weights none')
 
-
-def check_against_c(tab, w, dump_path):
-    """Compare our weights against the ones the C wrote. Produce the dump with
-
-        E555_FREQ_DUMP=/tmp/fw.txt bin/E555_beamer_datadriven SEED ROT \\
-            --table TABLE --freq_alpha A ...
-
-    and pass the same --alpha here, or the two are not computing the same thing."""
-    got = {}
-    with open(dump_path) as f:
-        for line in f:
-            if line.startswith('fw '):
-                _, p_, c_, v_ = line.split()
-                got[(int(p_), int(c_))] = float(v_)
-    if not got:
-        sys.exit(f"--check: {dump_path} holds no 'fw' lines")
-    miss = [k for k in got if k not in w]
-    worst, at = 0.0, None
-    for k, v in got.items():
-        d = abs(w.get(k, 0.0) - v)
-        if d > worst:
-            worst, at = d, k
-    print(f"--check: {len(got):,} weights compared against {dump_path}")
-    if miss:
-        print(f"         {len(miss):,} the C has and this does not, e.g. {miss[0]}")
-    print(f"         largest disagreement {worst:.3e} nats"
-          + (f" at piece {at[0]} cell {at[1]}" if at else ""))
-    ok = worst < 1e-3 and not miss
-    print("         " + ("AGREE" if ok else "DISAGREE -- one of the two is wrong"))
-    return 0 if ok else 1
+    ip = [p for p in tab.pieces if tab.pkind[p] == 0]
+    def segv(p, r, sg):
+        a = [active[p, c] for c in tab.free_cells if segment_of_cell(c) == (r, sg) and (p, c) in active]
+        return sum(a) / len(a) if a else 0.0
+    top = []
+    for p in ip:
+        best = max((segv(p, r, sg), r, sg) for r in range(12, 15) for sg in range(3))
+        top.append((best[0], p, best[1], best[2], min(segv(p, 1, sg) for sg in range(3))))
+    print('\nstrongest top reservations')
+    for v, p, r, sg, low in sorted(top, reverse=True)[:15]:
+        print(f'  piece {p:3d}  top {r:2d}{SEG_NAME[sg]} {v:+.3f}   worst row 1 {low:+.3f}')
+    exact = [((p, c), v) for (p, c), v in location.items()
+             if tab.pkind.get(p) == 0 and cell_kind(c) == 0]
+    print('\nstrongest exact-cell preferences (diagnostic; beam pools to A/B/C)')
+    for (p, c), v in sorted(exact, key=lambda kv: -kv[1])[:12]:
+        r, col = divmod(c, SIDE)
+        sg = segment_of_cell(c)[1]
+        print(f'  piece {p:3d}  cell {c:3d} (row {r:2d}, col {col:2d}, '
+              f'{SEG_NAME[sg]}) {v:+.3f}')
 
 
 def main():
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('table')
-    ap.add_argument('--alpha', type=float, default=20.0,
-                    help='shrinkage toward the piece-by-row prior (default 20)')
-    ap.add_argument('--out', default=None,
-                    help='HTML output path (default: TABLE with .html)')
-    ap.add_argument('--text', action='store_true', help='terminal summary instead')
-    ap.add_argument('--check', metavar='DUMP',
-                    help='compare against weights the C wrote via E555_FREQ_DUMP')
+    ap.add_argument('--out', help='HTML output path (default TABLE.html)')
+    ap.add_argument('--text', action='store_true')
+    ap.add_argument('--check', metavar='DUMP')
     a = ap.parse_args()
-    if a.alpha <= 0:
-        sys.exit('--alpha must be > 0: it is what keeps every log finite')
-
     tab = Table(a.table)
-    w = build(tab, a.alpha)
+    active, cellw, location = build(tab)
     if a.check:
-        sys.exit(check_against_c(tab, w, a.check))
+        got = {'fw': {}, 'fwseg': {}, 'fwcell': {}, 'fwb': {}}
+        header = ''
+        with open(a.check) as f:
+            for line in f:
+                if line.startswith('# beam_model '):
+                    header = line.strip()
+                    continue
+                w = line.split()
+                if len(w) == 4 and w[0] in got:
+                    got[w[0]][int(w[1]), int(w[2])] = float(w[3])
+        if not got['fw']:
+            sys.exit(f'{a.check}: no fw lines')
+
+        def cmp(label, observed, expected):
+            expected = {k: v for k, v in expected.items() if v != 0.0}
+            worst, at = 0.0, None
+            for k, v in observed.items():
+                d = abs(expected.get(k, 0.0) - v)
+                if d > worst:
+                    worst, at = d, k
+            miss_o = [k for k in observed if k not in expected]
+            miss_e = [k for k in expected if k not in observed]
+            print(f'{label}: {len(observed):,} weights; max |delta|={worst:.3e}'
+                  + (f' at {at}' if at else ''))
+            if miss_o: print(f'  {len(miss_o)} C-only keys; first {miss_o[0]}')
+            if miss_e: print(f'  {len(miss_e)} Python-only keys; first {miss_e[0]}')
+            return worst < 1e-3 and not miss_o and not miss_e
+
+        ok = cmp('segment', got['fwseg'], active)
+        ok = cmp('cell', got['fwcell'], cellw) and ok
+        ok = cmp('border', got['fwb'],
+                 {k: v for k, v in location.items() if tab.pkind.get(k[0]) == 1}) and ok
+        model = 'fwcell' if 'cell-preservation' in header else 'fwseg'
+        if got['fw'] != got[model]:
+            print(f'active fw differs from {model}')
+            ok = False
+        print('AGREE' if ok else 'DISAGREE')
+        raise SystemExit(0 if ok else 1)
     if a.text:
-        text_summary(tab, w, a.alpha)
+        text_summary(tab, active, location)
         return
-    out = a.out or (os.path.splitext(a.table)[0] + '.html')
+    out = a.out or os.path.splitext(a.table)[0] + '.html'
     with open(out, 'w') as f:
-        f.write(render(tab, w, a.alpha, a.table))
-    print(f"[out] {out}  ({os.path.getsize(out)/1024:.0f} KB) -- open it in a browser")
+        f.write(render(tab, active, location, a.table))
+    print(f'[out] {out} ({os.path.getsize(out)/1024:.0f} KB)')
 
 
 if __name__ == '__main__':

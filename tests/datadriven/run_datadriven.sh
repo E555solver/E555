@@ -3,50 +3,40 @@
 #
 #   bash tests/datadriven/run_datadriven.sh
 #   bash tests/datadriven/run_datadriven.sh THREADS=16 SEARCH_STOP_ROW=12
-#   bash tests/datadriven/run_datadriven.sh TABLE=runs/mine.txt LEARN=0   # reuse a table
+#   bash tests/datadriven/run_datadriven.sh LEARN=0 \
+#        TABLE=tests/datadriven/example_run/table_rnd_s9_row2.txt   # reuse a table
 #
-# YES, IT IS TWO RUNS. The learning phase measures where each piece sits and
-# writes a table; the search phase reads that table and steers by it. They are
-# separate binaries invocations on purpose, so every flag keeps the meaning it
-# already has in whichever phase it is passed to. This script just runs them in
-# order. Learning writes no boards, so it is cheap on disk; the search writes
-# the usual completions CSV, listed in $OUT_DIR/outputs.txt.
-#
-# LEARN=0 skips straight to the search, which is what you want when tuning
-# ALPHA: the table holds raw counts, so re-reading it at a different ALPHA costs
-# milliseconds and learning again costs hours.
+# The learning phase measures where each piece sits and writes a table; the
+# search phase reads it and steers by it. Learning writes no boards; the search
+# writes the usual completions CSV, listed in $OUT_DIR/outputs.txt. LEARN=0
+# skips straight to the search with an existing table, which must have been
+# learned on the same border (checked by the binary).
 set -euo pipefail
 
 # ---- settings: edit here, or pass NAME=value on the command line ------------
 REPO=$(cd "$(dirname "$0")/../.." && pwd)   # E555 checkout
 SEED=data/seed_Edge5.txt                    # paths below are relative to REPO
-ROTATIONS=data/borders_annealed_fix12.csv
-BORDER_ROW=1            # which rotations row to use, for both phases
+ROTATIONS=tests/datadriven/borders_stageAx6.csv
+BORDER_ROW=4            # which rotations row to use, for both phases (4 = r16178,
+                        # the border of example_run/table_rnd_s9_row2.txt)
 OUT_DIR=tests/datadriven/runs/pipeline
 TABLE=tests/datadriven/runs/pipeline/table.txt
-DB_FILE=tests/datadriven/runs/chain_clued.db   # 5.6 GB cache; empty = in memory
+DB_FILE=                # chain DB cache file (~6 GB); empty = build in memory
 THREADS=4
 RNG_SEED=12345          # determinism is this AND --threads, never this alone
 
 LEARN=1                 # 0 = keep the table at $TABLE and only search
-LEARN_BOTTOMS=50000     # bottom samples per pass. Set past the largest pool so
-                        # every pass returns the same number: the four are very
-                        # uneven (480 / 25920 / 46080 / 432 on border row 1), and
-                        # a pass whose pool runs out goes round it again with a
-                        # fresh random stream rather than stopping short.
+LEARN_BOTTOMS=50000     # bottom samples per pass. A pass whose pool is smaller
+                        # goes round it again with fresh random streams, so every
+                        # pass takes the same number of samples.
 LEARN_COLUMNS=5         # left columns per bottom. Keep this small: columns
                         # sharing a bottom are correlated, so they add votes
                         # faster than they add information.
-LEARN_STOP_ROW=10       # only boards that get this high are counted -- getting
-                        # near the top is the evidence that a partial is worth
-                        # something rather than pieces that merely match. 9 is
-                        # the floor for cheap tests; never below it. (7 is all
-                        # that full cell coverage needs, but coverage is not the
-                        # point: the boards have to be good.)
+LEARN_STOP_ROW=10       # only boards reaching this row are counted; 9 or more
 LEARN_BEAM=20000
 LEARN_WALL=0            # seconds for the learning phase, 0 = unlimited
 
-ALPHA=20                # shrinkage toward the piece-by-row prior. The one knob.
+FREQ_MODEL=segment      # beam statistic: segment (pooled A/B/C) or cell
 SEARCH_BOTTOMS=40
 SEARCH_COLUMNS=5
 SEARCH_STOP_ROW=12
@@ -67,6 +57,8 @@ BIN=tests/datadriven/bin/E555_beamer_datadriven
 mkdir -p "$(dirname "$TABLE")" "$OUT_DIR"
 
 CLUES="--clue_center --clue_corners --pin_clue 1"
+DB=()
+[ -n "$DB_FILE" ] && DB=(--db_file "$DB_FILE")
 
 if [ "$LEARN" = 1 ]; then
     echo "=== phase 1/2: learning the table -> $TABLE ==="
@@ -76,7 +68,7 @@ if [ "$LEARN" = 1 ]; then
         --stop_row "$LEARN_STOP_ROW" --beam_width "$LEARN_BEAM" \
         --threads "$THREADS" --rng_seed "$RNG_SEED" \
         --wall_time "$LEARN_WALL" \
-        $CLUES --db_file "$DB_FILE" \
+        $CLUES ${DB[@]+"${DB[@]}"} \
         --learn "$TABLE" --out_dir "$OUT_DIR/learn" --print_cmd
 else
     echo "=== phase 1/2: skipped, reusing $TABLE ==="
@@ -90,8 +82,8 @@ $BIN "$SEED" "$ROTATIONS" \
     --stop_row "$SEARCH_STOP_ROW" --beam_width "$SEARCH_BEAM" \
     --threads "$THREADS" --rng_seed "$RNG_SEED" \
     --wall_time "$SEARCH_WALL" --max_emitted "$MAX_EMITTED" \
-    $CLUES --db_file "$DB_FILE" \
-    --table "$TABLE" --freq_alpha "$ALPHA" \
+    $CLUES ${DB[@]+"${DB[@]}"} \
+    --table "$TABLE" --freq_model "$FREQ_MODEL" \
     --out_dir "$OUT_DIR" --print_cmd
 
 echo

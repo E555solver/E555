@@ -25,10 +25,11 @@
  *     SCORE       each child is ranked by the options it keeps open one row up
  *                 (segment-A exact cell + B/C fan-out table) plus the Mahalanobis
  *                 color-usage term.
- *     SELECT      pooled children are deduplicated by frontier signature (keeping
- *                 the best score per signature), ranked, and pruned to the row's
- *                 effective width by a score band with a per-parent offspring cap
- *                 plus a random band whose share follows the frac_rand schedule.
+ *     SELECT      below the stop row, pooled children are deduplicated by frontier
+ *                 signature (keeping the best score per signature), ranked, and
+ *                 pruned to the effective width. At the stop row the raw candidates
+ *                 are score-sorted, then exact duplicate boards are removed while
+ *                 distinct complete boards -- even one-piece variants -- survive.
  *     MATERIALIZE survivors become the next beam; their moves go to the ancestry
  *                 log from which emitted boards are reconstructed.
  *   A beam whose child pool comes up EMPTY is abandoned. That is a HEURISTIC
@@ -36,9 +37,9 @@
  *   per segment-A record, spends a bounded quota per parent, and starts from an
  *   already-pruned beam, so an empty pool means only that this bounded search
  *   found no child from the states it still held. Boards reaching --stop_row
- *   (default 12) are appended to the completions CSV, best-scored first, up to
- *   EMIT_MAX per config -- no lookahead is applied at the stop row; whether a
- *   row fits above it is deliberately left to the next stage.
+ *   (default 12) are appended to the completions CSV, best-scored first and with
+ *   exact-board deduplication only, up to EMIT_MAX per config -- no lookahead is
+ *   applied there; whether a row fits above is deliberately left to Stage C.
  *
  * WIDTH AND RANDOMNESS SCHEDULES
  *   The beam expands late, where extinction pressure is highest: half of the
@@ -98,7 +99,7 @@ static uint32_t g_beam_width      = 250000;
 static uint32_t g_stop_row        = 11;
 static uint32_t g_beam_expand     = 4;
 static uint32_t g_beam_expand_row = 7;
-static double   g_lambda_maha     = 0.6;   /* --lambda_Mahalanobis, in score-SD */
+static double   g_lambda_maha     = 1.0;   /* --lambda_Mahalanobis, in score-SD */
 static double   g_frac_rand       = 0.10;  /* flat across rows; see below */
 /* Share of the beam reserved as a per-orientation floor, split evenly over the
    four orientations (so K/8 each). Not a CLI knob: it exists to stop one
@@ -148,22 +149,45 @@ static const LeftOrder   *g_cur_left   = NULL;
    ("r<row>b<bottom>#<lap>l<column>"), which -Wformat-truncation checks. */
 static char     g_config_id_str[96] = "c0";
 
-/* Emit dedup table (open addressing, power-of-2; emission is serial). */
+/* Exact-board dedup table (open addressing, power of two). Learning uses it
+   before counting; search uses it only while writing the complete stop row.
+   Frontier dedup remains disabled there, so distinct histories/boards are kept. */
 static uint64_t  *g_emit_htable = NULL;
 static size_t     g_emit_htable_sz = 0, g_emit_count = 0;
 static FILE      *g_completions_fp = NULL;
 static uint64_t   g_solution_idx = 0;
 
-/* --incomplete_top: A+B rows that reach --stop_row but have no segment C. They
-   go to a separate partials file with their own dedup table; emission happens
-   inside the parallel expansion, so it is guarded by an OpenMP critical. */
-static bool       g_incomplete_top    = false;
-static FILE      *g_partial_fp        = NULL;
-static uint64_t  *g_partial_htable    = NULL;
-static size_t     g_partial_htable_sz = 0, g_partial_count = 0;
-static size_t     g_partial_total     = 0;
-/* Run totals per partial kind, for the summary line. Indexed by ROWMASK_*. */
-static size_t     g_part_ab = 0, g_part_ac = 0, g_part_bc = 0;
+/* --incomplete_top: stop-row boards that fill only part of the stop row. Two
+   segments (A+B, A+C, B+C) go to <...>_partial.csv, segment B alone to
+   <...>_partial_B.csv. Column 0 is always present. */
+static bool g_incomplete_top = false;
+
+#define PARTMASK_B ((uint16_t)0x07C1u)  /* col 0 + cols 6..10 */
+_Static_assert((ROWMASK_AB & PARTMASK_B) == PARTMASK_B
+            && (ROWMASK_BC & PARTMASK_B) == PARTMASK_B, "B mask");
+
+typedef enum { PART_AB = 0, PART_AC, PART_BC, PART_B, PART_N } PartialKind;
+static const char *const g_part_name[PART_N] = { "AB", "AC", "BC", "B" };
+static const uint16_t g_part_mask[PART_N] = {
+    ROWMASK_AB, ROWMASK_AC, ROWMASK_BC, PARTMASK_B
+};
+enum { PFILE_TWO = 0, PFILE_B, PFILE_N };
+static FILE *g_partial_fp[PFILE_N];
+static inline int partial_file_of(PartialKind k) { return k == PART_B ? PFILE_B : PFILE_TWO; }
+
+/* Partial dedup. Two partials of one kind are duplicates when the pieces below
+   the stop row are the same SET (the parent's used mask) and their stop-row
+   pieces differ in at most one cell (rotations ignored). Each partial with n
+   occupied stop-row cells stores n keys, key i hashing everything but cell i;
+   two sequences share a key iff their Hamming distance is <= 1. The key set
+   lives for one border row. */
+static uint64_t *g_pdedup = NULL;
+static size_t    g_pdedup_sz = 0, g_pdedup_n = 0;
+
+static size_t g_partial_count = 0;      /* this configuration, all kinds */
+static size_t g_part_count[PART_N];     /* this configuration by kind */
+static size_t g_partial_total = 0;      /* whole run, all kinds */
+static size_t g_part_total[PART_N];     /* whole run by kind */
 
 static volatile sig_atomic_t g_stop = 0;
 static void handle_stop(int sig) { (void)sig; g_stop = 1; }
@@ -174,16 +198,38 @@ static struct {
     uint64_t rows_advanced;
     uint64_t cands_total;
     uint64_t extinct_at[EDGE_LEN + 1];
+    uint64_t row_attempts[EDGE_LEN + 1];
+    uint64_t row_candidates[EDGE_LEN + 1];
+    uint64_t row_retained[EDGE_LEN + 1];
+    uint64_t row_selected[EDGE_LEN + 1];
     uint64_t reached_stop;
     uint64_t emitted_total;
     double   t_expand, t_select, t_mat, t_emit;
 } g_stats;
 
-/* --max_emitted budget: stop-row completions plus --incomplete_top A+B partials,
-   i.e. every board written to disk. Checked after each stop-row emission and at
-   each config boundary, so the beam in flight is always reported in full and the
-   final count may exceed N by up to one beam's worth. Called from serial code
-   only (g_partial_total is mutated inside the emission critical section).
+static struct {
+    uint64_t bottoms_ranked;
+    uint64_t bottoms_no_clue_column;
+    uint64_t columns_ordinary_viable;
+    uint64_t columns_clue_compatible;
+    uint64_t columns_run;
+    double   clue_seconds;
+} g_border_stats;
+
+/* Exact row-1 corner-clue compatibility, cached per ranked bottom and segment-A
+   left color for the current border row.  -1 unknown, 0 impossible, 1 possible. */
+static int8_t *g_corner_compat_cache = NULL;
+static size_t  g_corner_compat_nb = 0;
+static LeftOrder *g_left_filter_buf = NULL;
+static size_t     g_left_filter_cap = 0;
+
+
+/* --max_emitted budget: stop-row completions plus every --incomplete_top
+   partial, i.e. every board written to disk. Checked after
+   each stop-row emission and at each config boundary, so the beam in flight is
+   always reported in full and the final count may exceed N by up to one
+   configuration's reported output. Called from serial code only
+   (g_partial_total is mutated inside the emission critical section).
    The announcement is deferred to _announce() so that it never lands ahead of
    the [sweep] line of the config that triggered it. */
 static bool g_budget_hit = false;
@@ -387,38 +433,82 @@ static void htable_init(void) {
     g_emit_htable_sz = sz; g_emit_count = 0;
 }
 
-/* Dedup table for --incomplete_top partials (kept separate from the completions
-   table so g_emit_count is unaffected). Same open-addressing scheme. */
-static void partial_htable_grow(void) {
-    size_t new_sz = g_partial_htable_sz << 1;
-    uint64_t *nt = xmalloc(new_sz * sizeof(uint64_t));
-    memset(nt, 0, new_sz * sizeof(uint64_t));
-    for (size_t i = 0; i < g_partial_htable_sz; i++) {
-        uint64_t k = g_partial_htable[i];
-        if (!k) continue;
-        size_t h = k & (new_sz - 1);
-        while (nt[h]) h = (h + 1) & (new_sz - 1);
-        nt[h] = k;
+static bool pdedup_has(uint64_t k) {
+    size_t h = (size_t)k & (g_pdedup_sz - 1);
+    while (g_pdedup[h]) {
+        if (g_pdedup[h] == k) return true;
+        h = (h + 1) & (g_pdedup_sz - 1);
     }
-    free(g_partial_htable); g_partial_htable = nt; g_partial_htable_sz = new_sz;
+    return false;
 }
-static bool partial_htable_insert(uint64_t key) {
-    if (!key) key = 1;
-    size_t h = key & (g_partial_htable_sz - 1);
-    while (g_partial_htable[h]) {
-        if (g_partial_htable[h] == key) return false;
-        h = (h + 1) & (g_partial_htable_sz - 1);
+
+static void pdedup_put(uint64_t k) {
+    size_t h = (size_t)k & (g_pdedup_sz - 1);
+    while (g_pdedup[h]) {
+        if (g_pdedup[h] == k) return;
+        h = (h + 1) & (g_pdedup_sz - 1);
     }
-    g_partial_htable[h] = key; g_partial_count++;
-    if (g_partial_count * 2 > g_partial_htable_sz) partial_htable_grow();
+    g_pdedup[h] = k;
+    g_pdedup_n++;
+}
+
+static void pdedup_grow(void) {
+    uint64_t *old = g_pdedup; size_t old_sz = g_pdedup_sz;
+    g_pdedup_sz <<= 1;
+    g_pdedup = xmalloc(g_pdedup_sz * sizeof *g_pdedup);
+    memset(g_pdedup, 0, g_pdedup_sz * sizeof *g_pdedup);
+    g_pdedup_n = 0;
+    for (size_t i = 0; i < old_sz; i++) if (old[i]) pdedup_put(old[i]);
+    free(old);
+}
+
+/* The n masked keys of one partial. Cell contributions are summed, so masking
+   cell i is a subtraction. 0 marks an empty slot and is never a key. */
+static void partial_keys(const uint64_t used[4], PartialKind kind, int orient,
+                         const uint16_t *seq, int n, uint64_t *keys) {
+    uint64_t base = splitmix64(0x5A17D3D0C0FFEE11ULL ^ (uint64_t)kind
+                               ^ ((uint64_t)(orient + 2) << 8));
+    for (int k = 0; k < 4; k++) base = splitmix64(base ^ used[k]);
+    uint64_t part[PUZZLE_SIDE], sum = 0;
+    for (int i = 0; i < n; i++) {
+        part[i] = splitmix64(((uint64_t)i << 16) ^ seq[i] ^ 0x9E3779B97F4A7C15ULL);
+        sum += part[i];
+    }
+    for (int i = 0; i < n; i++) {
+        uint64_t k = splitmix64(base ^ (sum - part[i]) ^ (uint64_t)i);
+        keys[i] = k ? k : 1;
+    }
+}
+
+/* True, and the keys are recorded, iff no earlier partial is a duplicate.
+   Called inside the e555_incomplete critical section. */
+static bool partial_dedup_accept(const uint64_t *keys, int n) {
+    for (int i = 0; i < n; i++) if (pdedup_has(keys[i])) return false;
+    while ((g_pdedup_n + (size_t)n) * 2 > g_pdedup_sz) pdedup_grow();
+    for (int i = 0; i < n; i++) pdedup_put(keys[i]);
     return true;
 }
-static void partial_htable_init(void) {
-    size_t sz = 1u << 16;
-    if (g_partial_htable) free(g_partial_htable);
-    g_partial_htable = xmalloc(sz * sizeof(uint64_t));
-    memset(g_partial_htable, 0, sz * sizeof(uint64_t));
-    g_partial_htable_sz = sz; g_partial_count = 0;
+
+static void partial_dedup_init(void) {
+    free(g_pdedup);
+    g_pdedup_sz = (size_t)1 << 16;
+    g_pdedup = xmalloc(g_pdedup_sz * sizeof *g_pdedup);
+    memset(g_pdedup, 0, g_pdedup_sz * sizeof *g_pdedup);
+    g_pdedup_n = 0;
+    g_partial_count = 0;
+    memset(g_part_count, 0, sizeof g_part_count);
+}
+
+static void partial_config_reset(void) {
+    g_partial_count = 0;
+    memset(g_part_count, 0, sizeof g_part_count);
+}
+
+static PartialKind partial_kind_from_mask(uint16_t colmask) {
+    for (int k = 0; k < PART_N; k++)
+        if (g_part_mask[k] == colmask) return (PartialKind)k;
+    fatal("internal: unknown partial mask 0x%04x", (unsigned)colmask);
+    return PART_AB;
 }
 
 /* Reconstruct the move log of a beam board by walking its ancestry chain
@@ -470,6 +560,32 @@ static uint64_t board_fingerprint(const RowChoice rows[EDGE_LEN], int depth) {
    flushed after every config, which bounds the loss to the config in flight. */
 #define EMIT_FILE_BUF (1u << 20)
 
+static void partial_outputs_flush(void) {
+    for (int k = 0; k < PFILE_N; k++)
+        if (g_partial_fp[k]) fflush(g_partial_fp[k]);
+}
+
+static void partial_outputs_close(void) {
+    for (int k = 0; k < PFILE_N; k++) {
+        if (g_partial_fp[k]) fclose(g_partial_fp[k]);
+        g_partial_fp[k] = NULL;
+    }
+}
+
+static void partial_outputs_open_base(const char *base) {
+    static const char *const suffix[PFILE_N] = { "_partial", "_partial_B" };
+    char path[1152];
+    for (int k = 0; k < PFILE_N; k++) {
+        snprintf(path, sizeof path, "%s%s.csv", base, suffix[k]);
+        g_partial_fp[k] = fopen(path, "a");
+        if (!g_partial_fp[k]) fatal("cannot open %s: %s", path, strerror(errno));
+        setvbuf(g_partial_fp[k], NULL, _IOFBF, EMIT_FILE_BUF);
+        manifest_add(path);
+    }
+    printf("[out] incomplete-top partials -> %s_partial.csv (AB/AC/BC), "
+           "%s_partial_B.csv (append)\n", base, base);
+}
+
 /* Decimal conversion. A board line is 512 of these and almost nothing else, so
    it is worth not going through fprintf's general machinery: measured ~2x on the
    exact emission pattern. */
@@ -491,7 +607,7 @@ static inline bool cell_is_placed(int r, int c, int row, uint16_t colmask) {
 /* Flatten rows[0..row] into per-piece position/rotation vectors and write them
    as the 512 comma-separated fields that follow a line's prefix. colmask says
    which columns of the TOP row carry a piece (ROWMASK_FULL for a completed stop
-   row, ROWMASK_AB/AC/BC for an --incomplete_top partial); every row below it is
+   row, or AB/AC/BC/B for an --incomplete_top partial); every row below it is
    full either way. A mask rather than a last-placed column because the partial
    kinds leave a hole in the MIDDLE of the row, not only at its right end.
    Returns the byte count. */
@@ -533,53 +649,42 @@ static int format_board_tail(const RowChoice rows[EDGE_LEN], int row,
     return (int)(p - out);
 }
 
-/* Emit one --incomplete_top partial: the parent's ancestry plus the two stop-row
-   segments named by colmask (ROWMASK_AB, ROWMASK_AC or ROWMASK_BC); the third
-   segment's five columns are left unplaced (pos 999). Only the mv.ci[] slots
-   under the mask are read -- the missing segment's are never filled in.
-   Called from inside the parallel expansion, so the dedup + write are
-   guarded by an OpenMP critical -- but the ancestry walk, the fingerprint and the
-   512 field conversions are read-only over expansion-stable state and are nearly
-   all of the cost, so they happen BEFORE the lock is taken. A board that then
-   loses the dedup was formatted for nothing, which is cheap: that work is
-   parallel, whereas everything inside the critical stalls every other thread. */
+/* Emit one --incomplete_top partial: the parent's ancestry plus the stop-row
+   segments named by colmask. Reconstruction, keys and formatting are parallel;
+   only the dedup and the write are serialised. */
 static void emit_incomplete(const BeamCtx *ctx, const BeamEntry *parent,
                             const RowChoice *mv, int row, uint16_t colmask) {
-    if (!g_partial_fp) return;
+    PartialKind kind = partial_kind_from_mask(colmask);
+    FILE **fp = &g_partial_fp[partial_file_of(kind)];
+    if (!*fp) return;
+
     RowChoice rows[EDGE_LEN];
     rows[row] = *mv;
     collect_rows(ctx, parent, rows);
 
-    /* Fingerprint over placed cells only: full rows below, plus the masked
-       columns of the partial stop row. The mask joins the hash so two kinds can
-       never collide even if they somehow placed the same pieces. */
-    const uint64_t prime = 1099511628211ULL;
-    uint64_t fp = 14695981039346656037ULL;
-    fp ^= colmask; fp *= prime;
-    for (int r = 0; r <= row; r++) {
-        uint16_t m = (r == row) ? colmask : ROWMASK_FULL;
-        for (int c = 0; c < PUZZLE_SIDE; c++) {
-            if (!((m >> c) & 1u)) continue;
-            uint16_t pid; uint8_t rot; board_cell(rows, r, c, &pid, &rot);
-            fp ^= pid; fp *= prime; fp ^= rot; fp *= prime;
-        }
+    const int orient = ENTRY_HAS_ORIENT(parent) ? (int)ENTRY_ORIENT(parent) : -1;
+    uint16_t seq[PUZZLE_SIDE];
+    int n = 0;
+    for (int c = 1; c < PUZZLE_SIDE; c++) {
+        if (!((colmask >> c) & 1u)) continue;
+        uint8_t rot;
+        board_cell(rows, row, c, &seq[n++], &rot);
     }
-    if (!fp) fp = 1;
+    uint64_t keys[PUZZLE_SIDE];
+    partial_keys(parent->used, kind, orient, seq, n, keys);
 
     char line[EMIT_LINE_MAX];
-    int len = format_board_tail(rows, row, colmask,
-                                ENTRY_HAS_ORIENT(parent) ? (int)ENTRY_ORIENT(parent) : -1,
-                                line);
+    int len = format_board_tail(rows, row, colmask, orient, line);
 
     #pragma omp critical(e555_incomplete)
     {
-        if (g_partial_fp && partial_htable_insert(fp)) {
-            if      (colmask == ROWMASK_AB) g_part_ab++;
-            else if (colmask == ROWMASK_AC) g_part_ac++;
-            else                            g_part_bc++;
+        if (*fp && partial_dedup_accept(keys, n)) {
+            g_part_total[kind]++;
+            g_part_count[kind]++;
+            g_partial_count++;
             uint64_t sol_idx = g_partial_total++;
-            fprintf(g_partial_fp, "%s, %" PRIu64, g_config_id_str, sol_idx);
-            fwrite(line, 1, (size_t)len, g_partial_fp);
+            fprintf(*fp, "%s, %" PRIu64, g_config_id_str, sol_idx);
+            fwrite(line, 1, (size_t)len, *fp);
         }
     }
 }
@@ -709,10 +814,71 @@ static inline double maha_d2n(const BeamEntry *t, int row) {
 #define MAX_ACC_THREADS 256
 #define ACC_STRIDE      8               /* one cache line per thread, no sharing */
 #define MAHA_MIN_SAMPLES 64.0           /* below this a spread is mostly noise */
+
+typedef enum {
+    REJ_A_CELL = 0,
+    REJ_A_DECODE,
+    REJ_B_CELL,
+    REJ_B_DECODE,
+    REJ_C_CELL,
+    REJ_C_DECODE,
+    REJ_LOOKAHEAD,
+    REJ_PARITY,
+    REJ_N
+} RejectKind;
+
+static const char *const g_rej_name[REJ_N] = {
+    "A-cell", "A-conflict", "B-cell", "B-conflict",
+    "C-cell", "C-conflict", "lookahead", "parity"
+};
+static uint64_t g_reject[MAX_ACC_THREADS][EDGE_LEN + 2][REJ_N];
+
+static inline void reject_count(int row, RejectKind kind) {
+    int th = omp_get_thread_num();
+    if (th >= 0 && th < MAX_ACC_THREADS && row >= 0 && row <= EDGE_LEN + 1)
+        g_reject[th][row][kind]++;
+}
 static double g_d2n_acc[MAX_ACC_THREADS][ACC_STRIDE];   /* [0]=sum [1]=sumsq [2]=n */
-static double g_maha_mean[EDGE_LEN + 2];
-static double g_maha_sd[EDGE_LEN + 2];  /* 0 = row never measured */
-static double g_maha_n[EDGE_LEN + 2];   /* samples behind the stored estimate */
+/* Current-configuration estimates drive the next row.  If a row is too thin,
+   scoring falls back to the stable run-pooled estimate instead of whichever
+   earlier configuration happened to run last. */
+static double g_maha_local_mean[EDGE_LEN + 2];
+static double g_maha_local_sd[EDGE_LEN + 2];
+static double g_maha_local_n[EDGE_LEN + 2];
+static double g_maha_pool_sum[EDGE_LEN + 2];
+static double g_maha_pool_sumsq[EDGE_LEN + 2];
+static double g_maha_pool_n[EDGE_LEN + 2];
+
+/* Verbose-only score diagnostics.  These are descriptive candidate-population
+   moments, not independent statistical samples.  They quantify actual weighted
+   contributions, so their SDs show which terms can move a ranking and their
+   correlations show overlap. */
+typedef enum {
+    SD_FANOUT = 0, SD_CLOSURE, SD_MAHA, SD_TABLE_INC, SD_TABLE_ACC, SD_N
+} ScoreDiagKind;
+typedef struct {
+    double n, sum[SD_N], sumsq[SD_N];
+    double cross_table_fan, cross_table_J, cross_J_maha;
+} ScoreDiag;
+static ScoreDiag g_score_diag[MAX_ACC_THREADS][EDGE_LEN + 2];
+
+static inline void score_diag_acc(int row, double fanout, double closure,
+                                  double maha, double table_inc,
+                                  double table_acc) {
+    if (!g_verbose) return;
+    int th = omp_get_thread_num();
+    if (th < 0 || th >= MAX_ACC_THREADS || row < 0 || row > EDGE_LEN + 1) return;
+    ScoreDiag *d = &g_score_diag[th][row];
+    const double v[SD_N] = { fanout, closure, maha, table_inc, table_acc };
+    d->n += 1.0;
+    for (int k = 0; k < SD_N; k++) {
+        d->sum[k] += v[k];
+        d->sumsq[k] += v[k] * v[k];
+    }
+    d->cross_table_fan += table_acc * fanout;
+    d->cross_table_J   += table_acc * closure;
+    d->cross_J_maha    += closure * maha;
+}
 
 static inline void maha_acc(double d2n) {
     int th = omp_get_thread_num();
@@ -725,25 +891,48 @@ static inline void maha_acc(double d2n) {
 /* Reduce the row's accumulators and reset them. Summed in a FIXED thread order,
    so the result does not depend on how the row's work happened to be scheduled;
    it still depends on the thread COUNT, as every other float sum here does. */
+static void maha_reset_config(void) {
+    memset(g_maha_local_mean, 0, sizeof g_maha_local_mean);
+    memset(g_maha_local_sd,   0, sizeof g_maha_local_sd);
+    memset(g_maha_local_n,    0, sizeof g_maha_local_n);
+}
+
 static void maha_close_row(int row) {
     double sum = 0.0, sumsq = 0.0, n = 0.0;
     for (int th = 0; th < MAX_ACC_THREADS; th++) {
         sum += g_d2n_acc[th][0]; sumsq += g_d2n_acc[th][1]; n += g_d2n_acc[th][2];
         g_d2n_acc[th][0] = g_d2n_acc[th][1] = g_d2n_acc[th][2] = 0.0;
     }
-    if (row < 0 || row > EDGE_LEN + 1) return;
-    /* Too small a sample to RE-estimate the spread -- so keep the estimate that
-       is already there rather than erasing it. The table outlives a config on
-       purpose, and zeroing here let one config that died early strip the
-       calibration every later config would have scored against. An old estimate
-       of this row's spread beats no estimate. The sample count travels with it
-       so --verbose can show how much weight each row's figure carries. */
+    if (row < 0 || row > EDGE_LEN + 1 || n <= 0.0) return;
+
+    g_maha_pool_sum[row]   += sum;
+    g_maha_pool_sumsq[row] += sumsq;
+    g_maha_pool_n[row]     += n;
+
     if (n < MAHA_MIN_SAMPLES) return;
     double mean = sum / n;
     double var  = sumsq / n - mean * mean;
-    g_maha_mean[row] = mean;
-    g_maha_sd[row]   = (var > 1e-18) ? sqrt(var) : 0.0;
-    g_maha_n[row]    = n;
+    g_maha_local_mean[row] = mean;
+    g_maha_local_sd[row]   = (var > 1e-18) ? sqrt(var) : 0.0;
+    g_maha_local_n[row]    = n;
+}
+
+static bool maha_calibration(int source_row, double *mean, double *sd) {
+    if (source_row < 0 || source_row > EDGE_LEN + 1) return false;
+    if (g_maha_local_n[source_row] >= MAHA_MIN_SAMPLES
+        && g_maha_local_sd[source_row] > 0.0) {
+        *mean = g_maha_local_mean[source_row];
+        *sd   = g_maha_local_sd[source_row];
+        return true;
+    }
+    double n = g_maha_pool_n[source_row];
+    if (n < MAHA_MIN_SAMPLES) return false;
+    double m = g_maha_pool_sum[source_row] / n;
+    double v = g_maha_pool_sumsq[source_row] / n - m * m;
+    if (!(v > 1e-18)) return false;
+    *mean = m;
+    *sd = sqrt(v);
+    return true;
 }
 
 /* -- The closure objective: exact pairing combinatorics (--lambda_J) --------- */
@@ -827,16 +1016,22 @@ static inline double closure_raw(const BeamEntry *t) {
  * configs, and cost 32% against closure and 13% against the hybrid. It rewards
  * holding abundant frontier colours, while closure often wants to spend a
  * colour whose demand is already covered -- they pull against each other.) */
-static inline double color_term(const BeamEntry *t, int row) {
-    double s = g_lambda_J * closure_raw(t);
+static inline double color_term_parts(const BeamEntry *t, int row,
+                                      double *closure_out, double *maha_out) {
+    double closure = g_lambda_J * closure_raw(t);
+    double maha = 0.0;
     if (g_lambda_maha != 0.0) {
         double d2n = maha_d2n(t, row);
         maha_acc(d2n);
-        double sd = (row >= 2) ? g_maha_sd[row - 1] : 0.0;
-        if (sd > 0.0) s += g_lambda_maha * (d2n - g_maha_mean[row - 1]) / sd;
+        double mean = 0.0, sd = 0.0;
+        if (row >= 2 && maha_calibration(row - 1, &mean, &sd))
+            maha = g_lambda_maha * (d2n - mean) / sd;
     }
-    return s;
+    if (closure_out) *closure_out = closure;
+    if (maha_out) *maha_out = maha;
+    return closure + maha;
 }
+
 
 /* -- Scoring (one-row lookahead + heuristic terms) --------------------------- */
 
@@ -981,54 +1176,46 @@ static void clue_dump_schedule(void) {
 /* ===========================================================================
  * Data-driven frequency table  (this fork only)
  * ===========================================================================
- * A piece-by-cell distribution, measured in a LEARNING phase and then used as
- * the beam's ranking objective in a SEARCH phase.
+ * Piece-by-cell and piece-by-5-5-5-segment distributions, measured in a
+ * LEARNING phase and then used as the beam's ranking objective in a SEARCH
+ * phase.
  *
- * WHY THIS EXISTS. The stock objective is local: a colour ledger plus a one-row
- * fan-out lookahead. It has no opinion about WHERE a piece belongs, so rows 1..10
- * are committed on colour grounds alone and the pieces left for the top rows are
- * the wrong pieces. With the clues on and a Stage A rotations row fixing the four
- * corners the puzzle is anchored -- position is no longer free up to symmetry --
- * so "piece p tends to sit at cell x" is a real geometric statement that can be
- * measured.
+ * The stock objective is local: a colour ledger plus a one-row fan-out
+ * lookahead, with no opinion about WHERE a piece belongs. With the clues pinned
+ * and a rotations row fixing the corners the puzzle is anchored, so "piece p
+ * tends to sit at cell x" is a geometric statement that can be measured.
  *
- * THE FOUR PASSES. A bottom-up beam barely reaches row 10, so it learns almost
- * nothing about rows 11..14. Pass j turns the rotations row j quarter-turns
- * clockwise and pins the clue frame to match, which is the SAME anchored puzzle
- * relabelled -- so growing from each of the four sides in turn and folding every
- * board back to the canonical frame fills the table from all four directions. In
- * canonical coordinates at --stop_row 10, pass 0 covers rows 1..10, pass 2 rows
- * 5..14, pass 1 cols 1..10 and pass 3 cols 5..14: every interior cell covered,
- * 4x in the centre and 2x in the corner regions. The canonical TOP rows are
- * supplied by pass 2's rows 1..4 -- its deepest and most heavily sampled.
+ * FOUR PASSES. Pass j turns the rotations row j quarter-turns clockwise and pins
+ * the clue frame to match -- the same anchored puzzle, relabelled -- and every
+ * board is folded back to the canonical frame. At --stop_row S, pass 0 covers
+ * canonical rows 1..S, pass 2 rows 15-S..14, passes 1 and 3 the columns, so the
+ * top rows are measured by pass 2's first rows.
  * =========================================================================== */
 
 #define FREQ_NPASS           4
-#define LEARN_CAP_PER_CONFIG 500   /* boards counted per configuration */
-#define FREQ_BETA            1.0   /* row-marginal smoothing; alpha is the knob */
+#define LEARN_CAP_PER_CONFIG 10000 /* boards counted per configuration */
+#define FREQ_KT_HALF         0.5   /* Krichevsky-Trofimov: 1/2 count/category */
 #define SINKHORN_ITERS       400
 #define SINKHORN_TOL         1e-13
 #define FREQ_CENTRE_CELL     119   /* (7,7): where canonicalising must land 138 */
-#define FREQ_TABLE_MAGIC     "E555 datadriven counts v2"
-#define FREQ_TABLE_VERSION   2   /* v1 pre-dates the merge and ESS fixes */
+#define FREQ_TABLE_MAGIC     "E555 datadriven counts v4"
+#define FREQ_TABLE_VERSION   4
 
+/* --freq_model: the beam's spatial resolution. `segment` pools counts over the
+   generator's A/B/C bins, `cell` keeps the exact piece-by-cell matrix. Both are
+   KT-smoothed, Sinkhorn-balanced and conditioned on the rows still unfilled, so
+   only the resolution differs. Border ranking always uses exact cells: choosing
+   a bottom row or left column is an ordering problem. */
+typedef enum { FREQ_MODEL_SEGMENT = 0, FREQ_MODEL_CELL = 1 } FreqModel;
+static FreqModel g_freq_model = FREQ_MODEL_SEGMENT;
 static const char *g_learn_path = NULL;   /* --learn PATH */
 static const char *g_table_path = NULL;   /* --table PATH */
-static double      g_freq_alpha = 20.0;   /* --freq_alpha */
 static bool        g_learning   = false;  /* accumulating, not emitting */
 static bool        g_freq_on    = false;  /* a table is loaded and steering */
-/* The border block is keyed by which SIDE each edge piece sits on, and a
-   rotations row is what decides that. Another row deals the same 56 edges to
-   different sides, so its border weights are not merely stale, they are wrong.
-   They are dropped rather than applied, and the interior table -- which is about
-   the puzzle, not the border -- keeps steering. */
-static bool        g_freq_border_ok = true;
+static bool        g_freq_border_ok = true;  /* border block in use */
 
-/* --wall_time is the budget for the WHOLE run, so in learning mode it is split
-   evenly across the four passes. Spending it all on pass 0 would leave passes
-   1..3 empty, and those are the ones that cover the canonical top rows -- a
-   time-boxed learn would then be worse than useless, because it would look like
-   a table while carrying none of the information it exists to carry. */
+/* In learning, --wall_time is split evenly across the four passes, so a
+   time-boxed run still measures the top rows (passes 1..3). */
 static double      g_pass_deadline = 0.0;    /* absolute; 0 = no limit */
 
 static inline bool pass_time_spent(void)
@@ -1036,32 +1223,32 @@ static inline bool pass_time_spent(void)
     return g_pass_deadline > 0.0 && omp_get_wtime() >= g_pass_deadline;
 }
 static bool        g_freq_debug = false;  /* E555_FREQ_DEBUG=1 */
-/* The guided score KEEPS the library's own measure and adds position to it,
-   rather than replacing it. Position says where a piece belongs; the fan-out
-   lookahead says whether ANY row fits above the one being committed. Those are
-   different questions, and measurement settled it: replacing the lookahead
-   reaches the same depth but emits less than half the boards getting there
-   (496 against 1117 at --stop_row 10), because a positionally handsome row that
-   nothing can sit on top of is still a dead end. Both terms are in nats, so the
-   combination is a sum with no weight to tune -- a weight was swept over
-   0.1..1.0 and changed nothing.
+/* Guided score = stock row-local score (fan-out lookahead + colour terms) +
+   the learned statistic accumulated over every committed row. The two answer
+   different questions: where a piece belongs, and whether any row fits above.
+   BeamEntry.score carries ONLY the learned accumulator; the stock terms stay
+   row-local exactly as in the stock beamer.
 
-   E555_FREQ_PURE=1 restores the position-only score. It exists because the
-   E555_FREQ_DEBUG whole-board assertion is only meaningful there: with the
-   library's per-row terms mixed in, the running total is no longer a sum over
-   placed cells.
-
-   E555_FREQ_NOBORDER=1 drops the border block and leaves the bottom row and
-   left column to the library's ranking, so the beam score can be measured on
-   its own. */
+   E555_FREQ_PURE=1 ranks by the learned statistic alone; E555_FREQ_DEBUG=1 then
+   asserts that the accumulator equals a from-scratch sum over the placed cells.
+   E555_FREQ_NOBORDER=1 drops the border block, leaving the bottom row and left
+   column to the library's ranking. */
 static bool        g_freq_pure  = false;
 
 #define FREQ_TSZ ((size_t)NUM_PIECES * NUM_PIECES)   /* [piece*256 + cell] */
+#define FREQ_RSZ ((size_t)NUM_PIECES * PUZZLE_SIDE)  /* [piece*16 + row] */
+#define FREQ_SEG_N (PUZZLE_SIDE * NUM_SEG)            /* [row*3 + A/B/C] */
+#define FREQ_SSZ ((size_t)NUM_PIECES * FREQ_SEG_N)   /* [piece*48 + segment] */
 
-static float  *g_fw = NULL;          /* processed log weights, nats */
-static double *g_pcnt[FREQ_NPASS];   /* per-pass weighted counts */
-static double *g_pwcell[FREQ_NPASS]; /* per-pass weight covering each cell */
-static double *g_pwsq[FREQ_NPASS];   /* per-pass sum of squared weight (ESS) */
+static float  *g_fw = NULL;          /* active beam weights: segment or exact cell */
+static float  *g_fw_segment = NULL;  /* future-conditioned 5-5-5 preservation */
+static float  *g_fw_cell = NULL;     /* future-conditioned exact-cell preservation */
+static float  *g_fw_location = NULL; /* unconditional exact location for border rank */
+static double *g_pcnt[FREQ_NPASS];    /* per-pass weighted cell counts */
+static double *g_pwcell[FREQ_NPASS];  /* per-pass weight covering each cell */
+static double *g_pwsq[FREQ_NPASS];    /* per-pass sum of squared weight (ESS) */
+static double *g_psegcnt[FREQ_NPASS]; /* per-pass inner piece-by-segment counts */
+static double *g_pwseg[FREQ_NPASS];   /* per-pass total cell weight per segment */
 static size_t  g_pconfigs[FREQ_NPASS];   /* configurations that contributed */
 static size_t  g_ppool[FREQ_NPASS];      /* bottoms the pass had to draw from */
 static size_t  g_preps[FREQ_NPASS];      /* times it cycled that pool */
@@ -1072,11 +1259,11 @@ static int     g_orient_base = 0;    /* clue orientation of the INPUT rotations 
 static int     g_centre_cell = FREQ_CENTRE_CELL;  /* where it puts the centre clue */
 static uint8_t g_spin0[NUM_PIECES];  /* the canonical (unturned) rotations row */
 
-/* Leave-one-configuration-out lift, accumulated online: while a configuration is
-   being counted the merged table holds only configurations that FINISHED before
-   it, so scoring its boards against that table never uses their own data. The
-   first quarter of a pass scores against a thin table, so the reported figure is
-   taken over the rest. */
+/* Prequential lift, accumulated online. The current configuration is
+   scored before its counts are folded in, using the same 5-5-5 resolution as the
+   beam (exact cells for border pieces). The processed search table also applies
+   Sinkhorn and future conditioning; this cheaper statistic answers the basic
+   question "does the segment table predict unseen configurations at all?" */
 static double g_lift_sum = 0.0;
 static double g_lift_cells = 0.0;
 static size_t g_lift_boards = 0;
@@ -1134,7 +1321,20 @@ static void rot_row_turn(uint8_t spins[NUM_PIECES], int n)
 static bool g_piece_free[NUM_PIECES];
 static bool g_cell_free[NUM_PIECES];
 static int  g_n_free_inner_pieces = 0;
+static int  g_seg_cap[FREQ_SEG_N];              /* free inner slots per A/B/C bin */
 static int  g_edge_side_of_piece[NUM_PIECES];   /* 0=top 1=right 2=bottom 3=left */
+
+/* Segment numbering follows the live row generator exactly. Segment C has four
+   free INNER cells (11..14); its fifth database position is the right-edge piece
+   at column 15 and is modelled in the side-specific edge block. */
+static inline int freq_segment_of_cell(int cell)
+{
+    int r = cell / PUZZLE_SIDE, c = cell % PUZZLE_SIDE;
+    if (r <= 0 || r >= PUZZLE_SIDE - 1 || c <= 0 || c >= PUZZLE_SIDE - 1)
+        return -1;
+    int s = (c <= CHAIN_LEN) ? 0 : (c <= 2 * CHAIN_LEN) ? 1 : 2;
+    return r * NUM_SEG + s;
+}
 
 static void freq_mark_free(void)
 {
@@ -1150,6 +1350,11 @@ static void freq_mark_free(void)
     g_n_free_inner_pieces = 0;
     for (int p = 0; p < NUM_PIECES; p++)
         if (g_piece_free[p] && piece_kind(p) == 0) g_n_free_inner_pieces++;
+    memset(g_seg_cap, 0, sizeof g_seg_cap);
+    for (int x = 0; x < NUM_PIECES; x++) {
+        int z = g_cell_free[x] ? freq_segment_of_cell(x) : -1;
+        if (z >= 0) g_seg_cap[z]++;
+    }
 
     /* An edge piece's side in the CANONICAL frame, read off the canonical
        rotations row. Turning the row moves every edge to the next side, so in
@@ -1177,12 +1382,16 @@ static int edge_side_of_cell(int cell)
 static void freq_alloc(void)
 {
     for (int j = 0; j < FREQ_NPASS; j++) {
-        g_pcnt[j]   = xmalloc(FREQ_TSZ * sizeof(double));
-        g_pwcell[j] = xmalloc(NUM_PIECES * sizeof(double));
-        g_pwsq[j]   = xmalloc(NUM_PIECES * sizeof(double));
-        memset(g_pcnt[j],   0, FREQ_TSZ * sizeof(double));
-        memset(g_pwcell[j], 0, NUM_PIECES * sizeof(double));
-        memset(g_pwsq[j],   0, NUM_PIECES * sizeof(double));
+        g_pcnt[j]    = xmalloc(FREQ_TSZ * sizeof(double));
+        g_pwcell[j]  = xmalloc(NUM_PIECES * sizeof(double));
+        g_pwsq[j]    = xmalloc(NUM_PIECES * sizeof(double));
+        g_psegcnt[j] = xmalloc(FREQ_SSZ * sizeof(double));
+        g_pwseg[j]   = xmalloc(FREQ_SEG_N * sizeof(double));
+        memset(g_pcnt[j],    0, FREQ_TSZ * sizeof(double));
+        memset(g_pwcell[j],  0, NUM_PIECES * sizeof(double));
+        memset(g_pwsq[j],    0, NUM_PIECES * sizeof(double));
+        memset(g_psegcnt[j], 0, FREQ_SSZ * sizeof(double));
+        memset(g_pwseg[j],   0, FREQ_SEG_N * sizeof(double));
     }
     g_cfgcnt = xmalloc(FREQ_TSZ * sizeof(double));
     memset(g_cfgcnt, 0, FREQ_TSZ * sizeof(double));
@@ -1207,11 +1416,10 @@ static void freq_add_board(const RowChoice rows[EDGE_LEN], int row, int turn)
     g_cfg_boards++;
 }
 
-/* The lift this board scores against the table as it stands -- which holds only
-   configurations that closed before this one, so it is leave-one-configuration-
-   out. Nats above chance under the simple shrunk conditional; the full estimator
-   (backoff + Sinkhorn) is what the search uses, but this answers the only
-   question learning has to answer: is there signal at all. */
+/* Score one board against configurations closed before its own. Inner pieces use
+   the A/B/C segment containing the cell; border pieces retain exact-cell scoring.
+   KT adds one half-count to every eligible piece, the classical parameter-free
+   finite-log estimator. */
 static void freq_score_board(const RowChoice rows[EDGE_LEN], int row, int turn)
 {
     double sum = 0.0; int n = 0;
@@ -1224,13 +1432,22 @@ static void freq_score_board(const RowChoice rows[EDGE_LEN], int row, int turn)
             int kind = cell_kind(x);
             double K = (kind == 0) ? (double)g_n_free_inner_pieces : (double)EDGE_LEN;
             double nn = 0.0, w = 0.0;
-            for (int j = 0; j < FREQ_NPASS; j++) {
-                nn += g_pcnt[j][(size_t)pid * NUM_PIECES + x];
-                w  += g_pwcell[j][x];
+            if (kind == 0) {
+                int z = freq_segment_of_cell(x), cap = z >= 0 ? g_seg_cap[z] : 0;
+                if (cap <= 0) continue;
+                for (int j = 0; j < FREQ_NPASS; j++) {
+                    nn += g_psegcnt[j][(size_t)pid * FREQ_SEG_N + z];
+                    w  += g_pwseg[j][z];
+                }
+                nn /= (double)cap; w /= (double)cap;  /* evidence per physical slot */
+            } else {
+                for (int j = 0; j < FREQ_NPASS; j++) {
+                    nn += g_pcnt[j][(size_t)pid * NUM_PIECES + x];
+                    w  += g_pwcell[j][x];
+                }
             }
-            if (w <= 0.0) continue;
-            double p = (nn + g_freq_alpha / K) / (w + g_freq_alpha);
-            sum += log(p * K);
+            double prob = (nn + FREQ_KT_HALF) / (w + FREQ_KT_HALF * K);
+            sum += log(prob * K);
             n++;
         }
     if (!n) return;
@@ -1244,46 +1461,76 @@ static void freq_score_board(const RowChoice rows[EDGE_LEN], int row, int turn)
 static void freq_close_config(void)
 {
     if (!g_cfg_boards) return;
-    const double w = 1.0 / (double)g_cfg_boards;
+    const double board_w = 1.0 / (double)g_cfg_boards;
     double *pc = g_pcnt[g_pass], *pw = g_pwcell[g_pass], *pq = g_pwsq[g_pass];
+    double *ps = g_psegcnt[g_pass], *pws = g_pwseg[g_pass];
     for (int x = 0; x < NUM_PIECES; x++) {
         double tot = 0.0;
+        int z = (cell_kind(x) == 0) ? freq_segment_of_cell(x) : -1;
         for (int p = 0; p < NUM_PIECES; p++) {
             size_t i = (size_t)p * NUM_PIECES + x;
             if (g_cfgcnt[i] == 0.0) continue;
-            pc[i] += g_cfgcnt[i] * w;
-            tot   += g_cfgcnt[i] * w;
+            double add = g_cfgcnt[i] * board_w;
+            pc[i] += add;
+            if (z >= 0) ps[(size_t)p * FREQ_SEG_N + z] += add;
+            tot += add;
             g_cfgcnt[i] = 0.0;
         }
         /* tot is 1 for a cell every board of the configuration placed, so the
-           weights being squared here are CONFIGURATION weights, not board
-           weights. That is the unit that votes: a configuration's 500 boards are
-           near-copies of each other and counting them as 500 independent
-           samples would report an effective sample size in the tens of
-           thousands for evidence that is really a few dozen borders. */
-        if (tot > 0.0) { pw[x] += tot; pq[x] += tot * tot; }
+           squared weights and the segment totals remain in CONFIGURATION units. */
+        if (tot > 0.0) {
+            pw[x] += tot; pq[x] += tot * tot;
+            if (z >= 0) pws[z] += tot;
+        }
     }
     g_pconfigs[g_pass]++;
     g_cfg_boards = 0;
 }
 
-/* Learning's replacement for emit_stop_row: the same reconstruction and the same
-   dedup, but the boards are counted and dropped instead of formatted and written.
-   format_board_tail -- the 512-field conversion that is the bulk of emission --
-   is never called, so learning is cheaper than emitting.
+/* Learning's replacement for emit_stop_row: boards are reconstructed, counted
+   and dropped, never formatted or written.
 
-   Serial: emission is entered from serial code, and at LEARN_CAP_PER_CONFIG
-   boards there is nothing here worth a parallel region. */
-static void learn_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, int row)
+   A configuration's vote is estimated from at most LEARN_CAP_PER_CONFIG of its
+   distinct stop-row states, drawn uniformly without replacement: each state gets
+   the key splitmix64(frontier signature ^ cfg_hash) and the smallest keys are
+   counted. The draw follows board content, not pool order or score order; the
+   latter carries no information when every stop-row score ties (e.g. --lambda_J 0
+   --lambda_Mahalanobis 0 and no table). Serial: entered from serial code. */
+typedef struct { uint64_t key; uint32_t idx; } LearnPick;
+static LearnPick *g_learn_pick = NULL;
+static size_t     g_learn_pick_cap = 0;
+
+static int cmp_learn_pick(const void *a, const void *b)
+{
+    const LearnPick *x = a, *y = b;
+    if (x->key != y->key) return x->key < y->key ? -1 : 1;
+    return (x->idx > y->idx) - (x->idx < y->idx);
+}
+
+static void learn_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
+                           int row, uint64_t cfg_hash)
 {
     const int turn = (FREQ_NPASS - g_pass) & 3;   /* back to the canonical frame */
-    uint32_t cap = kept < LEARN_CAP_PER_CONFIG ? kept : LEARN_CAP_PER_CONFIG;
-    for (uint32_t k = 0; k < cap && !g_stop; k++) {
-        const PoolEntry *pe = &ctx->pool[ctx->keep[k]];
+    if (g_learn_pick_cap < kept) {
+        g_learn_pick = xrealloc(g_learn_pick, (size_t)kept * sizeof *g_learn_pick);
+        g_learn_pick_cap = kept;
+    }
+    for (uint32_t k = 0; k < kept; k++) {
+        uint32_t i = ctx->keep[k];
+        g_learn_pick[k].key = splitmix64(ctx->pool[i].sig ^ cfg_hash);
+        g_learn_pick[k].idx = i;
+    }
+    if (kept > LEARN_CAP_PER_CONFIG)
+        qsort(g_learn_pick, kept, sizeof *g_learn_pick, cmp_learn_pick);
+
+    uint32_t counted = 0;
+    for (uint32_t k = 0; k < kept && counted < LEARN_CAP_PER_CONFIG && !g_stop; k++) {
+        const PoolEntry *pe = &ctx->pool[g_learn_pick[k].idx];
         RowChoice rows[EDGE_LEN];
         rows[row] = pe->mv;
         collect_rows(ctx, &beam[pe->parent], rows);
         if (!htable_insert(board_fingerprint(rows, row))) continue;
+        counted++;
 
         /* The one assertion that proves the whole rotation chain: the centre clue
            is pinned to this pass's frame, so folding the board back by (4-j)
@@ -1307,6 +1554,35 @@ static void learn_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, i
         freq_score_board(rows, row, turn);
         freq_add_board(rows, row, turn);
         g_stats.emitted_total++;
+    }
+}
+
+/* Piece-by-row and piece-by-segment sums of the raw counts. Written to the
+   table for grep-level auditing and re-derived on load as a consistency check. */
+static void freq_make_rowcnt(const double *cnt, double *rowcnt)
+{
+    memset(rowcnt, 0, FREQ_RSZ * sizeof(double));
+    for (int p = 0; p < NUM_PIECES; p++) {
+        if (!g_piece_free[p]) continue;
+        for (int x = 0; x < NUM_PIECES; x++) {
+            if (!g_cell_free[x]) continue;
+            double v = cnt[(size_t)p * NUM_PIECES + x];
+            if (v != 0.0) rowcnt[(size_t)p * PUZZLE_SIDE + x / PUZZLE_SIDE] += v;
+        }
+    }
+}
+
+static void freq_make_segcnt(const double *cnt, double *segcnt)
+{
+    memset(segcnt, 0, FREQ_SSZ * sizeof(double));
+    for (int p = 0; p < NUM_PIECES; p++) {
+        if (!g_piece_free[p] || piece_kind(p) != 0) continue;
+        for (int x = 0; x < NUM_PIECES; x++) {
+            int z = g_cell_free[x] ? freq_segment_of_cell(x) : -1;
+            if (z < 0) continue;
+            double v = cnt[(size_t)p * NUM_PIECES + x];
+            if (v != 0.0) segcnt[(size_t)p * FREQ_SEG_N + z] += v;
+        }
     }
 }
 
@@ -1364,27 +1640,10 @@ static double block_balance_error(const double *m, int n)
     return worst;
 }
 
-/* Merge the four passes into one table.
- *
- * Each pass is scaled to the same total weight (Cbar/C_j). Without it a
- * productive pass dominates the band it shares with the others AND the bands
- * only it covers, which would bend the table spatially rather than merely
- * favour one pass. */
-/* Merge the four passes: one configuration, one vote, and no per-pass rescaling.
- *
- * An earlier version scaled each pass to the same total weight, on the theory
- * that a productive pass should not dominate. Measured, that is the wrong
- * correction and it fails in the dangerous direction: passes come out as uneven
- * as 48/1/10/78, so equalising multiplies the single-configuration pass by
- * thirty-odd and the shrinkage denominator W then claims thirty configurations
- * of evidence where one exists. W is what --freq_alpha is denominated in, so
- * that is not a cosmetic distortion -- it silently switches off the backoff
- * exactly where the backoff is all there is.
- *
- * Unequal coverage needs no correction here. It is real information: a quadrant two
- * thin passes cover really is less well known, shrinkage should be stronger
- * there, and Sinkhorn already removes coverage bias from the final matrix. The
- * cure for an uneven pass count is more --top_bottoms, which is reported. */
+/* Merge the four passes: one configuration, one vote, no per-pass rescaling.
+ * Unequal coverage is real information -- a region two thin passes cover is
+ * less well known -- and KT smoothing plus Sinkhorn handle finite counts and
+ * coverage bias. An uneven pass count is cured by more --top_bottoms. */
 static void freq_merge(double *cnt, double *wcell, double *wsq)
 {
     int live = 0;
@@ -1404,87 +1663,179 @@ static void freq_merge(double *cnt, double *wcell, double *wsq)
     }
 }
 
-/* Turn merged counts into the additive log weights the search weighs a board by.
+/* Turn merged counts into the statistics the search needs.
  *
- *   1. backoff   Prow(p | row) from the piece-by-row marginals. At 191x14 this is
- *                ~16x better sampled than the cell table, and it is the level the
- *                whole idea rests on: low pieces low, top pieces top.
- *   2. shrinkage Phat(p|x) = (N + alpha*Prow) / (Wcell + alpha). alpha, in
- *                pseudo-configurations, is the ONE knob: large alpha is the
- *                robust row prior, small alpha the sharp cell table. It also
- *                keeps every log finite -- a zero count would otherwise be a hard
- *                rejection, fatal for a table this thin -- and makes a thin cell
- *                shrink to the backoff, so trust follows the data by itself.
- *   3. balance   Sinkhorn, see above.
- *   4. weights   log(K * Q) nats: zero at chance, additive, and in the same units
- *                as the fan-out terms they replace.
+ * BEAM: SEGMENT OR EXACT-CELL PRESERVATION
+ *   Segment mode collapses inner counts to the generator's A/B/C bins. This SUMS raw
+ *   occurrences before any logarithm is taken: a piece concentrated in one
+ *   clue-adjacent cell contributes its full evidence to the segment rather than
+ *   being cancelled by neutral cells elsewhere in it. Each bin is then converted
+ *   back to evidence per physical slot, KT-smoothed, expanded over its free cells
+ *   and Sinkhorn-balanced. Let q[p,x] be that balanced per-slot mass.
+ *   When row r is being committed, only rows r..14 are still available, so
  *
- * Border pieces get the same treatment per side. A rotations row fixes which side
- * each edge belongs to, so the 56x56 block is really four 14x14 assignment
- * problems -- the orderings the Euler-trail enumeration permutes -- and a uniform
- * backoff is the only sensible one within a side. */
-static double freq_build(const double *cnt, const double *wcell)
+ *       score(p,x at row r) = log( q[p,x] * C_r / R_p(r) )
+ *
+ *   where C_r is the number of free slots in rows r..14 and R_p(r) is piece p's
+ *   total learned mass over those slots. This is the log lift over a uniform
+ *   remaining slot. In log space R_p is a log-sum-exp over all future segments:
+ *   one sharp top/corner preference dominates naturally, but no single noisy
+ *   cell becomes a hard max. Spending a top-loving piece low is penalised now;
+ *   a piece whose useful region is current is rewarded now.
+ *
+ *   Cell mode applies the identical remaining-opportunity normalization to the
+ *   Sinkhorn-balanced piece-by-cell matrix. It preserves sharp clue-adjacent
+ *   structure while remaining directly comparable to segment mode.
+ *
+ * BORDER: EXACT LOCATION
+ *   Bottom and left orderings are ranked by a KT-smoothed, Sinkhorn-
+ *   balanced piece-by-cell table. Exact position is the information that
+ *   distinguishes permutations near the lower clues.
+ *
+ * Edge pieces on the vertical sides use the same future-conditioned form in the
+ * beam, because their row is sequential too. Horizontal edge weights are zero
+ * in the beam (the bottom is already fixed; the top is Stage C), while their
+ * exact location weights remain live for border ranking. */
+static double freq_build(const double *cnt, const double *wcell, const double *segcnt)
 {
-    if (!g_fw) {                  /* the search path allocates it here */
-        g_fw = xmalloc(FREQ_TSZ * sizeof *g_fw);
-        memset(g_fw, 0, FREQ_TSZ * sizeof *g_fw);
-    }
+    if (!g_fw_segment)  g_fw_segment  = xmalloc(FREQ_TSZ * sizeof *g_fw_segment);
+    if (!g_fw_cell)     g_fw_cell     = xmalloc(FREQ_TSZ * sizeof *g_fw_cell);
+    if (!g_fw_location) g_fw_location = xmalloc(FREQ_TSZ * sizeof *g_fw_location);
+    memset(g_fw_segment,  0, FREQ_TSZ * sizeof *g_fw_segment);
+    memset(g_fw_cell,     0, FREQ_TSZ * sizeof *g_fw_cell);
+    memset(g_fw_location, 0, FREQ_TSZ * sizeof *g_fw_location);
+
     int pl[NUM_PIECES], cl[NUM_PIECES], np = 0, nc = 0;
-    for (int p = 0; p < NUM_PIECES; p++) if (g_piece_free[p] && piece_kind(p) == 0) pl[np++] = p;
-    for (int x = 0; x < NUM_PIECES; x++) if (g_cell_free[x] && cell_kind(x) == 0) cl[nc++] = x;
+    for (int p = 0; p < NUM_PIECES; p++)
+        if (g_piece_free[p] && piece_kind(p) == 0) pl[np++] = p;
+    for (int x = 0; x < NUM_PIECES; x++)
+        if (g_cell_free[x] && cell_kind(x) == 0) cl[nc++] = x;
     if (np != nc) fatal("interior block is %d pieces x %d cells -- not square", np, nc);
 
-    double *rowm = xmalloc((size_t)np * PUZZLE_SIDE * sizeof(double));
-    double *rowt = xmalloc((size_t)PUZZLE_SIDE * sizeof(double));
-    memset(rowm, 0, (size_t)np * PUZZLE_SIDE * sizeof(double));
-    memset(rowt, 0, (size_t)PUZZLE_SIDE * sizeof(double));
+    double seg_total[FREQ_SEG_N];
+    memset(seg_total, 0, sizeof seg_total);
+    for (int i = 0; i < np; i++)
+        for (int z = 0; z < FREQ_SEG_N; z++)
+            seg_total[z] += segcnt[(size_t)pl[i] * FREQ_SEG_N + z];
+
+    double *mloc = xmalloc((size_t)np * np * sizeof(double));
+    double *mseg = xmalloc((size_t)np * np * sizeof(double));
     for (int i = 0; i < np; i++)
         for (int k = 0; k < nc; k++) {
-            double v = cnt[(size_t)pl[i] * NUM_PIECES + cl[k]];
-            if (v == 0.0) continue;
-            int r = cl[k] / PUZZLE_SIDE;
-            rowm[(size_t)i * PUZZLE_SIDE + r] += v;
-            rowt[r] += v;
+            int x = cl[k], z = freq_segment_of_cell(x), cap = z >= 0 ? g_seg_cap[z] : 0;
+            if (cap <= 0) fatal("free interior cell %d has no 5-5-5 segment", x);
+            mloc[(size_t)i * np + k] =
+                (cnt[(size_t)pl[i] * NUM_PIECES + x] + FREQ_KT_HALF)
+                / (wcell[x] + FREQ_KT_HALF * np);
+            double mean_n = segcnt[(size_t)pl[i] * FREQ_SEG_N + z] / (double)cap;
+            double mean_w = seg_total[z] / (double)cap;
+            mseg[(size_t)i * np + k] =
+                (mean_n + FREQ_KT_HALF) / (mean_w + FREQ_KT_HALF * np);
         }
+    sinkhorn(mloc, NULL, np);
+    sinkhorn(mseg, NULL, np);
+    double err = block_balance_error(mloc, np);
+    double e = block_balance_error(mseg, np); if (e > err) err = e;
 
-    double *m = xmalloc((size_t)np * np * sizeof(double));
+    int row_slots[PUZZLE_SIDE] = {0}, rem_slots[PUZZLE_SIDE] = {0};
+    for (int k = 0; k < nc; k++) row_slots[cl[k] / PUZZLE_SIDE]++;
+    for (int r = PUZZLE_SIDE - 2; r >= 1; r--)
+        rem_slots[r] = rem_slots[r + 1] + row_slots[r];
+
+    double *rem_seg = xmalloc((size_t)np * PUZZLE_SIDE * sizeof(double));
+    double *rem_loc = xmalloc((size_t)np * PUZZLE_SIDE * sizeof(double));
+    memset(rem_seg, 0, (size_t)np * PUZZLE_SIDE * sizeof(double));
+    memset(rem_loc, 0, (size_t)np * PUZZLE_SIDE * sizeof(double));
+    for (int i = 0; i < np; i++) {
+        double acc_seg = 0.0, acc_loc = 0.0;
+        for (int r = PUZZLE_SIDE - 2; r >= 1; r--) {
+            for (int k = 0; k < nc; k++) if (cl[k] / PUZZLE_SIDE == r) {
+                acc_seg += mseg[(size_t)i * np + k];
+                acc_loc += mloc[(size_t)i * np + k];
+            }
+            rem_seg[(size_t)i * PUZZLE_SIDE + r] = acc_seg;
+            rem_loc[(size_t)i * PUZZLE_SIDE + r] = acc_loc;
+        }
+    }
+
     for (int i = 0; i < np; i++)
         for (int k = 0; k < nc; k++) {
-            int r = cl[k] / PUZZLE_SIDE;
-            double prow = (rowm[(size_t)i * PUZZLE_SIDE + r] + FREQ_BETA / np)
-                        / (rowt[r] + FREQ_BETA);
-            m[(size_t)i * np + k] = (cnt[(size_t)pl[i] * NUM_PIECES + cl[k]]
-                                     + g_freq_alpha * prow)
-                                  / (wcell[cl[k]] + g_freq_alpha);
+            int x = cl[k], r = x / PUZZLE_SIDE;
+            double rs = rem_seg[(size_t)i * PUZZLE_SIDE + r];
+            double rl = rem_loc[(size_t)i * PUZZLE_SIDE + r];
+            if (!(rs > 0.0) || !(rl > 0.0) || rem_slots[r] <= 0)
+                fatal("frequency model has no remaining mass for piece %d row %d", pl[i], r);
+            size_t fi = (size_t)pl[i] * NUM_PIECES + x;
+            g_fw_location[fi] = (float)log((double)np * mloc[(size_t)i * np + k]);
+            g_fw_segment[fi] = (float)log(mseg[(size_t)i * np + k]
+                                           * (double)rem_slots[r] / rs);
+            g_fw_cell[fi] = (float)log(mloc[(size_t)i * np + k]
+                                        * (double)rem_slots[r] / rl);
         }
-    sinkhorn(m, NULL, np);
-    double err = block_balance_error(m, np);
-    for (int i = 0; i < np; i++)
-        for (int k = 0; k < nc; k++)
-            g_fw[(size_t)pl[i] * NUM_PIECES + cl[k]] = (float)log((double)np * m[(size_t)i * np + k]);
-    free(rowm); free(rowt); free(m);
+    free(mloc); free(mseg); free(rem_seg); free(rem_loc);
 
-    for (int s = 0; s < 4; s++) {                       /* the four border sides */
+    /* Edge pieces have no A/B/C pooling.  On vertical sides both beam models use
+       the same future-conditioned exact-location distribution; on horizontal
+       sides the active beam weight is zero (bottom already fixed, top is Stage C).
+       The unconditional exact-location table remains live for border ranking. */
+    for (int side = 0; side < 4; side++) {
         int bp[PUZZLE_SIDE], bc[PUZZLE_SIDE], n1 = 0, n2 = 0;
         for (int p = 0; p < NUM_PIECES; p++)
-            if (g_piece_free[p] && piece_kind(p) == 1 && g_edge_side_of_piece[p] == s) bp[n1++] = p;
+            if (g_piece_free[p] && piece_kind(p) == 1 && g_edge_side_of_piece[p] == side)
+                bp[n1++] = p;
         for (int x = 0; x < NUM_PIECES; x++)
-            if (g_cell_free[x] && cell_kind(x) == 1 && edge_side_of_cell(x) == s) bc[n2++] = x;
-        if (n1 != n2 || !n1) continue;                  /* nothing learnable here */
+            if (g_cell_free[x] && cell_kind(x) == 1 && edge_side_of_cell(x) == side)
+                bc[n2++] = x;
+        if (n1 != n2 || !n1) continue;
+
         double *b = xmalloc((size_t)n1 * n1 * sizeof(double));
         for (int i = 0; i < n1; i++)
-            for (int k = 0; k < n1; k++)
-                b[(size_t)i * n1 + k] = (cnt[(size_t)bp[i] * NUM_PIECES + bc[k]]
-                                         + g_freq_alpha / n1)
-                                      / (wcell[bc[k]] + g_freq_alpha);
+            for (int k = 0; k < n1; k++) {
+                int x = bc[k];
+                b[(size_t)i * n1 + k] =
+                    (cnt[(size_t)bp[i] * NUM_PIECES + x] + FREQ_KT_HALF)
+                    / (wcell[x] + FREQ_KT_HALF * n1);
+            }
         sinkhorn(b, NULL, n1);
-        double e = block_balance_error(b, n1); if (e > err) err = e;
+        e = block_balance_error(b, n1); if (e > err) err = e;
+
+        int brow_slots[PUZZLE_SIDE] = {0}, brem_slots[PUZZLE_SIDE] = {0};
+        double *brem_mass = NULL;
+        if (side == 1 || side == 3) {
+            for (int k = 0; k < n1; k++) brow_slots[bc[k] / PUZZLE_SIDE]++;
+            for (int r = PUZZLE_SIDE - 2; r >= 1; r--)
+                brem_slots[r] = brem_slots[r + 1] + brow_slots[r];
+            brem_mass = xmalloc((size_t)n1 * PUZZLE_SIDE * sizeof(double));
+            memset(brem_mass, 0, (size_t)n1 * PUZZLE_SIDE * sizeof(double));
+            for (int i = 0; i < n1; i++) {
+                double acc = 0.0;
+                for (int r = PUZZLE_SIDE - 2; r >= 1; r--) {
+                    for (int k = 0; k < n1; k++)
+                        if (bc[k] / PUZZLE_SIDE == r) acc += b[(size_t)i * n1 + k];
+                    brem_mass[(size_t)i * PUZZLE_SIDE + r] = acc;
+                }
+            }
+        }
         for (int i = 0; i < n1; i++)
-            for (int k = 0; k < n1; k++)
-                g_fw[(size_t)bp[i] * NUM_PIECES + bc[k]] =
-                    g_freq_border_ok ? (float)log((double)n1 * b[(size_t)i * n1 + k]) : 0.0f;
-        free(b);
+            for (int k = 0; k < n1; k++) {
+                int x = bc[k], r = x / PUZZLE_SIDE;
+                double wl = log((double)n1 * b[(size_t)i * n1 + k]);
+                double wa = 0.0;
+                if (brem_mass) {
+                    double rm = brem_mass[(size_t)i * PUZZLE_SIDE + r];
+                    if (rm > 0.0 && brem_slots[r] > 0)
+                        wa = log(b[(size_t)i * n1 + k]
+                                 * (double)brem_slots[r] / rm);
+                }
+                size_t fi = (size_t)bp[i] * NUM_PIECES + x;
+                g_fw_location[fi] = g_freq_border_ok ? (float)wl : 0.0f;
+                g_fw_segment[fi] = g_freq_border_ok ? (float)wa : 0.0f;
+                g_fw_cell[fi] = g_freq_border_ok ? (float)wa : 0.0f;
+            }
+        free(brem_mass); free(b);
     }
+
+    g_fw = (g_freq_model == FREQ_MODEL_CELL) ? g_fw_cell : g_fw_segment;
     return err;
 }
 
@@ -1493,14 +1844,27 @@ static double freq_build(const double *cnt, const double *wcell)
 /* Line-oriented and greppable rather than binary or JSON, for the same reason
    E555_extract_consensus.py gives: being able to read one line of it with grep is
    worth more than loading it in one call. The file holds RAW counts, not the
-   processed weights, so --freq_alpha is retuned on the next search run in
-   milliseconds instead of by learning again. */
+   processed weights, so the estimator can change without re-learning. */
 static uint64_t seed_hash(void)
 {
     uint64_t h = 14695981039346656037ULL;
     for (int p = 0; p < NUM_PIECES; p++) {
         const int e[4] = { g_seed_top[p], g_seed_right[p], g_seed_bottom[p], g_seed_left[p] };
         for (int d = 0; d < 4; d++) { h ^= (uint64_t)e[d]; h *= 1099511628211ULL; }
+    }
+    return h;
+}
+
+/* The border a table belongs to: every edge and corner piece with its spin in
+   the canonical rotations row. That fixes each edge's side and the corners,
+   which is all a rotations row decides. */
+static uint64_t border_hash(void)
+{
+    uint64_t h = 14695981039346656037ULL;
+    for (int p = 0; p < NUM_PIECES; p++) {
+        if (piece_kind(p) < 1) continue;
+        h ^= (uint64_t)p;        h *= 1099511628211ULL;
+        h ^= (uint64_t)g_spin0[p]; h *= 1099511628211ULL;
     }
     return h;
 }
@@ -1513,9 +1877,12 @@ static void freq_write(const char *path, const char *seed_path, const char *rot_
     fprintf(f, "# %s\n", FREQ_TABLE_MAGIC);
     fprintf(f, "# canonical frame: clue orientation 0, centre clue on (7,7) = --pin_clue 1\n");
     fprintf(f, "# rows are 0-indexed bottom-up; cell = row*16 + col\n");
+    fprintf(f, "# rowcnt p r is the sum of cnt p x over free cells in row r\n");
+    fprintf(f, "# segcnt p r s is the sum over free inner cells in 5-5-5 segment s\n");
     fprintf(f, "version %d\n", FREQ_TABLE_VERSION);
     fprintf(f, "seed %s %" PRIu64 "\n", seed_path, seed_hash());
     fprintf(f, "rotations %s %u\n", rot_path ? rot_path : "-", g_start_row);
+    fprintf(f, "border %" PRIu64 "\n", border_hash());
     fprintf(f, "clue_mask %u pin %d\n", g_clue_mask, g_pin_clue);
     fprintf(f, "stop_row %u beam_width %u threads %d rng_seed %" PRIu64 "\n",
             g_stop_row, g_beam_width, g_nthreads, g_master_seed);
@@ -1538,10 +1905,27 @@ static void freq_write(const char *path, const char *seed_path, const char *rot_
                                      g_edge_side_of_piece[p]);
     for (int x = 0; x < NUM_PIECES; x++)
         if (g_cell_free[x]) fprintf(f, "freec %d\n", x);
+    fprintf(f, "lift_kind segment_kt_prequential\n");
     fprintf(f, "lift %.6f %zu\n",
             g_lift_cells > 0.0 ? g_lift_sum / g_lift_cells : 0.0, g_lift_boards);
     for (int x = 0; x < NUM_PIECES; x++)
         if (wcell[x] > 0.0) fprintf(f, "wcell %d %.10g %.10g\n", x, wcell[x], wsq[x]);
+    double *rowcnt = xmalloc(FREQ_RSZ * sizeof(double));
+    double *segcnt = xmalloc(FREQ_SSZ * sizeof(double));
+    freq_make_rowcnt(cnt, rowcnt);
+    freq_make_segcnt(cnt, segcnt);
+    for (int p = 0; p < NUM_PIECES; p++)
+        for (int r = 0; r < PUZZLE_SIDE; r++) {
+            double v = rowcnt[(size_t)p * PUZZLE_SIDE + r];
+            if (v > 0.0) fprintf(f, "rowcnt %d %d %.10g\n", p, r, v);
+        }
+    for (int p = 0; p < NUM_PIECES; p++)
+        for (int z = 0; z < FREQ_SEG_N; z++) {
+            double v = segcnt[(size_t)p * FREQ_SEG_N + z];
+            if (v > 0.0) fprintf(f, "segcnt %d %d %d %.10g\n",
+                                 p, z / NUM_SEG, z % NUM_SEG, v);
+        }
+    free(rowcnt); free(segcnt);
     for (int p = 0; p < NUM_PIECES; p++)
         for (int x = 0; x < NUM_PIECES; x++) {
             double v = cnt[(size_t)p * NUM_PIECES + x];
@@ -1550,54 +1934,87 @@ static void freq_write(const char *path, const char *seed_path, const char *rot_
     if (fclose(f)) fatal("error closing --learn table %s", path);
 }
 
-/* Read a table and process it at the requested alpha. The provenance is checked,
-   not trusted: a frozen table is a calibration tied to the seed, the border and
-   the clue frame, and the objection to one is that it goes stale SILENTLY when
-   any of them move. This one refuses out loud instead. */
+/* Read a table and build the weights. Seed, clue frame and border are checked
+   against this run; any mismatch is fatal (the border one can be overridden). */
 static void freq_load(const char *path, const char *seed_path, const char *rot_path)
 {
     (void)seed_path;                         /* the hash is what is checked */
     FILE *f = fopen(path, "r");
     if (!f) fatal("cannot read --table %s", path);
-    double *cnt   = xmalloc(FREQ_TSZ * sizeof(double));
-    double *wcell = xmalloc(NUM_PIECES * sizeof(double));
-    double *wsq   = xmalloc(NUM_PIECES * sizeof(double));
+    double *cnt     = xmalloc(FREQ_TSZ * sizeof(double));
+    double *wcell   = xmalloc(NUM_PIECES * sizeof(double));
+    double *wsq     = xmalloc(NUM_PIECES * sizeof(double));
+    double *rowcnt  = xmalloc(FREQ_RSZ * sizeof(double));
+    double *segcnt  = xmalloc(FREQ_SSZ * sizeof(double));
     memset(cnt, 0, FREQ_TSZ * sizeof(double));
     memset(wcell, 0, NUM_PIECES * sizeof(double));
     memset(wsq, 0, NUM_PIECES * sizeof(double));
+    memset(rowcnt, 0, FREQ_RSZ * sizeof(double));
+    memset(segcnt, 0, FREQ_SSZ * sizeof(double));
 
-    char line[512]; bool seen_version = false;
-    uint64_t want_seed = 0; unsigned rot_row = 0, clue_mask = 0; int pin = 0;
-    char rot_name[256] = "-", seed_name[256] = "-";
+    char line[512]; bool seen_version = false, seen_rowcnt = false, seen_segcnt = false;
+    uint64_t want_seed = 0, want_border = 0; bool seen_border = false;
+    unsigned rot_row = 0, clue_mask = 0; int pin = 0;
+    int tab_side[NUM_PIECES];
+    for (int k = 0; k < NUM_PIECES; k++) tab_side[k] = -2;   /* -2 = no freep line */
+    char rot_name[256] = "-", seed_name[256] = "-", lift_kind[64] = "";
     double lift = 0.0; size_t lift_n = 0;
     while (fgets(line, sizeof line, f)) {
         if (line[0] == '#' || line[0] == '\n') continue;
-        int p, x, j; double v, w;  size_t n;
+        int p, x, j, r, sg; double v, w; size_t n;
         if (!strncmp(line, "version ", 8)) {
-            int v = atoi(line + 8);
-            /* v1 stored per-pass-equalised counts and a board-based effective
-               sample size. Both were wrong, and a v1 table read here would be
-               scaled differently and would report an ESS in the thousands for
-               evidence worth a few dozen borders. Re-learn rather than guess. */
-            if (v != FREQ_TABLE_VERSION)
-                fatal("--table %s: version %d, this build writes and reads %d -- "
-                      "re-run the learning phase", path, v, FREQ_TABLE_VERSION);
+            int version = atoi(line + 8);
+            if (version != FREQ_TABLE_VERSION)
+                fatal("--table %s: version %d, this build reads %d -- "
+                      "re-run the learning phase", path, version, FREQ_TABLE_VERSION);
             seen_version = true;
-        } else if (sscanf(line, "seed %255s %" SCNu64, seed_name, &want_seed) == 2) {
-        } else if (sscanf(line, "rotations %255s %u", rot_name, &rot_row) == 2) {
-        } else if (sscanf(line, "clue_mask %u pin %d", &clue_mask, &pin) == 2) {
-        } else if (sscanf(line, "lift %lf %zu", &lift, &lift_n) == 2) {
-        } else if (sscanf(line, "wcell %d %lf %lf", &x, &v, &w) == 3) {
+            continue;
+        }
+        if (sscanf(line, "seed %255s %" SCNu64, seed_name, &want_seed) == 2) continue;
+        if (sscanf(line, "rotations %255s %u", rot_name, &rot_row) == 2) continue;
+        if (sscanf(line, "border %" SCNu64, &want_border) == 1) {
+            seen_border = true; continue;
+        }
+        if (sscanf(line, "freep %d %d %d", &p, &x, &j) == 3) {
+            if (p >= 0 && p < NUM_PIECES && x == 1) tab_side[p] = j;
+            continue;
+        }
+        if (sscanf(line, "clue_mask %u pin %d", &clue_mask, &pin) == 2) continue;
+        if (sscanf(line, "lift_kind %63s", lift_kind) == 1) continue;
+        if (sscanf(line, "lift %lf %zu", &lift, &lift_n) == 2) continue;
+        if (sscanf(line, "wcell %d %lf %lf", &x, &v, &w) == 3) {
             if (x >= 0 && x < NUM_PIECES) { wcell[x] = v; wsq[x] = w; }
-        } else if (sscanf(line, "cnt %d %d %lf", &p, &x, &v) == 3) {
+            continue;
+        }
+        if (sscanf(line, "rowcnt %d %d %lf", &p, &r, &v) == 3) {
+            if (p >= 0 && p < NUM_PIECES && r >= 0 && r < PUZZLE_SIDE) {
+                rowcnt[(size_t)p * PUZZLE_SIDE + r] = v;
+                seen_rowcnt = true;
+            }
+            continue;
+        }
+        if (sscanf(line, "segcnt %d %d %d %lf", &p, &r, &sg, &v) == 4) {
+            if (p >= 0 && p < NUM_PIECES && r >= 0 && r < PUZZLE_SIDE
+                && sg >= 0 && sg < NUM_SEG) {
+                segcnt[(size_t)p * FREQ_SEG_N + r * NUM_SEG + sg] = v;
+                seen_segcnt = true;
+            }
+            continue;
+        }
+        if (sscanf(line, "cnt %d %d %lf", &p, &x, &v) == 3) {
             if (p >= 0 && p < NUM_PIECES && x >= 0 && x < NUM_PIECES)
                 cnt[(size_t)p * NUM_PIECES + x] = v;
-        } else if (sscanf(line, "pass %d configs %zu", &j, &n) == 2) {
+            continue;
+        }
+        if (sscanf(line, "pass %d configs %zu", &j, &n) == 2) {
             if (j >= 0 && j < FREQ_NPASS) g_pconfigs[j] = n;
         }
     }
     fclose(f);
     if (!seen_version) fatal("--table %s: not an E555 datadriven table", path);
+    if (strcmp(lift_kind, "segment_kt_prequential"))
+        fatal("--table %s: lift_kind is '%s', expected segment_kt_prequential",
+              path, *lift_kind ? lift_kind : "(missing)");
     if (want_seed != seed_hash())
         fatal("--table %s was learned on a different seed (%s) -- refusing", path, seed_name);
     if (clue_mask != g_clue_mask)
@@ -1606,16 +2023,51 @@ static void freq_load(const char *path, const char *seed_path, const char *rot_p
     if (pin != g_pin_clue)
         fatal("--table %s was learned at --pin_clue %d, this run has %d -- refusing",
               path, pin, g_pin_clue);
-    if (rot_row != g_start_row || (rot_path && strcmp(rot_name, rot_path))) {
+    /* The border is compared by content, not by file name: the table's own
+       border hash when it has one, otherwise the side it records for every free
+       edge piece. The interior counts depend on the colours the border turns
+       inward, so a different border is refused; E555_FREQ_ANY_BORDER=1 accepts
+       it deliberately, steering the interior and dropping the border block. */
+    bool border_same = true;
+    if (seen_border) {
+        border_same = (want_border == border_hash());
+    } else {
+        for (int k = 0; k < NUM_PIECES; k++) {
+            bool free_edge = g_piece_free[k] && piece_kind(k) == 1;
+            if (free_edge ? tab_side[k] != g_edge_side_of_piece[k] : tab_side[k] != -2)
+                { border_same = false; break; }
+        }
+    }
+    if (!border_same) {
+        if (!getenv("E555_FREQ_ANY_BORDER"))
+            fatal("--table %s was learned on a different border (%s row %u) than "
+                  "%s row %u -- refusing (E555_FREQ_ANY_BORDER=1 overrides)",
+                  path, rot_name, rot_row, rot_path ? rot_path : "-", g_start_row);
         g_freq_border_ok = false;
-        fprintf(stderr, "[freq] table learned on %s row %u but searching %s row %u: "
-                "the border block is dropped (a different row deals the edges to "
-                "different sides); the interior table still steers\n",
-                rot_name, rot_row, rot_path ? rot_path : "-", g_start_row);
+        fprintf(stderr, "[freq] E555_FREQ_ANY_BORDER: table border differs; border "
+                "block dropped, interior table still steers\n");
     }
 
     if (getenv("E555_FREQ_NOBORDER")) g_freq_border_ok = false;
-    double err = freq_build(cnt, wcell);
+
+    /* rowcnt and segcnt are redundant with cnt; a disagreement means a
+       damaged or hand-edited file. */
+    if (!seen_rowcnt || !seen_segcnt)
+        fatal("--table %s: missing rowcnt/segcnt statistics", path);
+    double *derived_rowcnt = xmalloc(FREQ_RSZ * sizeof(double));
+    double *derived_segcnt = xmalloc(FREQ_SSZ * sizeof(double));
+    freq_make_rowcnt(cnt, derived_rowcnt);
+    freq_make_segcnt(cnt, derived_segcnt);
+    for (size_t i = 0; i < FREQ_RSZ; i++)
+        if (fabs(rowcnt[i] - derived_rowcnt[i]) > 1e-7 * (1.0 + fabs(derived_rowcnt[i])))
+            fatal("--table %s: rowcnt disagrees with cnt at piece %zu row %zu",
+                  path, i / PUZZLE_SIDE, i % PUZZLE_SIDE);
+    for (size_t i = 0; i < FREQ_SSZ; i++)
+        if (fabs(segcnt[i] - derived_segcnt[i]) > 1e-7 * (1.0 + fabs(derived_segcnt[i])))
+            fatal("--table %s: segcnt disagrees with cnt at piece %zu row %zu segment %zu",
+                  path, i / FREQ_SEG_N, (i % FREQ_SEG_N) / NUM_SEG, i % NUM_SEG);
+    free(derived_rowcnt); free(derived_segcnt);
+    double err = freq_build(cnt, wcell, segcnt);
     /* E555_FREQ_DUMP=PATH writes the processed weights out so freq_view.py
        --check can compare them against its own, independent implementation of
        this estimator. Two implementations of one formula disagreeing is the
@@ -1625,30 +2077,44 @@ static void freq_load(const char *path, const char *seed_path, const char *rot_p
     if (dump) {
         FILE *df = fopen(dump, "w");
         if (!df) fatal("E555_FREQ_DUMP: cannot write %s", dump);
+        fprintf(df, "# beam_model %s-preservation border_model location "
+                    "smoothing KT-1/2\n",
+                    g_freq_model == FREQ_MODEL_CELL ? "cell" : "segment");
         for (int pp = 0; pp < NUM_PIECES; pp++)
-            for (int xx = 0; xx < NUM_PIECES; xx++)
-                if (g_fw[(size_t)pp * NUM_PIECES + xx] != 0.0f)
-                    fprintf(df, "fw %d %d %.7g\n", pp, xx,
-                            (double)g_fw[(size_t)pp * NUM_PIECES + xx]);
+            for (int xx = 0; xx < NUM_PIECES; xx++) {
+                size_t fi = (size_t)pp * NUM_PIECES + xx;
+                if (g_fw[fi] != 0.0f)
+                    fprintf(df, "fw %d %d %.7g\n", pp, xx, (double)g_fw[fi]);
+                if (g_fw_segment[fi] != 0.0f)
+                    fprintf(df, "fwseg %d %d %.7g\n", pp, xx, (double)g_fw_segment[fi]);
+                if (g_fw_cell[fi] != 0.0f)
+                    fprintf(df, "fwcell %d %d %.7g\n", pp, xx, (double)g_fw_cell[fi]);
+                if (piece_kind(pp) == 1 && g_fw_location[fi] != 0.0f)
+                    fprintf(df, "fwb %d %d %.7g\n", pp, xx,
+                            (double)g_fw_location[fi]);
+            }
         if (fclose(df)) fatal("E555_FREQ_DUMP: error closing %s", dump);
         printf("[freq] weights dumped to %s\n", dump);
     }
     size_t covered = 0; double ess = 0.0;
     for (int x = 0; x < NUM_PIECES; x++)
         if (wcell[x] > 0.0) { covered++; ess += wcell[x] * wcell[x] / wsq[x]; }
-    printf("[freq] table %s: alpha=%.3g cells=%zu mean_ess=%.1f balance_err=%.2g "
-           "learned_lift=%.4f nats/cell over %zu boards\n",
-           path, g_freq_alpha, covered, covered ? ess / covered : 0.0, err, lift, lift_n);
-    free(cnt); free(wcell); free(wsq);
+    printf("[freq] table %s: beam_model=%s-preservation "
+           "border_model=location smoothing=KT-1/2 cells=%zu mean_ess=%.1f "
+           "balance_err=%.2g segment_lift=%.4f nats/cell over %zu boards%s\n",
+           path, g_freq_model == FREQ_MODEL_CELL ? "cell" : "segment",
+           covered, covered ? ess / covered : 0.0, err, lift, lift_n,
+           g_freq_border_ok ? "" : " (border block off)");
+    free(cnt); free(wcell); free(wsq); free(rowcnt); free(segcnt);
     g_freq_on = true;
 }
 
 /* -- Scoring ---------------------------------------------------------------- */
 
-/* One committed row's weight: its left border piece at column 0, the 14 inner
-   cells, and the right-edge terminal at column 15 -- exactly the 16 cells
-   format_board_tail writes for that row. Row 0 is scored once, by
-   freq_border_term, so every placed cell is scored exactly once. */
+/* One committed row's learned weight: future-conditioned segment or exact-cell
+   scores for the 14 inner pieces plus vertical-side scores for the two edge pieces. The bottom
+   row carries zero active weight (its exact location score already selected the
+   border), so every decision-relevant placed piece contributes once. */
 static inline double freq_row_term(const RowChoice *mv, int row)
 {
     const int base = row * PUZZLE_SIDE;
@@ -1659,12 +2125,25 @@ static inline double freq_row_term(const RowChoice *mv, int row)
     return s;
 }
 
-static inline double freq_border_term(const BottomOrder *bot)
+static inline double freq_bottom_term(const BottomOrder *bot, const float *weights)
 {
     double s = 0.0;
     for (int c = 0; c < PUZZLE_SIDE; c++)
-        s += g_fw[(size_t)bot->p[c]->piece_id * NUM_PIECES + c];
+        s += weights[(size_t)bot->p[c]->piece_id * NUM_PIECES + c];
     return s;
+}
+
+/* The beam accumulator uses segment preservation. Border enumeration does not:
+   it always uses exact location, because two border orderings contain the same
+   pieces and differ only by their cells. */
+static inline double freq_beam_bottom_term(const BottomOrder *bot)
+{
+    return freq_bottom_term(bot, g_fw);
+}
+
+static inline double freq_location_bottom_term(const BottomOrder *bot)
+{
+    return freq_bottom_term(bot, g_fw_location);
 }
 
 /* The whole board, recomputed from every placed cell. Only E555_FREQ_DEBUG uses
@@ -1698,15 +2177,17 @@ static double freq_board_term(const RowChoice rows[EDGE_LEN], int row)
  *
  * E555_database.c:1348 makes the case for why a positional term belongs here:
  * every colour-multiset functional is CONSTANT across a border row's columns, so
- * only positional information can tell them apart. A piece-by-cell table is
- * exactly that. */
+ * only positional information can tell them apart. Border ranking therefore
+ * ALWAYS uses g_fw_location. The beam's A/B/C statistic intentionally removes
+ * within-segment noise; the border is an ordering decision and needs the full
+ * piece-by-cell resolution. */
 static double freq_bottom_rank(const BottomOrder *b)
 {
     const int *rt = b->rtop0;
     double s = log1p((double)db_seg_fanout(rt[1], rt[2], rt[3], rt[4], rt[5]))
              + log1p((double)db_seg_fanout(rt[6], rt[7], rt[8], rt[9], rt[10]))
              + log1p((double)db_seg_fanout(rt[11], rt[12], rt[13], rt[14], rt[15]));
-    return s + freq_border_term(b);
+    return s + freq_location_bottom_term(b);
 }
 
 /* A column the bottom cannot start row 1 with: -inf sorts last at any tau, since
@@ -1722,7 +2203,8 @@ static double freq_left_rank(const LeftOrder *l, const BottomOrder *bot)
     for (int r = 1; r + CHAIN_LEN - 1 <= EDGE_LEN; r++)
         s += left_window_logfanout(l->right, r);
     for (int r = 1; r <= EDGE_LEN; r++)
-        s += g_fw[(size_t)l->p[r]->piece_id * NUM_PIECES + r * PUZZLE_SIDE];
+        s += g_fw_location[(size_t)l->p[r]->piece_id * NUM_PIECES
+                           + r * PUZZLE_SIDE];
     return s;
 }
 
@@ -1799,33 +2281,42 @@ static size_t freq_rank_lefts(const BottomOrder *bot, double tau, RNG *rng, size
    sum on the far side of a float rounding boundary. */
 static inline float score_scanned(const BeamEntry *t, int row,
                                   uint32_t nA, uint64_t fB, uint64_t fC,
-                                  const RowChoice *mv, float parent_acc) {
-    /* Guided: the score IS the whole board, carried forward. A sum over every
-       placed cell and "the parent's total plus this row" are the same number, so
-       the cheap form is used -- and BeamEntry.score, which the stock beamer
-       writes and never reads, becomes that running total at no cost. A board
-       that spent a top-loving piece on a low row keeps the deficit for life and
-       loses the moment the pool overflows, which is the point: the stock score
-       is recomputed fresh each row and carries no history at all. */
-    if (g_freq_on && g_freq_pure)     /* position alone: the colour ledger and the
-                                         fan-out lookahead are not even computed */
-        return (float)((double)parent_acc + freq_row_term(mv, row));
-    double s = log((double)nA * (1.0 + (double)fB) * (1.0 + (double)fC))
-               + color_term(t, row);
-    if (g_freq_on)
-        return (float)((double)parent_acc + freq_row_term(mv, row) + s);
-    return (float)s;
+                                  const RowChoice *mv, float parent_learned) {
+    /* BeamEntry.score is the learned accumulator and nothing else. The stock
+       objective remains row-local, as it is without a table. This isolates the
+       experiment: loading a zero learned table cannot turn the stock heuristic
+       into a cumulative path score. */
+    double learned_inc = 0.0, learned = 0.0;
+    if (g_freq_on) {
+        learned_inc = freq_row_term(mv, row);
+        learned = (double)parent_learned + learned_inc;
+        if (g_freq_pure) {
+            score_diag_acc(row, 0.0, 0.0, 0.0, learned_inc, learned);
+            return (float)learned;
+        }
+    }
+    double closure = 0.0, maha = 0.0;
+    double fanout = log((double)nA * (1.0 + (double)fB) * (1.0 + (double)fC));
+    double colors = color_term_parts(t, row, &closure, &maha);
+    score_diag_acc(row, fanout, closure, maha, learned_inc, learned);
+    return (float)(fanout + colors + learned);
 }
 
 /* The stop row drops the fan-out lookahead (whether a row fits above is the next
-   stage's problem), so it scores on the colour terms alone -- or, guided, on the
-   same running whole-board total. */
+   stage's problem). Guided search still adds the complete learned accumulator,
+   but only the CURRENT row's colour term. */
 static inline float score_stop(const BeamEntry *t, const BeamEntry *parent,
                                int row, const RowChoice *mv) {
-    if (g_freq_on)
-        return (float)((double)parent->score + freq_row_term(mv, row)
-                       + (g_freq_pure ? 0.0 : color_term(t, row)));
-    return (float)color_term(t, row);
+    double learned_inc = g_freq_on ? freq_row_term(mv, row) : 0.0;
+    double learned = g_freq_on ? (double)parent->score + learned_inc : 0.0;
+    if (g_freq_on && g_freq_pure) {
+        score_diag_acc(row, 0.0, 0.0, 0.0, learned_inc, learned);
+        return (float)learned;
+    }
+    double closure = 0.0, maha = 0.0;
+    double colors = color_term_parts(t, row, &closure, &maha);
+    score_diag_acc(row, 0.0, closure, maha, learned_inc, learned);
+    return (float)(learned + colors);
 }
 
 /* Full scoring for a child that already exists: the same gate as
@@ -1916,7 +2407,8 @@ static bool expand_prepare(Expand *e, const BeamEntry *p, uint32_t pi, int row, 
 
     e->cA = g_db[INNER_IDX(la)][INNER_IDX(rt[1])][INNER_IDX(rt[2])]
                 [INNER_IDX(rt[3])][INNER_IDX(rt[4])][rt[5]];
-    return e->cA != NULL;
+    if (!e->cA) { reject_count(row, REJ_A_CELL); return false; }
+    return true;
 }
 
 /* Buffered pool append: one atomic reservation per POOL_BATCH children. */
@@ -2002,6 +2494,169 @@ static inline void mask_of_chain(const uint16_t ci[CHAIN_LEN], int count, uint64
     for (int i = 0; i < count; i++) { uint16_t pid = g_cat[ci[i]].piece_id; mask[pid>>6] |= piece_bit(pid); }
 }
 
+/* Exact startup feasibility for the two lower corner clues.  The row-1 pins are
+   TOPCOLOR constraints in segment A (col 2) and C (col 13).  This walk uses the
+   same complete database cells and exact used masks as the beam, but stops at the
+   first full A+B+C row.  It therefore has no false negatives from quotas, promise
+   ordering, or CLUE_SEG_CAP. */
+static inline bool chain_pin_ok(const uint16_t ci[], int count, int pin_idx,
+                                int pin_kind, uint16_t pin_val) {
+    if (pin_idx < 0) return true;
+    if (pin_idx >= count) return false;
+    if (pin_kind == PIN_PIECE) return ci[pin_idx] == pin_val;
+    return g_cat[ci[pin_idx]].top == pin_val;
+}
+
+static void border_used_mask(const BottomOrder *bot, const LeftOrder *lft,
+                             uint64_t used[4]) {
+    for (int k = 0; k < 4; k++) used[k] = bot->used[k] | lft->used[k];
+    used_set(used, g_cTR.piece_id);
+    for (int k = 0; k < CLUE_N; k++) {
+        if (!clue_on(k)) continue;
+        for (int o = 0; o < 4; o++)
+            if (g_clue_orients & (1u << o)) used_set(used, g_clue[o][k].piece);
+    }
+}
+
+static bool row1_corner_compatible(const BottomOrder *bot, const LeftOrder *lft) {
+    if (!(g_clue_mask & CLUE_CORNERS)) return true;
+
+    const int la_A = lft->right[1];
+    const int *rt = bot->rtop0;
+    uint8_t bt[PUZZLE_SIDE];
+    for (int c = 0; c < PUZZLE_SIDE; c++) bt[c] = (uint8_t)rt[c];
+    if (!color_is_inner(la_A)) return false;
+    for (int c = 1; c <= EDGE_LEN; c++) if (!color_is_inner(rt[c])) return false;
+    if (!color_is_edge_iface(rt[15])) return false;
+
+    const Cell *cA = g_db[INNER_IDX(la_A)][INNER_IDX(rt[1])][INNER_IDX(rt[2])]
+                         [INNER_IDX(rt[3])][INNER_IDX(rt[4])][rt[5]];
+    if (!cA) return false;
+
+    uint64_t used0[4];
+    border_used_mask(bot, lft, used0);
+
+    for (int o = 0; o < 4; o++) {
+        if (!(g_clue_orients & (1u << o))) continue;
+        int pin_idx[3], pin_kind[3]; uint16_t pin_val[3];
+        if (!clue_pins_for(1, o, pin_idx, pin_kind, pin_val)) continue;
+
+        for (uint32_t ja = 0; ja < cA->n; ja++) {
+            uint32_t wa = rec_load(cA->rec, ja, g_rec_bytes_inner);
+            uint8_t fa[CHAIN_LEN]; unpack_inner(wa, fa, g_lb_bits);
+            uint16_t A[CHAIN_LEN]; uint64_t mA[4] = {0,0,0,0};
+            if (!decode_inner_chain(fa, CHAIN_LEN, la_A, bt + 1,
+                                    A, mA, used0)) continue;
+            if (masks_intersect4(used0, mA)
+                || !chain_pin_ok(A, CHAIN_LEN, pin_idx[0], pin_kind[0], pin_val[0]))
+                continue;
+
+            uint64_t fA[4] = { used0[0]|mA[0], used0[1]|mA[1],
+                               used0[2]|mA[2], used0[3]|mA[3] };
+            int la_B = g_cat[A[CHAIN_LEN-1]].right;
+            if (!color_is_inner(la_B)) continue;
+            const Cell *cB = g_db[INNER_IDX(la_B)][INNER_IDX(rt[6])][INNER_IDX(rt[7])]
+                                 [INNER_IDX(rt[8])][INNER_IDX(rt[9])][rt[10]];
+            if (!cB) continue;
+
+            for (uint32_t jb = 0; jb < cB->n; jb++) {
+                uint16_t B[CHAIN_LEN]; int la_C;
+                if (!pick_segB(cB, jb, bt + 6, fA, B, la_B, &la_C))
+                    continue;
+                if (!chain_pin_ok(B, CHAIN_LEN, pin_idx[1], pin_kind[1], pin_val[1])
+                    || !color_is_inner(la_C)) continue;
+
+                uint64_t mB[4], fB[4];
+                mask_of_chain(B, CHAIN_LEN, mB);
+                for (int k = 0; k < 4; k++) fB[k] = fA[k] | mB[k];
+                const Cell *cC = g_db[INNER_IDX(la_C)][INNER_IDX(rt[11])][INNER_IDX(rt[12])]
+                                     [INNER_IDX(rt[13])][INNER_IDX(rt[14])][rt[15]];
+                if (!cC) continue;
+
+                for (uint32_t jc = 0; jc < cC->n; jc++) {
+                    uint16_t C[CHAIN_LEN-1]; uint8_t rterm;
+                    if (!pick_segC(cC, jc, bt + 11, fB,
+                                   C, la_C, &rterm)) continue;
+                    if (!chain_pin_ok(C, CHAIN_LEN-1, pin_idx[2],
+                                      pin_kind[2], pin_val[2])) continue;
+                    (void)rterm;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static void corner_compat_cache_init(size_t nb) {
+    free(g_corner_compat_cache);
+    g_corner_compat_cache = NULL;
+    g_corner_compat_nb = nb;
+    if (!nb || !(g_clue_mask & CLUE_CORNERS)) return;
+    if (g_left_n) {
+        for (size_t i = 1; i < g_left_n; i++)
+            if (memcmp(g_lefts[i].used, g_lefts[0].used,
+                       sizeof g_lefts[i].used) != 0)
+                fatal("corner-clue cache assumes fixed-mode left orders are "
+                      "permutations of one piece set");
+    }
+    if (nb > SIZE_MAX / NUM_COLORS_TOTAL)
+        fatal("corner-clue compatibility cache size overflow");
+    g_corner_compat_cache = xmalloc(nb * NUM_COLORS_TOTAL);
+    memset(g_corner_compat_cache, -1, nb * NUM_COLORS_TOTAL);
+}
+
+static bool row1_corner_compatible_cached(size_t b_idx, const BottomOrder *bot,
+                                          const LeftOrder *lft) {
+    if (!g_corner_compat_cache) return true;
+    if (b_idx >= g_corner_compat_nb) fatal("internal: corner cache bottom index");
+    int la = lft->right[1];
+    if (la < 0 || la >= NUM_COLORS_TOTAL) return false;
+    int8_t *slot = &g_corner_compat_cache[b_idx * NUM_COLORS_TOTAL + (size_t)la];
+    if (*slot < 0) *slot = row1_corner_compatible(bot, lft) ? 1 : 0;
+    return *slot != 0;
+}
+
+/* g_lefts is already sorted by its ordinary/database+table rank.  Stable
+   compaction retains that order while dropping columns that cannot satisfy both
+   row-1 corner-clue colors.  A bottom with no survivors is thereby eliminated
+   before a beam workspace is touched. */
+static size_t clue_filter_ranked_lefts(size_t b_idx, const BottomOrder *bot,
+                                       size_t ordinary_viable) {
+    g_border_stats.bottoms_ranked++;
+    g_border_stats.columns_ordinary_viable += ordinary_viable;
+    if (!(g_clue_mask & CLUE_CORNERS)) {
+        g_border_stats.columns_clue_compatible += ordinary_viable;
+        return ordinary_viable;
+    }
+
+    if (g_left_filter_cap < g_left_n) {
+        g_left_filter_buf = xrealloc(g_left_filter_buf,
+                                     g_left_n * sizeof(*g_left_filter_buf));
+        g_left_filter_cap = g_left_n;
+    }
+
+    size_t out = 0;
+    /* Compatible ordinary-viable entries go first.  Rejected viable entries are
+       retained after them, and the ordinary-dead suffix follows unchanged.  The
+       next bottom therefore still ranks the complete, uncorrupted left-order set. */
+    for (size_t i = 0; i < ordinary_viable; i++)
+        if (row1_corner_compatible_cached(b_idx, bot, &g_lefts[i]))
+            g_left_filter_buf[out++] = g_lefts[i];
+    size_t tail = out;
+    for (size_t i = 0; i < ordinary_viable; i++)
+        if (!row1_corner_compatible_cached(b_idx, bot, &g_lefts[i]))
+            g_left_filter_buf[tail++] = g_lefts[i];
+    for (size_t i = ordinary_viable; i < g_left_n; i++)
+        g_left_filter_buf[tail++] = g_lefts[i];
+    if (tail != g_left_n) fatal("internal: clue column partition lost entries");
+    memcpy(g_lefts, g_left_filter_buf, g_left_n * sizeof(*g_lefts));
+
+    g_border_stats.columns_clue_compatible += out;
+    if (!out) g_border_stats.bottoms_no_clue_column++;
+    return out;
+}
+
 /* A+C partials (--incomplete_top): segment B is missing, so segment C has lost
    its left key -- B's exposed right color -- and every inner color is a
    candidate. Its bottom rt[11..15] is still pinned by the parent and the right
@@ -2027,12 +2682,10 @@ static void emit_AC_partials(const BeamCtx *ctx, const BeamEntry *p, RowChoice *
     }
 }
 
-/* B+C partials (--incomplete_top): segment A is missing, so segment B has lost
-   its left key -- the border column's exposed right color -- and every inner
-   color is a candidate; C then chains off B exactly as it always does. This is
-   the only partial kind that needs no segment A, so it is driven per PARENT
-   rather than per A record: it is what rescues the boards whose segment-A cell
-   is empty or wholly conflicted, which try_A never even reaches. */
+/* B+C and B-only partials (--incomplete_top): segment A is missing, so B has
+   lost its left key and every inner colour is a candidate; C chains off B as
+   usual. Driven per PARENT rather than per A record, so it also covers parents
+   whose segment-A cell is empty or wholly conflicted. */
 static void try_BC(const BeamCtx *ctx, const BeamEntry *p, int row) {
     const uint8_t *rt = p->rtop;
     /* Only B's and C's bottoms constrain such a board: rt[1..5] lie under the
@@ -2050,13 +2703,14 @@ static void try_BC(const BeamCtx *ctx, const BeamEntry *p, int row) {
             uint16_t ciB[CHAIN_LEN]; int la_C;
             if (!pick_segB(cB, jb, rt + 6, p->used, ciB, lbi + COLOR_MIN, &la_C)) continue;
             if (!color_is_inner(la_C)) continue;
+            memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));
+            emit_incomplete(ctx, p, &mv, row, PARTMASK_B);
             const Cell *cC = g_db[INNER_IDX(la_C)][INNER_IDX(rt[11])][INNER_IDX(rt[12])]
                                  [INNER_IDX(rt[13])][INNER_IDX(rt[14])][rt[15]];
             if (!cC) continue;
             uint64_t maskB[4], forbidB[4];
             mask_of_chain(ciB, CHAIN_LEN, maskB);
             for (int k = 0; k < 4; k++) forbidB[k] = p->used[k] | maskB[k];
-            memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));
             for (uint32_t jc = 0; jc < cC->n; jc++) {
                 uint16_t ciC[CHAIN_LEN-1]; uint8_t rterm;
                 if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
@@ -2155,11 +2809,14 @@ static void expand_clued(BeamCtx *ctx, const BeamEntry *p, uint32_t pi, int row,
 
                     *t = *p; commit_row(t, row, &mv);
                     t->flags = oflags;          /* before pool_append: it hashes flags */
-                    if (!parity_ok(t)) continue;
+                    if (!parity_ok(t)) {
+                        reject_count(row, REJ_PARITY); continue;
+                    }
                     float score;
                     if (at_stop) {
                         score = score_stop(t, p, row, &mv);
                     } else if (!score_child(t, row, &score, &mv, p->score)) {
+                        reject_count(row, REJ_LOOKAHEAD);
                         continue;
                     }
                     pool_append(ctx, sc, t, pi, score, &mv);
@@ -2205,8 +2862,12 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     uint32_t w = rec_load(e->cA->rec, j, g_rec_bytes_inner);
     uint8_t fA[CHAIN_LEN]; unpack_inner(w, fA, g_lb_bits);
     uint16_t ciA[CHAIN_LEN]; uint64_t maskA[4] = {0,0,0,0};
-    if (!decode_inner_chain(fA, CHAIN_LEN, e->la_A, rt + 1, ciA, maskA, p->used)) return;  /* bottoms rt[1..5] */
-    if (masks_intersect4(p->used, maskA)) return;
+    if (!decode_inner_chain(fA, CHAIN_LEN, e->la_A, rt + 1, ciA, maskA, p->used)) {
+        reject_count(e->row, REJ_A_DECODE); return;
+    }  /* bottoms rt[1..5] */
+    if (masks_intersect4(p->used, maskA)) {
+        reject_count(e->row, REJ_A_DECODE); return;
+    }
 
     e->budget--;                                   /* a real decode attempt */
 
@@ -2214,7 +2875,10 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     const Cell *cB = color_is_inner(la_B) ? segB_cell(p, la_B) : NULL;
     /* No B cell at all. Below the stop row that kills the child; at the stop row
        a missing B is exactly what an A+C partial records, so fall through. */
-    if (!cB && !(e->at_stop && g_incomplete_top)) return;
+    if (!cB && !(e->at_stop && g_incomplete_top)) {
+        reject_count(e->row, REJ_B_CELL);
+        return;
+    }
 
     uint64_t forbidA[4] = { p->used[0]|maskA[0], p->used[1]|maskA[1],
                             p->used[2]|maskA[2], p->used[3]|maskA[3] };
@@ -2225,7 +2889,9 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     if (e->at_stop) {
         for (uint32_t jb = 0; cB && jb < cB->n && e->quota > 0; jb++) {
             uint16_t ciB[CHAIN_LEN]; int la_C;
-            if (!pick_segB(cB, jb, rt + 6, forbidA, ciB, la_B, &la_C)) continue;
+            if (!pick_segB(cB, jb, rt + 6, forbidA, ciB, la_B, &la_C)) {
+                reject_count(e->row, REJ_B_DECODE); continue;
+            }
             memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));
             if (!color_is_inner(la_C)) {
                 if (g_incomplete_top) emit_incomplete(ctx, p, &mv, e->row, ROWMASK_AB);
@@ -2234,6 +2900,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
             const Cell *cC = g_db[INNER_IDX(la_C)][INNER_IDX(rt[11])][INNER_IDX(rt[12])]
                                  [INNER_IDX(rt[13])][INNER_IDX(rt[14])][rt[15]];
             if (!cC) {
+                reject_count(e->row, REJ_C_CELL);
                 if (g_incomplete_top) emit_incomplete(ctx, p, &mv, e->row, ROWMASK_AB);
                 continue;
             }
@@ -2243,11 +2910,13 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
             bool ab_full = false;
             for (uint32_t jc = 0; jc < cC->n && e->quota > 0; jc++) {
                 uint16_t ciC[CHAIN_LEN-1]; uint8_t rterm;
-                if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
+                if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) {
+                    reject_count(e->row, REJ_C_DECODE); continue;
+                }
                 memcpy(&mv.ci[2*CHAIN_LEN], ciC, (CHAIN_LEN-1) * sizeof(uint16_t));
                 mv.rterm = rterm;
                 *t = *p; commit_row(t, e->row, &mv);
-                if (!parity_ok(t)) continue;
+                if (!parity_ok(t)) { reject_count(e->row, REJ_PARITY); continue; }
                 /* No lookahead gate at the stop row: every board that completes
                    it is emitted -- whether a row fits above is deliberately the
                    next stage's problem. Rank by the heuristic terms only. */
@@ -2302,12 +2971,14 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     for (uint32_t jb = 0; jb < cB->n && nb_done < nB_lim && e->quota > 0; jb++) {
         if (!e->keep_all && b_left <= 0) break;
         uint16_t ciB[CHAIN_LEN]; int la_C;
-        if (!pick_segB(cB, jb, rt + 6, forbidA, ciB, la_B, &la_C)) continue;
+        if (!pick_segB(cB, jb, rt + 6, forbidA, ciB, la_B, &la_C)) {
+            reject_count(e->row, REJ_B_DECODE); continue;
+        }
         b_left--;
         if (!color_is_inner(la_C)) continue;
         const Cell *cC = g_db[INNER_IDX(la_C)][INNER_IDX(rt[11])][INNER_IDX(rt[12])]
                              [INNER_IDX(rt[13])][INNER_IDX(rt[14])][rt[15]];
-        if (!cC) continue;
+        if (!cC) { reject_count(e->row, REJ_C_CELL); continue; }
         uint64_t maskB[4]; mask_of_chain(ciB, CHAIN_LEN, maskB);
         uint64_t forbidB[4] = { forbidA[0]|maskB[0], forbidA[1]|maskB[1],
                                 forbidA[2]|maskB[2], forbidA[3]|maskB[3] };
@@ -2316,15 +2987,19 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
         const uint32_t nC_lim = e->keep_all ? cC->n : g_bc_nC;
         for (uint32_t jc = 0; jc < cC->n && nc_done < nC_lim && e->quota > 0; jc++) {
             uint16_t ciC[CHAIN_LEN-1]; uint8_t rterm;
-            if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
+            if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) {
+                reject_count(e->row, REJ_C_DECODE); continue;
+            }
             memcpy(&mv.ci[2*CHAIN_LEN], ciC, (CHAIN_LEN-1) * sizeof(uint16_t));
             mv.rterm = rterm;
             /* Lookahead first: an exact one-row death costs nothing to find here,
                where it used to cost a board copy, commit_row and a parity scan. */
             uint32_t nA; uint64_t fB, fC;
-            if (!child_lookahead(mv.ci, rterm, e->row, &nA, &fB, &fC)) continue;
+            if (!child_lookahead(mv.ci, rterm, e->row, &nA, &fB, &fC)) {
+                reject_count(e->row, REJ_LOOKAHEAD); continue;
+            }
             *t = *p; commit_row(t, e->row, &mv);
-            if (!parity_ok(t)) continue;
+            if (!parity_ok(t)) { reject_count(e->row, REJ_PARITY); continue; }
             float score = score_scanned(t, e->row, nA, fB, fC, &mv, p->score);
             if (e->keep_all) {                  /* starved beam: keep them all */
                 pool_append(ctx, sc, t, e->parent_idx, score, &mv);
@@ -2424,7 +3099,8 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
         /* Before expand_prepare, whose guard would drop this parent when its
            segment-A cell is empty -- exactly the case a B+C partial records.
            Once per parent, not once per slice. */
-        if (at_stop && g_incomplete_top && sl == 0) try_BC(ctx, &beam[pi], row);
+        if (at_stop && g_incomplete_top && sl == 0 && !clue_row)
+            try_BC(ctx, &beam[pi], row);
         if (clue_row) {
             /* A clue row is expanded ONCE per parent, not once per slice: the
                pinned walk already enumerates the parent's whole candidate set.
@@ -2613,6 +3289,24 @@ static uint32_t dedup_and_rank(BeamCtx *ctx, uint64_t pool_n, int nt) {
     return kept;
 }
 
+/* Complete stop-row candidates bypass FRONTIER deduplication. Stage C may reopen
+   lower rows, so two complete boards with the same future frontier are not
+   interchangeable there. The raw pool is score-sorted; emit_stop_row removes
+   only exact duplicate boards. Near-duplicate suppression applies only to the
+   --incomplete_top partials. */
+static uint32_t rank_pool_raw(BeamCtx *ctx, uint64_t pool_n, int nt) {
+    if (pool_n > UINT32_MAX) fatal("stop-row pool exceeds 32-bit ranking index");
+    uint32_t n = (uint32_t)pool_n;
+    #pragma omp parallel for schedule(static) num_threads(nt)
+    for (uint32_t i = 0; i < n; i++) {
+        ctx->srt[i].score = ctx->pool[i].score;
+        ctx->srt[i].idx = i;
+    }
+    sort_recs_desc(ctx->srt, ctx->srt_tmp, n, nt);
+    for (uint32_t i = 0; i < n; i++) ctx->keep[i] = ctx->srt[i].idx;
+    return n;
+}
+
 /* Prune the ranked survivors to target_K: a score band (respecting the
    per-parent offspring cap) plus a random band of frac_rand_now * target_K,
    then best-first fill of any remainder. */
@@ -2691,7 +3385,13 @@ static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
         ctx->log[row][i].parent_log = d->log_idx;   /* parent's own log entry */
         ctx->log[row][i].mv = pe->mv;
         commit_row(d, row, &pe->mv);
-        d->depth = (uint16_t)row; d->score = pe->score; d->log_idx = i;
+        d->depth = (uint16_t)row;
+        /* PoolEntry.score is the ranking used on THIS row. BeamEntry.score must
+           carry only the learned path statistic into the NEXT row. */
+        d->score = g_freq_on
+            ? (float)((double)src[pe->parent].score + freq_row_term(&pe->mv, row))
+            : pe->score;
+        d->log_idx = i;
         d->flags = pe->flags;
         assert(parity_ok(d));
     }
@@ -2700,36 +3400,33 @@ static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
 /* Stop-row emission buffers, allocated on first use (emission is entered from
    serial code). One tile is ~12.6 MB. */
 #define EMIT_TILE 4096
-static char     *g_emit_lines = NULL;    /* EMIT_TILE x EMIT_LINE_MAX */
-static uint64_t *g_emit_fps   = NULL;
-static int      *g_emit_lens  = NULL;
+static char *g_emit_lines = NULL;    /* EMIT_TILE x EMIT_LINE_MAX */
+static uint64_t *g_emit_fps = NULL;
+static int  *g_emit_lens  = NULL;
 
-/* Emit the stop-row boards, best-scored first. Reconstructing a board, hashing
-   it and converting its 512 fields is ~all of the cost and touches only
-   read-only state, so a tile of boards is built in parallel; the dedup, the
-   index draw and the write itself then run serially over that tile in rank
-   order, so the file is byte for byte what emitting one board at a time
-   produced. Boards losing the dedup were formatted for nothing -- parallel work
-   traded against serial work, which is the point. */
+/* Emit complete stop-row boards best-scored first. Formatting and exact-board
+   fingerprints are tiled in parallel; writes and the fingerprint table stay
+   serial so file order is the score order. Distinct complete boards are never
+   suppressed merely because they differ in only one piece. */
 static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, int row) {
     if (!g_completions_fp) return;
-    uint32_t n_emit = kept < EMIT_MAX ? kept : EMIT_MAX;
     if (!g_emit_lines) {
         g_emit_lines = xmalloc((size_t)EMIT_TILE * EMIT_LINE_MAX);
         g_emit_fps   = xmalloc((size_t)EMIT_TILE * sizeof(uint64_t));
         g_emit_lens  = xmalloc((size_t)EMIT_TILE * sizeof(int));
     }
     int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
-    for (uint32_t base = 0; base < n_emit && !g_stop; base += EMIT_TILE) {
-        uint32_t tile = n_emit - base < (uint32_t)EMIT_TILE
-                      ? n_emit - base : (uint32_t)EMIT_TILE;
+    for (uint32_t base = 0; base < kept && g_emit_count < EMIT_MAX && !g_stop;
+         base += EMIT_TILE) {
+        uint32_t tile = kept - base < (uint32_t)EMIT_TILE
+                      ? kept - base : (uint32_t)EMIT_TILE;
         #pragma omp parallel for schedule(static) num_threads(nt)
         for (uint32_t k = 0; k < tile; k++) {
             const PoolEntry *pe = &ctx->pool[ctx->keep[base + k]];
             RowChoice rows[EDGE_LEN];
             rows[row] = pe->mv;
             collect_rows(ctx, &beam[pe->parent], rows);
-            g_emit_fps[k]  = board_fingerprint(rows, row);
+            g_emit_fps[k] = board_fingerprint(rows, row);
             g_emit_lens[k] = format_board_tail(rows, row, ROWMASK_FULL,
                                                (pe->flags & FLAG_ORIENT_SET)
                                                    ? (int)(pe->flags & FLAG_ORIENT_MASK) : -1,
@@ -2747,7 +3444,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
                           "board sums to %.6f -- the running total is not the board",
                           (double)pe->score, full);
             }
-        for (uint32_t k = 0; k < tile; k++) {
+        for (uint32_t k = 0; k < tile && g_emit_count < EMIT_MAX; k++) {
             if (!htable_insert(g_emit_fps[k])) continue;
             fprintf(g_completions_fp, "%s, %" PRIu64, g_config_id_str, g_solution_idx++);
             fwrite(g_emit_lines + (size_t)k * EMIT_LINE_MAX, 1,
@@ -2765,12 +3462,13 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
     int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
     BeamEntry *cur = ctx->beam_a, *nxt = ctx->beam_b;
     beam_init_border(&cur[0], g_cur_bottom, g_cur_left);
-    /* The root carries row 0. Every later row adds its own 16 cells, so the
-       running total is the whole board and nothing is counted twice. */
-    if (g_freq_on) cur[0].score = (float)freq_border_term(g_cur_bottom);
+    /* The root carries row 0 of the learned statistic. Stock lookahead/colour
+       scores are deliberately not stored here: they remain local to each row. */
+    if (g_freq_on) cur[0].score = (float)freq_beam_bottom_term(g_cur_bottom);
     uint32_t beam_n = 1;
     g_beam_unpruned = false;          /* row 1 keeps the one-child economy */
     memset(ctx->log_n, 0, sizeof ctx->log_n);
+    maha_reset_config();
     g_stats.configs++;
 
     for (int row = 1; (uint32_t)row <= g_stop_row; row++) {
@@ -2784,30 +3482,39 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         uint64_t pool_n = ctx->pool_n;
         if (pool_n > ctx->pool_cap) pool_n = ctx->pool_cap;
         g_stats.cands_total += pool_n;
+        g_stats.row_attempts[row]++;
+        g_stats.row_candidates[row] += pool_n;
         if (pool_n == 0) {
             res.reason = "extinct"; res.row = (uint32_t)row;
             g_stats.extinct_at[row]++;
             break;
         }
 
-        /* ctx->keep drives emit_stop_row, so the stop row's emission order IS
-           this ranking -- by the real score, and by nothing else. */
-        uint32_t kept = dedup_and_rank(ctx, pool_n, nt);
+        /* Search-mode stop-row candidates remain raw through ranking so frontier
+           equivalence cannot collapse distinct complete boards. emit_stop_row
+           then removes exact duplicate boards only. Learning still frontier-
+           deduplicates before counting, and all earlier rows must deduplicate
+           because equivalent futures do not both belong in the beam. */
+        const bool raw_stop = ((uint32_t)row == g_stop_row) && !g_learning;
+        uint32_t kept = raw_stop ? rank_pool_raw(ctx, pool_n, nt)
+                                 : dedup_and_rank(ctx, pool_n, nt);
+        g_stats.row_retained[row] += kept;
         g_stats.t_select += omp_get_wtime() - t_exp;
         res.row = (uint32_t)row;
         g_stats.rows_advanced++;
 
         if ((uint32_t)row == g_stop_row) {
             res.width = kept;
+            g_stats.row_selected[row] += kept;
             double t0 = omp_get_wtime();
-            if (g_learning) learn_stop_row(ctx, cur, kept, row);
+            if (g_learning) learn_stop_row(ctx, cur, kept, row, cfg_hash);
             else             emit_stop_row(ctx, cur, kept, row);
             g_stats.t_emit += omp_get_wtime() - t0;
             g_stats.reached_stop++;
             partials_budget_spent();       /* the whole beam is written by now */
             if (g_verbose) {
                 double dt = omp_get_wtime() - t_row;
-                printf("[beam] %s row=%d cands=%" PRIu64 " uniq=%u emitted<=%u t=%.2fs\n",
+                printf("[beam] %s row=%d cands=%" PRIu64 " ranked=%u emitted<=%u t=%.2fs\n",
                        g_config_id_str, row, pool_n, kept,
                        kept < EMIT_MAX ? kept : EMIT_MAX, dt);
                 fflush(stdout);
@@ -2820,6 +3527,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         g_beam_unpruned = (kept <= eff_K);
         uint32_t n_sel = select_beam(ctx, kept, beam_n, eff_K,
                                      parent_cap_eff(row), g_frac_rand, &sel_rng);
+        g_stats.row_selected[row] += n_sel;
         double t0 = omp_get_wtime();
         materialize_beam(ctx, cur, nxt, n_sel, row);
         g_stats.t_mat += omp_get_wtime() - t0;
@@ -2904,6 +3612,23 @@ static void read_checkpoint(const char *path) {
 
 /* -- Summary ------------------------------------------------------------------ */
 
+static double score_diag_sd(double n, double sum, double sumsq) {
+    if (n <= 0.0) return 0.0;
+    double v = sumsq / n - (sum / n) * (sum / n);
+    return v > 0.0 ? sqrt(v) : 0.0;
+}
+
+static bool score_diag_corr(double n, double sx, double sxx,
+                            double sy, double syy, double sxy,
+                            double *out) {
+    if (n <= 1.0) return false;
+    double vx = sxx - sx * sx / n;
+    double vy = syy - sy * sy / n;
+    if (!(vx > 1e-18) || !(vy > 1e-18)) return false;
+    *out = (sxy - sx * sy / n) / sqrt(vx * vy);
+    return true;
+}
+
 static void print_summary(double wall_total, double init_s, double sweep_s) {
     printf("\n================= run summary =================\n");
     printf("[sum] wall %.1fs = init %.1fs (DB build %.1fs, sort %.1fs) + sweep %.1fs\n",
@@ -2923,19 +3648,101 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
             if (g_stats.extinct_at[r]) { printf("  r%d:%" PRIu64, r, g_stats.extinct_at[r]); any = true; }
         if (!any) printf("  none");
         printf("   reached stop_row: %" PRIu64 "\n", g_stats.reached_stop);
-    }
-    if (g_verbose && g_lambda_maha != 0.0) {
-        /* The measured Mahalanobis spread per row -- what --lambda_Mahalanobis
-           is denominated in. Printed so the calibration is visible rather than
-           implicit: a row reading 0 had too small a sample and stood the
-           correction down, and a table far from the reference values means the
-           regime moved and the weight no longer means what it did. */
-        printf("[sum] maha sd by row:");
-        bool anysd = false;
+        printf("[sum] row flow (attempts:candidates/retained/selected):");
         for (int r = 1; r <= (int)g_stop_row; r++)
-            if (g_maha_sd[r] > 0.0) { printf("  r%d:%.3f(n=%.0f)", r, g_maha_sd[r], g_maha_n[r]); anysd = true; }
-        if (!anysd) printf("  none measured (every row under the %.0f-sample floor)", MAHA_MIN_SAMPLES);
+            if (g_stats.row_attempts[r])
+                printf("  r%d=%" PRIu64 ":%" PRIu64 "/%" PRIu64 "/%" PRIu64,
+                       r, g_stats.row_attempts[r], g_stats.row_candidates[r],
+                       g_stats.row_retained[r], g_stats.row_selected[r]);
         printf("\n");
+    }
+    if (g_border_stats.bottoms_ranked) {
+        printf("[sum] border prefilter: bottom-slots=%" PRIu64
+               " no-clue-column=%" PRIu64
+               " columns ordinary=%" PRIu64 " clue-compatible=%" PRIu64
+               " run=%" PRIu64 " time=%.1fs\n",
+               g_border_stats.bottoms_ranked,
+               g_border_stats.bottoms_no_clue_column,
+               g_border_stats.columns_ordinary_viable,
+               g_border_stats.columns_clue_compatible,
+               g_border_stats.columns_run,
+               g_border_stats.clue_seconds);
+    }
+    if (g_lambda_maha != 0.0) {
+        printf("[sum] Mahalanobis pooled raw SD by row:");
+        bool anysd = false;
+        for (int r = 1; r <= (int)g_stop_row; r++) {
+            double n = g_maha_pool_n[r];
+            if (n < MAHA_MIN_SAMPLES) continue;
+            double m = g_maha_pool_sum[r] / n;
+            double v = g_maha_pool_sumsq[r] / n - m * m;
+            if (!(v > 1e-18)) continue;
+            printf("  r%d:%.3f(n=%.0f)", r, sqrt(v), n);
+            anysd = true;
+        }
+        if (!anysd)
+            printf("  none measured (every row under the %.0f-sample floor)",
+                   MAHA_MIN_SAMPLES);
+        printf("\n");
+    }
+    if (g_verbose) {
+        for (int r = 1; r <= (int)g_stop_row; r++) {
+            ScoreDiag a = {0};
+            for (int th = 0; th < MAX_ACC_THREADS; th++) {
+                const ScoreDiag *d = &g_score_diag[th][r];
+                a.n += d->n;
+                for (int k = 0; k < SD_N; k++) {
+                    a.sum[k] += d->sum[k]; a.sumsq[k] += d->sumsq[k];
+                }
+                a.cross_table_fan += d->cross_table_fan;
+                a.cross_table_J   += d->cross_table_J;
+                a.cross_J_maha    += d->cross_J_maha;
+            }
+            if (a.n <= 0.0) continue;
+            printf("[score] r%d n=%.0f SD fan=%.3f J=%.3f Maha=%.3f "
+                   "table_inc=%.3f table_acc=%.3f",
+                   r, a.n,
+                   score_diag_sd(a.n, a.sum[SD_FANOUT], a.sumsq[SD_FANOUT]),
+                   score_diag_sd(a.n, a.sum[SD_CLOSURE], a.sumsq[SD_CLOSURE]),
+                   score_diag_sd(a.n, a.sum[SD_MAHA], a.sumsq[SD_MAHA]),
+                   score_diag_sd(a.n, a.sum[SD_TABLE_INC], a.sumsq[SD_TABLE_INC]),
+                   score_diag_sd(a.n, a.sum[SD_TABLE_ACC], a.sumsq[SD_TABLE_ACC]));
+            double c;
+            if (score_diag_corr(a.n,
+                                a.sum[SD_TABLE_ACC], a.sumsq[SD_TABLE_ACC],
+                                a.sum[SD_FANOUT], a.sumsq[SD_FANOUT],
+                                a.cross_table_fan, &c))
+                printf(" corr(T,F)=%.3f", c);
+            if (score_diag_corr(a.n,
+                                a.sum[SD_TABLE_ACC], a.sumsq[SD_TABLE_ACC],
+                                a.sum[SD_CLOSURE], a.sumsq[SD_CLOSURE],
+                                a.cross_table_J, &c))
+                printf(" corr(T,J)=%.3f", c);
+            if (score_diag_corr(a.n,
+                                a.sum[SD_CLOSURE], a.sumsq[SD_CLOSURE],
+                                a.sum[SD_MAHA], a.sumsq[SD_MAHA],
+                                a.cross_J_maha, &c))
+                printf(" corr(J,M)=%.3f", c);
+            printf("\n");
+        }
+    }
+    {
+        int first = (int)g_stop_row - 2;
+        if (first < 1) first = 1;
+        for (int r = first; r <= (int)g_stop_row; r++) {
+            uint64_t tot[REJ_N] = {0};
+            uint64_t all = 0;
+            for (int th = 0; th < MAX_ACC_THREADS; th++)
+                for (int k = 0; k < REJ_N; k++) {
+                    tot[k] += g_reject[th][r][k];
+                }
+            for (int k = 0; k < REJ_N; k++) all += tot[k];
+            if (!all) continue;
+            printf("[late] row %d rejection attempts:", r);
+            for (int k = 0; k < REJ_N; k++)
+                if (tot[k]) printf(" %s=%" PRIu64, g_rej_name[k], tot[k]);
+            printf("\n");
+        }
     }
     if (g_clue_debug)
         for (int r = 1; r <= EDGE_LEN; r++)
@@ -2943,10 +3750,18 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
                 printf("[clue] row %2d: parents=%llu sumA=%llu sumB=%llu sumC=%llu\n", r,
                        (unsigned long long)g_dbg_calls[r], (unsigned long long)g_dbg_nA[r],
                        (unsigned long long)g_dbg_nB[r], (unsigned long long)g_dbg_nC[r]);
-    printf("[sum] emitted unique boards: %" PRIu64 "\n", g_stats.emitted_total);
-    if (g_incomplete_top)
-        printf("[sum] incomplete-top partials: %zu  (A+B %zu, A+C %zu, B+C %zu)\n",
-               g_partial_total, g_part_ab, g_part_ac, g_part_bc);
+    if (g_learning)
+        printf("[sum] learned unique boards counted: %" PRIu64 "\n",
+               g_stats.emitted_total);
+    else
+        printf("[sum] emitted complete boards: %" PRIu64 "\n",
+               g_stats.emitted_total);
+    if (g_incomplete_top) {
+        printf("[sum] incomplete-top partials: %zu  (", g_partial_total);
+        for (int k = 0; k < PART_N; k++)
+            printf("%s%s %zu", k ? ", " : "", g_part_name[k], g_part_total[k]);
+        printf(")\n");
+    }
     fflush(stdout);
 }
 
@@ -3111,15 +3926,13 @@ static void usage(const char *a0) {
 "  --TL N / --TR N        Bottom-Right / Top-Left / Top-Right corner (--random_edges\n"
 "                         only); unpinned corners are sampled, and with 3 pinned the\n"
 "                         4th is forced. Each must be a genuine, distinct corner\n"
-"  --incomplete_top       also emit boards that reach --stop_row with only TWO of its\n"
-"                         three 5-piece segments -- 11 of the row's 16 pieces -- to a\n"
-"                         separate <...>_<stop_row>_partial.csv. All three shapes are\n"
-"                         kept: A+B (cols 11-15 unplaced), A+C (cols 6-10) and B+C\n"
-"                         (cols 1-5). The two segments that lost their left-hand\n"
-"                         neighbour are searched over all 17 inner colors, so expect\n"
-"                         roughly 10x the partials of A+B alone; --max_emitted caps it.\n"
-"                         Both CSVs are APPENDED to, never truncated: a fresh run\n"
-"                         adds to whatever the out_dir already holds\n"
+"  --incomplete_top       also emit stop-row boards with only part of the stop row:\n"
+"                         two segments (A+B, A+C, B+C) to <...>_partial.csv and\n"
+"                         segment B alone to <...>_partial_B.csv. A partial is dropped\n"
+"                         when an earlier one of the same kind has the same pieces\n"
+"                         below the stop row and differs in at most one stop-row\n"
+"                         piece. Complete rows drop exact duplicates only. All CSVs\n"
+"                         are APPENDED, never truncated\n"
 "\n"
 "Beam shape:\n"
 "  --beam_width K         boards kept per row (default 250000)\n"
@@ -3140,7 +3953,7 @@ static void usage(const char *a0) {
 "                         per-row standard deviation -- the spread is measured live and\n"
 "                         divided out, so F means the same thing at every depth. Small\n"
 "                         by design: it correlates ~0.88 with closure, so only the\n"
-"                         residual is new (default 0.6, useful 0.3-0.7; 0 = off)\n"
+"                         residual is new (default 1.0; 0 = off)\n"
 "                         Both terms are always live. --lambda_Mahalanobis 0 is closure\n"
 "                         alone and --lambda_J 0 is Mahalanobis alone, which is why\n"
 "                         there is no --score_model.\n"
@@ -3150,19 +3963,6 @@ static void usage(const char *a0) {
 "                         both on row 2; the row-13 pair is only reserved, never pinned,\n"
 "                         and constrains no searched row. Clue pieces leave the database\n"
 "  --pin_clue N           search ONE of the four clue frames instead of hedging over all\n"
-"\n"
-"DATA-DRIVEN STEERING (this fork only; --learn and --table are separate runs)\n"
-"  --learn PATH           learning phase: grow the board from all four sides in turn,\n"
-"                         counting where each piece lands in the canonical frame, and\n"
-"                         write the table to PATH. Emits nothing. Needs a rotations\n"
-"                         file and --pin_clue.\n"
-"  --table PATH           search phase: rank the beam, and the bottom row and left\n"
-"                         column, by whole-board fit to the table in PATH. Emission is\n"
-"                         unchanged. --tau_bottoms/--tau_columns then sample the border\n"
-"                         in proportion to that fit.\n"
-"  --freq_alpha A         shrinkage toward the piece-by-row prior, in pseudo-configs\n"
-"                         (default 20). Large is the robust row prior (low pieces low),\n"
-"                         small is the sharp cell table. The one knob.\n"
 "                         four. The five clues are one rigid body, so naming where the\n"
 "                         CENTRE clue sits names the whole set. Rows are 0-indexed\n"
 "                         bottom-up, and N runs anticlockwise from the lower left:\n"
@@ -3179,6 +3979,17 @@ static void usage(const char *a0) {
 "                         yourself if you want it, since it costs four more pieces out\n"
 "                         of the chain database. Pinning alone does not, so a pinned run\n"
 "                         reuses an unpinned run's --db_file cache\n"
+"\n"
+"DATA-DRIVEN STEERING (this fork only; --learn and --table are separate runs)\n"
+"  --learn PATH           learning phase: grow the board from all four sides in turn,\n"
+"                         counting where each piece lands in the canonical frame, and\n"
+"                         write the table to PATH. Emits nothing. Needs a rotations\n"
+"                         file and --pin_clue.\n"
+"  --table PATH           search phase: use the learned table in the beam and\n"
+"                         ALWAYS rank bottom rows and left columns by exact location.\n"
+"  --freq_model M         beam statistic: segment (default, pooled A/B/C) or cell\n"
+"                         (exact piece-cell). Both use the same future-preservation\n"
+"                         normalization, KT half-count smoothing and Sinkhorn.\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by\n"
 "                         score, FLAT across rows. Both bands are drawn from the\n"
 "                         same deduplicated pool and sum to the row width, so a\n"
@@ -3238,8 +4049,9 @@ static void usage(const char *a0) {
 "                         re-measure before raising it\n"
 "  --bail_columns N       abandon a bottom after N consecutive columns that emitted\n"
 "                         nothing, instead of running all --top_columns. Most useful\n"
-"                         with --incomplete_top, which emits below the stop row; on\n"
-"                         completions alone at a high --stop_row emissions are rare\n"
+"                         with --incomplete_top: completions and two-segment partials\n"
+"                         reset the streak, B-only partials do not.\n"
+"                         On completions alone at a high --stop_row emissions are rare\n"
 "                         enough that this acts as a cap of N columns per bottom.\n"
 "                         0 = never bail (default 0)\n"
 "  --time_limit S         wall-time slice per (bottom x left) config; a per-row\n"
@@ -3247,17 +4059,17 @@ static void usage(const char *a0) {
 "                         (default 600)\n"
 "  --wall_time S          total wall-time budget; 0 = unlimited (default 0)\n"
 "  --max_emitted N        stop once N boards have been reported, counting both\n"
-"                         completions and --incomplete_top partials; the stop-row\n"
-"                         beam in flight is always reported in full, so the final\n"
-"                         count can overshoot N by up to one beam width\n"
+"                         completions and --incomplete_top partials; the\n"
+"                         configuration in flight is always reported in full, so the\n"
+"                         final count can overshoot N by that configuration's output\n"
 "                         (0 = unlimited; default 0)\n"
 "  --resume               continue from <out_dir>/sweep_checkpoint.txt\n"
 "\n"
 "Misc:\n"
 "  --threads N            OpenMP threads (default: all cores)\n"
-"  --rng_seed S           RNG seed; omitted or 0 = randomized from clock+pid and\n"
-"                         printed, so repeated runs are uncorrelated\n"
-"  --verbose              per-row beam progress lines\n"
+"  --rng_seed S           RNG seed; omitted = randomized from clock+pid. Explicit\n"
+"                         0 is a valid deterministic seed, like any other integer\n"
+"  --verbose              per-row beam traces plus score-component SD/correlations\n"
 "  --help                 this text\n", a0);
 }
 
@@ -3305,7 +4117,9 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     printf(" --top_bottoms %ld --top_columns %ld", g_top_bottoms, g_top_columns);
     if (g_learn_path) printf(" --learn %s", g_learn_path);
     if (g_table_path) printf(" --table %s", g_table_path);
-    printf(" --freq_alpha %g", g_freq_alpha);
+    if (g_learn_path || g_table_path)
+        printf(" --freq_model %s",
+               g_freq_model == FREQ_MODEL_CELL ? "cell" : "segment");
     printf(" --tau_bottoms %g --tau_columns %g", g_tau_bottoms, g_tau_columns);
     printf(" --bail_columns %u", g_bail_columns);
     printf(" --threads %d --rng_seed %" PRIu64, g_nthreads, g_master_seed);
@@ -3339,6 +4153,7 @@ static bool     g_sw_armed = false;    /* a run is open, even at zero suppressed
 static long     g_sw_first = -1, g_sw_last = -1;   /* the SUPPRESSED span      */
 static uint32_t g_sw_n     = 0;        /* suppressed since the printed one     */
 static double   g_sw_wall  = 0.0;      /* their combined wall time             */
+static double   g_progress_last = 0.0;
 
 /* Does any enabled orientation pin something on this row? A row is pinned by a
    clue ON it and, one row earlier, by the colour that clue will sit on -- which
@@ -3363,6 +4178,11 @@ static const char *sweep_reason(const BeamResult *br) {
 }
 
 static void sweep_flush(void) {
+    if (!g_verbose) {
+        g_sw_group[0] = g_sw_key[0] = '\0';
+        g_sw_armed = false; g_sw_first = g_sw_last = -1; g_sw_n = 0; g_sw_wall = 0.0;
+        return;
+    }
     if (g_sw_n == 1)                    /* one held back is not worth a range */
         printf("[sweep] %sl%ld %s wall=%.1fs\n",
                g_sw_group, g_sw_first, g_sw_key, g_sw_wall);
@@ -3382,6 +4202,45 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
     char key[96];
     snprintf(key, sizeof key, "%s=%u width=%u reason=%s",
              filled ? "filled" : "died", br->row, br->width, sweep_reason(br));
+
+    if (!g_verbose) {
+        /* Compact log: a line for completions and two-segment partials; B-only
+           partials are counted in the periodic progress line and the summary. */
+        const size_t strong_partials = g_part_count[PART_AB]
+                                     + g_part_count[PART_AC]
+                                     + g_part_count[PART_BC];
+        const bool productive = g_emit_count != 0 || strong_partials != 0;
+        const bool exceptional = strcmp(br->reason, "extinct") != 0
+                              && strcmp(br->reason, "stop_row") != 0;
+        if (productive || exceptional) {
+            printf("[sweep] %sl%ld %s", group, li, key);
+            if (g_emit_count) printf(" emitted=%zu", g_emit_count);
+            if (g_incomplete_top && g_partial_count)
+                printf(" partials=%zu part_total=%zu", g_partial_count, g_partial_total);
+            if (g_emit_count) printf(" sol_total=%" PRIu64, g_solution_idx);
+            printf(" wall=%.1fs\n", wall);
+            fflush(stdout);
+            return;
+        }
+
+        double now = omp_get_wtime();
+        if (g_progress_last == 0.0) g_progress_last = now;
+        if (now - g_progress_last >= SWEEP_QUIET_SEC) {
+            printf("[progress] %sl%ld configs=%" PRIu64
+                   " stop=%" PRIu64 " boards=%" PRIu64,
+                   group, li, g_stats.configs, g_stats.reached_stop,
+                   g_stats.emitted_total);
+            if (g_incomplete_top) printf(" partials=%zu", g_partial_total);
+            printf(" deaths");
+            for (int r = 1; r <= (int)g_stop_row; r++)
+                if (g_stats.extinct_at[r])
+                    printf(" r%d=%" PRIu64, r, g_stats.extinct_at[r]);
+            printf("\n");
+            fflush(stdout);
+            g_progress_last = now;
+        }
+        return;
+    }
 
     if (g_emit_count + g_partial_count == 0) {          /* nothing to report */
         if (g_sw_armed && !strcmp(g_sw_group, group) && !strcmp(g_sw_key, key)) {
@@ -3469,7 +4328,12 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--pin_clue")    && i+1 < argc) g_pin_clue = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--learn")       && i+1 < argc) g_learn_path = argv[++i];
         else if (!strcmp(argv[i], "--table")       && i+1 < argc) g_table_path = argv[++i];
-        else if (!strcmp(argv[i], "--freq_alpha")  && i+1 < argc) g_freq_alpha = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--freq_model") && i+1 < argc) {
+            const char *m = argv[++i];
+            if      (!strcmp(m, "segment")) g_freq_model = FREQ_MODEL_SEGMENT;
+            else if (!strcmp(m, "cell"))    g_freq_model = FREQ_MODEL_CELL;
+            else fatal("--freq_model must be segment or cell");
+        }
         else if (!strcmp(argv[i], "--bc_window")   && i+1 < argc) {
             unsigned nb = 0, nc = 0;
             /* Bounded above as well: b_left is B_TRY + nB - 1 as an int, so an
@@ -3593,6 +4457,8 @@ int main(int argc, char *argv[]) {
               "deals each edge to, so folding several rows into one table would "
               "mix incompatible side assignments (--num_rows 0, the default, means "
               "every remaining row of the file)");
+    if (g_table_path && g_num_rows != 1)
+        fatal("--table needs --num_rows 1: a table belongs to one border");
     if (g_learn_path && resume)
         fatal("--resume cannot resume a --learn run: the checkpoint stores "
               "(border row, bottom, column) but not which of the four passes wrote "
@@ -3603,8 +4469,6 @@ int main(int argc, char *argv[]) {
         fatal("--learn cannot use --free_edges: the border block assumes each edge "
               "piece has a fixed side, which is exactly what a rotations row "
               "decides and --free_edges releases");
-    if (!(g_freq_alpha > 0.0))
-        fatal("--freq_alpha must be > 0 (it is what keeps every log finite)");
     g_learning   = (g_learn_path != NULL);
     g_freq_debug = (getenv("E555_FREQ_DEBUG") != NULL);
     g_freq_pure  = (getenv("E555_FREQ_PURE") != NULL);
@@ -3660,6 +4524,10 @@ int main(int argc, char *argv[]) {
            g_db_file ? g_db_file : "(none)");
     printf("[cfg] tau_bottoms=%.2f tau_columns=%.2f bail_columns=%u\n",
            g_tau_bottoms, g_tau_columns, g_bail_columns);
+    if (g_learn_path || g_table_path)
+        printf("[cfg] beam_freq_model=%s-preservation "
+               "border_freq_model=location smoothing=KT-1/2\n",
+               g_freq_model == FREQ_MODEL_CELL ? "cell" : "segment");
     fflush(stdout);
 
     double t_start = omp_get_wtime();
@@ -3777,7 +4645,7 @@ int main(int argc, char *argv[]) {
 
         finalize_fixed_corners();          /* validate/resolve any pinned corners */
         htable_init();
-        if (g_incomplete_top) partial_htable_init();
+        if (g_incomplete_top) partial_dedup_init();
         char comp_path[1024];
         snprintf(comp_path, sizeof comp_path, "%s/beam_completions_random_%u.csv", g_out_dir, g_stop_row);
         g_completions_fp = fopen(comp_path, "a");
@@ -3786,13 +4654,10 @@ int main(int argc, char *argv[]) {
         printf("[out] completions -> %s (append)\n", comp_path);
         manifest_add(comp_path);
         if (g_incomplete_top) {
-            char part_path[1024];
-            snprintf(part_path, sizeof part_path, "%s/beam_completions_random_%u_partial.csv", g_out_dir, g_stop_row);
-            g_partial_fp = fopen(part_path, "a");
-            if (!g_partial_fp) fatal("cannot open %s: %s", part_path, strerror(errno));
-            setvbuf(g_partial_fp, NULL, _IOFBF, EMIT_FILE_BUF);
-            printf("[out] incomplete-top partials -> %s (append)\n", part_path);
-            manifest_add(part_path);
+            char part_base[1024];
+            snprintf(part_base, sizeof part_base,
+                     "%s/beam_completions_random_%u", g_out_dir, g_stop_row);
+            partial_outputs_open_base(part_base);
         }
         fflush(stdout);
         g_solution_idx = 0;
@@ -3803,14 +4668,32 @@ int main(int argc, char *argv[]) {
             if (!sample_random_bottom(&srng, g_tau_bottoms, &bot))
                 fatal("random bottom sampling failed; seed edge pool too constrained");
             validate_color_constants();
+            g_border_stats.bottoms_ranked++;
             uint32_t barren = 0;            /* consecutive columns that emitted nothing */
             for (size_t li = 0; li < run_l && !g_stop; li++) {
                 if (g_max_wall_sec > 0.0 && omp_get_wtime() - t_start >= g_max_wall_sec) { printf("[sweep] max_wall reached.\n"); g_stop = 1; break; }
                 if (partials_budget_spent()) { partials_budget_announce(); break; }
-                if (!sample_random_left(&srng, g_tau_columns, &bot, &lft)) {
-                    fprintf(stderr, "[warn] no left column fits bottom %zu; resampling bottom\n", bi);
+                bool got_left = false;
+                double clue_t0 = omp_get_wtime();
+                unsigned left_tries = (g_clue_mask & CLUE_CORNERS) ? 64u : 1u;
+                for (unsigned tr = 0; tr < left_tries; tr++) {
+                    if (!sample_random_left(&srng, g_tau_columns, &bot, &lft)) break;
+                    g_border_stats.columns_ordinary_viable++;
+                    if (row1_corner_compatible(&bot, &lft)) {
+                        g_border_stats.columns_clue_compatible++;
+                        got_left = true;
+                        break;
+                    }
+                }
+                g_border_stats.clue_seconds += omp_get_wtime() - clue_t0;
+                if (!got_left) {
+                    g_border_stats.bottoms_no_clue_column++;
+                    if (g_verbose)
+                        fprintf(stderr, "[warn] no clue-compatible left column sampled "
+                                "for random bottom %zu\n", bi);
                     break;
                 }
+                g_border_stats.columns_run++;
                 g_cur_bottom = &bot;
                 g_cur_left   = &lft;
                 snprintf(g_config_id_str, sizeof g_config_id_str, "rndb%zul%zu", bi, li);
@@ -3818,7 +4701,7 @@ int main(int argc, char *argv[]) {
                                     ^ (fnv1a_str(g_config_id_str) * 0x9E3779B97F4A7C15ULL));
 
                 g_emit_count = 0; memset(g_emit_htable, 0, g_emit_htable_sz*sizeof(uint64_t));
-                if (g_incomplete_top) { g_partial_count = 0; memset(g_partial_htable, 0, g_partial_htable_sz*sizeof(uint64_t)); }
+                if (g_incomplete_top) partial_config_reset();
                 double tc0 = omp_get_wtime();
                 double slice_end = tc0 + g_config_time_sec;
                 if (g_max_wall_sec > 0.0) { double ge = t_start + g_max_wall_sec; if (ge < slice_end) slice_end = ge; }
@@ -3829,14 +4712,18 @@ int main(int argc, char *argv[]) {
                 { char grp[64]; snprintf(grp, sizeof grp, "rndb%zu", bi);
                   sweep_report(grp, (long)li, &br, omp_get_wtime()-tc0); }
                 if (g_completions_fp) fflush(g_completions_fp);
-                if (g_partial_fp)     fflush(g_partial_fp);
+                partial_outputs_flush();
                 partials_budget_announce();
-                barren = (g_emit_count + g_partial_count > 0) ? 0 : barren + 1;
+                barren = (g_emit_count + g_part_count[PART_AB]
+                          + g_part_count[PART_AC] + g_part_count[PART_BC] > 0)
+                         ? 0 : barren + 1;
                 if (g_bail_columns && barren >= g_bail_columns) {
                     sweep_flush();
-                    printf("[bail] rndb%zu: %u column(s) in a row emitted nothing, "
-                           "moving to the next bottom\n", bi, barren);
-                    fflush(stdout);
+                    if (g_verbose) {
+                        printf("[bail] rndb%zu: %u column(s) in a row emitted nothing, "
+                               "moving to the next bottom\n", bi, barren);
+                        fflush(stdout);
+                    }
                     break;
                 }
             }
@@ -3882,6 +4769,7 @@ int main(int argc, char *argv[]) {
         else                               rank_bottoms(g_tau_bottoms, &brng);
 
         size_t nb = g_bottom_n, nl = g_left_n;
+        corner_compat_cache_init(nb);
         size_t run_b = (g_top_bottoms >= 1 && (size_t)g_top_bottoms < nb) ? (size_t)g_top_bottoms : nb;
         size_t cap_l = (g_top_columns >= 1 && (size_t)g_top_columns < nl) ? (size_t)g_top_columns : nl;
         /* LEARNING TAKES THE NUMBER OF SAMPLES IT ASKED FOR, EVEN FROM A SMALL POOL.
@@ -3903,9 +4791,7 @@ int main(int argc, char *argv[]) {
          * Without that the repeat would be bit-identical, every board would be
          * dropped by the per-row dedup, and the configuration would not even be
          * counted -- which is exactly what makes the fresh stream the whole point.
-         *
-         * Search mode is untouched: it still stops at the pool, so the fork's
-         * byte-for-byte agreement with the stock beamer is unaffected. */
+         * Search mode stops at the pool. */
         if (g_learning && g_top_bottoms >= 1 && (size_t)g_top_bottoms > nb)
             run_b = (size_t)g_top_bottoms;
         if (g_learning) {
@@ -3919,10 +4805,10 @@ int main(int argc, char *argv[]) {
         if (nb == 0 || nl == 0) fatal("no border configs for row %u", cur_row);
 
         htable_init();
-        if (g_incomplete_top) partial_htable_init();
+        if (g_incomplete_top) partial_dedup_init();
         if (g_completions_fp) fclose(g_completions_fp);
-        if (g_partial_fp) fclose(g_partial_fp);
-        g_completions_fp = g_partial_fp = NULL;
+        g_completions_fp = NULL;
+        partial_outputs_close();
         if (!g_learning) {
         char comp_path[1024];
         snprintf(comp_path, sizeof comp_path, "%s/beam_completions_%u_%u.csv", g_out_dir, cur_row, g_stop_row);
@@ -3932,13 +4818,10 @@ int main(int argc, char *argv[]) {
         printf("[out] completions -> %s (append)\n", comp_path);
         manifest_add(comp_path);
         if (g_incomplete_top) {
-            char part_path[1024];
-            snprintf(part_path, sizeof part_path, "%s/beam_completions_%u_%u_partial.csv", g_out_dir, cur_row, g_stop_row);
-            g_partial_fp = fopen(part_path, "a");
-            if (!g_partial_fp) fatal("cannot open %s: %s", part_path, strerror(errno));
-            setvbuf(g_partial_fp, NULL, _IOFBF, EMIT_FILE_BUF);
-            printf("[out] incomplete-top partials -> %s (append)\n", part_path);
-            manifest_add(part_path);
+            char part_base[1024];
+            snprintf(part_base, sizeof part_base,
+                     "%s/beam_completions_%u_%u", g_out_dir, cur_row, g_stop_row);
+            partial_outputs_open_base(part_base);
         }
         }   /* !g_learning: the learning phase counts boards, it writes none */
         fflush(stdout);
@@ -3965,13 +4848,22 @@ int main(int argc, char *argv[]) {
                ordering for the bottom it re-enters. */
             RNG lrng = rng_for(g_master_seed, cur_row + (uint32_t)g_pass * 65536u, 0x1EF7C015u, (uint32_t)bi);
             size_t distinct = 0;
-            size_t viable = (g_freq_on && g_freq_border_ok)
+            size_t ordinary_viable = (g_freq_on && g_freq_border_ok)
                 ? freq_rank_lefts(&g_bottoms[b_idx], g_tau_columns, &lrng, &distinct)
                 : rank_lefts(&g_bottoms[b_idx], g_tau_columns, &lrng, &distinct);
+            double clue_t0 = omp_get_wtime();
+            size_t viable = clue_filter_ranked_lefts(b_idx, &g_bottoms[b_idx],
+                                                      ordinary_viable);
+            g_border_stats.clue_seconds += omp_get_wtime() - clue_t0;
             size_t run_l = viable < cap_l ? viable : cap_l;
-            printf("[rank] %s: columns %zu -> %zu viable, %zu distinct rank(s), run %zu\n",
-                   blab, nl, viable, distinct, run_l); fflush(stdout);
-            if (run_l == 0) {                /* no column completes row 1 with it */
+            g_border_stats.columns_run += run_l;
+            if (g_verbose) {
+                printf("[rank] %s: columns %zu -> %zu ordinary -> %zu clue-compatible, "
+                       "%zu distinct ordinary rank(s), run %zu\n",
+                       blab, nl, ordinary_viable, viable, distinct, run_l);
+                fflush(stdout);
+            }
+            if (run_l == 0) {                /* no clue-compatible row 1 */
                 if (!g_learning) write_checkpoint(ckpath, cur_row, (uint32_t)(bi+1), 0);
                 continue;
             }
@@ -3993,7 +4885,7 @@ int main(int argc, char *argv[]) {
                     cfg_hash = splitmix64(cfg_hash ^ (0x9E3779B97F4A7C15ULL * (uint64_t)(g_pass + 1)));
 
                 g_emit_count = 0; memset(g_emit_htable, 0, g_emit_htable_sz*sizeof(uint64_t));
-                if (g_incomplete_top) { g_partial_count = 0; memset(g_partial_htable, 0, g_partial_htable_sz*sizeof(uint64_t)); }
+                if (g_incomplete_top) partial_config_reset();
                 double tc0 = omp_get_wtime();
                 double slice_end = tc0 + g_config_time_sec;
                 if (g_pass_deadline > 0.0 && g_pass_deadline < slice_end) slice_end = g_pass_deadline;
@@ -4005,15 +4897,19 @@ int main(int argc, char *argv[]) {
                 { char grp[64]; snprintf(grp, sizeof grp, "%s", blab);
                   sweep_report(grp, (long)li, &br, omp_get_wtime()-tc0); }
                 if (g_completions_fp) fflush(g_completions_fp);
-                if (g_partial_fp)     fflush(g_partial_fp);
+                partial_outputs_flush();
                 partials_budget_announce();
                 if (!g_learning) write_checkpoint(ckpath, cur_row, (uint32_t)bi, (uint32_t)(li+1));
-                barren = (g_emit_count + g_partial_count > 0) ? 0 : barren + 1;
+                barren = (g_emit_count + g_part_count[PART_AB]
+                          + g_part_count[PART_AC] + g_part_count[PART_BC] > 0)
+                         ? 0 : barren + 1;
                 if (g_bail_columns && barren >= g_bail_columns) {
                     sweep_flush();
-                    printf("[bail] %s: %u column(s) in a row emitted nothing, "
-                           "moving to the next bottom\n", blab, barren);
-                    fflush(stdout);
+                    if (g_verbose) {
+                        printf("[bail] %s: %u column(s) in a row emitted nothing, "
+                               "moving to the next bottom\n", blab, barren);
+                        fflush(stdout);
+                    }
                     /* Point the checkpoint at the next bottom, not at the column
                        we stopped on -- otherwise --resume walks back into the
                        bottom we just abandoned and undoes the saving. */
@@ -4065,9 +4961,9 @@ int main(int argc, char *argv[]) {
                "configurations of the fattest%s\n", 100.0 * (double)cmin / (double)cmax,
                (cmin * 4 < cmax) ? "  <-- raise --top_bottoms" : "");
         /* The one number that says whether any of this carries signal. Scored
-           leave-one-configuration-out: a board is measured against a table that
-           holds only configurations finished before its own. */
-        printf("[learn] held-out lift %.4f nats/cell over %zu boards%s\n",
+           prequentially: a board is measured against a table that holds only
+           configurations finished before its own. */
+        printf("[learn] prequential segment lift %.4f nats/cell over %zu boards%s\n",
                g_lift_cells > 0.0 ? g_lift_sum / g_lift_cells : 0.0, g_lift_boards,
                g_lift_cells > 0.0 && g_lift_sum / g_lift_cells <= 0.0
                    ? "  <-- NO SIGNAL: the table is not worth searching with" : "");
@@ -4077,7 +4973,7 @@ int main(int argc, char *argv[]) {
     double wall = omp_get_wtime() - t_start;
     print_summary(wall, init_s, omp_get_wtime() - t_sweep0);
     if (g_completions_fp) fclose(g_completions_fp);
-    if (g_partial_fp) fclose(g_partial_fp);
+    partial_outputs_close();
     /* After the closes: the manifest reports which files GREW, so their buffers
        have to have reached the disk before it stats them. */
     manifest_write(g_out_dir);
