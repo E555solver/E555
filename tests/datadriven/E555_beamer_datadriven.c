@@ -641,6 +641,33 @@ static int format_board_tail(const RowChoice rows[EDGE_LEN], int row,
             pos[cc->piece]     = (uint32_t)(cc->row * PUZZLE_SIDE + cc->col);
             rot_arr[cc->piece] = cc->spin;
         }
+    /* Rotations mode: the rest of the fixed frame the search held -- the whole
+       left column (cBL..cTL, one matched Euler trail) and the top-right corner.
+       The config chose them before the first row and kept them out of the beam
+       (beam_init_border puts all 17 in the used set), so no searched cell can
+       hold them and none of them touches a searched cell with an edge the
+       search did not score: above the top row their only placed neighbours are
+       each other. Written only where the board is still empty, so rows the
+       search placed are emitted exactly as before. Not under --random_edges,
+       where the frame is a sample rather than an input. */
+    if (!g_random_edges) {
+        for (int r = 0; r < PUZZLE_SIDE; r++) {
+            if (cell_is_placed(r, 0, row, colmask)) continue;
+            const Oriented *o = g_cur_left->p[r];
+            if (pos[o->piece_id] != 999)
+                fatal("left-column piece %u (row %d) is already on the board",
+                      o->piece_id, r);
+            pos[o->piece_id]     = (uint32_t)(r * PUZZLE_SIDE);
+            rot_arr[o->piece_id] = o->rotation;
+        }
+        const int tr = PUZZLE_SIDE * PUZZLE_SIDE - 1;
+        if (!cell_is_placed(PUZZLE_SIDE - 1, PUZZLE_SIDE - 1, row, colmask)) {
+            if (pos[g_cTR.piece_id] != 999)
+                fatal("top-right corner %u is already on the board", g_cTR.piece_id);
+            pos[g_cTR.piece_id]     = (uint32_t)tr;
+            rot_arr[g_cTR.piece_id] = g_cTR.rotation;
+        }
+    }
 
     char *p = out;
     for (int i = 0; i < NUM_PIECES; i++) { *p++ = ','; *p++ = ' '; p = u32a(p, pos[i]); }
