@@ -1869,6 +1869,41 @@ static uint64_t border_hash(void)
     return h;
 }
 
+/* Rotations row `want`, verbatim, and the comment line nearest above it (the
+   Stage A "#  TOP=.. RIGHT=.. BOTTOM=.. LEFT=..  Score=.." line), so the log and
+   the table can carry the border they were run on: if the rotations file is
+   lost, the row can be rebuilt from either. Nothing is recomputed -- the trail
+   counts and score are echoed as the file states them.
+
+   Rows are counted exactly as read_one_border_row counts them: a line whose
+   first non-blank character is '#' or '%' is a comment, a blank line is
+   skipped, anything else is a data row. The comment is the last comment line
+   after the previous data row, or NULL when there is none. Both strings are
+   malloc'd without the line ending; the caller frees them. */
+static bool read_border_row_text(const char *path, uint32_t want,
+                                 char **row_out, char **comment_out)
+{
+    *row_out = NULL; *comment_out = NULL;
+    FILE *f = fopen(path, "r");
+    if (!f) fatal("cannot open rotation CSV %s: %s", path, strerror(errno));
+    char *line = NULL, *comment = NULL; size_t sz = 0; ssize_t len;
+    uint32_t data_idx = 0; bool found = false;
+    while ((len = getline(&line, &sz, f)) >= 0) {
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        const char *s = line;
+        while (*s == ' ' || *s == '\t') s++;
+        if (*s == '\0') continue;
+        if (*s == '#' || *s == '%') { free(comment); comment = strdup(line); continue; }
+        if (data_idx++ == want) {
+            *row_out = strdup(line); *comment_out = comment; comment = NULL;
+            found = true; break;
+        }
+        free(comment); comment = NULL;
+    }
+    free(comment); free(line); fclose(f);
+    return found;
+}
+
 static void freq_write(const char *path, const char *seed_path, const char *rot_path,
                        const double *cnt, const double *wcell, const double *wsq)
 {
@@ -1882,6 +1917,18 @@ static void freq_write(const char *path, const char *seed_path, const char *rot_
     fprintf(f, "version %d\n", FREQ_TABLE_VERSION);
     fprintf(f, "seed %s %" PRIu64 "\n", seed_path, seed_hash());
     fprintf(f, "rotations %s %u\n", rot_path ? rot_path : "-", g_start_row);
+    /* The rotations row itself, untouched (unturned: pass 0's border), and its
+       Stage A comment when the file has one. Provenance only -- the reader
+       checks the border by hash -- but it lets the rotations file be rebuilt:
+         grep -E '^rotations_(comment|row) ' TABLE | cut -d' ' -f2- */
+    if (rot_path) {
+        char *row_txt, *cmt_txt;
+        if (read_border_row_text(rot_path, g_start_row, &row_txt, &cmt_txt)) {
+            if (cmt_txt) fprintf(f, "rotations_comment %s\n", cmt_txt);
+            fprintf(f, "rotations_row %s\n", row_txt);
+        }
+        free(row_txt); free(cmt_txt);
+    }
     fprintf(f, "border %" PRIu64 "\n", border_hash());
     fprintf(f, "clue_mask %u pin %d\n", g_clue_mask, g_pin_clue);
     fprintf(f, "stop_row %u beam_width %u threads %d rng_seed %" PRIu64 "\n",
@@ -1952,14 +1999,17 @@ static void freq_load(const char *path, const char *seed_path, const char *rot_p
     memset(rowcnt, 0, FREQ_RSZ * sizeof(double));
     memset(segcnt, 0, FREQ_SSZ * sizeof(double));
 
-    char line[512]; bool seen_version = false, seen_rowcnt = false, seen_segcnt = false;
+    /* getline, not a fixed buffer: a rotations_row line runs past 512 bytes, and
+       fgets would hand its tail back as a line of its own. */
+    char *line = NULL; size_t line_sz = 0;
+    bool seen_version = false, seen_rowcnt = false, seen_segcnt = false;
     uint64_t want_seed = 0, want_border = 0; bool seen_border = false;
     unsigned rot_row = 0, clue_mask = 0; int pin = 0;
     int tab_side[NUM_PIECES];
     for (int k = 0; k < NUM_PIECES; k++) tab_side[k] = -2;   /* -2 = no freep line */
     char rot_name[256] = "-", seed_name[256] = "-", lift_kind[64] = "";
     double lift = 0.0; size_t lift_n = 0;
-    while (fgets(line, sizeof line, f)) {
+    while (getline(&line, &line_sz, f) >= 0) {
         if (line[0] == '#' || line[0] == '\n') continue;
         int p, x, j, r, sg; double v, w; size_t n;
         if (!strncmp(line, "version ", 8)) {
@@ -2010,7 +2060,7 @@ static void freq_load(const char *path, const char *seed_path, const char *rot_p
             if (j >= 0 && j < FREQ_NPASS) g_pconfigs[j] = n;
         }
     }
-    fclose(f);
+    free(line); fclose(f);
     if (!seen_version) fatal("--table %s: not an E555 datadriven table", path);
     if (strcmp(lift_kind, "segment_kt_prequential"))
         fatal("--table %s: lift_kind is '%s', expected segment_kt_prequential",
@@ -4741,6 +4791,19 @@ int main(int argc, char *argv[]) {
 
         uint8_t spins[NUM_PIECES];
         if (!read_one_border_row(csv_path, cur_row, spins)) { printf("[sweep] border row %u not found; stopping.\n", cur_row); break; }
+        /* The row as the file has it (before this pass's turn), with its Stage A
+           comment, so the log alone is enough to rebuild the rotations file. */
+        {
+            char *row_txt, *cmt_txt;
+            if (read_border_row_text(csv_path, cur_row, &row_txt, &cmt_txt)) {
+                printf("[border] %s row %u, as in the file%s:\n", csv_path, cur_row,
+                       g_pass ? " (unturned)" : "");
+                if (cmt_txt) printf("%s\n", cmt_txt);
+                printf("%s\n", row_txt);
+                fflush(stdout);
+            }
+            free(row_txt); free(cmt_txt);
+        }
         /* Turn the border and the clue frame together: the same anchored puzzle,
            relabelled, so the pass grows from what was another side of it. */
         rot_row_turn(spins, g_pass);
