@@ -206,6 +206,21 @@ makes that more likely.
   Rotations are ignored. Completions and two-segment partials reset
   `--bail_columns`; B-only partials do not. `--max_emitted` counts everything
   written.
+- **Emitted boards carry the fixed frame.** With a rotations file, each
+  configuration fixes the whole left column (BL to TL) and the TR corner before
+  the first row, and the beam never places those 17 pieces anywhere else. Every
+  emitted board, completion or partial, writes them into the cells the search left
+  empty: column 0 above the stop row, and cell 255. Cells the search placed are
+  unchanged. The column is one matched trail, so a board gains matched edges (six
+  at `--stop_row 9`) and never a break. Stage C tools treat these pieces as fixed;
+  free them with a holes file. Not under `--random_edges`.
+- **The rotations row is echoed.** At the start of each border row the log prints
+  the row exactly as it appears in the file (unturned), after the comment line
+  above it (the Stage A `TOP= RIGHT= BOTTOM= LEFT= Score=` line) when there is
+  one. `--learn` writes the same two lines into the table as `rotations_comment`
+  and `rotations_row`, so a lost rotations file can be rebuilt from either:
+  `grep -E '^rotations_(comment|row) ' TABLE | cut -d' ' -f2-`. They are a record
+  only; the border check uses the hash.
 - `--verbose` adds per-row standard deviations and correlations of the score
   components.
 
@@ -231,7 +246,7 @@ A table and the boards found with it, kept as a reference and a test input.
 |---|---|
 | `table_rnd_s9_row2.txt` | Table learned on border **r16178**, which is row 4 of `borders_stageAx6.csv`. Its header names the file it was run from (`borders_stageAx6_best.csv`, row 2); the border check matches it by content. Learning used `--stop_row 9 --beam_width 250000 --top_bottoms 10000 --top_columns 10`, 24 threads, and the randomised settings of the slurm script. It covers 10 510 configurations, and its segment lift is +0.24 nats/cell. |
 | `freq_view_table_rnd_s9_row2.txt` | `freq_view.py --text` of the table. |
-| `beam_completions_2_11.csv` | 282 boards to `--stop_row 11` found with the table, from 174 configurations. All are edge-legal with 356 matched edges. |
+| `beam_completions_2_11.csv` | 282 boards to `--stop_row 11` found with the table, from 174 configurations. All are edge-legal with 356 matched edges. Written before emitted boards carried the frame, so rows 12 to 15 of the left column and the TR corner are empty. |
 | `slurm_datadriven.sh` | The learn-then-search job. Its defaults match the settings recorded in the table header. |
 | `E555_annealer_MaxSides.csv` | 30 Stage A borders maximising all four sides (100k restarts, 750k steps), sorted by top. |
 
