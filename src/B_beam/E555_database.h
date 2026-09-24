@@ -617,4 +617,128 @@ void finalize_fixed_corners(void);
 /* Read the want-th non-comment data row's 256 spins from a Stage A CSV. */
 bool read_one_border_row(const char *csv_path, uint32_t want, uint8_t spins[NUM_PIECES]);
 
+/* -- Top-corner supply (--lambda_corners) ----------------------------------- */
+/* The beam stops at row 12 at most, so the two top corners are left to Stage C,
+   and nothing in the score keeps the pieces they need unspent. With the sides
+   fixed (a rotations row, or a complete border), every legal filling of a small
+   block against each top corner can be enumerated exactly, and a board can be
+   scored by how many of those blocks it can still build from its unused pieces.
+
+   Two templates, shown for TL (TR is the mirror image):
+
+     --clue_corners on                       off
+       row 15  corner  w1    w2                corner  w1
+       row 14  side    in_a  in_b              side    in_a
+       row 13  side    in_c  CLUE
+
+   A BLOCK is the side and inner pieces (5, or 2 unclued) with their spins; the
+   top-border cells w are only witnesses that the top border can meet it, and
+   serve the joint report. The clued block depends on the clue frame, so it is
+   built once per allowed orientation; the unclued one once, in slot 0.
+
+   The score of a child is step(n_TL) + step(n_TR), with n the blocks still
+   alive (no piece on the board), capped at 3, and step = -3, +1, +2, +3 for
+   n = 0, 1, 2, 3+. Tools multiply it by lambda * u_row, where u_row is the
+   standard deviation of the rest of their score, so lambda is in score-SD
+   units. At --stop_row 12 a clued block must also meet the exposed tops, since
+   the row-13 clues pin nothing and row 12 is built blind to them. */
+#define TC_TL              0
+#define TC_TR              1
+#define TC_MAX_BLOCKS      4096
+#define TC_MAX_WIT         32
+#define TC_CAP             3
+#define TC_LAMBDA_DEFAULT  0.5
+#define TC_MAX_THREADS     256
+#define TC_NO_PIECE        0xFFFFu
+
+typedef struct {
+    uint16_t pid[5];          /* clued: side r14, side r13, in_a, in_b, in_c; unclued: side, in_a */
+    uint8_t  spin[5];
+    uint8_t  n;               /* 5 clued, 2 unclued */
+    uint8_t  nwit;
+    uint16_t wit[TC_MAX_WIT][2];   /* (w1, w2); w2 = TC_NO_PIECE unclued */
+} TcBlock;
+
+/* One block as the live test sees it: the pieces that must still be unused,
+   and the colours it owes row 12 (clued only). */
+typedef struct {
+    uint64_t mask[4];
+    uint16_t blk;
+    uint8_t  in_c_bottom;     /* in_c's bottom: meets row 12 at col 1 / 14 */
+    uint8_t  side_lo_bottom;  /* side r13's bottom: meets row 12 at col 0 / 15 */
+} TcLive;
+
+extern bool     g_tc_clued;                    /* catalog built with the clue template */
+extern uint8_t  g_tc_slots;                    /* slots built: orientations, or bit 0 */
+extern int      g_tc_blk_n[4][2];
+extern TcBlock  g_tc_blk[4][2][TC_MAX_BLOCKS];
+extern TcLive   g_tc_live[4][2][TC_MAX_BLOCKS];
+extern int      g_tc_live_n[4][2];
+extern uint8_t  g_tc_clue_bottom[4][2];
+extern double   g_tc_unit;                     /* u_row of the row being expanded */
+extern uint64_t g_tc_columns_dead, g_tc_skipped;
+
+/* Enumerate the catalogs from g_spin and the clue table; returns the mask of
+   slots in which BOTH corners have at least one block (0 = nothing can close).
+   `label` names the input in the log line. */
+uint8_t tc_build(uint8_t orient_mask, bool clued, const char *label);
+/* Can this column's side piece(s) at rows 14 (and 13) be used by some block in
+   some built slot? True when the column does not reach them. */
+bool    tc_left_ok(const LeftOrder *lft);
+/* Per-configuration live lists for the given column. Returns the mask of slots
+   whose TL and TR both keep a block alive against `used` (the pieces already
+   spent or reserved before the search starts). */
+uint8_t tc_config(const LeftOrder *lft, const uint64_t used[4]);
+
+/* u_row: tc_acc(rest of score) per child, tc_close_row per row; tc_unit(row) is
+   the previous row's spread, else this row's, else the nearest measured row,
+   else 1 nat. The table persists across configurations. */
+void    tc_acc(double pre);
+void    tc_close_row(int row);
+double  tc_unit(int row);
+
+/* Stop-row report: n_TL | n_TR << 2 | joint << 4 for one emitted board. */
+uint8_t tc_board_code(int orient, const uint64_t used[4], const uint8_t rtop[PUZZLE_SIDE], bool at12);
+void    tc_tally(uint8_t code);
+void    tc_print_summary(uint32_t stop_row);
+
+static inline int tc_slot_of(int orient) { return g_tc_clued ? orient : 0; }
+
+static inline bool tc_alive(int s, int k, int i, const uint64_t used[4],
+                            const uint8_t rtop[PUZZLE_SIDE], bool at12) {
+    const TcLive *L = &g_tc_live[s][k][i];
+    if ((L->mask[0] & used[0]) | (L->mask[1] & used[1]) |
+        (L->mask[2] & used[2]) | (L->mask[3] & used[3])) return false;
+    if (!at12 || !g_tc_clued) return true;
+    if (k == TC_TL) return rtop[1] == L->in_c_bottom && rtop[0] == L->side_lo_bottom;
+    return rtop[PUZZLE_SIDE - 2] == L->in_c_bottom && rtop[PUZZLE_SIDE - 1] == L->side_lo_bottom;
+}
+
+/* Alive blocks of corner k in slot s, counted up to `cap`. The clue's own
+   junction with row 12 is a board-level fact: miss it and no block can help. */
+static inline int tc_count(int s, int k, const uint64_t used[4],
+                           const uint8_t rtop[PUZZLE_SIDE], bool at12, int cap) {
+    if (at12 && g_tc_clued && rtop[k ? PUZZLE_SIDE - 3 : 2] != g_tc_clue_bottom[s][k]) return 0;
+    int n = 0;
+    for (int i = 0; i < g_tc_live_n[s][k] && n < cap; i++)
+        if (tc_alive(s, k, i, used, rtop, at12)) n++;
+    return n;
+}
+
+/* step(n_TL) + step(n_TR) in -6..+6. A board with no orientation yet (only
+   possible before its clues commit it) takes its best built slot. */
+static inline int tc_step_sum(int orient, const uint64_t used[4],
+                              const uint8_t rtop[PUZZLE_SIDE], bool at12) {
+    static const int8_t step[TC_CAP + 1] = { -3, 1, 2, 3 };
+    int best = -6;
+    for (int s = 0; s < 4; s++) {
+        if (!(g_tc_slots & (1u << s))) continue;
+        if (g_tc_clued && orient >= 0 && s != orient) continue;
+        int v = step[tc_count(s, TC_TL, used, rtop, at12, TC_CAP)]
+              + step[tc_count(s, TC_TR, used, rtop, at12, TC_CAP)];
+        if (v > best) best = v;
+    }
+    return best;
+}
+
 #endif /* E555_DATABASE_V1_H */

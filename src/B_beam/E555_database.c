@@ -1695,3 +1695,339 @@ bool read_one_border_row(const char *csv_path, uint32_t want, uint8_t spins[NUM_
     free(line); fclose(f);
     return found;
 }
+
+/* -- Top-corner supply (--lambda_corners) ----------------------------------- */
+/* See the header for the model. Everything here is built from g_spin (the
+   sides of the current rotations row or complete border) and the clue table;
+   nothing touches the chain database. */
+
+bool     g_tc_clued = false;
+uint8_t  g_tc_slots = 0;
+int      g_tc_blk_n[4][2];
+TcBlock  g_tc_blk[4][2][TC_MAX_BLOCKS];
+TcLive   g_tc_live[4][2][TC_MAX_BLOCKS];
+int      g_tc_live_n[4][2];
+uint8_t  g_tc_clue_bottom[4][2];
+double   g_tc_unit = 1.0;
+uint64_t g_tc_columns_dead = 0, g_tc_skipped = 0;
+
+static bool     s_tc_wit_truncated = false;
+static uint8_t *s_tc_compat[4];               /* [tl * n_TR + tr]: piece-disjoint pair */
+static size_t   s_tc_compat_cap[4];
+
+/* The face pointing toward corner k's side column, and away from it. */
+static inline uint8_t tc_toward(const Oriented *o, int k) { return k ? o->right : o->left; }
+static inline uint8_t tc_away(const Oriented *o, int k)   { return k ? o->left : o->right; }
+
+/* A piece the clue options take out of play: never a block candidate. */
+static bool tc_reserved_clue(uint16_t p) {
+    for (int k = 0; k < CLUE_N; k++) {
+        bool on = (k == 0) ? (g_clue_mask & CLUE_CENTER) != 0 : (g_clue_mask & CLUE_CORNERS) != 0;
+        if (on && g_clue[0][k].piece == p) return true;   /* same five pieces in every frame */
+    }
+    return false;
+}
+
+static void tc_add_block(int s, int k, const Oriented *const cell[], int n,
+                         const Oriented *top, int ntop, const Oriented *corner,
+                         const Oriented *c_in_a, const Oriented *c_in_b) {
+    TcBlock b;
+    memset(&b, 0, sizeof b);
+    for (int u = 0; u < ntop; u++) {                         /* w1 (row 15, near) */
+        const Oriented *w1 = &top[u];
+        if (tc_toward(w1, k) != tc_away(corner, k) || w1->bottom != c_in_a->top) continue;
+        if (!c_in_b) {
+            if (b.nwit < TC_MAX_WIT) { b.wit[b.nwit][0] = w1->piece_id; b.wit[b.nwit][1] = TC_NO_PIECE; b.nwit++; }
+            else s_tc_wit_truncated = true;
+            continue;
+        }
+        for (int v = 0; v < ntop; v++) {                     /* w2 (row 15, far) */
+            const Oriented *w2 = &top[v];
+            if (v == u || tc_toward(w2, k) != tc_away(w1, k) || w2->bottom != c_in_b->top) continue;
+            if (b.nwit < TC_MAX_WIT) { b.wit[b.nwit][0] = w1->piece_id; b.wit[b.nwit][1] = w2->piece_id; b.nwit++; }
+            else s_tc_wit_truncated = true;
+        }
+    }
+    if (!b.nwit) return;                                     /* the top border cannot meet it */
+    if (g_tc_blk_n[s][k] >= TC_MAX_BLOCKS)
+        fatal("--lambda_corners: more than %d legal %s blocks", TC_MAX_BLOCKS, k ? "TR" : "TL");
+    b.n = (uint8_t)n;
+    for (int q = 0; q < n; q++) { b.pid[q] = cell[q]->piece_id; b.spin[q] = cell[q]->rotation; }
+    g_tc_blk[s][k][g_tc_blk_n[s][k]++] = b;
+}
+
+uint8_t tc_build(uint8_t orient_mask, bool clued, const char *label) {
+    Oriented side[2][EDGE_LEN], top[EDGE_LEN], corner[2];
+    int nside[2] = {0, 0}, ntop = 0;
+    bool have[2] = {false, false};
+    for (int p = 0; p < NUM_PIECES; p++) {
+        int z = canonical_zero_count(p);
+        if (z == 0) continue;
+        Oriented r = make_oriented((uint16_t)p, g_spin[p]);
+        if (z == 2) {
+            if (r.top == 0 && r.left == 0)  { corner[TC_TL] = r; have[TC_TL] = true; }
+            if (r.top == 0 && r.right == 0) { corner[TC_TR] = r; have[TC_TR] = true; }
+        } else if (r.top == 0)   { if (ntop < EDGE_LEN) top[ntop++] = r; }
+        else if (r.left == 0)    { if (nside[TC_TL] < EDGE_LEN) side[TC_TL][nside[TC_TL]++] = r; }
+        else if (r.right == 0)   { if (nside[TC_TR] < EDGE_LEN) side[TC_TR][nside[TC_TR]++] = r; }
+    }
+    if (!have[0] || !have[1] || ntop != EDGE_LEN || nside[0] != EDGE_LEN || nside[1] != EDGE_LEN)
+        fatal("--lambda_corners: %s does not deal 14 pieces to the top, left and right "
+              "sides with both top corners", label);
+
+    g_tc_clued = clued;
+    g_tc_slots = clued ? (uint8_t)(orient_mask & 0xF) : 1u;
+    memset(g_tc_blk_n, 0, sizeof g_tc_blk_n);
+    memset(g_tc_live_n, 0, sizeof g_tc_live_n);
+    uint8_t live = 0;
+    for (int s = 0; s < 4; s++) {
+        if (!(g_tc_slots & (1u << s))) continue;
+        Oriented clue[2];
+        if (clued)
+            for (int k = 3; k < CLUE_N; k++) {
+                const ClueCell *cc = &g_clue[s][k];
+                int c = (cc->col == 2) ? TC_TL : (cc->col == PUZZLE_SIDE - 3) ? TC_TR : -1;
+                if (cc->row != PUZZLE_SIDE - 3 || c < 0)
+                    fatal("clue table: entries 3,4 must be (13,2) and (13,13)");
+                clue[c] = make_oriented(cc->piece, cc->spin);
+                g_tc_clue_bottom[s][c] = clue[c].bottom;
+            }
+        int pairs_all[2] = {0, 0}, pairs_ok[2] = {0, 0};
+        for (int k = 0; k < 2; k++) {
+            const Oriented *cr = &corner[k];
+            for (int a = 0; a < nside[k]; a++) {                     /* side (row 14) */
+                const Oriented *sh = &side[k][a];
+                if (sh->top != cr->bottom) continue;
+                if (!clued) {
+                    pairs_all[k]++;
+                    int before = g_tc_blk_n[s][k];
+                    for (int ia = 0; ia < g_cat_count; ia++) {       /* in_a (row 14) */
+                        const Oriented *c1 = &g_cat[ia];
+                        if (tc_toward(c1, k) != tc_away(sh, k) || tc_reserved_clue(c1->piece_id)) continue;
+                        const Oriented *cell[2] = { sh, c1 };
+                        tc_add_block(s, k, cell, 2, top, ntop, cr, c1, NULL);
+                    }
+                    if (g_tc_blk_n[s][k] > before) pairs_ok[k]++;
+                    continue;
+                }
+                const Oriented *cl = &clue[k];
+                for (int b = 0; b < nside[k]; b++) {                 /* side (row 13) */
+                    const Oriented *sl = &side[k][b];
+                    if (b == a || sl->top != sh->bottom) continue;
+                    pairs_all[k]++;
+                    int before = g_tc_blk_n[s][k];
+                    for (int ic = 0; ic < g_cat_count; ic++) {       /* in_c (13, near) */
+                        const Oriented *c3 = &g_cat[ic];
+                        if (tc_toward(c3, k) != tc_away(sl, k) || tc_away(c3, k) != tc_toward(cl, k)) continue;
+                        if (tc_reserved_clue(c3->piece_id)) continue;
+                        for (int ia = 0; ia < g_cat_count; ia++) {   /* in_a (14, near) */
+                            const Oriented *c1 = &g_cat[ia];
+                            if (c1->piece_id == c3->piece_id) continue;
+                            if (tc_toward(c1, k) != tc_away(sh, k) || c1->bottom != c3->top) continue;
+                            if (tc_reserved_clue(c1->piece_id)) continue;
+                            for (int ib = 0; ib < g_cat_count; ib++) {   /* in_b (14, far) */
+                                const Oriented *c2 = &g_cat[ib];
+                                if (c2->piece_id == c3->piece_id || c2->piece_id == c1->piece_id) continue;
+                                if (tc_toward(c2, k) != tc_away(c1, k) || c2->bottom != cl->top) continue;
+                                if (tc_reserved_clue(c2->piece_id)) continue;
+                                const Oriented *cell[5] = { sh, sl, c1, c2, c3 };
+                                tc_add_block(s, k, cell, 5, top, ntop, cr, c1, c2);
+                            }
+                        }
+                    }
+                    if (g_tc_blk_n[s][k] > before) pairs_ok[k]++;
+                }
+            }
+        }
+        if (g_tc_blk_n[s][TC_TL] && g_tc_blk_n[s][TC_TR]) live |= (uint8_t)(1u << s);
+        const char *what = clued ? "pairs" : "pieces";
+        if (clued) printf("[corner] %s, clue orientation %d: ", label, s);
+        else       printf("[corner] %s: ", label);
+        printf("TL %d block(s) on %d of %d left %s | TR %d block(s) on %d of %d right %s\n",
+               g_tc_blk_n[s][TC_TL], pairs_ok[TC_TL], pairs_all[TC_TL], what,
+               g_tc_blk_n[s][TC_TR], pairs_ok[TC_TR], pairs_all[TC_TR], what);
+    }
+    if (s_tc_wit_truncated)
+        printf("[corner] note: some blocks have more than %d top-border witnesses; the "
+               "joint report is a lower bound\n", TC_MAX_WIT);
+    fflush(stdout);
+    return live;
+}
+
+/* The pieces a column places at the TL block's side cells, or NO_PIECE. */
+static void tc_left_pieces(const LeftOrder *lft, uint16_t *hi, uint16_t *lo) {
+    const Oriented *ph = lft->p[PUZZLE_SIDE - 2], *pl = lft->p[PUZZLE_SIDE - 3];
+    *hi = ph ? ph->piece_id : TC_NO_PIECE;
+    *lo = pl ? pl->piece_id : TC_NO_PIECE;
+}
+
+static inline bool tc_tl_matches(const TcBlock *b, uint16_t hi, uint16_t lo) {
+    if (b->pid[0] != hi) return false;
+    return !g_tc_clued || lo == TC_NO_PIECE || b->pid[1] == lo;
+}
+
+bool tc_left_ok(const LeftOrder *lft) {
+    uint16_t hi, lo;
+    tc_left_pieces(lft, &hi, &lo);
+    if (hi == TC_NO_PIECE) return true;
+    for (int s = 0; s < 4; s++) {
+        if (!(g_tc_slots & (1u << s))) continue;
+        for (int i = 0; i < g_tc_blk_n[s][TC_TL]; i++)
+            if (tc_tl_matches(&g_tc_blk[s][TC_TL][i], hi, lo)) return true;
+    }
+    return false;
+}
+
+static bool tc_blocks_compatible(const TcBlock *a, const TcBlock *b) {
+    for (int i = 0; i < a->n; i++)
+        for (int j = 0; j < b->n; j++)
+            if (a->pid[i] == b->pid[j]) return false;
+    for (int u = 0; u < a->nwit; u++)
+        for (int v = 0; v < b->nwit; v++) {
+            bool clash = false;
+            for (int x = 0; x < 2 && !clash; x++)
+                for (int y = 0; y < 2 && !clash; y++)
+                    if (a->wit[u][x] != TC_NO_PIECE && a->wit[u][x] == b->wit[v][y]) clash = true;
+            if (!clash) return true;
+        }
+    return false;
+}
+
+uint8_t tc_config(const LeftOrder *lft, const uint64_t used[4]) {
+    uint16_t hi, lo;
+    tc_left_pieces(lft, &hi, &lo);
+    uint8_t live = 0;
+    for (int s = 0; s < 4; s++) {
+        if (!(g_tc_slots & (1u << s))) continue;
+        for (int k = 0; k < 2; k++) {
+            g_tc_live_n[s][k] = 0;
+            for (int i = 0; i < g_tc_blk_n[s][k]; i++) {
+                const TcBlock *b = &g_tc_blk[s][k][i];
+                /* TL on a column that places the side cells: only its own blocks,
+                   and only their inner pieces are still to be spent. */
+                int from = 0;
+                if (k == TC_TL && hi != TC_NO_PIECE) {
+                    if (!tc_tl_matches(b, hi, lo)) continue;
+                    from = (g_tc_clued && lo != TC_NO_PIECE) ? 2 : 1;
+                }
+                TcLive *L = &g_tc_live[s][k][g_tc_live_n[s][k]++];
+                memset(L->mask, 0, sizeof L->mask);
+                for (int q = from; q < b->n; q++) used_set(L->mask, b->pid[q]);
+                L->blk = (uint16_t)i;
+                L->in_c_bottom = 0; L->side_lo_bottom = 0;
+                if (g_tc_clued) {
+                    L->in_c_bottom    = make_oriented(b->pid[4], b->spin[4]).bottom;
+                    L->side_lo_bottom = make_oriented(b->pid[1], b->spin[1]).bottom;
+                }
+            }
+        }
+        uint8_t rtop0[PUZZLE_SIDE] = {0};
+        if (tc_count(s, TC_TL, used, rtop0, false, 1) && tc_count(s, TC_TR, used, rtop0, false, 1))
+            live |= (uint8_t)(1u << s);
+        size_t need = (size_t)g_tc_live_n[s][TC_TL] * (size_t)g_tc_live_n[s][TC_TR];
+        if (need > s_tc_compat_cap[s]) {
+            s_tc_compat[s] = realloc(s_tc_compat[s], need);
+            if (!s_tc_compat[s]) fatal("out of memory (corner compatibility table)");
+            s_tc_compat_cap[s] = need;
+        }
+        for (int i = 0; i < g_tc_live_n[s][TC_TL]; i++)
+            for (int j = 0; j < g_tc_live_n[s][TC_TR]; j++)
+                s_tc_compat[s][(size_t)i * g_tc_live_n[s][TC_TR] + j] = tc_blocks_compatible(
+                    &g_tc_blk[s][TC_TL][g_tc_live[s][TC_TL][i].blk],
+                    &g_tc_blk[s][TC_TR][g_tc_live[s][TC_TR][j].blk]);
+    }
+    return live;
+}
+
+/* u_row: per-thread sums, reduced in a fixed thread order at the end of a row. */
+#define TC_MIN_SAMPLES 64.0
+static double s_tc_acc[TC_MAX_THREADS][8];
+static double s_tc_sd[PUZZLE_SIDE + 1];
+static double s_tc_n[PUZZLE_SIDE + 1];
+
+void tc_acc(double pre) {
+    int th = omp_get_thread_num();
+    if (th < 0 || th >= TC_MAX_THREADS) return;
+    s_tc_acc[th][0] += pre; s_tc_acc[th][1] += pre * pre; s_tc_acc[th][2] += 1.0;
+}
+
+void tc_close_row(int row) {
+    double sum = 0.0, sumsq = 0.0, n = 0.0;
+    for (int th = 0; th < TC_MAX_THREADS; th++) {
+        sum += s_tc_acc[th][0]; sumsq += s_tc_acc[th][1]; n += s_tc_acc[th][2];
+        s_tc_acc[th][0] = s_tc_acc[th][1] = s_tc_acc[th][2] = 0.0;
+    }
+    /* Too thin a sample keeps the previous estimate rather than erasing it. */
+    if (row < 0 || row > PUZZLE_SIDE || n < TC_MIN_SAMPLES) return;
+    double m = sum / n, v = sumsq / n - m * m;
+    s_tc_sd[row] = (v > 1e-18) ? sqrt(v) : 0.0;
+    s_tc_n[row]  = n;
+}
+
+double tc_unit(int row) {
+    if (row >= 1 && row - 1 <= PUZZLE_SIDE && s_tc_sd[row - 1] > 0.0) return s_tc_sd[row - 1];
+    if (row >= 0 && row <= PUZZLE_SIDE && s_tc_sd[row] > 0.0) return s_tc_sd[row];
+    for (int d = 1; d <= PUZZLE_SIDE; d++) {
+        if (row - d >= 0 && row - d <= PUZZLE_SIDE && s_tc_sd[row - d] > 0.0) return s_tc_sd[row - d];
+        if (row + d >= 0 && row + d <= PUZZLE_SIDE && s_tc_sd[row + d] > 0.0) return s_tc_sd[row + d];
+    }
+    return 1.0;
+}
+
+static struct { uint64_t boards, tl[TC_CAP + 1], tr[TC_CAP + 1], both, joint; } s_tc_hist;
+
+uint8_t tc_board_code(int orient, const uint64_t used[4], const uint8_t rtop[PUZZLE_SIDE], bool at12) {
+    int best_ntl = 0, best_ntr = 0; bool best_joint = false; int best_key = -1;
+    int16_t tl[TC_MAX_BLOCKS], tr[TC_MAX_BLOCKS];
+    for (int s = 0; s < 4; s++) {
+        if (!(g_tc_slots & (1u << s))) continue;
+        if (g_tc_clued && orient >= 0 && s != orient) continue;
+        int ntl = 0, ntr = 0;
+        bool tl_ok = !(at12 && g_tc_clued && rtop[2] != g_tc_clue_bottom[s][TC_TL]);
+        bool tr_ok = !(at12 && g_tc_clued && rtop[PUZZLE_SIDE - 3] != g_tc_clue_bottom[s][TC_TR]);
+        for (int i = 0; tl_ok && i < g_tc_live_n[s][TC_TL]; i++)
+            if (tc_alive(s, TC_TL, i, used, rtop, at12)) tl[ntl++] = (int16_t)i;
+        for (int j = 0; tr_ok && j < g_tc_live_n[s][TC_TR]; j++)
+            if (tc_alive(s, TC_TR, j, used, rtop, at12)) tr[ntr++] = (int16_t)j;
+        bool joint = false;
+        for (int a = 0; a < ntl && !joint; a++)
+            for (int b = 0; b < ntr && !joint; b++)
+                if (s_tc_compat[s][(size_t)tl[a] * g_tc_live_n[s][TC_TR] + tr[b]]) joint = true;
+        int ctl = ntl < TC_CAP ? ntl : TC_CAP, ctr = ntr < TC_CAP ? ntr : TC_CAP;
+        int key = (joint ? 64 : 0) + ctl * 4 + ctr;
+        if (key > best_key) { best_key = key; best_ntl = ctl; best_ntr = ctr; best_joint = joint; }
+    }
+    return (uint8_t)(best_ntl | (best_ntr << 2) | ((best_joint ? 1 : 0) << 4));
+}
+
+void tc_tally(uint8_t code) {
+    int ntl = code & 3, ntr = (code >> 2) & 3;
+    s_tc_hist.boards++;
+    s_tc_hist.tl[ntl]++; s_tc_hist.tr[ntr]++;
+    if (ntl && ntr) s_tc_hist.both++;
+    if (code >> 4) s_tc_hist.joint++;
+}
+
+void tc_print_summary(uint32_t stop_row) {
+    const uint64_t B = s_tc_hist.boards;
+    const double pc = B ? 100.0 / (double)B : 0.0;
+    printf("[sum] corner supply (%s blocks) at stop row %u over %" PRIu64 " emitted boards%s:\n",
+           g_tc_clued ? "clue" : "3-cell", stop_row, B,
+           (g_tc_clued && stop_row == (uint32_t)(PUZZLE_SIDE - 4)) ? ", matched to row 12's tops" : "");
+    for (int k = 0; k < 2; k++) {
+        const uint64_t *h = k ? s_tc_hist.tr : s_tc_hist.tl;
+        printf("[sum]   %s alive blocks  0:%" PRIu64 " (%.1f%%)  1:%" PRIu64 "  2:%" PRIu64
+               "  3+:%" PRIu64 "\n", k ? "TR" : "TL", h[0], (double)h[0] * pc, h[1], h[2], h[3]);
+    }
+    printf("[sum]   both corners alive %" PRIu64 " (%.1f%%), with a piece-disjoint TL+TR "
+           "pair %" PRIu64 " (%.1f%%)\n", s_tc_hist.both, (double)s_tc_hist.both * pc,
+           s_tc_hist.joint, (double)s_tc_hist.joint * pc);
+    printf("[sum] corner filter: columns never run %" PRIu64 ", inputs skipped %" PRIu64 "\n",
+           g_tc_columns_dead, g_tc_skipped);
+    printf("[sum] corner unit u_row by row:");
+    bool any = false;
+    for (int r = 1; r <= (int)stop_row && r <= PUZZLE_SIDE; r++)
+        if (s_tc_sd[r] > 0.0) { printf("  r%d:%.3f", r, s_tc_sd[r]); any = true; }
+    printf("%s\n", any ? "" : "  none measured");
+    fflush(stdout);
+}

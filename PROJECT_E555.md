@@ -745,6 +745,56 @@ penalized exactly the pattern the Mahalanobis term rewards, hard infeasibility
 is already caught by the parity check, and supply health is already encoded in
 the fan-out lookahead.)
 
+### Top-corner supply (`--lambda_corners`)
+
+The beam stops at row 12 at most, so the two top corners are Stage C's, and
+nothing above protects the pieces they need. With the sides fixed (a rotations
+row, or a complete border in the finalizer), every legal filling of a small
+block against each top corner is enumerated exactly, in milliseconds. Top-border
+cells `w` only witness that the border can meet the block:
+
+```
+with --clue_corners                         without
+row 15  corner  w1    w2                    corner  w1
+row 14  side    in_a  in_b                  side    in_a
+row 13  side    in_c  CLUE
+```
+
+A **block** is its side and inner pieces. With the clues on there are few of
+them: 0–55 per TL corner and 1–75 per TR over 48 Stage A borders. On the
+reference border (r16178) there are 7 and 33, and 0 of 282 stop-row-11 boards
+could still build both. Some borders have none at all, and no board from them
+can place the (13,2) clue legally. Without the clues, the 3-cell blocks number
+10–93 per corner and usually survive, so the term is a milder nudge. A larger
+unclued block would number in the thousands and would almost never die, so it
+is not offered.
+
+A child is scored by the blocks per corner still buildable from its unused
+pieces, capped at 3:
+
+```
+step(n) = -3, +1, +2, +3   for n = 0, 1, 2, 3+
+term    = lambda_corners * u_row * (step(n_TL) + step(n_TR))
+```
+
+- `u_row` is the SD of the rest of the score over the previous row, so λ is
+  in score-SD units like `--lambda_Mahalanobis`. At the suggested 0.5,
+  losing a corner's last block costs 2 SD, and going from 3 blocks to 2 costs
+  0.5.
+- At `--stop_row 12` a clued block must also meet row 12's exposed tops.
+- The clue catalog depends on the frame, so hedged runs keep one per
+  orientation and each board uses its own.
+- Left columns whose (0,14)[,(0,13)] no TL block uses are never run.
+- Border rows (beamer), or lines and orientations (finalizer), that cannot
+  close a corner are skipped with a message.
+- The summary reports alive blocks per corner at the stop row, and how many
+  boards keep a piece-disjoint TL+TR pair. That joint count is the one that
+  says both corners can really close.
+
+The flag is off when absent (outputs unchanged). A bare `--lambda_corners`
+means 0.5. It needs known sides and `--stop_row` ≤ 12. The catalog code lives
+in `E555_database.c` (`tc_*`) and is shared by both tools.
+
 ### Eternity II clue pieces (`--clue_center`, `--clue_corners`)
 
 The five published hints, converted once into this repo's numbering (0-based
@@ -978,6 +1028,7 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--beam_expand_row R` | 7 | row with the full ExK width |
 | `--lambda_J F` | 1.0 | weight of the CLOSURE term, the primary color objective (useful 0.5-1.5) |
 | `--lambda_Mahalanobis F` | 0.6 | weight of the piece-structure correction, in units of its own measured per-row SD (useful 0.3-0.7) |
+| `--lambda_corners [F]` | off | top-corner supply, in score-SD units; bare = 0.5 (see *Top-corner supply*) |
 | `--no_free_demand` | -- | **disable** the free-mode demand accounting (on by default) |
 | `--frac_rand F` | 0.10 | random selection band, flat across rows |
 | `--parent_cap N` | 4 | children per parent in the score band |
@@ -1129,6 +1180,16 @@ program behaves exactly as before. They matter here more than anywhere else in
 the pipeline, because the shipped `--finalize_from = BEAM_STOP - 5` frees the
 centre clue's row and the search then quietly refills that cell with something
 else (measured above: never 5/5 without the flags, always 5/5 with them).
+
+**`--lambda_corners [F]`** works as in the beamer (*Top-corner supply*), and
+needs known sides:
+- **Free-mode lines** are skipped.
+- **Fixed mode** takes the sides and the whole left column from the partial.
+- **Rotations-matched mode** takes the sides from the row. Sampled columns
+  that no TL block can use are redrawn. The exhaustive enumerator stops the
+  column at the stop row, so its TL blocks keep all five pieces in play.
+- **Each orientation pass** builds its own catalog. A pass, or a column, whose
+  lock already spent every block of a corner is skipped.
 
 Unlike the beamer, which explores all four orientations at once and pays for it
 with orientation bits in the beam entry, a term in the frontier signature and a
@@ -2653,7 +2714,7 @@ tools to the same-seed-same-threads contract.
 | file | role |
 |---|---|
 | `src/A_border/E555_edge_annealer.py` | Stage A border annealer (BEST theorem + SA). |
-| `src/B_beam/E555_database.c/.h` | Seed/catalog, border enumeration + ranking, `DB_5pieces` build, fan-out table, disk cache. |
+| `src/B_beam/E555_database.c/.h` | Seed/catalog, border enumeration + ranking, `DB_5pieces` build, fan-out table, disk cache; the top-corner block catalog shared by `--lambda_corners`. |
 | `src/B_beam/E555_beamer.c/.h` | Stage B beam search: expand/score/select/materialize/emit, sweep driver, CLI. |
 | `src/B_beam/E555_finalizer.c` | Beam from a partial: locking, input dedup, reduced DB, column sampling/enumeration. |
 | `src/B_beam/E555_roundhouse.c` | Strip solver: board rotation, width-W chain DB, relaxed DP oracle, exhaustive/sampling strip search, 3-round spiral. |

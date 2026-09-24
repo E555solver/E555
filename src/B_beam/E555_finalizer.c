@@ -94,6 +94,8 @@ static uint32_t g_beam_expand_row = 8;
 static double   g_lambda_maha     = 0.6;   /* --lambda_Mahalanobis, in score-SD */
 static double   g_frac_rand       = 0.30;  /* flat; deliberately above the beamer */
 static double   g_lambda_J        = 1.0;    /* --lambda_J, the closure weight */
+static double   g_lambda_corners  = 0.0;    /* --lambda_corners [F]; 0 = off */
+static bool     g_corners_on      = false;
 static bool     g_free_demand     = true;   /* --no_free_demand turns it off */
 static uint32_t g_parent_cap      = 4;
 static uint32_t g_pool_factor     = 8;
@@ -1029,6 +1031,22 @@ static inline double color_term(const BeamEntry *t, int row) {
    table (their next left neighbour is unknown until A/B are chosen). Any
    NULL/zero is an exact one-row death -> the child is rejected. Applied on beam
    rows only: stop-row boards are emitted without this gate (see try_A). */
+/* --lambda_corners: lambda * u_row * (step(n_TL) + step(n_TR)), see the top-corner
+   section of E555_database.h. `pre` is the rest of the child's score, whose
+   spread u_row is measured over. This pass's clue frame picks the catalog. */
+static inline double corner_term(const BeamEntry *t, int row, bool at_stop, double pre) {
+    tc_acc(pre);
+    bool at12 = at_stop && row == PUZZLE_SIDE - 4;
+    return g_lambda_corners * g_tc_unit * (double)tc_step_sum(g_fin_orient, t->used, t->rtop, at12);
+}
+
+/* The stop row has no lookahead, so the colour term alone ranks it. */
+static inline float score_stop(const BeamEntry *t, int row) {
+    double s = color_term(t, row);
+    if (g_corners_on) s += corner_term(t, row, true, s);
+    return (float)s;
+}
+
 static bool score_child(const BeamEntry *t, int row, float *out) {
     const uint8_t *rt = t->rtop;
     for (int c = 1; c <= EDGE_LEN; c++) if (!color_is_inner(rt[c])) return false;
@@ -1050,6 +1068,7 @@ static bool score_child(const BeamEntry *t, int row, float *out) {
        gates above), so the product is >= 4 and log is safely in range. */
     double s = log((double)cA->n * (1.0 + (double)fB) * (1.0 + (double)fC))
                + color_term(t, row);
+    if (g_corners_on) s += corner_term(t, row, false, s);
     *out = (float)s;
     return true;
 }
@@ -1279,7 +1298,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
                 /* No lookahead gate at the stop row: every board that completes
                    it is emitted -- whether a row fits above is deliberately the
                    next stage's problem. Rank by the heuristic terms only. */
-                float score = (float)color_term(t, e->row);
+                float score = score_stop(t, e->row);
                 pool_append(ctx, sc, t, e->parent_idx, score, &mv);
                 e->quota--;
                 ab_full = true;
@@ -1483,7 +1502,7 @@ static void fin_expand_clued(BeamCtx *ctx, const BeamEntry *p, uint32_t pi, int 
                     if (!parity_ok(t)) continue;
                     float score;
                     if (at_stop) {
-                        score = (float)color_term(t, row);
+                        score = score_stop(t, row);
                     } else if (!score_child(t, row, &score)) {
                         continue;
                     }
@@ -1616,6 +1635,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
        is not a corner case but the whole row. */
     for (int t = 0; t < nt; t++) pool_flush(ctx, scratch[t]);
     maha_close_row(row);        /* this row's spread calibrates the next one */
+    if (g_corners_on) tc_close_row(row);   /* likewise u_row */
 }
 
 /* -- Beam selection --------------------------------------------------------- */
@@ -1789,6 +1809,22 @@ static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
 static char     *g_emit_lines = NULL;    /* EMIT_TILE x EMIT_LINE_MAX */
 static uint64_t *g_emit_fps   = NULL;
 static int      *g_emit_lens  = NULL;
+static uint8_t  *g_emit_corner = NULL;   /* --lambda_corners: tc_board_code */
+
+/* The emitted board's used set and exposed tops, for the corner report. */
+static uint8_t corner_code_of(const BeamEntry *parent, const RowChoice *mv, int row) {
+    uint64_t used[4];
+    uint8_t rtop[PUZZLE_SIDE];
+    memcpy(used, parent->used, sizeof used);
+    rtop[0] = g_cur_left->p[row]->top;
+    for (int i = 0; i < EDGE_LEN; i++) {
+        used_set(used, g_cat[mv->ci[i]].piece_id);
+        rtop[1 + i] = g_cat[mv->ci[i]].top;
+    }
+    used_set(used, g_edge_term[mv->rterm].piece_id);
+    rtop[PUZZLE_SIDE - 1] = g_edge_term[mv->rterm].top;
+    return tc_board_code(g_fin_orient, used, rtop, row == PUZZLE_SIDE - 4);
+}
 
 /* Emit the stop-row boards, best-scored first. Reconstructing a board, hashing
    it and converting its 512 fields is ~all of the cost and touches only
@@ -1804,6 +1840,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
         g_emit_lines = xmalloc((size_t)EMIT_TILE * EMIT_LINE_MAX);
         g_emit_fps   = xmalloc((size_t)EMIT_TILE * sizeof(uint64_t));
         g_emit_lens  = xmalloc((size_t)EMIT_TILE * sizeof(int));
+        g_emit_corner = xmalloc((size_t)EMIT_TILE);
     }
     int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
     for (uint32_t base = 0; base < n_emit && !g_stop; base += EMIT_TILE) {
@@ -1818,6 +1855,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
             g_emit_fps[k]  = board_fingerprint(rows, row);
             g_emit_lens[k] = format_board_tail(rows, row, ROWMASK_FULL, g_fin_orient,
                                                g_emit_lines + (size_t)k * EMIT_LINE_MAX);
+            if (g_corners_on) g_emit_corner[k] = corner_code_of(&beam[pe->parent], &pe->mv, row);
         }
         for (uint32_t k = 0; k < tile; k++) {
             if (!htable_insert(g_emit_fps[k])) continue;
@@ -1825,6 +1863,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
             fwrite(g_emit_lines + (size_t)k * EMIT_LINE_MAX, 1,
                    (size_t)g_emit_lens[k], g_completions_fp);
             g_stats.emitted_total++;
+            if (g_corners_on) tc_tally(g_emit_corner[k]);
         }
     }
 }
@@ -1844,6 +1883,20 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         g_stats.configs++;
         return res;
     }
+    /* This column, the lock and every reserved piece against the catalog: a
+       corner none of whose blocks survives them can never close. */
+    if (g_corners_on) {
+        uint8_t live = tc_config(g_cur_left, cur[0].used);
+        if (!(live & (1u << tc_slot_of(g_fin_orient < 0 ? 0 : g_fin_orient)))) {
+            if (g_verbose)
+                printf("[beam] %s: no top-corner block survives the lock and the "
+                       "column; skipped\n", g_config_id_str);
+            res.reason = "corner"; res.row = g_finalize_from;
+            g_tc_skipped++;
+            g_stats.configs++;
+            return res;
+        }
+    }
     uint32_t beam_n = 1;
     memset(ctx->log_n, 0, sizeof ctx->log_n);
     g_stats.configs++;
@@ -1853,6 +1906,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         if (omp_get_wtime() >= deadline) { res.reason = "time";        break; }
         double t_row = omp_get_wtime();
 
+        if (g_corners_on) g_tc_unit = tc_unit(row);   /* read by every child */
         expand_row(ctx, cur, beam_n, row, cfg_hash, scratch);
         double t_exp = omp_get_wtime();
         g_stats.t_expand += t_exp - t_row;
@@ -2708,6 +2762,12 @@ static bool fin_sample_left(RNG *rng, double tau, LeftOrder *lo) {
             used_set(used, o->piece_id);
             prev_top = o->top;
         }
+        if (ok && g_corners_on) {        /* a column that can never close TL */
+            LeftOrder probe = *lo;
+            probe.p[PUZZLE_SIDE - 2] = &seq[EDGE_LEN];
+            probe.p[PUZZLE_SIDE - 3] = &seq[EDGE_LEN - 1];
+            if (!tc_left_ok(&probe)) { ok = false; g_tc_columns_dead++; }
+        }
         if (!ok) {
             if (++restarts > FIN_SAMPLE_RESTARTS) break;
             continue;
@@ -2938,6 +2998,7 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
     if (g_incomplete_top)
         printf("[sum] incomplete-top partials: %zu  (A+B %zu, A+C %zu, B+C %zu)\n",
                g_partial_total, g_part_ab, g_part_ac, g_part_bc);
+    if (g_corners_on) tc_print_summary(g_stop_row);
     fflush(stdout);
 }
 
@@ -3078,6 +3139,14 @@ static void usage(const char *a0) {
 "                         Both terms are always live. --lambda_Mahalanobis 0 is closure\n"
 "                         alone and --lambda_J 0 is Mahalanobis alone, which is why\n"
 "                         there is no --score_model.\n"
+"  --lambda_corners [F]   TOP-CORNER SUPPLY, as in the beamer: score each child by the\n"
+"                         legal blocks per top corner still buildable from unused\n"
+"                         pieces (the 2x3 clue block with --clue_corners, else the\n"
+"                         3 cells next to the corner), -3/+1/+2/+3 for 0/1/2/3+, times\n"
+"                         F in units of the row's score SD. Needs known sides: lines\n"
+"                         in free mode are skipped, as is a line, orientation or\n"
+"                         column whose lock already spends every block of a corner.\n"
+"                         Bare flag = 0.5; absent = 0 (off). --stop_row <= 12\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by score,\n"
 "                         FLAT across every row (default 0.30). Deliberately well above\n"
 "                         the beamer's 0.10 and the one place these two tools should\n"
@@ -3172,6 +3241,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     printf(" --beam_width %u --stop_row %u", g_beam_width, g_stop_row);
     printf(" --beam_expand %u --beam_expand_row %u", g_beam_expand, g_beam_expand_row);
     printf(" --lambda_J %g --lambda_Mahalanobis %g", g_lambda_J, g_lambda_maha);
+    if (g_corners_on) printf(" --lambda_corners %g", g_lambda_corners);
     printf(" --frac_rand %g --parent_cap %u --pool_factor %u",
            g_frac_rand, g_parent_cap, g_pool_factor);
     printf(" --top_columns %ld --tau_columns %g --bail_columns %u",
@@ -3198,6 +3268,16 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--free_edges"))                g_opt_free_edges = true;
         else if (!strcmp(argv[i], "--clue_center"))               g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(argv[i], "--clue_corners"))              g_clue_mask |= CLUE_CORNERS;
+        else if (!strcmp(argv[i], "--lambda_corners")) {
+            /* The value is optional: taken only when the next token is a number
+               in its entirety, so a bare flag followed by another flag works. */
+            g_lambda_corners = TC_LAMBDA_DEFAULT;
+            if (i + 1 < argc) {
+                char *end = NULL;
+                double v = strtod(argv[i + 1], &end);
+                if (end != argv[i + 1] && *end == '\0') { g_lambda_corners = v; i++; }
+            }
+        }
         else if (!strcmp(argv[i], "--clue_orient")  && i+1 < argc) g_clue_orient_req = parse_clue_orient(argv[++i]);
         else if (!strcmp(argv[i], "--pin_clue")     && i+1 < argc) g_pin_clue = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--incomplete_top"))            g_incomplete_top = true;
@@ -3250,6 +3330,14 @@ int main(int argc, char *argv[]) {
     if (g_finalize_repeats < 1) g_finalize_repeats = 1;
     if (!(fabs(g_lambda_maha) <= 1e6)) fatal("--lambda_Mahalanobis in [-1e6,1e6]");
     if (!(fabs(g_lambda_J) <= 1e6))    fatal("--lambda_J in [-1e6,1e6]");
+    if (!(g_lambda_corners >= 0.0 && g_lambda_corners <= 1e6))
+        fatal("--lambda_corners must be in [0,1e6] (0 = off)");
+    g_corners_on = (g_lambda_corners > 0.0);
+    if (g_corners_on && g_opt_free_edges)
+        fatal("--lambda_corners needs known sides: it cannot run with --free_edges");
+    if (g_corners_on && g_stop_row > (uint32_t)(PUZZLE_SIDE - 4))
+        fatal("--lambda_corners needs --stop_row 12 or below: rows 13-14 hold the "
+              "corner blocks it protects");
     if (!(g_tau_columns >= 0.0 && g_tau_columns <= 1e6)) fatal("--tau_columns in [0,1e6]");
     if (g_frac_rand < 0.0 || g_frac_rand > 1.0) fatal("--frac_rand must be in [0,1]");
     if (g_pool_factor == 0) g_pool_factor = 1;
@@ -3304,6 +3392,10 @@ int main(int argc, char *argv[]) {
            g_frac_rand, g_parent_cap, g_pool_factor);
     printf("[cfg] lambda_J=%.3f lambda_Maha=%.3f free_demand=%d\n",
            g_lambda_J, g_lambda_maha, g_free_demand ? 1 : 0);
+    if (g_corners_on)
+        printf("[cfg] lambda_corners=%.3f (score-SD units; %s top-corner blocks; lines "
+               "in free mode are skipped)\n", g_lambda_corners,
+               (g_clue_mask & CLUE_CORNERS) ? "clue 2x3" : "3-cell");
     printf("[cfg] tau_columns=%.2f\n", g_tau_columns);
     printf("[cfg] top_columns=%ld bail_columns=%u time_limit=%.0fs wall_time=%.0fs max_emitted=%" PRIu64 " free_edges=%s\n",
            g_top_columns, g_bail_columns, g_config_time_sec, g_max_wall_sec, g_max_partials,
@@ -3410,6 +3502,12 @@ int main(int argc, char *argv[]) {
         else                  snprintf(mode_str, sizeof mode_str, "%s", g_free_edges ? "free" : "fixed");
         printf("[sweep] line %u: source '%s'  depth=%d  lock rows 0..%u  mode=%s\n",
                line, src_id, g_partial_depth, g_finalize_from, mode_str); fflush(stdout);
+        if (g_corners_on && g_free_edges) {
+            printf("[corner] line %u: free mode, so the sides are unknown and no corner "
+                   "catalog exists -- skipped (--lambda_corners)\n", line);
+            g_tc_skipped++;
+            continue;
+        }
 
         if (!g_free_edges && !g_sides_from_rot) {  /* sides from the partial itself */
             for (int r = 0; r < PUZZLE_SIDE; r++)
@@ -3433,6 +3531,29 @@ int main(int argc, char *argv[]) {
            budget still stops the line part-way through its orientations. */
         for (int oi = 0; oi < (g_fin_orient_n ? g_fin_orient_n : 1) && !g_stop; oi++) {
             g_fin_orient = g_fin_orient_n ? g_fin_orient_cand[oi] : -1;
+            if (g_corners_on) {
+                /* The catalog of this line's sides in this pass's clue frame, and
+                   whether the lock has already spent every block of a corner. */
+                const bool clued = (g_clue_mask & CLUE_CORNERS) != 0;
+                char lab[48]; snprintf(lab, sizeof lab, "line %u", line);
+                uint8_t live = tc_build(g_fin_orient >= 0 ? (uint8_t)(1u << g_fin_orient) : 1u,
+                                        clued, lab);
+                if (live) {
+                    LeftOrder probe;
+                    fin_left_prefix(&probe);             /* only the locked rows */
+                    uint64_t base[4];
+                    memcpy(base, g_lock_mask, sizeof base);
+                    if (g_clue_mask) fin_clue_reserve(base);
+                    live = tc_config(&probe, base);
+                }
+                if (!live) {
+                    printf("[corner] line %u%s: a top corner has no block the lock leaves "
+                           "buildable -- skipped\n", line,
+                           g_fin_orient_n > 1 ? " (this orientation)" : "");
+                    g_tc_skipped++;
+                    continue;
+                }
+            }
             fin_clue_dump_schedule();
             if (g_fin_orient_n > 1)
                 printf("[sweep] line %u: orientation %d (%d of %d)\n",
