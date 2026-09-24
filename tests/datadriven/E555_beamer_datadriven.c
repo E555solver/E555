@@ -216,7 +216,6 @@ static struct {
     uint64_t bottoms_no_clue_column;
     uint64_t columns_ordinary_viable;
     uint64_t columns_clue_compatible;
-    uint64_t columns_corner_dead;   /* --lambda_corners: no TL block on the column's pair */
     uint64_t columns_run;
     double   clue_seconds;
 } g_border_stats;
@@ -2350,307 +2349,22 @@ static size_t freq_rank_lefts(const BottomOrder *bot, double tau, RNG *rng, size
 /* ===========================================================================
  * Top-corner supply  (--lambda_corners, search phase only)
  * ===========================================================================
- * With --clue_corners the two top clues sit on row 13, at columns 2 and 13.
- * Each one closes a 2x3 block against its corner:
+ * The model, the exact block catalogs, the alive counting and the stop-row
+ * report are the shared tc_* code in E555_database.c/.h (see the header for
+ * the templates and the step score). This fork keeps only what is its own:
+ * the flag, the per-configuration calibration of u_row, and the verbose
+ * diagnostics.
  *
- *     row 15   corner   w1     w2              w2     w1   corner
- *     row 14   side     in_a   in_b    ...     in_b   in_a  side
- *     row 13   side     in_c   CLUE    ...     CLUE   in_c  side
- *              col 0    1      2               13     14    15
- *
- * The beam stops at row 12 at most, so these blocks are Stage C's -- but the
- * beam spends their pieces long before, because nothing in its score knows they
- * are needed, and a piece-by-cell statistic cannot say "these three together".
- *
- * THE CATALOG IS EXACT. For one rotations row the corner piece, the clue and
- * which pieces are on each side are all fixed, so every legal filling of the
- * two side cells, the three inner cells and the two top-border cells w1, w2 can
- * simply be enumerated: a depth-7 search that runs in milliseconds. A block is
- * the five pieces the beam could spend (sides and inner, with their spins); w1
- * and w2 are only witnesses that the top border can meet it, kept for the joint
- * report. Across 48 Stage A borders this is 0-55 blocks for TL and 1-75 for TR,
- * and some borders have none at all: no board from them can place that clue
- * legally, so the whole border row is skipped.
- *
- * THE TERM. The left column is fixed per configuration, so TL keeps only the
- * blocks on the column's own (0,14),(0,13) pair -- and a column with none is
- * never run. The right column is chosen row by row, so TR keeps every block and
- * also needs its two side pieces unspent. A block is ALIVE while none of its
- * pieces is on the board; at --stop_row 12 it must also meet the exposed tops,
- * because the row-13 clues pin nothing and row 12 is built blind to them. With
- * n alive per corner, capped at 3,
- *
- *     step(n) = -3, +1, +2, +3   for n = 0, 1, 2, >=3
- *     term    = lambda_corners * u_row * (step(n_TL) + step(n_TR))
- *
- * u_row is the standard deviation of the rest of the score over the previous
- * row's children, so lambda is in score-SD units exactly like
- * --lambda_Mahalanobis, and means the same thing at every depth. The term is a
- * function of the child's used set and frontier, both of which the dedup
- * signature already covers, so it needs no state in BeamEntry.
+ * u_row is the standard deviation of the rest of the score, so lambda is in
+ * score-SD units like --lambda_Mahalanobis. Here it is taken from this
+ * configuration's previous row first, then that row pooled over the run, then
+ * this row pooled over earlier configurations, else one nat.
  * =========================================================================== */
-
-#define LAMBDA_CORNERS_DEFAULT 0.5
-#define CORNER_TL          0
-#define CORNER_TR          1
-#define CORNER_MAX_BLOCKS  4096
-#define CORNER_MAX_WIT     32
-#define CORNER_CAP         3
 
 static double g_lambda_corners = 0.0;   /* --lambda_corners [X]; 0 = off */
 static bool   g_corners_on     = false;
-
-typedef struct {
-    uint16_t pid[5];     /* side row 14, side row 13, in_a, in_b, in_c */
-    uint8_t  spin[5];
-    uint8_t  in_c_bottom;     /* meets row 12 under column 1 / 14 */
-    uint8_t  side_lo_bottom;  /* meets row 12 in the side column */
-    uint8_t  nwit;
-    uint16_t wit[CORNER_MAX_WIT][2];     /* top-border witnesses (w1, w2) */
-} CornerBlock;
-
-static CornerBlock g_cblk[2][CORNER_MAX_BLOCKS];
-static int      g_cblk_n[2];
-static int      g_cpairs_all[2], g_cpairs_ok[2];
-static uint8_t  g_cclue_bottom[2];       /* the clue's bottom colour, per corner */
-static bool     g_cwit_truncated = false;
-
-/* Per configuration: the blocks the term tests, with the pieces as a mask. */
-typedef struct { uint64_t mask[4]; uint16_t blk; } CornerLive;
-static CornerLive g_clive[2][CORNER_MAX_BLOCKS];
-static int        g_clive_n[2];
-static uint8_t   *g_ccompat = NULL;      /* [tl * n_TR + tr]: piece-disjoint pair */
-static size_t     g_ccompat_cap = 0;
-
 static double g_corner_u = 1.0;          /* u_row for the row being expanded */
 
-static inline Oriented corner_orient(uint16_t p, uint8_t spin)
-{
-    const int e[4] = { g_seed_top[p], g_seed_right[p], g_seed_bottom[p], g_seed_left[p] };
-    Oriented o;
-    o.piece_id = p; o.rotation = spin;
-    o.top    = (uint8_t)e[(0 + spin) & 3]; o.right = (uint8_t)e[(1 + spin) & 3];
-    o.bottom = (uint8_t)e[(2 + spin) & 3]; o.left  = (uint8_t)e[(3 + spin) & 3];
-    return o;
-}
-
-/* The face of a piece pointing TOWARD corner k's border column, and AWAY from
-   it: left/right for TL, mirrored for TR. */
-static inline uint8_t c_toward(const Oriented *o, int k) { return k ? o->right : o->left; }
-static inline uint8_t c_away(const Oriented *o, int k)   { return k ? o->left : o->right; }
-
-static bool corner_is_clue_piece(uint16_t p)
-{
-    for (int o = 0; o < 4; o++)
-        for (int k = 0; k < CLUE_N; k++)
-            if (g_clue[o][k].piece == p) return true;
-    return false;
-}
-
-/* Enumerate both top corners for the current rotations row (g_spin) in the
-   pinned clue frame. Returns false when a corner has no legal block. */
-static bool corner_build(uint32_t border_row)
-{
-    const int o = clue_orient_for_pin(g_pin_clue);
-    Oriented sidep[2][EDGE_LEN], topp[EDGE_LEN], corner[2], clue[2];
-    int nside[2] = {0, 0}, ntop = 0;
-    bool have_corner[2] = {false, false}, have_clue[2] = {false, false};
-
-    for (int p = 0; p < NUM_PIECES; p++) {
-        int kind = piece_kind(p);
-        if (kind == 0) continue;
-        Oriented r = corner_orient((uint16_t)p, g_spin[p]);
-        if (kind == 2) {
-            if (r.top == 0 && r.left == 0)  { corner[CORNER_TL] = r; have_corner[CORNER_TL] = true; }
-            if (r.top == 0 && r.right == 0) { corner[CORNER_TR] = r; have_corner[CORNER_TR] = true; }
-            continue;
-        }
-        if (r.top == 0) { if (ntop < EDGE_LEN) topp[ntop++] = r; }
-        else if (r.left == 0)  { if (nside[CORNER_TL] < EDGE_LEN) sidep[CORNER_TL][nside[CORNER_TL]++] = r; }
-        else if (r.right == 0) { if (nside[CORNER_TR] < EDGE_LEN) sidep[CORNER_TR][nside[CORNER_TR]++] = r; }
-    }
-    if (!have_corner[0] || !have_corner[1] || ntop != EDGE_LEN
-        || nside[0] != EDGE_LEN || nside[1] != EDGE_LEN)
-        fatal("--lambda_corners: rotations row %u does not deal 14 pieces to the top, "
-              "left and right sides with both top corners", border_row);
-    for (int k = 3; k < CLUE_N; k++) {
-        const ClueCell *cc = &g_clue[o][k];
-        int c = (cc->col == 2) ? CORNER_TL : (cc->col == PUZZLE_SIDE - 3) ? CORNER_TR : -1;
-        if (cc->row != PUZZLE_SIDE - 3 || c < 0)
-            fatal("clue table: entries 3,4 must be (13,2) and (13,13)");
-        clue[c] = corner_orient(cc->piece, cc->spin);
-        have_clue[c] = true;
-    }
-    if (!have_clue[0] || !have_clue[1]) fatal("clue table: a top corner clue is missing");
-
-    for (int k = 0; k < 2; k++) {
-        const Oriented *cr = &corner[k], *cl = &clue[k];
-        g_cblk_n[k] = 0; g_cpairs_all[k] = 0; g_cpairs_ok[k] = 0;
-        g_cclue_bottom[k] = cl->bottom;
-        for (int a = 0; a < nside[k]; a++) {                  /* (14, side) */
-            const Oriented *sh = &sidep[k][a];
-            if (sh->top != cr->bottom) continue;
-            for (int b = 0; b < nside[k]; b++) {              /* (13, side) */
-                const Oriented *sl = &sidep[k][b];
-                if (b == a || sl->top != sh->bottom) continue;
-                g_cpairs_all[k]++;
-                int before = g_cblk_n[k];
-                for (int ic = 0; ic < g_cat_count; ic++) {    /* in_c (13, near) */
-                    const Oriented *c3 = &g_cat[ic];
-                    if (c_toward(c3, k) != c_away(sl, k) || c_away(c3, k) != c_toward(cl, k)) continue;
-                    if (corner_is_clue_piece(c3->piece_id)) continue;
-                    for (int ia = 0; ia < g_cat_count; ia++) {    /* in_a (14, near) */
-                        const Oriented *c1 = &g_cat[ia];
-                        if (c1->piece_id == c3->piece_id) continue;
-                        if (c_toward(c1, k) != c_away(sh, k) || c1->bottom != c3->top) continue;
-                        if (corner_is_clue_piece(c1->piece_id)) continue;
-                        for (int ib = 0; ib < g_cat_count; ib++) {    /* in_b (14, far) */
-                            const Oriented *c2 = &g_cat[ib];
-                            if (c2->piece_id == c3->piece_id || c2->piece_id == c1->piece_id) continue;
-                            if (c_toward(c2, k) != c_away(c1, k) || c2->bottom != cl->top) continue;
-                            if (corner_is_clue_piece(c2->piece_id)) continue;
-                            CornerBlock blk;
-                            blk.nwit = 0;
-                            for (int u = 0; u < ntop; u++) {          /* w1 (15, near) */
-                                const Oriented *w1 = &topp[u];
-                                if (c_toward(w1, k) != c_away(cr, k) || w1->bottom != c1->top) continue;
-                                for (int v = 0; v < ntop; v++) {      /* w2 (15, far) */
-                                    const Oriented *w2 = &topp[v];
-                                    if (v == u || c_toward(w2, k) != c_away(w1, k)
-                                        || w2->bottom != c2->top) continue;
-                                    if (blk.nwit < CORNER_MAX_WIT) {
-                                        blk.wit[blk.nwit][0] = w1->piece_id;
-                                        blk.wit[blk.nwit][1] = w2->piece_id;
-                                        blk.nwit++;
-                                    } else g_cwit_truncated = true;
-                                }
-                            }
-                            if (!blk.nwit) continue;                  /* top border cannot meet it */
-                            if (g_cblk_n[k] >= CORNER_MAX_BLOCKS)
-                                fatal("--lambda_corners: more than %d legal %s blocks",
-                                      CORNER_MAX_BLOCKS, k ? "TR" : "TL");
-                            const Oriented *cell[5] = { sh, sl, c1, c2, c3 };
-                            for (int q = 0; q < 5; q++) {
-                                blk.pid[q]  = cell[q]->piece_id;
-                                blk.spin[q] = cell[q]->rotation;
-                            }
-                            blk.in_c_bottom    = c3->bottom;
-                            blk.side_lo_bottom = sl->bottom;
-                            g_cblk[k][g_cblk_n[k]++] = blk;
-                        }
-                    }
-                }
-                if (g_cblk_n[k] > before) g_cpairs_ok[k]++;
-            }
-        }
-    }
-
-    printf("[corner] border row %u: TL %d block(s) on %d of %d left pairs | "
-           "TR %d block(s) on %d of %d right pairs\n", border_row,
-           g_cblk_n[CORNER_TL], g_cpairs_ok[CORNER_TL], g_cpairs_all[CORNER_TL],
-           g_cblk_n[CORNER_TR], g_cpairs_ok[CORNER_TR], g_cpairs_all[CORNER_TR]);
-    if (g_cwit_truncated)
-        printf("[corner] note: some blocks have more than %d top-border witnesses; "
-               "the joint report is a lower bound\n", CORNER_MAX_WIT);
-    for (int k = 0; k < 2; k++)
-        if (!g_cblk_n[k]) {
-            printf("[corner] border row %u: no legal %s block -- no board from this "
-                   "border can place the %s clue, skipping the row\n", border_row,
-                   k ? "TR" : "TL", k ? "(13,13)" : "(13,2)");
-            fflush(stdout);
-            return false;
-        }
-    fflush(stdout);
-
-    /* TR does not depend on the configuration: its side pieces are placed by the
-       beam, so every block stays a candidate and all five pieces are tested. */
-    g_clive_n[CORNER_TR] = 0;
-    for (int i = 0; i < g_cblk_n[CORNER_TR]; i++) {
-        CornerLive *L = &g_clive[CORNER_TR][g_clive_n[CORNER_TR]++];
-        memset(L->mask, 0, sizeof L->mask);
-        for (int q = 0; q < 5; q++) used_set(L->mask, g_cblk[CORNER_TR][i].pid[q]);
-        L->blk = (uint16_t)i;
-    }
-    return true;
-}
-
-/* Does this left column end in a pair some TL block can use? */
-static bool corner_left_ok(const LeftOrder *l)
-{
-    if (!g_corners_on) return true;
-    const uint16_t hi = l->p[PUZZLE_SIDE - 2]->piece_id, lo = l->p[PUZZLE_SIDE - 3]->piece_id;
-    for (int i = 0; i < g_cblk_n[CORNER_TL]; i++)
-        if (g_cblk[CORNER_TL][i].pid[0] == hi && g_cblk[CORNER_TL][i].pid[1] == lo) return true;
-    return false;
-}
-
-static bool corner_blocks_compatible(const CornerBlock *a, const CornerBlock *b)
-{
-    for (int i = 0; i < 5; i++)
-        for (int j = 0; j < 5; j++)
-            if (a->pid[i] == b->pid[j]) return false;
-    for (int u = 0; u < a->nwit; u++)
-        for (int v = 0; v < b->nwit; v++)
-            if (a->wit[u][0] != b->wit[v][0] && a->wit[u][0] != b->wit[v][1] &&
-                a->wit[u][1] != b->wit[v][0] && a->wit[u][1] != b->wit[v][1])
-                return true;
-    return false;
-}
-
-/* The configuration's TL list (its column's pair) and the TL x TR joint table. */
-static void corner_config_init(const LeftOrder *l)
-{
-    const uint16_t hi = l->p[PUZZLE_SIDE - 2]->piece_id, lo = l->p[PUZZLE_SIDE - 3]->piece_id;
-    g_clive_n[CORNER_TL] = 0;
-    for (int i = 0; i < g_cblk_n[CORNER_TL]; i++) {
-        const CornerBlock *b = &g_cblk[CORNER_TL][i];
-        if (b->pid[0] != hi || b->pid[1] != lo) continue;
-        CornerLive *L = &g_clive[CORNER_TL][g_clive_n[CORNER_TL]++];
-        memset(L->mask, 0, sizeof L->mask);
-        for (int q = 2; q < 5; q++) used_set(L->mask, b->pid[q]);   /* the pair is the column's */
-        L->blk = (uint16_t)i;
-    }
-    if (!g_clive_n[CORNER_TL])
-        fatal("internal: a configuration ran on a column no TL block can use");
-    size_t need = (size_t)g_clive_n[CORNER_TL] * (size_t)g_clive_n[CORNER_TR];
-    if (need > g_ccompat_cap) { g_ccompat = xrealloc(g_ccompat, need); g_ccompat_cap = need; }
-    for (int i = 0; i < g_clive_n[CORNER_TL]; i++)
-        for (int j = 0; j < g_clive_n[CORNER_TR]; j++)
-            g_ccompat[(size_t)i * g_clive_n[CORNER_TR] + j] = corner_blocks_compatible(
-                &g_cblk[CORNER_TL][g_clive[CORNER_TL][i].blk],
-                &g_cblk[CORNER_TR][g_clive[CORNER_TR][j].blk]);
-}
-
-/* Is block i of corner k still buildable on this board? `at12`: the board's
-   top row is row 12, so the block must also meet its exposed colours. */
-static inline bool corner_alive_one(int k, int i, const uint64_t used[4],
-                                    const uint8_t rtop[PUZZLE_SIDE], bool at12)
-{
-    const CornerLive *L = &g_clive[k][i];
-    if ((L->mask[0] & used[0]) | (L->mask[1] & used[1]) |
-        (L->mask[2] & used[2]) | (L->mask[3] & used[3])) return false;
-    if (!at12) return true;
-    const CornerBlock *b = &g_cblk[k][L->blk];
-    if (k == CORNER_TL) return rtop[1] == b->in_c_bottom;
-    return rtop[PUZZLE_SIDE - 2] == b->in_c_bottom
-        && rtop[PUZZLE_SIDE - 1] == b->side_lo_bottom;
-}
-
-/* Alive blocks of corner k, counted up to `cap`. The clue's own junction with
-   row 12 is a board-level fact: miss it and no block of that corner can help. */
-static inline int corner_count(int k, const uint64_t used[4],
-                               const uint8_t rtop[PUZZLE_SIDE], bool at12, int cap)
-{
-    if (at12 && rtop[k ? PUZZLE_SIDE - 3 : 2] != g_cclue_bottom[k]) return 0;
-    int n = 0;
-    for (int i = 0; i < g_clive_n[k] && n < cap; i++)
-        if (corner_alive_one(k, i, used, rtop, at12)) n++;
-    return n;
-}
-
-/* u_row: the spread of the rest of the score, per row, measured the way the
-   Mahalanobis calibration is -- per-thread sums reduced in a fixed order at the
-   end of the row, the previous row's value used on this one. */
 static double g_cu_acc[MAX_ACC_THREADS][ACC_STRIDE];
 static double g_cu_local_sd[EDGE_LEN + 2], g_cu_local_n[EDGE_LEN + 2];
 static double g_cu_pool_sum[EDGE_LEN + 2], g_cu_pool_sumsq[EDGE_LEN + 2],
@@ -2691,8 +2405,6 @@ static double corner_pooled_sd(int row)
     return (v > 1e-18) ? sqrt(v) : 0.0;
 }
 
-/* This configuration's previous row, else that row pooled over the run, else
-   this row pooled over earlier configurations, else one nat. */
 static double corner_unit(int row)
 {
     int src = row - 1;
@@ -2704,10 +2416,8 @@ static double corner_unit(int row)
     return sd > 0.0 ? sd : 1.0;
 }
 
-static const int8_t k_corner_step[CORNER_CAP + 1] = { -3, 1, 2, 3 };
-
 /* The term itself. `pre` is the rest of the child's score, which is what u_row
-   measures the spread of. */
+   measures the spread of; the board's clue frame picks the catalog. */
 static inline double corner_term(const BeamEntry *t, int row, bool at_stop,
                                  double pre, double fanout, double closure)
 {
@@ -2716,9 +2426,9 @@ static inline double corner_term(const BeamEntry *t, int row, bool at_stop,
         g_cu_acc[th][0] += pre; g_cu_acc[th][1] += pre * pre; g_cu_acc[th][2] += 1.0;
     }
     const bool at12 = at_stop && row == PUZZLE_SIDE - 4;
-    int ntl = corner_count(CORNER_TL, t->used, t->rtop, at12, CORNER_CAP);
-    int ntr = corner_count(CORNER_TR, t->used, t->rtop, at12, CORNER_CAP);
-    double c = g_lambda_corners * g_corner_u * (k_corner_step[ntl] + k_corner_step[ntr]);
+    const int orient = ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) : -1;
+    double c = g_lambda_corners * g_corner_u
+             * (double)tc_step_sum(orient, t->used, t->rtop, at12);
     if (g_verbose && th >= 0 && th < MAX_ACC_THREADS && row >= 0 && row <= EDGE_LEN + 1) {
         CornerDiag *d = &g_cdiag[th][row];
         d->n += 1.0; d->sc += c; d->scc += c * c;
@@ -2728,49 +2438,21 @@ static inline double corner_term(const BeamEntry *t, int row, bool at_stop,
     return c;
 }
 
-/* Stop-row report: exact alive counts (capped at 3) and whether some TL and TR
-   block can be built together, for one emitted board. Packed as
-   n_TL | n_TR << 2 | joint << 4. */
-static struct { uint64_t boards, tl[CORNER_CAP + 1], tr[CORNER_CAP + 1], both, joint; } g_chist;
-static uint64_t g_corner_rows_skipped = 0;
-
-static uint8_t corner_emit_code(const BeamEntry *parent, const RowChoice *mv, int row)
+/* The emitted board's used set and exposed tops, for the stop-row report. */
+static uint8_t corner_emit_code(const BeamEntry *parent, const RowChoice *mv,
+                                int row, int orient)
 {
     uint64_t used[4];
     uint8_t rtop[PUZZLE_SIDE];
     memcpy(used, parent->used, sizeof used);
-    rtop[0] = 0;
+    rtop[0] = g_cur_left->p[row]->top;
     for (int i = 0; i < EDGE_LEN; i++) {
         used_set(used, g_cat[mv->ci[i]].piece_id);
         rtop[1 + i] = g_cat[mv->ci[i]].top;
     }
     used_set(used, g_edge_term[mv->rterm].piece_id);
     rtop[PUZZLE_SIDE - 1] = g_edge_term[mv->rterm].top;
-    const bool at12 = (row == PUZZLE_SIDE - 4);
-
-    int16_t tl[CORNER_MAX_BLOCKS], tr[CORNER_MAX_BLOCKS];
-    int ntl = 0, ntr = 0;
-    bool tl_ok = !at12 || rtop[2] == g_cclue_bottom[CORNER_TL];
-    bool tr_ok = !at12 || rtop[PUZZLE_SIDE - 3] == g_cclue_bottom[CORNER_TR];
-    for (int i = 0; tl_ok && i < g_clive_n[CORNER_TL]; i++)
-        if (corner_alive_one(CORNER_TL, i, used, rtop, at12)) tl[ntl++] = (int16_t)i;
-    for (int j = 0; tr_ok && j < g_clive_n[CORNER_TR]; j++)
-        if (corner_alive_one(CORNER_TR, j, used, rtop, at12)) tr[ntr++] = (int16_t)j;
-    bool joint = false;
-    for (int a = 0; a < ntl && !joint; a++)
-        for (int b = 0; b < ntr && !joint; b++)
-            if (g_ccompat[(size_t)tl[a] * g_clive_n[CORNER_TR] + tr[b]]) joint = true;
-    int ctl = ntl < CORNER_CAP ? ntl : CORNER_CAP, ctr = ntr < CORNER_CAP ? ntr : CORNER_CAP;
-    return (uint8_t)(ctl | (ctr << 2) | ((joint ? 1 : 0) << 4));
-}
-
-static void corner_tally(uint8_t code)
-{
-    int ntl = code & 3, ntr = (code >> 2) & 3;
-    g_chist.boards++;
-    g_chist.tl[ntl]++; g_chist.tr[ntr]++;
-    if (ntl && ntr) g_chist.both++;
-    if (code >> 4) g_chist.joint++;
+    return tc_board_code(orient, used, rtop, row == PUZZLE_SIDE - 4);
 }
 
 /* ====================== end top-corner supply ============================== */
@@ -3143,7 +2825,8 @@ static size_t clue_filter_ranked_lefts(size_t b_idx, const BottomOrder *bot,
                                        size_t ordinary_viable) {
     g_border_stats.bottoms_ranked++;
     g_border_stats.columns_ordinary_viable += ordinary_viable;
-    if (!(g_clue_mask & CLUE_CORNERS)) {
+    const bool clues = (g_clue_mask & CLUE_CORNERS) != 0;
+    if (!clues && !g_corners_on) {
         g_border_stats.columns_clue_compatible += ordinary_viable;
         return ordinary_viable;
     }
@@ -3162,16 +2845,16 @@ static size_t clue_filter_ranked_lefts(size_t b_idx, const BottomOrder *bot,
        use: the column fixes (0,14) and (0,13), so any other column can never
        place the (13,2) clue legally. */
     for (size_t i = 0; i < ordinary_viable; i++) {
-        if (!row1_corner_compatible_cached(b_idx, bot, &g_lefts[i])) continue;
-        if (corner_left_ok(&g_lefts[i])) g_left_filter_buf[out++] = g_lefts[i];
+        if (clues && !row1_corner_compatible_cached(b_idx, bot, &g_lefts[i])) continue;
+        if (!g_corners_on || tc_left_ok(&g_lefts[i])) g_left_filter_buf[out++] = g_lefts[i];
         else corner_dead++;
     }
     size_t tail = out;
     for (size_t i = 0; i < ordinary_viable; i++)
-        if (!row1_corner_compatible_cached(b_idx, bot, &g_lefts[i])
-            || !corner_left_ok(&g_lefts[i]))
+        if ((clues && !row1_corner_compatible_cached(b_idx, bot, &g_lefts[i]))
+            || (g_corners_on && !tc_left_ok(&g_lefts[i])))
             g_left_filter_buf[tail++] = g_lefts[i];
-    g_border_stats.columns_corner_dead += corner_dead;
+    g_tc_columns_dead += corner_dead;
     for (size_t i = ordinary_viable; i < g_left_n; i++)
         g_left_filter_buf[tail++] = g_lefts[i];
     if (tail != g_left_n) fatal("internal: clue column partition lost entries");
@@ -3960,7 +3643,8 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
                                                    ? (int)(pe->flags & FLAG_ORIENT_MASK) : -1,
                                                g_emit_lines + (size_t)k * EMIT_LINE_MAX);
             if (g_corners_on)
-                g_emit_corner[k] = corner_emit_code(&beam[pe->parent], &pe->mv, row);
+                g_emit_corner[k] = corner_emit_code(&beam[pe->parent], &pe->mv, row,
+                    (pe->flags & FLAG_ORIENT_SET) ? (int)(pe->flags & FLAG_ORIENT_MASK) : -1);
         }
         if (g_freq_debug && g_freq_on && g_freq_pure)
             for (uint32_t k = 0; k < tile; k++) {
@@ -3980,7 +3664,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
             fwrite(g_emit_lines + (size_t)k * EMIT_LINE_MAX, 1,
                    (size_t)g_emit_lens[k], g_completions_fp);
             g_stats.emitted_total++;
-            if (g_corners_on) corner_tally(g_emit_corner[k]);
+            if (g_corners_on) tc_tally(g_emit_corner[k]);
         }
     }
 }
@@ -4000,7 +3684,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
     g_beam_unpruned = false;          /* row 1 keeps the one-child economy */
     memset(ctx->log_n, 0, sizeof ctx->log_n);
     maha_reset_config();
-    if (g_corners_on) { corner_reset_config(); corner_config_init(g_cur_left); }
+    if (g_corners_on) { corner_reset_config(); (void)tc_config(g_cur_left, cur[0].used); }
     g_stats.configs++;
 
     for (int row = 1; (uint32_t)row <= g_stop_row; row++) {
@@ -4200,30 +3884,9 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
                g_border_stats.columns_clue_compatible,
                g_border_stats.columns_run,
                g_border_stats.clue_seconds);
-        if (g_corners_on)
-            printf("[sum] corner prefilter: clue-compatible columns whose (0,14),(0,13) "
-                   "pair no TL block can use, never run: %" PRIu64 "\n",
-                   g_border_stats.columns_corner_dead);
     }
     if (g_corners_on) {
-        if (g_corner_rows_skipped)
-            printf("[sum] corner: %" PRIu64 " border row(s) skipped, a top corner "
-                   "with no legal block\n", g_corner_rows_skipped);
-        const uint64_t B = g_chist.boards;
-        const double pc = B ? 100.0 / (double)B : 0.0;
-        printf("[sum] corner supply at stop row %u over %" PRIu64 " emitted boards "
-               "(alive blocks, 3 = three or more)%s:\n", g_stop_row, B,
-               g_stop_row == (uint32_t)(PUZZLE_SIDE - 4) ? ", matched to row 12's tops" : "");
-        for (int k = 0; k < 2; k++) {
-            const uint64_t *h = k ? g_chist.tr : g_chist.tl;
-            printf("[sum]   %s  0:%" PRIu64 " (%.1f%%)  1:%" PRIu64 "  2:%" PRIu64
-                   "  3:%" PRIu64 "\n", k ? "TR" : "TL",
-                   h[0], (double)h[0] * pc, h[1], h[2], h[3]);
-        }
-        printf("[sum]   both corners alive %" PRIu64 " (%.1f%%), with a piece-disjoint "
-               "TL+TR pair %" PRIu64 " (%.1f%%)\n",
-               g_chist.both, (double)g_chist.both * pc,
-               g_chist.joint, (double)g_chist.joint * pc);
+        tc_print_summary(g_stop_row, false);
         printf("[sum] corner unit u_row (pooled SD of the rest of the score):");
         for (int r = 1; r <= (int)g_stop_row; r++) {
             double sd = corner_pooled_sd(r);
@@ -4539,15 +4202,16 @@ static void usage(const char *a0) {
 "                         Both terms are always live. --lambda_Mahalanobis 0 is closure\n"
 "                         alone and --lambda_J 0 is Mahalanobis alone, which is why\n"
 "                         there is no --score_model.\n"
-"  --lambda_corners [F]   TOP-CORNER SUPPLY (search only). Enumerates, per border\n"
-"                         row, every legal filling of the 2x3 blocks the row-13\n"
-"                         clues close with the top corners, never runs a left\n"
-"                         column no TL block can use, and scores each child by how\n"
-"                         many blocks per corner are still buildable from unused\n"
-"                         pieces: -3/+1/+2/+3 for 0/1/2/3+, times F in units of the\n"
-"                         row's score SD. Bare flag = 0.5; absent = 0 (off). Needs\n"
-"                         --clue_corners, --pin_clue and --stop_row <= 12; works with\n"
-"                         or without --table\n"
+"  --lambda_corners [F]   TOP-CORNER SUPPLY (search only). Per border row,\n"
+"                         enumerates every legal filling of a small block against\n"
+"                         each top corner -- with --clue_corners the 2x3 block the\n"
+"                         row-13 clue closes (one catalog per clue frame), else the\n"
+"                         3 cells next to the corner -- never runs a left column no\n"
+"                         TL block can use, and scores each child by the blocks per\n"
+"                         corner still buildable from unused pieces: -3/+1/+2/+3 for\n"
+"                         0/1/2/3+, times F in units of the row's score SD. Bare flag\n"
+"                         = 0.5; absent = 0 (off). Needs a rotations file and\n"
+"                         --stop_row <= 12; works with or without --table\n"
 "  --clue_center          force the published center clue piece onto its cell, at its\n"
 "                         orientation's spin (piece 138; one of the 4 center cells)\n"
 "  --clue_corners         force the two published corner clues the beam can reach,\n"
@@ -4920,7 +4584,7 @@ int main(int argc, char *argv[]) {
             /* The value is optional: taken only when the next token is a number
                in its entirety, so `--lambda_corners --stop_row 12` is the bare
                flag followed by another flag, not a parse error. */
-            g_lambda_corners = LAMBDA_CORNERS_DEFAULT;
+            g_lambda_corners = TC_LAMBDA_DEFAULT;
             if (i + 1 < argc) {
                 char *end = NULL;
                 double v = strtod(argv[i + 1], &end);
@@ -4996,18 +4660,12 @@ int main(int argc, char *argv[]) {
             fatal("--lambda_corners is a search-phase option: steering the learning "
                   "phase would bias the table the search relies on, and its turned "
                   "passes put other corners at the top");
-        if (!(g_clue_mask & CLUE_CORNERS))
-            fatal("--lambda_corners needs --clue_corners: it protects the blocks "
-                  "around the two row-13 clues");
-        if (g_pin_clue < 1 || g_pin_clue > 4)
-            fatal("--lambda_corners needs --pin_clue 1..4: the corner catalog is "
-                  "built in one clue frame");
         if (g_random_edges || g_free_edges)
             fatal("--lambda_corners needs a rotations file without --random_edges "
                   "or --free_edges: the catalog is built from the sides it deals");
         if (g_stop_row > (uint32_t)(PUZZLE_SIDE - 4))
-            fatal("--lambda_corners needs --stop_row 12 or below: row 13 holds the "
-                  "blocks it protects");
+            fatal("--lambda_corners needs --stop_row 12 or below: rows 13-14 hold the "
+                  "corner blocks it protects");
     }
     if (g_beam_width == 0) fatal("--beam_width must be positive");
     if (g_beam_width > (1u << 24)) fatal("--beam_width above 2^24 not supported");
@@ -5159,9 +4817,8 @@ int main(int argc, char *argv[]) {
            g_lambda_maha, (g_learn_path && !g_lambda_maha_set) ? " (learn default)" : "",
            g_free_demand?1:0, g_bc_nB, g_bc_nC);
     if (g_corners_on)
-        printf("[cfg] lambda_corners=%.3f (score-SD units; exact top-corner catalog "
-               "per border row, TL column filter, step -3/+1/+2/+3 per corner)\n",
-               g_lambda_corners);
+        printf("[cfg] lambda_corners=%.3f (score-SD units; %s top-corner blocks)\n",
+               g_lambda_corners, (g_clue_mask & CLUE_CORNERS) ? "clue 2x3" : "3-cell");
     printf("[cfg] top_bottoms=%ld top_columns=%ld time_limit=%.0fs wall_time=%.0fs max_emitted=%" PRIu64 " db_file=%s\n",
            g_top_bottoms, g_top_columns, g_config_time_sec, g_max_wall_sec, g_max_partials,
            g_db_file ? g_db_file : "(none)");
@@ -5417,7 +5074,17 @@ int main(int argc, char *argv[]) {
         validate_color_constants();
         /* The exact top-corner catalog of this border. A corner with no legal
            block makes every configuration of the row unfinishable: skip it. */
-        if (g_corners_on && !corner_build(cur_row)) { g_corner_rows_skipped++; continue; }
+        if (g_corners_on) {
+            char lab[48]; snprintf(lab, sizeof lab, "border row %u", cur_row);
+            if (!tc_build(g_clue_orients, (g_clue_mask & CLUE_CORNERS) != 0, lab)) {
+                printf("[corner] border row %u: a top corner has no legal block in any "
+                       "allowed clue frame -- no board from it can close, skipping the row\n",
+                       cur_row);
+                fflush(stdout);
+                g_tc_skipped++;
+                continue;
+            }
+        }
 
         enumerate_bottoms();
         enumerate_lefts();

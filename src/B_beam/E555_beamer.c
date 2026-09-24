@@ -2147,7 +2147,7 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
     if (g_incomplete_top)
         printf("[sum] incomplete-top partials: %zu  (A+B %zu, A+C %zu, B+C %zu)\n",
                g_partial_total, g_part_ab, g_part_ac, g_part_bc);
-    if (g_corners_on) tc_print_summary(g_stop_row);
+    if (g_corners_on) tc_print_summary(g_stop_row, true);
     fflush(stdout);
 }
 

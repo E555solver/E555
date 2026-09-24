@@ -253,8 +253,15 @@ statistic can't say "these three together". Measured on the reference run
 (`example_run/beam_completions_2_11.csv`): of 282 boards at row 11, **none** can
 still build a legal block at both top corners from its unused pieces.
 
-**The catalog is exact.** For one rotations row the corner piece, the clue and
-the pieces on each side are all fixed. So every legal filling of the two side
+**Without `--clue_corners`** the block is just the 3 cells next to each corner:
+the side piece at (0,14), the inner piece at (1,14) and a top-border witness at
+(1,15), mirrored for TR. These blocks number 10–93 per corner and usually
+survive, so the term is a milder nudge there.
+
+**The catalog is exact.** It is the shared `tc_*` code in
+`src/B_beam/E555_database.c`, the same one the stock beamer and finalizer use.
+For one rotations row the corner piece, the clue and the pieces on each side are
+all fixed. So every legal filling of the two side
 cells, the three inner cells and the two top-border cells `w1`, `w2` is
 enumerated at the start of the border row, which takes milliseconds:
 
@@ -277,7 +284,7 @@ block uses can never close the corner, so it is never run. On r16178 that is
 two columns in three. The count is in the summary:
 
 ```
-[sum] corner prefilter: clue-compatible columns whose (0,14),(0,13) pair no TL block can use, never run: 4800
+[sum] corner filter: columns never run 4800, inputs skipped 0
 ```
 
 **The score.** A block is *alive* while none of its pieces is on the board. At
@@ -306,9 +313,10 @@ The term depends only on the child's used set and frontier, which the dedup
 signature already covers.
 
 **Flag forms.** Absent → off, with outputs byte-identical to before. A bare
-`--lambda_corners` → 0.5. `--lambda_corners F` → F. It needs `--clue_corners`,
-`--pin_clue 1..4`, a rotations file (not `--random_edges` or `--free_edges`) and
-`--stop_row 12` or below. It is refused under `--learn`, because steering the
+`--lambda_corners` → 0.5. `--lambda_corners F` → F. It needs a rotations file
+(not `--random_edges` or `--free_edges`) and `--stop_row 12` or below. With
+`--clue_corners` it uses the clue catalog of the frame being searched; this fork
+searches one frame per pass, so that is `--pin_clue`'s, or frame 0 without it. It is refused under `--learn`, because steering the
 learning would bias the table the search relies on, and in the turned passes
 the frame's top corners are not the canonical ones.
 
@@ -318,7 +326,9 @@ the frame's top corners are not the canonical ones.
   a *piece-disjoint* TL+TR pair. The two corners are scored separately, but
   about a third of TL×TR block pairs share a piece or a top-border witness, so
   the joint number is the one that says both corners can really be closed.
-- The block also prints `u_row` by row.
+- The block also prints `u_row` by row. This fork calibrates it per
+  configuration (the previous row of the same configuration first, then run-pooled
+  values), not with the shared run-level table.
 - `--verbose` adds, per row, the corner term's SD, its mean, and its correlation
   with fan-out and closure.
 

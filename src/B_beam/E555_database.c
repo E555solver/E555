@@ -2008,7 +2008,7 @@ void tc_tally(uint8_t code) {
     if (code >> 4) s_tc_hist.joint++;
 }
 
-void tc_print_summary(uint32_t stop_row) {
+void tc_print_summary(uint32_t stop_row, bool with_unit) {
     const uint64_t B = s_tc_hist.boards;
     const double pc = B ? 100.0 / (double)B : 0.0;
     printf("[sum] corner supply (%s blocks) at stop row %u over %" PRIu64 " emitted boards%s:\n",
@@ -2024,6 +2024,7 @@ void tc_print_summary(uint32_t stop_row) {
            s_tc_hist.joint, (double)s_tc_hist.joint * pc);
     printf("[sum] corner filter: columns never run %" PRIu64 ", inputs skipped %" PRIu64 "\n",
            g_tc_columns_dead, g_tc_skipped);
+    if (!with_unit) { fflush(stdout); return; }
     printf("[sum] corner unit u_row by row:");
     bool any = false;
     for (int r = 1; r <= (int)stop_row && r <= PUZZLE_SIDE; r++)

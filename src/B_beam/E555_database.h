@@ -700,7 +700,9 @@ double  tc_unit(int row);
 /* Stop-row report: n_TL | n_TR << 2 | joint << 4 for one emitted board. */
 uint8_t tc_board_code(int orient, const uint64_t used[4], const uint8_t rtop[PUZZLE_SIDE], bool at12);
 void    tc_tally(uint8_t code);
-void    tc_print_summary(uint32_t stop_row);
+/* with_unit: also print the tc_unit table (off for a caller that calibrates
+   u_row itself). */
+void    tc_print_summary(uint32_t stop_row, bool with_unit);
 
 static inline int tc_slot_of(int orient) { return g_tc_clued ? orient : 0; }
 
