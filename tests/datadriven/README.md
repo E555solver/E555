@@ -24,6 +24,7 @@ Learning and searching are separate invocations of the same binary.
 | `--learn PATH` | Grow the board from each of the four sides in turn. Count where each piece lands in the canonical frame, and write the raw counts to `PATH`. Emits no boards. |
 | `--table PATH` | Search with the table: in the beam score, and in the ranking of bottom rows and left columns. |
 | `--freq_model M` | The beam's spatial resolution. `segment` (default) pools the 5-5-5 A/B/C bins; `cell` uses exact cells. See *Choosing `--freq_model`*. |
+| `--lambda_corners [F]` | Search only, with or without a table: keep the blocks around the two row-13 clues buildable. See *Corner supply*. |
 
 Both phases need `--clue_center`, `--pin_clue 1..4`, a rotations file and
 `--num_rows 1`. A table belongs to one seed, one clue frame and one border.
@@ -39,6 +40,15 @@ python3 tests/datadriven/freq_view.py TABLE --out table.html              # HTML
 ```
 
 ### Learning
+
+**Defaults.** `--learn` changes three defaults, never a value you pass:
+`--lambda_J 0 --lambda_Mahalanobis 0 --stop_row 9`. The table is meant to
+measure where pieces land, so boards are grown on the chain database and the
+fan-out alone, without the colour heuristics steering them. Row 9 is still
+reached often, and learning writes no boards, so the larger number of stop-row
+boards costs no disk. The `[cfg]` line marks each value that came from these
+defaults, and the table records the objective it was learned under as a
+`learn_objective lambda_J .. lambda_Mahalanobis ..` line.
 
 **Four passes.** Pass *j* turns the rotations row *j* quarter-turns clockwise and
 pins the clue frame to match. That is the same anchored puzzle, relabelled.
@@ -224,6 +234,99 @@ makes that more likely.
 - `--verbose` adds per-row standard deviations and correlations of the score
   components.
 
+## Corner supply (`--lambda_corners`)
+
+A search-phase option that works with or without `--table`. With `--clue_corners`
+the two top clues sit on row 13, at columns 2 and 13. Each closes a 2x3 block with
+its corner:
+
+```
+row 15   corner  w1    w2              w2    w1    corner
+row 14   side    in_a  in_b    ...     in_b  in_a  side
+row 13   side    in_c  CLUE    ...     CLUE  in_c  side
+         col 0   1     2               13    14    15
+```
+
+The beam stops at row 12 or lower, so these blocks are Stage C's. Nothing in the
+stock score or the learned table protects their pieces, and a piece-by-cell
+statistic can't say "these three together". Measured on the reference run
+(`example_run/beam_completions_2_11.csv`): of 282 boards at row 11, **none** can
+still build a legal block at both top corners from its unused pieces.
+
+**The catalog is exact.** For one rotations row the corner piece, the clue and
+the pieces on each side are all fixed. So every legal filling of the two side
+cells, the three inner cells and the two top-border cells `w1`, `w2` is
+enumerated at the start of the border row, which takes milliseconds:
+
+```
+[corner] border row 4: TL 7 block(s) on 3 of 9 left pairs | TR 33 block(s) on 12 of 13 right pairs
+```
+
+A block is the five pieces the beam could spend: the two side pieces and the
+three inner pieces, with their spins. `w1` and `w2` are only witnesses that the
+top border can meet the block. Across 48 Stage A borders this is 0–55 TL blocks
+and 1–75 TR blocks, so no learning and no truncation are needed.
+
+Some borders have **no** legal TL block at all: rows 1 and 3 of
+`borders_stageAx6.csv`, rows 6 and 8 of `data/borders_annealed_fix12.csv`, and
+row 20 of the MaxSides file. No board from those borders can place the (13,2)
+clue legally, so the whole border row is skipped.
+
+**Left columns.** A column fixes (0,14) and (0,13). A column whose pair no TL
+block uses can never close the corner, so it is never run. On r16178 that is
+two columns in three. The count is in the summary:
+
+```
+[sum] corner prefilter: clue-compatible columns whose (0,14),(0,13) pair no TL block can use, never run: 4800
+```
+
+**The score.** A block is *alive* while none of its pieces is on the board. At
+`--stop_row 12` it must also meet row 12's exposed tops, because the row-13 clues
+pin nothing and row 12 is built blind to them. TL keeps only the blocks on its
+column's pair, and tests their three inner pieces. TR keeps every block, and
+tests all five pieces, because the right column is chosen row by row. With `n`
+alive per corner, capped at 3:
+
+```
+step(n) = -3, +1, +2, +3        for n = 0, 1, 2, 3+
+term    = lambda_corners * u_row * (step(n_TL) + step(n_TR))      in [-6, +6] * lambda * u_row
+```
+
+`u_row` is the standard deviation of the rest of the child's score, measured
+on the previous row. So λ is in score-SD units, like `--lambda_Mahalanobis`,
+and means the same thing at every depth. At λ = 0.5 and the default
+`--pool_factor 8`:
+- about the top 12% of children survive (z ≈ +1.15);
+- killing a corner's last block costs 2 SD, which is decisive;
+- going from 3 to 2 blocks costs 0.5 SD, which is a nudge;
+- a lineage dead at both corners loses 3 SD and is purged whenever healthy
+  lineages exist.
+
+The term depends only on the child's used set and frontier, which the dedup
+signature already covers.
+
+**Flag forms.** Absent → off, with outputs byte-identical to before. A bare
+`--lambda_corners` → 0.5. `--lambda_corners F` → F. It needs `--clue_corners`,
+`--pin_clue 1..4`, a rotations file (not `--random_edges` or `--free_edges`) and
+`--stop_row 12` or below. It is refused under `--learn`, because steering the
+learning would bias the table the search relies on, and in the turned passes
+the frame's top corners are not the canonical ones.
+
+**What it reports.**
+- The `[sum]` block gives, over emitted stop-row boards, the histogram of alive
+  blocks per corner, how many boards have both corners alive, and how many have
+  a *piece-disjoint* TL+TR pair. The two corners are scored separately, but
+  about a third of TL×TR block pairs share a piece or a top-border witness, so
+  the joint number is the one that says both corners can really be closed.
+- The block also prints `u_row` by row.
+- `--verbose` adds, per row, the corner term's SD, its mean, and its correlation
+  with fan-out and closure.
+
+**When it bites.** Only where the beam discards children: rows where the pool
+exceeds the width, and the best-of-nB×nC window inside a parent. Once the beam
+collapses and keeps every child, the term only orders the emitted boards. So it
+does most at wide beams.
+
 ## Border check and environment variables
 
 `--table` compares the table's border with the one being searched by content, not
@@ -244,7 +347,7 @@ A table and the boards found with it, kept as a reference and a test input.
 
 | file | content |
 |---|---|
-| `table_rnd_s9_row2.txt` | Table learned on border **r16178**, which is row 4 of `borders_stageAx6.csv`. Its header names the file it was run from (`borders_stageAx6_best.csv`, row 2); the border check matches it by content. Learning used `--stop_row 9 --beam_width 250000 --top_bottoms 10000 --top_columns 10`, 24 threads, and the randomised settings of the slurm script. It covers 10 510 configurations, and its segment lift is +0.24 nats/cell. |
+| `table_rnd_s9_row2.txt` | Table learned on border **r16178**, which is row 4 of `borders_stageAx6.csv`. Its header names the file it was run from (`borders_stageAx6_best.csv`, row 2); the border check matches it by content. Learning used `--stop_row 9 --beam_width 250000 --top_bottoms 10000 --top_columns 10`, 24 threads, and the randomised settings of the slurm script. It covers 10 510 configurations, and its segment lift is +0.24 nats/cell. The slurm script passed `--lambda_J 0 --lambda_Mahalanobis 0`, so the table matches today's learn defaults; it predates the `learn_objective` line. |
 | `freq_view_table_rnd_s9_row2.txt` | `freq_view.py --text` of the table. |
 | `beam_completions_2_11.csv` | 282 boards to `--stop_row 11` found with the table, from 174 configurations. All are edge-legal with 356 matched edges. Written before emitted boards carried the frame, so rows 12 to 15 of the left column and the TR corner are empty. |
 | `slurm_datadriven.sh` | The learn-then-search job. Its defaults match the settings recorded in the table header. |

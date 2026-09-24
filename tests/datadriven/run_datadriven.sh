@@ -32,7 +32,9 @@ LEARN_BOTTOMS=50000     # bottom samples per pass. A pass whose pool is smaller
 LEARN_COLUMNS=5         # left columns per bottom. Keep this small: columns
                         # sharing a bottom are correlated, so they add votes
                         # faster than they add information.
-LEARN_STOP_ROW=10       # only boards reaching this row are counted; 9 or more
+LEARN_STOP_ROW=9        # only boards reaching this row are counted; 9 or more
+LEARN_LAMBDA_J=         # empty = the binary's learn default, 0: learning grows boards
+LEARN_LAMBDA_MAHA=      # without the colour heuristics, so the table measures the puzzle
 LEARN_BEAM=20000
 LEARN_WALL=0            # seconds for the learning phase, 0 = unlimited
 
@@ -43,6 +45,7 @@ SEARCH_STOP_ROW=12
 SEARCH_BEAM=200000
 SEARCH_WALL=0           # seconds for the search phase, 0 = unlimited
 MAX_EMITTED=0           # stop after this many boards, 0 = unlimited
+LAMBDA_CORNERS=0        # top-corner supply, in score-SD units; 0 = off, 0.5 recommended
 # -----------------------------------------------------------------------------
 for arg in "$@"; do
     case "$arg" in
@@ -59,6 +62,11 @@ mkdir -p "$(dirname "$TABLE")" "$OUT_DIR"
 CLUES="--clue_center --clue_corners --pin_clue 1"
 DB=()
 [ -n "$DB_FILE" ] && DB=(--db_file "$DB_FILE")
+LEARN_LAMBDAS=()
+[ -n "$LEARN_LAMBDA_J" ]    && LEARN_LAMBDAS+=(--lambda_J "$LEARN_LAMBDA_J")
+[ -n "$LEARN_LAMBDA_MAHA" ] && LEARN_LAMBDAS+=(--lambda_Mahalanobis "$LEARN_LAMBDA_MAHA")
+CORNERS=()
+awk -v x="$LAMBDA_CORNERS" 'BEGIN { exit !(x + 0 > 0) }' && CORNERS=(--lambda_corners "$LAMBDA_CORNERS")
 
 if [ "$LEARN" = 1 ]; then
     echo "=== phase 1/2: learning the table -> $TABLE ==="
@@ -68,7 +76,7 @@ if [ "$LEARN" = 1 ]; then
         --stop_row "$LEARN_STOP_ROW" --beam_width "$LEARN_BEAM" \
         --threads "$THREADS" --rng_seed "$RNG_SEED" \
         --wall_time "$LEARN_WALL" \
-        $CLUES ${DB[@]+"${DB[@]}"} \
+        $CLUES ${DB[@]+"${DB[@]}"} ${LEARN_LAMBDAS[@]+"${LEARN_LAMBDAS[@]}"} \
         --learn "$TABLE" --out_dir "$OUT_DIR/learn" --print_cmd
 else
     echo "=== phase 1/2: skipped, reusing $TABLE ==="
@@ -83,7 +91,7 @@ $BIN "$SEED" "$ROTATIONS" \
     --threads "$THREADS" --rng_seed "$RNG_SEED" \
     --wall_time "$SEARCH_WALL" --max_emitted "$MAX_EMITTED" \
     $CLUES ${DB[@]+"${DB[@]}"} \
-    --table "$TABLE" --freq_model "$FREQ_MODEL" \
+    --table "$TABLE" --freq_model "$FREQ_MODEL" ${CORNERS[@]+"${CORNERS[@]}"} \
     --out_dir "$OUT_DIR" --print_cmd
 
 echo
