@@ -51,8 +51,10 @@
  * END DIVES (--end_dive M --emit_score S)
  *   Instead of being written, each stop-row board is completed to 256 pieces
  *   by M greedy random dives that allow broken edges (the backtracker's stuck
- *   mode), in two stages, and the best completion per board is written if it
- *   has >= S connected edges, sorted by score. See dv_run_config.
+ *   mode), in two stages, the second learning from each board's best dives;
+ *   --end_polish R then hill-climbs and kicks the best ones. The best
+ *   completion per board is written if it has >= S connected edges, sorted
+ *   by score. See dv_run_config.
  *
  * WIDTH AND RANDOMNESS SCHEDULES
  *   The beam expands late, where extinction pressure is highest: half of the
@@ -122,6 +124,7 @@ static inline uint32_t gen_stop_row(void) { return g_backtrack_row ? g_backtrack
    each and emitted by score (>= --emit_score S) instead of written as found. */
 static uint32_t g_end_dive       = 0;
 static int      g_emit_score     = 450;
+static int      g_end_polish     = -1;    /* --end_polish R; -1 = off */
 static bool     g_emit_score_set = false;
 static uint32_t g_beam_expand     = 4;
 static uint32_t g_beam_expand_row = 7;
@@ -3648,51 +3651,75 @@ static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
    nothing on it moves. Score = connected edges out of 480.
 
      stage 1  M/10 dives per root; best board kept
-     stage 2  roots at or above their configuration's median stage-1 best, or
-              at >= S-2, get the other M - M/10 dives
+     stage 2  roots whose stage-1 best is >= S-4, or at or above their
+              configuration's median stage-1 best, get the other M - M/10
+     polish   (--end_polish R) each root within 6 of S: its 16 best distinct
+              dives are hill-climbed (best swap or re-rotation, repeated),
+              then R kick-and-polish rounds (3 random swaps, re-polish, keep
+              if not worse) run over 8 walks from the best polished boards
      keep     roots whose best is >= S (--emit_score), in memory
      emit     when the completions file closes (end of a border row, end of
               run): sorted by score, exact duplicates dropped, at most
               --max_emitted, as "config_id, score, pos[256], rot[256]"
 
-   GUIDED DIVES (--table with --freq_model cell). The learned table never
-   overrides the safety order (fewest breaks, fewest stranded cells); it acts
+   LEARNING DIVES. The dive never overrides its safety order (fewest breaks,
+   fewest stranded cells); a weight w(p,x) per piece and open cell acts only
    where the stock dive draws at random or ranks by room:
-     prior    w(p,x) = log( q[p,x] * n_open(p) / sum over open y of q[p,y] ),
-              the beam's remaining-opportunity normalisation applied to the
-              cells this root leaves open (q = the Sinkhorn-balanced location
-              table, exp(g_fw_location)).
      cells    MRV ties go to the cell whose best exact fit has the largest
               beta*w plus Gumbel noise instead of uniformly.
      values   the LCV third key becomes log1p(room) + beta*(w + Gumbel); a
               forced break with more than LCV_CAP candidates scores the ones
               a Gumbel-top-k draw on beta*w picks.
-     arms     stage 1 splits the dives over beta in {0, 0.5, 1, 2}; beta 0 is
-              exactly the stock dive, so a quarter of the budget is unguided.
-     stage 2  nine rounds of the cross-entropy method: after each round the
-              top 5% of its dives vote, w += gamma*log((E+1/2)/(expected+1/2))
-              with gamma 0.3 and both the vote and the running shift clipped to
-              +-2, and each round's beta is drawn from the arms in proportion
-              to exp(pooled stage-1 mean best).
+     stage 2  18 rounds of the cross-entropy method at beta 2: after each
+              round the top 5% of its dives vote, w += gamma*log((E+1/2)/
+              (expected+1/2)) with gamma 0.3, the vote and the running shift
+              clipped to +-2. w starts flat (0), so each board learns from its
+              own best dives.
+     stage 1  plain dives -- or, with --table --freq_model cell, dives at
+              beta 0.5 and 1 on the table prior w(p,x) = log( q[p,x] * n_open /
+              sum over open y of q[p,y] ) (the beam's remaining-opportunity
+              normalisation over this root's open cells, q the Sinkhorn-balanced
+              location table).
+   Measured (README): the rounds add about 1.5 edges per board over plain
+   dives; starting them from the table prior instead of flat LOST 0.3.
    Every dive's stream is keyed by the root and the dive index, so the output
    does not depend on the thread count. */
 
 static double   g_dv_deadline    = 0.0;   /* absolute --wall_time end; 0 = none */
-static bool     g_dv_guided      = false; /* --table with --freq_model cell */
+static bool     g_dv_guided      = false; /* learning dives (off: E555_DIVE_PLAIN=1) */
 
 #define DV_WORDS      ((NUM_PIECES * 4) / 64)
 #define DV_CLASSES    9
 #define DV_PLACED     0xFFFFu
 #define DV_EMPTY      0xFFFFu
 #define DV_BREAK_CAP  4       /* a cell has 4 neighbours: this is "unlimited" */
-#define DV_LCV_CAP    8
+#define DV_LCV_MAX    16
 #define DV_EDGES      480
-#define DV_NARMS      4
-#define DV_ROUNDS     9
-#define DV_ELITE_FRAC 0.05
-#define DV_CEM_GAMMA  0.3f
-#define DV_CEM_CLIP   2.0f
-static const double g_dv_beta[DV_NARMS] = { 0.0, 0.5, 1.0, 2.0 };
+#define DV_NARMS      8       /* room for arms; g_dv_narms are in use */
+#define DV_ROUNDS_MAX 64
+/* The tuning constants. Defaults are the measured choices (README); every one
+   can be overridden from the environment for experiments (dv_read_env). */
+static int      g_dv_lcv_cap = 8;
+static int      g_dv_narms   = 4;
+static double   g_dv_beta[DV_NARMS] = { 0.0, 0.5, 1.0, 2.0 };
+static int      g_dv_rounds  = 18;
+static double   g_dv_elite   = 0.05;
+static float    g_dv_gamma   = 0.3f;
+static float    g_dv_clip    = 2.0f;
+static double   g_dv_s1frac  = 0.10;   /* share of M spent in stage 1 */
+static double   g_dv_s2beta  = 2.0;    /* fixed stage-2 beta; < 0 = drawn from the arms */
+static int      g_dv_noprior = 0;      /* 1: no table prior; 2: prior in stage 1 only */
+static FILE    *g_dv_trace   = NULL;   /* E555_DIVE_TRACE: per-root score histograms */
+static int      g_dv_polish  = 0;      /* E555_DIVE_POLISH=K: polish each root's K best dives */
+static int      g_dv_ils     = 0;      /* E555_DIVE_ILS=R: R kick-and-polish rounds on the best */
+static int      g_dv_kick    = 3;      /* E555_DIVE_KICK: random swaps per kick */
+static int      g_dv_margin  = 4;      /* stage 2 for stage-1 best >= S - margin */
+static int      g_dv_median  = 1;      /* ...or at/above the configuration median */
+static int      g_dv_ils_full = 0;     /* E555_DIVE_ILS_FULL=1: full-scan polish after kicks */
+#define DV_STARTS_MAX 16
+static int      g_dv_ils_starts = 8;   /* E555_DIVE_STARTS: kick-and-polish walks per root */
+#define DV_POLISH_TOP    16     /* --end_polish: dives polished per board */
+#define DV_POLISH_MARGIN 6      /* ...on boards whose best dive is >= S - this */
 
 typedef struct { uint64_t w[DV_WORDS]; } DvMask;
 typedef struct { Oriented c[NUM_PIECES]; } DvBoard;   /* piece_id DV_EMPTY = empty */
@@ -3997,14 +4024,14 @@ static float dv_maxw(const DvFc *f, int x, const float *w) {
 static int dv_lcv(DvBoard *b, DvFc *f, int x, const DvCand *cand, int lo, int hi,
                   RNG *rng, const float *w, double beta) {
     const bool g = (w && beta > 0.0);
-    const int n = hi - lo, cap = n < DV_LCV_CAP ? n : DV_LCV_CAP;
-    int idx[DV_LCV_CAP];
+    const int n = hi - lo, cap = n < g_dv_lcv_cap ? n : g_dv_lcv_cap;
+    int idx[DV_LCV_MAX];
     if (n <= cap) {
         for (int k = 0; k < cap; k++) idx[k] = lo + k;
     } else if (!g) {
         for (int k = 0; k < cap; k++) idx[k] = lo + (int)rng_uniform(rng, (uint32_t)n);
     } else {                                   /* Gumbel-top-k on beta*w */
-        double key[DV_LCV_CAP];
+        double key[DV_LCV_MAX];
         int m = 0;
         for (int i = lo; i < hi; i++) {
             const double k = beta * dv_w(w, cand[i].pid, x) + gumbel_noise(rng);
@@ -4124,7 +4151,18 @@ typedef struct {
     int      best, arm_best[DV_NARMS];
     uint32_t dives;
     bool     stage2;
+    uint32_t *hist;                  /* E555_DIVE_TRACE: [segment][score] */
+    uint8_t  *top;                   /* polish candidates: K boards x (pid,rot) x 256 */
+    int      *top_s;
+    uint64_t *top_fp;
+    int       ntop;
 } DvRoot;
+
+/* Trace segments: stage-1 arms first, then the stage-2 rounds. */
+static inline int dv_nseg(void) { return g_dv_narms + g_dv_rounds; }
+static inline void dv_hist_add(DvRoot *r, int seg, int score) {
+    if (r->hist) r->hist[(size_t)seg * (DV_EDGES + 1) + score]++;
+}
 
 typedef struct {
     uint8_t  pid[NUM_PIECES], rot[NUM_PIECES];   /* per cell */
@@ -4143,11 +4181,61 @@ static size_t   g_dv_ncfg = 0, g_dv_cfgcap = 0;
 
 static struct {
     uint64_t roots, stage2, dives, kept, written, dup;
-    uint64_t arm_n, arm_win[DV_NARMS];
+    uint64_t arm_n, pol_gain, pol_roots;
+    double   arm_win[DV_NARMS];
     double   arm_sum[DV_NARMS], t;
     int      best;
     uint64_t hist[DV_EDGES + 1];
 } g_dv_run = { .best = -1 };
+
+/* Experiment overrides, read once at start-up (README, environment table). */
+static const char *g_dv_roots_path = NULL;   /* E555_DIVE_ROOTS: replay saved boards */
+static void dv_read_env(void) {
+    const char *v;
+    if ((v = getenv("E555_DIVE_LCV"))) {
+        g_dv_lcv_cap = atoi(v);
+        if (g_dv_lcv_cap < 1 || g_dv_lcv_cap > DV_LCV_MAX) fatal("E555_DIVE_LCV must be 1..%d", DV_LCV_MAX);
+    }
+    if ((v = getenv("E555_DIVE_BETAS"))) {
+        g_dv_narms = 0;
+        for (const char *t = v; *t && g_dv_narms < DV_NARMS; ) {
+            char *e; double b = strtod(t, &e);
+            if (e == t || b < 0.0) fatal("E555_DIVE_BETAS: a comma list of betas >= 0");
+            g_dv_beta[g_dv_narms++] = b;
+            t = (*e == ',') ? e + 1 : e;
+        }
+        if (!g_dv_narms) fatal("E555_DIVE_BETAS is empty");
+    }
+    if ((v = getenv("E555_DIVE_ROUNDS"))) {
+        g_dv_rounds = atoi(v);
+        if (g_dv_rounds < 1 || g_dv_rounds > DV_ROUNDS_MAX) fatal("E555_DIVE_ROUNDS must be 1..%d", DV_ROUNDS_MAX);
+    }
+    if ((v = getenv("E555_DIVE_ELITE")))  g_dv_elite = atof(v);
+    if ((v = getenv("E555_DIVE_GAMMA")))  g_dv_gamma = (float)atof(v);
+    if ((v = getenv("E555_DIVE_CLIP")))   g_dv_clip  = (float)atof(v);
+    if ((v = getenv("E555_DIVE_STAGE1"))) g_dv_s1frac = atof(v);
+    if ((v = getenv("E555_DIVE_S2BETA"))) g_dv_s2beta = atof(v);
+    if ((v = getenv("E555_DIVE_NOPRIOR"))) g_dv_noprior = atoi(v);
+    if (!(g_dv_elite > 0.0 && g_dv_elite <= 1.0)) fatal("E555_DIVE_ELITE must be in (0,1]");
+    if (!(g_dv_s1frac > 0.0 && g_dv_s1frac <= 1.0)) fatal("E555_DIVE_STAGE1 must be in (0,1]");
+    if (!(g_dv_clip > 0.0f) || g_dv_gamma < 0.0f) fatal("E555_DIVE_CLIP > 0, E555_DIVE_GAMMA >= 0");
+    if ((v = getenv("E555_DIVE_TRACE"))) {
+        g_dv_trace = fopen(v, "w");
+        if (!g_dv_trace) fatal("cannot write E555_DIVE_TRACE %s", v);
+        fprintf(g_dv_trace, "# cfg seq segment beta dives score:count...\n");
+    }
+    if ((v = getenv("E555_DIVE_ROOTS"))) g_dv_roots_path = v;
+    if ((v = getenv("E555_DIVE_POLISH"))) g_dv_polish = atoi(v);
+    if ((v = getenv("E555_DIVE_ILS")))    g_dv_ils = atoi(v);
+    if ((v = getenv("E555_DIVE_KICK")))   g_dv_kick = atoi(v);
+    if ((v = getenv("E555_DIVE_MARGIN"))) g_dv_margin = atoi(v);
+    if ((v = getenv("E555_DIVE_MEDIAN"))) g_dv_median = atoi(v);
+    if ((v = getenv("E555_DIVE_ILS_FULL"))) g_dv_ils_full = atoi(v);
+    if ((v = getenv("E555_DIVE_STARTS"))) g_dv_ils_starts = atoi(v);
+    if (g_dv_ils_starts < 1 || g_dv_ils_starts > DV_STARTS_MAX) fatal("E555_DIVE_STARTS must be 1..%d", DV_STARTS_MAX);
+    if (g_dv_kick < 1 || g_dv_kick > 16) fatal("E555_DIVE_KICK must be 1..16");
+    if (g_dv_polish < 0 || g_dv_polish > 256) fatal("E555_DIVE_POLISH must be 0..256");
+}
 
 static inline bool dv_time_up(void) {
     return g_stop || (g_dv_deadline > 0.0 && omp_get_wtime() >= g_dv_deadline);
@@ -4218,6 +4306,13 @@ static void dv_work_root(DvWork *k, const DvRoot *r) {
     /* The remaining-opportunity prior over this root's open cells. */
     for (int i = 0; i < k->nup; i++) {
         const int p = k->up[i];
+        if (g_dv_noprior == 1) {                /* CEM from a flat start */
+            for (int j = 0; j < k->ncell; j++) {
+                const size_t fi = (size_t)p * NUM_PIECES + k->cells[j];
+                k->prior[fi] = k->delta[fi] = k->w[fi] = 0.0f;
+            }
+            continue;
+        }
         double R = 0.0; int n = 0;
         for (int j = 0; j < k->ncell; j++) {
             const int x = k->cells[j];
@@ -4225,6 +4320,7 @@ static void dv_work_root(DvWork *k, const DvRoot *r) {
             R += exp((double)g_fw_location[(size_t)p * NUM_PIECES + x]); n++;
         }
         const double lr = n ? log(R / n) : 0.0;
+
         for (int j = 0; j < k->ncell; j++) {
             const int x = k->cells[j];
             const size_t fi = (size_t)p * NUM_PIECES + x;
@@ -4236,7 +4332,31 @@ static void dv_work_root(DvWork *k, const DvRoot *r) {
     }
 }
 
+/* Keep the K best distinct dives of a root as polish candidates. */
+static void dv_offer_top(DvRoot *r, const DvBoard *b, int s) {
+    if (!r->top) return;
+    const int K = g_dv_polish;
+    int lo = 0;
+    if (r->ntop == K) {
+        for (int i = 1; i < K; i++) if (r->top_s[i] < r->top_s[lo]) lo = i;
+        if (s <= r->top_s[lo]) return;
+    }
+    uint64_t h = 14695981039346656037ULL;
+    for (int x = 0; x < NUM_PIECES; x++) {
+        h ^= b->c[x].piece_id; h *= 1099511628211ULL;
+        h ^= b->c[x].rotation; h *= 1099511628211ULL;
+    }
+    for (int i = 0; i < r->ntop; i++) if (r->top_fp[i] == h) return;
+    const int at = (r->ntop < K) ? r->ntop++ : lo;
+    uint8_t *d = r->top + (size_t)at * 2 * NUM_PIECES;
+    for (int x = 0; x < NUM_PIECES; x++) {
+        d[x] = (uint8_t)b->c[x].piece_id; d[NUM_PIECES + x] = b->c[x].rotation;
+    }
+    r->top_s[at] = s; r->top_fp[at] = h;
+}
+
 static void dv_take_best(DvRoot *r, const DvBoard *b, int s) {
+    dv_offer_top(r, b, s);
     if (s <= r->best) return;
     r->best = s;
     for (int x = 0; x < NUM_PIECES; x++) {
@@ -4245,17 +4365,166 @@ static void dv_take_best(DvRoot *r, const DvBoard *b, int s) {
     }
 }
 
+/* Matched edges between x and its neighbours (a full board). */
+static inline int dv_local(const DvBoard *b, int x) {
+    int m = 0;
+    for (int d = 0; d < 4; d++) {
+        const int y = dv_nb(x, d);
+        if (y >= 0 && dv_side(&b->c[x], d) == dv_side(&b->c[y], (d + 2) & 3)) m++;
+    }
+    return m;
+}
+/* 1 if the shared edge of adjacent x, y matches. */
+static inline int dv_local_edge(const DvBoard *b, int x, int y) {
+    for (int d = 0; d < 4; d++)
+        if (dv_nb(x, d) == y) return dv_side(&b->c[x], d) == dv_side(&b->c[y], (d + 2) & 3);
+    return 0;
+}
+static inline int dv_pair(const DvBoard *b, int x, int y) {
+    return dv_local(b, x) + dv_local(b, y) - dv_local_edge(b, x, y);   /* shared edge once */
+}
+
+/* Polish (E555_DIVE_POLISH): hill-climb a finished board over the cells the
+   dives filled -- every re-rotation of one piece and every swap of two
+   (each with its best frame-legal spins) -- taking any move that adds matched
+   edges, until none does. */
+static int dv_polish(DvBoard *b, const uint8_t *cells, int n) {
+    int gained = 0;
+    for (int pass = 0; pass < 100; pass++) {
+        int improved = 0;
+        for (int i = 0; i < n; i++) {
+            const int x = cells[i];
+            /* re-rotate in place */
+            {
+                const int p = b->c[x].piece_id, cls = dv_cls(x);
+                const Oriented keep = b->c[x];
+                int best = dv_local(b, x), bs = -1;
+                for (int s = 0; s < 4; s++) {
+                    if (!(g_dv_spins[p] >> s & 1u) || s == keep.rotation) continue;
+                    if (!(g_dv_base[cls].w[(p * 4 + s) >> 6] >> ((p * 4 + s) & 63) & 1ULL)) continue;
+                    b->c[x] = g_dv_or[p][s];
+                    const int v = dv_local(b, x);
+                    if (v > best) { best = v; bs = s; }
+                }
+                b->c[x] = keep;
+                if (bs >= 0) { gained += best - dv_local(b, x); b->c[x] = g_dv_or[p][bs]; improved++; }
+            }
+            for (int j = i + 1; j < n; j++) {
+                const int y = cells[j];
+                const int p = b->c[x].piece_id, q = b->c[y].piece_id;
+                const int cx = dv_cls(x), cy = dv_cls(y);
+                if (!(g_dv_pclass[p] >> cy & 1u) || !(g_dv_pclass[q] >> cx & 1u)) continue;
+                const Oriented ox = b->c[x], oy = b->c[y];
+                const int before = dv_pair(b, x, y);
+                int best = before, bsp = -1, bsq = -1;
+                for (int sp = 0; sp < 4; sp++) {
+                    if (!(g_dv_spins[p] >> sp & 1u)) continue;
+                    if (!(g_dv_base[cy].w[(p * 4 + sp) >> 6] >> ((p * 4 + sp) & 63) & 1ULL)) continue;
+                    b->c[y] = g_dv_or[p][sp];
+                    for (int sq = 0; sq < 4; sq++) {
+                        if (!(g_dv_spins[q] >> sq & 1u)) continue;
+                        if (!(g_dv_base[cx].w[(q * 4 + sq) >> 6] >> ((q * 4 + sq) & 63) & 1ULL)) continue;
+                        b->c[x] = g_dv_or[q][sq];
+                        const int v = dv_pair(b, x, y);
+                        if (v > best) { best = v; bsp = sp; bsq = sq; }
+                    }
+                }
+                if (bsp >= 0) {
+                    b->c[y] = g_dv_or[p][bsp]; b->c[x] = g_dv_or[q][bsq];
+                    gained += best - before; improved++;
+                } else { b->c[x] = ox; b->c[y] = oy; }
+            }
+        }
+        if (!improved) break;
+    }
+    return gained;
+}
+
+/* Try the best move involving cell x: re-rotate it, or swap it with any other
+   cell of the region. Applies it if it gains; returns the partner cell moved
+   (x itself for a rotation), or -1. */
+static int dv_best_move_at(DvBoard *b, const uint8_t *cells, int n, int x, int *gain) {
+    const int p = b->c[x].piece_id, cx = dv_cls(x);
+    const Oriented ox = b->c[x];
+    int best_g = 0, by = -1, bsp = -1, bsq = -1;
+    {
+        const int base = dv_local(b, x);
+        for (int s = 0; s < 4; s++) {
+            if (!(g_dv_spins[p] >> s & 1u) || s == ox.rotation) continue;
+            if (!(g_dv_base[cx].w[(p * 4 + s) >> 6] >> ((p * 4 + s) & 63) & 1ULL)) continue;
+            b->c[x] = g_dv_or[p][s];
+            const int g = dv_local(b, x) - base;
+            if (g > best_g) { best_g = g; by = x; bsp = s; }
+        }
+        b->c[x] = ox;
+    }
+    for (int j = 0; j < n; j++) {
+        const int y = cells[j];
+        if (y == x) continue;
+        const int q = b->c[y].piece_id, cy = dv_cls(y);
+        if (!(g_dv_pclass[p] >> cy & 1u) || !(g_dv_pclass[q] >> cx & 1u)) continue;
+        const Oriented oy = b->c[y];
+        const int before = dv_pair(b, x, y);
+        for (int sp = 0; sp < 4; sp++) {
+            if (!(g_dv_spins[p] >> sp & 1u)) continue;
+            if (!(g_dv_base[cy].w[(p * 4 + sp) >> 6] >> ((p * 4 + sp) & 63) & 1ULL)) continue;
+            b->c[y] = g_dv_or[p][sp];
+            for (int sq = 0; sq < 4; sq++) {
+                if (!(g_dv_spins[q] >> sq & 1u)) continue;
+                if (!(g_dv_base[cx].w[(q * 4 + sq) >> 6] >> ((q * 4 + sq) & 63) & 1ULL)) continue;
+                b->c[x] = g_dv_or[q][sq];
+                const int g = dv_pair(b, x, y) - before;
+                if (g > best_g) { best_g = g; by = y; bsp = sp; bsq = sq; }
+            }
+        }
+        b->c[x] = ox; b->c[y] = oy;
+    }
+    if (by < 0) return -1;
+    if (by == x) b->c[x] = g_dv_or[p][bsp];
+    else { const int q = b->c[by].piece_id; b->c[by] = g_dv_or[p][bsp]; b->c[x] = g_dv_or[q][bsq]; }
+    *gain = best_g;
+    return by;
+}
+
+/* Polish driven by a work queue: only cells whose surroundings changed are
+   re-examined (a move's gain depends only on the two cells and their
+   neighbours). Seeds with queue[0..qn); returns the edges gained. */
+static int dv_polish_q(DvBoard *b, const uint8_t *cells, int n, const bool *inreg,
+                       int *queue, int qn, bool *inq) {
+    int gained = 0, head = 0, tail = qn;   /* ring of NUM_PIECES slots */
+    int cnt = qn;
+    while (cnt > 0) {
+        const int x = queue[head]; head = (head + 1) % NUM_PIECES; cnt--;
+        inq[x] = false;
+        int g = 0;
+        const int y = dv_best_move_at(b, cells, n, x, &g);
+        if (y < 0) continue;
+        gained += g;
+        const int touched[2] = { x, y };
+        for (int t = 0; t < 2; t++) {
+            const int z = touched[t];
+            for (int d = -1; d < 4; d++) {
+                const int w = d < 0 ? z : dv_nb(z, d);
+                if (w < 0 || !inreg[w] || inq[w]) continue;
+                inq[w] = true; queue[tail] = w; tail = (tail + 1) % NUM_PIECES; cnt++;
+            }
+        }
+    }
+    return gained;
+}
+
 static void dv_stage1(DvRoot *r, DvWork *k, uint32_t n1) {
     dv_work_root(k, r);
     for (uint32_t i = 0; i < n1; i++) {
         if ((i & 15u) == 0 && dv_time_up()) break;
-        const int arm = g_dv_guided ? (int)(i % DV_NARMS) : 0;
+        const int arm = g_dv_guided ? (int)(i % (uint32_t)g_dv_narms) : 0;
         RNG rng = rng_for(r->fp, 1u, i, 0u);
         k->b = k->base; k->f = k->proto;
         dv_dive(&k->b, &k->f, k->cells, k->ncell, &rng,
                 g_dv_guided ? k->w : NULL, g_dv_beta[arm]);
         const int s = dv_score(&k->b);
         r->dives++;
+        dv_hist_add(r, arm, s);
         if (s > r->arm_best[arm]) r->arm_best[arm] = s;
         dv_take_best(r, &k->b, s);
     }
@@ -4268,7 +4537,7 @@ static int dv_cmp_u64(const void *a, const void *b) {
 
 /* Cross-entropy update from one round's elite dives. */
 static void dv_cem(DvWork *k, int nd) {
-    int ne = (int)(nd * DV_ELITE_FRAC);
+    int ne = (int)(nd * g_dv_elite);
     if (ne < 1) ne = 1;
     /* Best score first, then dive order: (480 - score) << 32 | dive. */
     for (int i = 0; i < nd; i++)
@@ -4289,11 +4558,11 @@ static void dv_cem(DvWork *k, int nd) {
             if (!(g_dv_pclass[p] >> dv_cls(x) & 1u)) continue;
             const size_t fi = (size_t)p * NUM_PIECES + x;
             float ev = (float)log((k->E[fi] + 0.5) / (expect + 0.5));
-            if (ev >  DV_CEM_CLIP) ev =  DV_CEM_CLIP;
-            if (ev < -DV_CEM_CLIP) ev = -DV_CEM_CLIP;
-            float d = k->delta[fi] + DV_CEM_GAMMA * ev;
-            if (d >  DV_CEM_CLIP) d =  DV_CEM_CLIP;
-            if (d < -DV_CEM_CLIP) d = -DV_CEM_CLIP;
+            if (ev >  g_dv_clip) ev =  g_dv_clip;
+            if (ev < -g_dv_clip) ev = -g_dv_clip;
+            float d = k->delta[fi] + g_dv_gamma * ev;
+            if (d >  g_dv_clip) d =  g_dv_clip;
+            if (d < -g_dv_clip) d = -g_dv_clip;
             k->delta[fi] = d;
             k->w[fi] = k->prior[fi] + d;
             k->E[fi] = 0;
@@ -4303,23 +4572,29 @@ static void dv_cem(DvWork *k, int nd) {
 
 static void dv_stage2(DvRoot *r, DvWork *k, uint32_t n2, const double arm_p[DV_NARMS]) {
     dv_work_root(k, r);
-    const uint32_t per = n2 / DV_ROUNDS;
-    if (g_dv_guided && k->rec_cap < (size_t)(per + DV_ROUNDS) * NUM_PIECES) {
-        k->rec_cap = (size_t)(per + DV_ROUNDS) * NUM_PIECES;
+    if (g_dv_guided && g_dv_noprior == 2)     /* stage 2 learns from a flat start */
+        for (int i = 0; i < k->nup; i++)
+            for (int j = 0; j < k->ncell; j++) {
+                const size_t fi = (size_t)k->up[i] * NUM_PIECES + k->cells[j];
+                k->prior[fi] = k->delta[fi] = k->w[fi] = 0.0f;
+            }
+    const uint32_t per = n2 / (uint32_t)g_dv_rounds;
+    if (g_dv_guided && k->rec_cap < (size_t)(per + DV_ROUNDS_MAX) * NUM_PIECES) {
+        k->rec_cap = (size_t)(per + DV_ROUNDS_MAX) * NUM_PIECES;
         k->rec  = xrealloc(k->rec, k->rec_cap);
-        k->rsc  = xrealloc(k->rsc, (per + DV_ROUNDS) * sizeof *k->rsc);
-        k->rord = xrealloc(k->rord, (per + DV_ROUNDS) * sizeof *k->rord);
+        k->rsc  = xrealloc(k->rsc, (per + DV_ROUNDS_MAX) * sizeof *k->rsc);
+        k->rord = xrealloc(k->rord, (per + DV_ROUNDS_MAX) * sizeof *k->rord);
     }
     uint32_t done = 0;
-    for (int rd = 0; rd < DV_ROUNDS && done < n2; rd++) {
-        const uint32_t nd = (rd == DV_ROUNDS - 1) ? n2 - done : per;
+    for (int rd = 0; rd < g_dv_rounds && done < n2; rd++) {
+        const uint32_t nd = (rd == g_dv_rounds - 1) ? n2 - done : per;
         double beta = 0.0;
         if (g_dv_guided) {
             RNG ar = rng_for(r->fp, 2u, (uint32_t)rd, 0xA7u);
             double u = (double)(rng_next(&ar) >> 11) * (1.0 / 9007199254740992.0), acc = 0.0;
-            int arm = DV_NARMS - 1;
-            for (int a = 0; a < DV_NARMS; a++) { acc += arm_p[a]; if (u < acc) { arm = a; break; } }
-            beta = g_dv_beta[arm];
+            int arm = g_dv_narms - 1;
+            for (int a = 0; a < g_dv_narms; a++) { acc += arm_p[a]; if (u < acc) { arm = a; break; } }
+            beta = g_dv_s2beta >= 0.0 ? g_dv_s2beta : g_dv_beta[arm];
         }
         uint32_t i = 0;
         for (; i < nd; i++) {
@@ -4329,6 +4604,7 @@ static void dv_stage2(DvRoot *r, DvWork *k, uint32_t n2, const double arm_p[DV_N
             dv_dive(&k->b, &k->f, k->cells, k->ncell, &rng, g_dv_guided ? k->w : NULL, beta);
             const int s = dv_score(&k->b);
             r->dives++;
+            dv_hist_add(r, g_dv_narms + rd, s);
             dv_take_best(r, &k->b, s);
             if (g_dv_guided) {
                 k->rsc[i] = s;
@@ -4338,7 +4614,7 @@ static void dv_stage2(DvRoot *r, DvWork *k, uint32_t n2, const double arm_p[DV_N
         }
         done += i;
         if (i < nd) break;                              /* out of time */
-        if (g_dv_guided && rd < DV_ROUNDS - 1 && i > 0) dv_cem(k, (int)i);
+        if (g_dv_guided && g_dv_gamma > 0.0f && rd < g_dv_rounds - 1 && i > 0) dv_cem(k, (int)i);
     }
 }
 
@@ -4355,7 +4631,23 @@ static void dv_run_config(void) {
     const double t0 = omp_get_wtime();
     dv_build_frame();
     const int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
-    const uint32_t n1 = g_end_dive / 10, n2 = g_end_dive - n1;
+    if (g_dv_polish)
+        for (size_t i = 0; i < n; i++) {
+            g_dv_q[i].top    = xmalloc((size_t)g_dv_polish * 2 * NUM_PIECES);
+            g_dv_q[i].top_s  = xmalloc((size_t)g_dv_polish * sizeof(int));
+            g_dv_q[i].top_fp = xmalloc((size_t)g_dv_polish * sizeof(uint64_t));
+            g_dv_q[i].ntop = 0;
+        }
+    if (g_dv_trace)
+        for (size_t i = 0; i < n; i++) {
+            const size_t hn = (size_t)dv_nseg() * (DV_EDGES + 1);
+            g_dv_q[i].hist = xmalloc(hn * sizeof(uint32_t));
+            memset(g_dv_q[i].hist, 0, hn * sizeof(uint32_t));
+        }
+    uint32_t n1 = (uint32_t)(g_end_dive * g_dv_s1frac + 0.5);
+    if (n1 < 1) n1 = 1;
+    if (n1 > g_end_dive) n1 = g_end_dive;
+    const uint32_t n2 = g_end_dive - n1;
     DvRoot *q = g_dv_q;
 
     DvWork **work = xmalloc((size_t)nt * sizeof *work);
@@ -4384,12 +4676,14 @@ static void dv_run_config(void) {
         if (q[i].best < 0) continue;
         sc[ns++] = q[i].best;
         if (g_dv_guided) {
-            int win = 0;
-            for (int a = 0; a < DV_NARMS; a++) {
+            int top = -1, nwin = 0;
+            for (int a = 0; a < g_dv_narms; a++) {
                 arm_sum[a] += q[i].arm_best[a];
-                if (q[i].arm_best[a] > q[i].arm_best[win]) win = a;
+                if (q[i].arm_best[a] > top) top = q[i].arm_best[a];
             }
-            g_dv_run.arm_win[win]++;
+            for (int a = 0; a < g_dv_narms; a++) nwin += q[i].arm_best[a] == top;
+            for (int a = 0; a < g_dv_narms; a++)     /* a tie shares the win */
+                if (q[i].arm_best[a] == top) g_dv_run.arm_win[a] += 1.0 / nwin;
         }
     }
     int median = -1, s1_best = -1;
@@ -4399,16 +4693,16 @@ static void dv_run_config(void) {
         s1_best = sc[ns - 1];
     }
     free(sc);
-    double arm_p[DV_NARMS] = { 1.0, 0.0, 0.0, 0.0 };
+    double arm_p[DV_NARMS] = { 1.0 };
     if (g_dv_guided && ns) {
         double mx = -1e300, z = 0.0;
-        for (int a = 0; a < DV_NARMS; a++) {
+        for (int a = 0; a < g_dv_narms; a++) {
             g_dv_run.arm_sum[a] += arm_sum[a];
             arm_sum[a] /= (double)ns;
             if (arm_sum[a] > mx) mx = arm_sum[a];
         }
-        for (int a = 0; a < DV_NARMS; a++) { arm_p[a] = exp(arm_sum[a] - mx); z += arm_p[a]; }
-        for (int a = 0; a < DV_NARMS; a++) arm_p[a] /= z;
+        for (int a = 0; a < g_dv_narms; a++) { arm_p[a] = exp(arm_sum[a] - mx); z += arm_p[a]; }
+        for (int a = 0; a < g_dv_narms; a++) arm_p[a] /= z;
         g_dv_run.arm_n += ns;
     }
 
@@ -4416,7 +4710,8 @@ static void dv_run_config(void) {
     size_t *sel = xmalloc(n * sizeof *sel);
     for (size_t i = 0; i < n; i++) {
         q[i].stage2 = q[i].best >= 0 && n2 > 0 &&
-                      (q[i].best >= median || q[i].best >= g_emit_score - 2);
+                      ((g_dv_median && q[i].best >= median)
+                       || q[i].best >= g_emit_score - g_dv_margin);
         if (q[i].stage2) sel[n_s2++] = i;
     }
     if (!dv_time_up()) {
@@ -4428,6 +4723,110 @@ static void dv_run_config(void) {
     }
     free(sel);
 
+    /* Polish (E555_DIVE_POLISH=K): hill-climb each root's K best dives, then
+       (E555_DIVE_ILS=R) R rounds of kick-and-polish on the best of them. */
+    uint64_t pol_gain = 0, pol_roots = 0;
+    if (g_dv_polish && !dv_time_up()) {
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(nt) reduction(+:pol_gain,pol_roots)
+        for (size_t i = 0; i < n; i++) {
+            DvRoot *r = &q[i];
+            if (r->best < 0 || !r->ntop || r->best < g_emit_score - DV_POLISH_MARGIN) continue;
+            const int before = r->best;
+            uint8_t cells[NUM_PIECES];
+            int nc = 0;
+            for (int x = 0; x < NUM_PIECES; x++)
+                if (r->base_pid[x] == DV_EMPTY) cells[nc++] = (uint8_t)x;
+            /* Polish every candidate; keep the best `starts` distinct results. */
+            const int starts = g_dv_ils_starts;
+            DvBoard *st = xmalloc((size_t)starts * sizeof *st);
+            int st_s[DV_STARTS_MAX]; uint64_t st_fp[DV_STARTS_MAX];
+            int nst = 0;
+            DvBoard b, cur;
+            for (int t = 0; t < r->ntop; t++) {
+                const uint8_t *d = r->top + (size_t)t * 2 * NUM_PIECES;
+                for (int x = 0; x < NUM_PIECES; x++) b.c[x] = g_dv_or[d[x]][d[NUM_PIECES + x]];
+                const int g = dv_polish(&b, cells, nc);
+                const int sc = dv_score(&b);
+                if (sc != r->top_s[t] + g)
+                    fatal("internal error: polish gained %d but the score moved %d -> %d",
+                          g, r->top_s[t], sc);
+                uint64_t h = 14695981039346656037ULL;
+                for (int j = 0; j < nc; j++) {
+                    h ^= b.c[cells[j]].piece_id; h *= 1099511628211ULL;
+                    h ^= b.c[cells[j]].rotation; h *= 1099511628211ULL;
+                }
+                bool dup = false;
+                for (int j = 0; j < nst; j++) if (st_fp[j] == h) dup = true;
+                if (dup) continue;
+                int at = -1;
+                if (nst < starts) at = nst++;
+                else {
+                    int lo = 0;
+                    for (int j = 1; j < nst; j++) if (st_s[j] < st_s[lo]) lo = j;
+                    if (sc > st_s[lo]) at = lo;
+                }
+                if (at >= 0) { st[at] = b; st_s[at] = sc; st_fp[at] = h; }
+            }
+            int cur_s = -1;
+            for (int j = 0; j < nst; j++) if (st_s[j] > cur_s) { cur_s = st_s[j]; cur = st[j]; }
+            bool inreg[NUM_PIECES] = { false }, inq[NUM_PIECES] = { false };
+            for (int j = 0; j < nc; j++) inreg[cells[j]] = true;
+            int queue[NUM_PIECES];
+            for (int j = 0; j < nst; j++) {          /* kick-and-polish from each start */
+                RNG rng = rng_for(r->fp, 0x9011u, (uint32_t)j, 0u);
+                DvBoard walk = st[j];
+                int walk_s = st_s[j];
+                const int iters = g_dv_ils / nst + (j < g_dv_ils % nst);
+                for (int it = 0; it < iters; it++) {
+                    b = walk;
+                    int qn = 0;
+                    for (int kk = 0; kk < g_dv_kick; kk++) {   /* kick: random swaps */
+                        for (int tries = 0; tries < 32; tries++) {
+                            const int x = cells[rng_uniform(&rng, (uint32_t)nc)];
+                            const int y = cells[rng_uniform(&rng, (uint32_t)nc)];
+                            if (x == y) continue;
+                            const int p = b.c[x].piece_id, qq = b.c[y].piece_id;
+                            if (!(g_dv_pclass[p] >> dv_cls(y) & 1u) || !(g_dv_pclass[qq] >> dv_cls(x) & 1u)) continue;
+                            int sp, sq;
+                            do sp = (int)rng_uniform(&rng, 4); while (!(g_dv_spins[p] >> sp & 1u) ||
+                                   !(g_dv_base[dv_cls(y)].w[(p * 4 + sp) >> 6] >> ((p * 4 + sp) & 63) & 1ULL));
+                            do sq = (int)rng_uniform(&rng, 4); while (!(g_dv_spins[qq] >> sq & 1u) ||
+                                   !(g_dv_base[dv_cls(x)].w[(qq * 4 + sq) >> 6] >> ((qq * 4 + sq) & 63) & 1ULL));
+                            b.c[y] = g_dv_or[p][sp]; b.c[x] = g_dv_or[qq][sq];
+                            const int kicked[2] = { x, y };
+                            for (int t = 0; t < 2; t++)
+                                for (int d = -1; d < 4; d++) {
+                                    const int w = d < 0 ? kicked[t] : dv_nb(kicked[t], d);
+                                    if (w < 0 || !inreg[w] || inq[w]) continue;
+                                    inq[w] = true; queue[qn++] = w;
+                                }
+                            break;
+                        }
+                    }
+                    if (g_dv_ils_full) {
+                        for (int t = 0; t < qn; t++) inq[queue[t]] = false;
+                        dv_polish(&b, cells, nc);
+                    } else {
+                        dv_polish_q(&b, cells, nc, inreg, queue, qn, inq);
+                    }
+                    const int sc = dv_score(&b);
+                    if (sc >= walk_s) { walk_s = sc; walk = b; }
+                }
+                if (walk_s > cur_s) { cur_s = walk_s; cur = walk; }
+            }
+            free(st);
+            if (cur_s > r->best) {
+                dv_take_best(r, &cur, cur_s);
+                pol_gain += (uint64_t)(r->best - before); pol_roots++;
+            }
+        }
+        g_dv_run.pol_gain += pol_gain; g_dv_run.pol_roots += pol_roots;
+    }
+    for (size_t i = 0; i < n; i++) {
+        free(q[i].top); free(q[i].top_s); free(q[i].top_fp);
+        q[i].top = NULL; q[i].top_s = NULL; q[i].top_fp = NULL; q[i].ntop = 0;
+    }
+
     for (int t = 0; t < nt; t++) {
         free(work[t]->prior); free(work[t]->delta); free(work[t]->w); free(work[t]->E);
         free(work[t]->rec); free(work[t]->rsc); free(work[t]->rord);
@@ -4435,6 +4834,25 @@ static void dv_run_config(void) {
     }
     free(work);
 
+    if (g_dv_trace) {             /* one line per root and segment that ran */
+        for (size_t i = 0; i < n; i++) {
+            for (int sg = 0; sg < dv_nseg(); sg++) {
+                const uint32_t *h = q[i].hist + (size_t)sg * (DV_EDGES + 1);
+                uint64_t tot = 0;
+                for (int v = 0; v <= DV_EDGES; v++) tot += h[v];
+                if (!tot) continue;
+                fprintf(g_dv_trace, "%s %" PRIu64 " %s%d %g %" PRIu64,
+                        g_config_id_str, q[i].seq, sg < g_dv_narms ? "s1a" : "s2r",
+                        sg < g_dv_narms ? sg : sg - g_dv_narms,
+                        sg < g_dv_narms ? (g_dv_guided ? g_dv_beta[sg] : 0.0) : -1.0, tot);
+                for (int v = 0; v <= DV_EDGES; v++)
+                    if (h[v]) fprintf(g_dv_trace, " %d:%u", v, h[v]);
+                fputc('\n', g_dv_trace);
+            }
+            free(q[i].hist); q[i].hist = NULL;
+        }
+        fflush(g_dv_trace);
+    }
     /* Keep the roots at or above S. */
     uint64_t dives = 0, kept = 0;
     int best = -1;
@@ -4482,11 +4900,43 @@ static void dv_run_config(void) {
                dives, dt);
         if (g_dv_guided && ns) {
             printf(" arms(mean best)");
-            for (int a = 0; a < DV_NARMS; a++) printf(" b%g:%.1f", g_dv_beta[a], arm_sum[a]);
+            for (int a = 0; a < g_dv_narms; a++) printf(" b%g:%.1f", g_dv_beta[a], arm_sum[a]);
         }
         printf("\n");
         fflush(stdout);
     }
+}
+
+/* E555_DIVE_ROOTS=FILE: instead of growing boards, dive the saved stop-row
+   boards of border row `row` read from FILE (lines "r<row>b...", any stage's
+   CSV), one configuration per run of equal config ids. For measuring dive
+   settings on identical roots, and for re-diving an earlier run's output. */
+static void dv_replay_row(uint32_t row) {
+    FILE *f = fopen(g_dv_roots_path, "r");
+    if (!f) fatal("cannot read E555_DIVE_ROOTS %s: %s", g_dv_roots_path, strerror(errno));
+    char pre[32], cur[sizeof g_config_id_str] = "";
+    snprintf(pre, sizeof pre, "r%ub", row);
+    const size_t pl = strlen(pre);
+    char *line = NULL; size_t cap = 0, nroots = 0;
+    while (getline(&line, &cap, f) > 0 && !g_stop) {
+        if (strncmp(line, pre, pl)) continue;
+        char *c1 = strchr(line, ',');
+        char *c2 = c1 ? strchr(c1 + 1, ',') : NULL;
+        if (!c2 || (size_t)(c1 - line) >= sizeof cur) continue;
+        const size_t idl = (size_t)(c1 - line);
+        if (strncmp(cur, line, idl) || cur[idl]) {
+            if (g_dv_qn) { strcpy(g_config_id_str, cur); dv_run_config(); }
+            memcpy(cur, line, idl); cur[idl] = 0;
+        }
+        dv_queue_tail(c2);
+        nroots++;
+    }
+    if (g_dv_qn && !g_stop) { strcpy(g_config_id_str, cur); dv_run_config(); }
+    g_dv_qn = 0;
+    free(line); fclose(f);
+    printf("[dive] replayed %zu saved board(s) of border row %u from %s\n",
+           nroots, row, g_dv_roots_path);
+    fflush(stdout);
 }
 
 static int dv_cmp_keep(const void *a, const void *b) {
@@ -5139,7 +5589,12 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
                g_end_dive, g_dv_run.roots, g_dv_run.stage2, g_dv_run.dives,
                g_dv_run.t > 0 ? (double)g_dv_run.dives / g_dv_run.t : 0.0,
                g_dv_run.best, g_emit_score, g_dv_run.kept, g_dv_run.written, g_dv_run.dup,
-               g_dv_guided ? "on" : "off", g_dv_run.t);
+               !g_dv_guided ? "off (plain dives)" : g_dv_noprior == 1 ? "rounds" : "rounds+table",
+               g_dv_run.t);
+        if (g_dv_polish)
+            printf("[sum] end dive polish: %" PRIu64 " board(s) improved, +%" PRIu64
+                   " edges in all (%d kick-and-polish rounds per board)\n",
+                   g_dv_run.pol_roots, g_dv_run.pol_gain, g_dv_ils);
         printf("[sum] end dive scores written:");
         int shown = 0;
         for (int sc = DV_EDGES; sc >= 0 && shown < 16; sc--)
@@ -5148,8 +5603,8 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         printf("\n");
         if (g_dv_guided && g_dv_run.arm_n) {
             printf("[sum] end dive stage-1 arms (beta: mean best per board, boards won):");
-            for (int a = 0; a < DV_NARMS; a++)
-                printf("  %g:%.2f/%" PRIu64, g_dv_beta[a],
+            for (int a = 0; a < g_dv_narms; a++)
+                printf("  %g:%.2f/%.0f", g_dv_beta[a],
                        g_dv_run.arm_sum[a] / (double)g_dv_run.arm_n, g_dv_run.arm_win[a]);
             printf("\n");
         }
@@ -5477,14 +5932,20 @@ static void usage(const char *a0) {
 "  --end_dive M           complete every stop-row board (beam or --backtrack_row) to\n"
 "                         256 pieces with greedy random dives that allow broken edges\n"
 "                         (the backtracker's stuck mode: MRV, minimal breaks, LCV):\n"
-"                         M/10 dives each, then M-M/10 more for boards at or above\n"
-"                         their configuration's median or >= S-2. Boards whose best\n"
-"                         scores >= S are written instead of the stop-row boards,\n"
-"                         best first, as config_id, connected edges, pos, rot, when\n"
-"                         the completions file closes. With --table and --freq_model\n"
-"                         cell the dives are steered by the table (cross-entropy\n"
-"                         refinement in stage 2). --max_emitted then caps the written\n"
-"                         boards instead of stopping the search\n"
+"                         M/10 dives each, then M-M/10 more, learning from each\n"
+"                         board's own best dives (cross-entropy rounds), for boards\n"
+"                         whose stage-1 best is >= S-4 or at/above their\n"
+"                         configuration's median. Boards whose best scores >= S are\n"
+"                         written instead of the stop-row boards, best first, as\n"
+"                         config_id, connected edges, pos, rot, when the completions\n"
+"                         file closes. With --table and --freq_model cell the table\n"
+"                         steers the stage-1 dives. --max_emitted then caps the\n"
+"                         written boards instead of stopping the search\n"
+"  --end_polish R         with --end_dive: polish each board's 16 best dives (best\n"
+"                         swap/re-rotation, repeated) and then run R kick-and-polish\n"
+"                         rounds (3 random swaps, re-polish, keep if not worse) over 8\n"
+"                         walks; only boards whose best dive is within 6 of S. 0 =\n"
+"                         polish only. Measured +2..3 edges per board (README)\n"
 "  --emit_score S         connected edges (of 480) a dived board needs to be written\n"
 "                         (default 450; only with --end_dive)\n"
 "  --beam_expand E        late-search width multiplier (default 4; 1 = no expansion)\n"
@@ -5670,6 +6131,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     printf(" --beam_width %u --stop_row %u", g_beam_width, g_stop_row);
     if (g_backtrack_row) printf(" --backtrack_row %u", g_backtrack_row);
     if (g_end_dive) printf(" --end_dive %u --emit_score %d", g_end_dive, g_emit_score);
+    if (g_end_dive && g_end_polish >= 0) printf(" --end_polish %d", g_end_polish);
     printf(" --beam_expand %u --beam_expand_row %u", g_beam_expand, g_beam_expand_row);
     printf(" --lambda_J %g --lambda_Mahalanobis %g", g_lambda_J, g_lambda_maha);
     if (g_lambda_corners > 0.0) printf(" --lambda_corners %g", g_lambda_corners);
@@ -5889,6 +6351,10 @@ int main(int argc, char *argv[]) {
             if (v < 10 || v > 1000000000L) fatal("--end_dive must be in 10..1000000000");
             g_end_dive = (uint32_t)v;
         }
+        else if (!strcmp(argv[i], "--end_polish") && i+1 < argc) {
+            g_end_polish = atoi(argv[++i]);
+            if (g_end_polish < 0) fatal("--end_polish must be >= 0");
+        }
         else if (!strcmp(argv[i], "--emit_score") && i+1 < argc) {
             g_emit_score = atoi(argv[++i]); g_emit_score_set = true;
         }
@@ -6002,9 +6468,15 @@ int main(int argc, char *argv[]) {
         }
     }
     if (g_emit_score < 0 || g_emit_score > 480) fatal("--emit_score must be in 0..480");
+    if (g_end_polish >= 0 && !g_end_dive)
+        fprintf(stderr, "[warn] --end_polish has no effect without --end_dive\n");
     if (g_emit_score_set && !g_end_dive) {
         fprintf(stderr, "[warn] --emit_score has no effect without --end_dive\n");
     }
+    if (!g_end_dive && getenv("E555_DIVE_ROOTS"))
+        fatal("E555_DIVE_ROOTS needs --end_dive");
+    if (g_end_dive && g_random_edges && getenv("E555_DIVE_ROOTS"))
+        fatal("E555_DIVE_ROOTS replays a rotations row's boards, not --random_edges ones");
     if (g_end_dive && g_learn_path)
         fatal("--end_dive is a search-phase option: the learning phase writes no boards");
     if (!(fabs(g_lambda_maha) <= 1e6)) fatal("--lambda_Mahalanobis in [-1e6,1e6]");
@@ -6121,11 +6593,17 @@ int main(int argc, char *argv[]) {
         printf("[cfg] backtrack_row=%u (beam through row %u, then an exhaustive "
                "row-major search of every row-%u candidate to row %u)\n",
                g_backtrack_row, g_backtrack_row, g_backtrack_row, g_stop_row);
-    if (g_end_dive)
-        printf("[cfg] end_dive=%u (stage 1 %u dives per stop-row board, stage 2 %u more) "
-               "emit_score=%d guided=%s\n", g_end_dive, g_end_dive / 10,
+    if (g_end_dive) {
+        printf("[cfg] end_dive=%u (stage 1 %u dives per stop-row board, stage 2 %u more for "
+               "boards >= S-4 or at/above their configuration's median) emit_score=%d "
+               "stage-1 table prior=%s\n", g_end_dive, g_end_dive / 10,
                g_end_dive - g_end_dive / 10, g_emit_score,
-               (g_table_path && g_freq_model == FREQ_MODEL_CELL) ? "on (table, cell model)" : "off");
+               (g_table_path && g_freq_model == FREQ_MODEL_CELL) ? "on (cell model)" : "off");
+        if (g_end_polish >= 0)
+            printf("[cfg] end_polish=%d (polish the %d best dives of each board within %d "
+                   "of S, then %d kick-and-polish rounds over 8 walks)\n",
+                   g_end_polish, DV_POLISH_TOP, DV_POLISH_MARGIN, g_end_polish);
+    }
     printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u\n",
            g_frac_rand, g_parent_cap, g_pool_factor);
     if (g_clue_mask) {
@@ -6271,11 +6749,20 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, handle_stop); signal(SIGTERM, handle_stop);
     if (g_end_dive) {
         dv_build_static();
-        /* E555_DIVE_PLAIN=1 keeps the stock dives under a cell-model table:
-           the same roots, unguided, for measuring what the guidance buys. */
+        /* The measured defaults (README): the stage-2 cross-entropy rounds
+           always run, from a flat start; a cell-model table steers stage 1 only
+           (beta 0.5 and 1). E555_DIVE_PLAIN=1 keeps the stock dives throughout,
+           for measuring what the learning buys. */
         const char *plain = getenv("E555_DIVE_PLAIN");
-        g_dv_guided = g_freq_on && g_freq_model == FREQ_MODEL_CELL
-                   && !(plain && plain[0] == '1');
+        const bool cell = g_freq_on && g_freq_model == FREQ_MODEL_CELL;
+        if (cell) { g_dv_noprior = 2; g_dv_narms = 2; g_dv_beta[0] = 0.5; g_dv_beta[1] = 1.0; }
+        else      { g_dv_noprior = 1; g_dv_narms = 1; g_dv_beta[0] = 0.0; }
+        if (g_end_polish >= 0) { g_dv_polish = DV_POLISH_TOP; g_dv_ils = g_end_polish; }
+        dv_read_env();
+        g_dv_guided = !(plain && plain[0] == '1');
+        if (!cell && g_dv_noprior != 1) {
+            if (!g_freq_on) g_dv_noprior = 1;          /* no table, no prior */
+        }
         if (g_max_wall_sec > 0.0) g_dv_deadline = t_start + g_max_wall_sec;
     }
     double t_sweep0 = omp_get_wtime();
@@ -6502,6 +6989,7 @@ int main(int argc, char *argv[]) {
         }
         }   /* !g_learning: the learning phase counts boards, it writes none */
         fflush(stdout);
+        if (g_dv_roots_path) { dv_replay_row(cur_row); continue; }
 
         size_t start_bi = 0, start_li = 0;
         if (g_resume_active && cur_row == g_start_row) { start_bi = g_resume_bi; start_li = g_resume_li; g_solution_idx = g_resume_sol_idx; }

@@ -28,6 +28,7 @@ Learning and searching are separate invocations of the same binary.
 | `--backtrack_row N` | Search only: stop the beam at row N, then search every row-N candidate exhaustively up to `--stop_row` and emit every board that completes it. See *Backtracking to the stop row*. |
 | `--end_dive M` | Search only: complete every stop-row board to 256 pieces with M random dives that allow broken edges, and write the best completion per board, sorted by connected edges. See *Finishing boards with random dives*. |
 | `--emit_score S` | With `--end_dive`: the connected edges (of 480) a dived board needs to be written. Default 450. |
+| `--end_polish R` | With `--end_dive`: hill-climb each board's 16 best dives, then R kick-and-polish rounds. The largest single gain measured. See *Finishing boards with random dives*. |
 
 Both phases need `--clue_center`, `--pin_clue 1..4`, a rotations file and
 `--num_rows 1`. A table belongs to one seed, one clue frame and one border.
@@ -431,9 +432,21 @@ connected edges out of 480.
 **Two stages per configuration** (one bottom × left column):
 
 1. Every distinct stop-row board gets `M/10` dives and keeps its best.
-2. A board goes on if its stage-1 best is at or above the configuration's
-   median stage-1 best, **or** at least `S-2`. It gets the other `M - M/10`
-   dives.
+2. A board goes on if its stage-1 best is at least `S-4`, **or** at or above the
+   configuration's median stage-1 best. It gets the other `M - M/10` dives, and
+   these **learn from the board's own best dives** (below).
+
+**Polish** (`--end_polish R`, off by default). Every board whose best dive is
+within 6 of `S` is then improved by local search over the cells the dives
+filled:
+
+- its 16 best distinct dives are each hill-climbed: the best re-rotation of one
+  piece or swap of two (with their best frame-legal spins), repeated until no
+  move adds an edge;
+- then `R` kick-and-polish rounds, split over 8 walks from the best polished
+  boards: 3 random swaps, re-polish (only cells whose surroundings changed are
+  re-examined), keep the result if it is not worse;
+- `R = 0` polishes only.
 
 Boards whose best is at least `S` (`--emit_score`, default 450) are kept in
 memory. When the completions file closes (the end of a border row, or the end
@@ -449,61 +462,95 @@ of the run) they are written to it:
   stop-row board is still inside it, untouched.
 
 ```bash
-bin/E555_beamer_datadriven SEED ROT --clue_center --pin_clue 1 --start_row 4 --num_rows 1 \
-    --beam_width 50000 --backtrack_row 5 --stop_row 11 --end_dive 50000 --emit_score 456
+bin/E555_beamer_datadriven SEED ROT --clue_center --clue_corners --pin_clue 1 \
+    --start_row 4 --num_rows 1 --beam_width 250000 --backtrack_row 5 --stop_row 11 \
+    --end_dive 10000 --end_polish 20000 --emit_score 452
 ```
 
-**Guided dives** (`--table` with `--freq_model cell`). The learned table
-never overrides the safety order (fewest breaks, fewest stranded cells). It
-acts only where the plain dive draws at random or ranks by room:
+**Learning dives.** The dive never overrides its safety order (fewest breaks,
+fewest stranded cells). A weight `w(p,x)` per piece and open cell acts only
+where the plain dive draws at random or ranks by room:
 
-- **Prior.** For each board, `w(p,x) = log(q[p,x] × n_open / Σ q[p,y])`
-  over the cells that board leaves open, where `q` is the table's
-  Sinkhorn-balanced location mass. This is the beam's own
-  remaining-opportunity normalisation, applied to the dive's region.
 - **Cell.** Among cells tied for fewest exact fits, the one whose best fit has
   the largest `β·w` plus Gumbel noise goes first.
 - **Piece.** The least-constraining value's third key becomes
   `log1p(room) + β·(w + Gumbel)`. A forced break with more than 8 candidates
   scores the 8 that a Gumbel-top-k draw on `β·w` picks.
-- **Stage 1** splits the dives over `β ∈ {0, 0.5, 1, 2}`; `β = 0` is exactly
-  the plain dive, so a quarter of the budget is always unguided.
-- **Stage 2** runs in nine rounds of the cross-entropy method. After each
-  round, the top 5% of its dives vote on (piece, cell) placements, and
-  `w += 0.3·log((votes + ½)/(expected + ½))`, with the vote and the total shift
-  both clipped to ±2 so that nothing becomes certain. Each round's `β` is
-  drawn from the arms in proportion to `exp(pooled stage-1 mean best)`.
+- **Stage 2** runs 18 rounds of the cross-entropy method at `β = 2`, with `w`
+  starting flat (0). After each round the top 5% of its dives vote on
+  (piece, cell) placements, and `w += 0.3·log((votes + ½)/(expected + ½))`,
+  with the vote and the total shift both clipped to ±2 so that nothing becomes
+  certain. Each board learns what its own best completions agree on.
+- **Stage 1** is the plain dive, or, with `--table --freq_model cell`, dives
+  at `β = 0.5` and `1` on the table prior
+  `w(p,x) = log(q[p,x] × n_open / Σ q[p,y])` over the board's open cells (`q`
+  the Sinkhorn-balanced location mass; the beam's remaining-opportunity
+  normalisation applied to the dive's region).
 
-The run summary prints each arm's mean best per board, which is how to tell
-whether the table helps on a given border.
+`E555_DIVE_PLAIN=1` turns the learning off (plain dives throughout).
 
-**Measured**, 4 threads, border r16178 (row 4 of `borders_stageAx6.csv`):
+### Measured: what each part buys
 
-- **Speed.** About 8,000 dives/s per thread for a stop-row-10 board (about 75
-  open cells), and about 6,000 for a stop-row-9 board. Guided dives cost about
-  6% more. At `M = 50000`, a board costs about 0.6 s of one thread in stage 1
-  and about 5.5 s in stage 2.
-- **Budget.** A `--backtrack_row 8 --stop_row 10` configuration gave 200-600
-  boards, i.e. minutes per configuration at `M = 50000`. A plain beam
-  configuration can hand over tens of thousands of stop-row boards (13,000-34,000
-  measured at width 3,000), and every one is dived: there the beam width decides
-  the bill.
-- **Same engine as the backtracker.** On the same 1,497 stop-row-10 boards at
-  200 dives each, `bin/E555_backtracker --break_mode stuck --restarts 200`
-  reached best 452, median 446, mean 446.19. The fork reached 452, 446, 446.04;
-  the fork keeps edge pieces on their own side.
-- **Guided vs plain,** on the same roots (`E555_DIVE_PLAIN=1` for plain), stop
-  row 9, clued, the example table:
+97 stop-row-11 boards (clued, `--pin_clue 1`, the example table, border r16178,
+width 100,000, `--backtrack_row 5`, 40 bottoms × 15 columns), each dived with
+every board taking all `M` dives (`--emit_score 0`), 4 threads. The same boards
+were replayed for every setting, so differences are paired per board.
 
-  | M | roots paired | mean best, guided − plain | guided higher / lower | roots ≥ 448, guided / plain |
+| setting | mean best | top 10 | best | boards ≥ 454 | time |
+|---|---|---|---|---|---|
+| plain dives, M = 50k | 449.34 | 452.8 | 454 | 2 | 188 s |
+| first version (table prior, 4 β arms, 9 rounds), M = 50k | 450.36 | 453.8 | 455 | 6 | 202 s |
+| learning from a flat start, 18 rounds, β 2 (**new default**), M = 50k | 450.98 | 454.3 | 457 | 8 | 206 s |
+| + `--end_polish 0` (polish only) | 451.89 | 455.2 | 457 | 15 | 212 s |
+| M = 10k + `--end_polish 5000` | 453.33 | 456.0 | 457 | 42 | 83 s |
+| **M = 10k + `--end_polish 20000`** | **453.76** | **456.3** | **458** | **50** | **203 s** |
+| M = 10k + `--end_polish 50000` | 453.79 | 456.5 | 458 | 54 | 434 s |
+
+- **The learning is worth more than 10× the dives.** Plain dives gain about
+  0.7-0.9 edges per 10× more dives (1k 447.4, 10k 448.7, 100k 449.6, extrapolated
+  500k 449.9). The learning rounds reach 451.0 at 50k.
+- **Without a table the learning helps just as much:** +1.52 ± 0.12 edges per
+  board over plain dives (better on 78 of 97, worse on 2).
+- **The table prior helps plain dives but hurts the learning.** Stage-1 dives on
+  the prior gain about 0.2-0.5 edges over plain ones. Starting the stage-2
+  rounds from it instead of flat loses 0.27 ± 0.11. So the prior now steers
+  stage 1 only.
+- **Polish and kicks are the biggest single gain:** about +2.8 edges per board
+  at equal time. They never lower a board, and their extra over the dives alone
+  was +2 to +4 edges on 90 of 97 boards (at most +5).
+- **Flat parameters** (paired against the old default, ±0.06-0.07): learning rate
+  0.15/0.6, elite 2%/10%, clip 1/4 and LCV cap 16 changed nothing within about
+  0.2. 5 rounds lost 0.27; LCV cap 4 lost 0.20. Kicks of 1 swap lost 0.8; 3
+  beat 2 by 0.2; 4 matched 3 but slower. 8 walks ≈ 4 walks.
+
+### How many dives, stage 1 and who goes to stage 2
+
+- **M.** With `--end_polish`, dives beyond about 10k barely pay: with 5k kick
+  rounds (4 walks), M = 2k, 5k, 10k, 20k, 50k gave 453.17, 453.18, 453.33,
+  453.37, 453.38, in 50, 62, 83, 124 and 242 s. Spend the time on kick rounds
+  instead. Without polish, M = 50k is reasonable: 20k gives 0.55 less, 100k 0.17
+  more, 200k 0.40 more.
+- **Speed** at stop row 11 (about 57 open cells): about 6,000 learning dives/s
+  per thread; a kick-and-polish round costs about as much as 2-3 dives.
+- **Stage-1 length.** With every board taking stage 2, stage 1 at 2%, 5%, 10%,
+  20%, 30% of M ended at 450.95-450.99: the length does not matter for the
+  boards that go on. 10% stays.
+- **Who goes to stage 2.** The learning adds 1-4 edges to a board's stage-1 best
+  (5-7 on about 3%), so the first rule's `S-2` was too tight. Offline, on the
+  traces of every board's stage-1 and final best, a policy either lets a board
+  reach `S` or loses it:
+
+  | rule | S = 452: lost (of 36) | dives spent | S = 454: lost (of 8) | dives spent |
   |---|---|---|---|---|
-  | 1,000 | 3,666 | +0.64 | 1,731 / 727 | 49 / 22 |
-  | 10,000 | 1,554 | +0.82 | 842 / 244 | 110 / 52 |
+  | median or `S-2` (first version) | 3 | 88% | 0 | 88% |
+  | `S-2` only | 8 | 42% | 2 | 16% |
+  | **median or `S-4` (new default)** | **0** | 93% | **0** | 88% |
+  | `S-4` only | 2 | 76% | 0 | 42% |
 
-  The stage-1 arms score within 0.2 edges of each other, so the gain comes from
-  the stage-2 cross-entropy rounds more than from the table prior itself. The
-  single best board of a run can still come from the plain dives (453 against
-  451 at `M = 10000`): guidance moves the typical board, not the luck of the tail.
+  With few boards per configuration (typical at row 11) the median admits 85-92%
+  of them, so stage 2 saves little. When `S` is high for the boards (454 here),
+  `E555_DIVE_MEDIAN=0` (`S-4` alone) cut the dives to 42% with nothing lost; at
+  452 it lost 2 of 36.
 
 - **Log.** `--verbose` adds a `[dive]` line per configuration: roots, stage-1
   best and median, roots in stage 2, best, boards kept, dives, time, and the
@@ -533,7 +580,10 @@ records for each edge piece. A different border is fatal.
 | `E555_FREQ_PURE=1` | Rank the beam by the learned sum alone. |
 | `E555_FREQ_DEBUG=1` | With `PURE`: assert that the carried sum equals a from-scratch sum over the placed cells. |
 | `E555_FREQ_DUMP=PATH` | Write the processed weights (`fw`, `fwseg`, `fwcell`, `fwb`) for `freq_view.py --check`. |
-| `E555_DIVE_PLAIN=1` | With `--end_dive` and a cell-model table: plain dives, no guidance. Same roots, for measuring what the guidance buys. |
+| `E555_DIVE_PLAIN=1` | With `--end_dive`: plain dives, no learning. For measuring what the learning buys. |
+| `E555_DIVE_ROOTS=FILE` | With `--end_dive`: skip the beam and dive the saved stop-row boards of the border row from `FILE` (any completions CSV). Measures dive settings on identical boards, or re-dives an earlier run. Not with `--random_edges`. |
+| `E555_DIVE_TRACE=FILE` | With `--end_dive`: one line per board and stage segment with the histogram of its dive scores. |
+| `E555_DIVE_*` tuning | `STAGE1` (share of M, 0.1), `ROUNDS` (18), `S2BETA` (2), `BETAS` (stage-1 arms), `NOPRIOR` (1 flat, 2 prior in stage 1 only), `GAMMA` (0.3), `ELITE` (0.05), `CLIP` (2), `LCV` (8), `MARGIN` (4), `MEDIAN` (1), `POLISH` (dives polished), `ILS` (kick rounds), `KICK` (3), `STARTS` (8), `ILS_FULL` (full rescan after a kick). Defaults are the measured ones. |
 
 ## example_run/
 
