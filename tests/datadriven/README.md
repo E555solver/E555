@@ -552,6 +552,27 @@ were replayed for every setting, so differences are paired per board.
   `E555_DIVE_MEDIAN=0` (`S-4` alone) cut the dives to 42% with nothing lost; at
   452 it lost 2 of 36.
 
+### Measured: complete runs
+
+Border r16178, clued (`--clue_center --clue_corners --pin_clue 1`), width
+250,000, `--backtrack_row 5 --stop_row 11`, 5 bottoms × 15 columns,
+`--end_dive 10000 --end_polish 20000 --emit_score 450`, 4 threads:
+
+| run | boards reaching row 11 | written (≥ 450) | best | ≥ 455 | dive + polish time |
+|---|---|---|---|---|---|
+| (a) `--table`, `--freq_model cell` | 20 | 20 | 456 | 9 | 33 s |
+| (b) `--table`, `--freq_model segment` | 19 | 19 | 456 | 5 | 29 s |
+| (c) no table | 6 | 6 | 454 | 0 | 8 s |
+| (d) `--random_edges --samples 5 --top_columns 1`, `--end_dive 2000 --end_polish 2000 --emit_score 452` | 2,748 (1 of 5 borders) | 1,898 (≥ 452) | 458 | 495 | 445 s |
+
+The beam and exhaustive search took about 2-3 minutes per surviving
+configuration; most columns die at the corner-clue row. Random-edge borders let
+any edge piece take any border cell, and one such border sent 2,748 boards
+through row 11 (the rotations border above: 6-20 over 75 configurations). At
+the (a)-(c) settings that border alone would take about 2 hours of dives, hence
+the smaller settings for (d). `tools/E555_viewer.py` confirms the best boards
+at 458/480 (221 solid pieces) and 456/480.
+
 - **Log.** `--verbose` adds a `[dive]` line per configuration: roots, stage-1
   best and median, roots in stage 2, best, boards kept, dives, time, and the
   arm means when guided. The run summary always carries the totals and the
