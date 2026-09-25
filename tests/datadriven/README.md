@@ -25,6 +25,7 @@ Learning and searching are separate invocations of the same binary.
 | `--table PATH` | Search with the table: in the beam score, and in the ranking of bottom rows and left columns. |
 | `--freq_model M` | The beam's spatial resolution. `segment` (default) pools the 5-5-5 A/B/C bins; `cell` uses exact cells. See *Choosing `--freq_model`*. |
 | `--lambda_corners [F]` | Search only, with or without a table: keep the blocks around the two row-13 clues buildable. See *Corner supply*. |
+| `--backtrack_row N` | Search only: stop the beam at row N, then search every row-N candidate exhaustively up to `--stop_row` and emit every board that completes it. See *Backtracking to the stop row*. |
 
 Both phases need `--clue_center`, `--pin_clue 1..4`, a rotations file and
 `--num_rows 1`. A table belongs to one seed, one clue frame and one border.
@@ -41,14 +42,14 @@ python3 tests/datadriven/freq_view.py TABLE --out table.html              # HTML
 
 ### Learning
 
-**Defaults.** `--learn` changes three defaults, never a value you pass:
-`--lambda_J 0 --lambda_Mahalanobis 0 --stop_row 9`. The table is meant to
-measure where pieces land, so boards are grown on the chain database and the
-fan-out alone, without the colour heuristics steering them. Row 9 is still
-reached often, and learning writes no boards, so the larger number of stop-row
-boards costs no disk. The `[cfg]` line marks each value that came from these
-defaults, and the table records the objective it was learned under as a
-`learn_objective lambda_J .. lambda_Mahalanobis ..` line.
+**Defaults.** `--learn` changes two defaults, never a value you pass:
+`--lambda_J 0 --lambda_Mahalanobis 0`. The table is meant to measure where
+pieces land, so boards are grown on the chain database and the fan-out alone,
+without the colour heuristics steering them. The `[cfg]` line marks each value
+that came from these defaults, and the table records the objective it was
+learned under as a `learn_objective lambda_J .. lambda_Mahalanobis ..` line.
+`--stop_row` defaults to 11 here as everywhere else; `run_datadriven.sh` passes
+its own `LEARN_STOP_ROW` (9), where the stop row is still reached often.
 
 **Four passes.** Pass *j* turns the rotations row *j* quarter-turns clockwise and
 pins the clue frame to match. That is the same anchored puzzle, relabelled.
@@ -336,6 +337,69 @@ the frame's top corners are not the canonical ones.
 exceeds the width, and the best-of-nB×nC window inside a parent. Once the beam
 collapses and keeps every child, the term only orders the emitted boards. So it
 does most at wide beams.
+
+## Backtracking to the stop row (`--backtrack_row N`)
+
+The beam's own collapse is not the limit it looks like. Past row 6 or so the
+beam keeps a small fraction of the legal children, yet an exhaustive search over
+the same boards is cheap, because the tree dies out within a few rows.
+`--backtrack_row N` splits the work at row N:
+
+1. **Rows 1..N-1** are the ordinary beam, with every heuristic, the table and the
+   corner term.
+2. **Row N** is expanded as a stop row: every conflict-free completion the
+   per-parent quota allows, ranked raw with no frontier dedup. These candidates are
+   the roots, exactly the boards `--stop_row N` would emit.
+3. **Rows N+1..`--stop_row`** are searched exhaustively for every root, in the
+   beam's rank order. The search goes cell by cell in row-major order:
+   - column 0 is the configuration's fixed left column;
+   - columns 1-14 take every unused inner piece orientation matching the left
+     and bottom colours;
+   - column 15 takes every unused right edge of the border's own terminal pool
+     (all edges under `--free_edges`).
+
+Nothing past row N is scored or selected. A path ends only when:
+
+- a cell has no fitting piece;
+- a completed row fails the beam's colour-parity test (`parity_ok`);
+- with `--lambda_corners`, a completed row leaves the TL or the TR corner
+  without a single alive block. The corner test is the same catalog as
+  *Corner supply*. Alive counts only fall as pieces are used, so this cut is
+  exact.
+
+Clue pins are enforced as in the beam: the clue piece on its cell, and the colour
+it will sit on in the row below. **Every** board that completes the stop row is
+emitted, best root first. Only exact duplicate boards are dropped; there is no
+per-configuration cap.
+
+```bash
+bin/E555_beamer_datadriven SEED ROT --clue_center --pin_clue 1 --start_row 4 --num_rows 1 \
+    --beam_width 50000 --backtrack_row 5 --stop_row 11 --max_emitted 100000
+```
+
+- **Output volume.** The number of emitted boards can be very large when the
+  stop row is close to N: 2,048 row-5 roots gave 123,355 row-8 boards. Use
+  `--max_emitted`. It is checked after each tile of 32 × threads roots, so the
+  final count can overshoot by one tile.
+- **Measured** on border r16178, clued (`--pin_clue 1`), width 50,000, 4 threads,
+  6 configurations:
+  - The plain beam died at row 11 in all 6 (3.3 s each).
+  - `--backtrack_row 5` searched about 2.17 million roots at about 110 M nodes/s,
+    about 17 s per configuration.
+  - It emitted 104 row-11 boards, from every configuration.
+- **Log.** `--verbose` adds a `[dfs]` line per configuration: roots, roots that
+  emitted, nodes, parity and corner cuts, and boards completing each row. The run
+  summary always carries the totals.
+- **Stopping.** `--time_limit` and Ctrl-C stop the search mid-root. Boards found
+  so far are still written, and the `[sweep]` reason says `time` or `interrupted`.
+- **Deterministic.** Roots are searched in parallel a tile at a time and written in
+  root order, so the output does not depend on the thread count.
+- **Rejected with `--learn`.** Learning counts a beam's stop-row boards, not an
+  exhaustive search's.
+- **`--incomplete_top` is ignored, with a warning.** Only complete stop-row boards
+  are emitted.
+- **Clue frames.** Search mode runs a single clue frame per pass, so every root
+  already belongs to one orientation.
 
 ## Border check and environment variables
 
