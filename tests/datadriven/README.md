@@ -26,6 +26,8 @@ Learning and searching are separate invocations of the same binary.
 | `--freq_model M` | The beam's spatial resolution. `segment` (default) pools the 5-5-5 A/B/C bins; `cell` uses exact cells. See *Choosing `--freq_model`*. |
 | `--lambda_corners [F]` | Search only, with or without a table: keep the blocks around the two row-13 clues buildable. See *Corner supply*. |
 | `--backtrack_row N` | Search only: stop the beam at row N, then search every row-N candidate exhaustively up to `--stop_row` and emit every board that completes it. See *Backtracking to the stop row*. |
+| `--end_dive M` | Search only: complete every stop-row board to 256 pieces with M random dives that allow broken edges, and write the best completion per board, sorted by connected edges. See *Finishing boards with random dives*. |
+| `--emit_score S` | With `--end_dive`: the connected edges (of 480) a dived board needs to be written. Default 450. |
 
 Both phases need `--clue_center`, `--pin_clue 1..4`, a rotations file and
 `--num_rows 1`. A table belongs to one seed, one clue frame and one border.
@@ -401,6 +403,123 @@ bin/E555_beamer_datadriven SEED ROT --clue_center --pin_clue 1 --start_row 4 --n
 - **Clue frames.** Search mode runs a single clue frame per pass, so every root
   already belongs to one orientation.
 
+## Finishing boards with random dives (`--end_dive M`)
+
+A stop-row board covers rows 0..stop_row only, so its real quality is unknown
+until the top is filled. With `--end_dive M`, each stop-row board is finished
+to all 256 pieces, allowing broken edges, and the finished boards are what the
+run writes. It works with or without `--backtrack_row`.
+
+**The dive** is the stuck mode of `src/C_tail/E555_backtracker.c`
+(`--break_mode stuck`), ported into the fork:
+
+- Next cell: the one with the fewest exact fits.
+- Piece: an exact fit where there is one, otherwise a placement from the
+  minimal-break class, taken only when every open cell is stuck.
+- Within a class: least-constraining value (fewest broken edges, then fewest
+  stranded cells, then most room left around it). Ties go at random.
+- A dive never backtracks and cannot fail, so it is cheap and every dive is a
+  different board.
+
+The dive starts from the board exactly as the stop row would have written it:
+rows 0..stop_row, the whole left column, the top-right corner and any attached
+corner clues. None of it moves. In rotations mode an edge piece stays on the
+side its rotations-row spin gives it; under `--free_edges` or
+`--random_edges` any edge piece may take any border cell. The score is
+connected edges out of 480.
+
+**Two stages per configuration** (one bottom × left column):
+
+1. Every distinct stop-row board gets `M/10` dives and keeps its best.
+2. A board goes on if its stage-1 best is at or above the configuration's
+   median stage-1 best, **or** at least `S-2`. It gets the other `M - M/10`
+   dives.
+
+Boards whose best is at least `S` (`--emit_score`, default 450) are kept in
+memory. When the completions file closes (the end of a border row, or the end
+of the run) they are written to it:
+
+- sorted by score, best first (ties in the order the boards were found);
+- exact duplicate boards dropped;
+- at most `--max_emitted` dived boards in the whole run. The budget caps the
+  written boards and no longer stops the search; `--incomplete_top` partials
+  do not count against it;
+- each line is `config_id, score, pos[256], rot[256]`, with connected edges in
+  the score field, so rank, the viewer and the finalizer read it as it is. The
+  stop-row board is still inside it, untouched.
+
+```bash
+bin/E555_beamer_datadriven SEED ROT --clue_center --pin_clue 1 --start_row 4 --num_rows 1 \
+    --beam_width 50000 --backtrack_row 5 --stop_row 11 --end_dive 50000 --emit_score 456
+```
+
+**Guided dives** (`--table` with `--freq_model cell`). The learned table
+never overrides the safety order (fewest breaks, fewest stranded cells). It
+acts only where the plain dive draws at random or ranks by room:
+
+- **Prior.** For each board, `w(p,x) = log(q[p,x] × n_open / Σ q[p,y])`
+  over the cells that board leaves open, where `q` is the table's
+  Sinkhorn-balanced location mass. This is the beam's own
+  remaining-opportunity normalisation, applied to the dive's region.
+- **Cell.** Among cells tied for fewest exact fits, the one whose best fit has
+  the largest `β·w` plus Gumbel noise goes first.
+- **Piece.** The least-constraining value's third key becomes
+  `log1p(room) + β·(w + Gumbel)`. A forced break with more than 8 candidates
+  scores the 8 that a Gumbel-top-k draw on `β·w` picks.
+- **Stage 1** splits the dives over `β ∈ {0, 0.5, 1, 2}`; `β = 0` is exactly
+  the plain dive, so a quarter of the budget is always unguided.
+- **Stage 2** runs in nine rounds of the cross-entropy method. After each
+  round, the top 5% of its dives vote on (piece, cell) placements, and
+  `w += 0.3·log((votes + ½)/(expected + ½))`, with the vote and the total shift
+  both clipped to ±2 so that nothing becomes certain. Each round's `β` is
+  drawn from the arms in proportion to `exp(pooled stage-1 mean best)`.
+
+The run summary prints each arm's mean best per board, which is how to tell
+whether the table helps on a given border.
+
+**Measured**, 4 threads, border r16178 (row 4 of `borders_stageAx6.csv`):
+
+- **Speed.** About 8,000 dives/s per thread for a stop-row-10 board (about 75
+  open cells), and about 6,000 for a stop-row-9 board. Guided dives cost about
+  6% more. At `M = 50000`, a board costs about 0.6 s of one thread in stage 1
+  and about 5.5 s in stage 2.
+- **Budget.** A `--backtrack_row 8 --stop_row 10` configuration gave 200-600
+  boards, i.e. minutes per configuration at `M = 50000`. A plain beam
+  configuration can hand over tens of thousands of stop-row boards (13,000-34,000
+  measured at width 3,000), and every one is dived: there the beam width decides
+  the bill.
+- **Same engine as the backtracker.** On the same 1,497 stop-row-10 boards at
+  200 dives each, `bin/E555_backtracker --break_mode stuck --restarts 200`
+  reached best 452, median 446, mean 446.19. The fork reached 452, 446, 446.04;
+  the fork keeps edge pieces on their own side.
+- **Guided vs plain,** on the same roots (`E555_DIVE_PLAIN=1` for plain), stop
+  row 9, clued, the example table:
+
+  | M | roots paired | mean best, guided − plain | guided higher / lower | roots ≥ 448, guided / plain |
+  |---|---|---|---|---|
+  | 1,000 | 3,666 | +0.64 | 1,731 / 727 | 49 / 22 |
+  | 10,000 | 1,554 | +0.82 | 842 / 244 | 110 / 52 |
+
+  The stage-1 arms score within 0.2 edges of each other, so the gain comes from
+  the stage-2 cross-entropy rounds more than from the table prior itself. The
+  single best board of a run can still come from the plain dives (453 against
+  451 at `M = 10000`): guidance moves the typical board, not the luck of the tail.
+
+- **Log.** `--verbose` adds a `[dive]` line per configuration: roots, stage-1
+  best and median, roots in stage 2, best, boards kept, dives, time, and the
+  arm means when guided. The run summary always carries the totals and the
+  scores written.
+- **Time.** `--time_limit` bounds the beam and the exhaustive search; the dives
+  of that configuration then run in full. `--wall_time` and Ctrl-C stop the
+  dives, and every board that already has a score is still written.
+- **Crash.** Kept boards live in memory until the file closes, so a killed run
+  (SIGKILL) loses the current border row's dived boards, and `--resume` will
+  not redo those configurations.
+- **Deterministic.** Each dive's random stream is keyed by its board and its
+  index, so the output does not depend on the thread count.
+- **Not with `--learn`.** `--incomplete_top` partials are still written, not
+  dived, to their own files.
+
 ## Border check and environment variables
 
 `--table` compares the table's border with the one being searched by content, not
@@ -414,6 +533,7 @@ records for each edge piece. A different border is fatal.
 | `E555_FREQ_PURE=1` | Rank the beam by the learned sum alone. |
 | `E555_FREQ_DEBUG=1` | With `PURE`: assert that the carried sum equals a from-scratch sum over the placed cells. |
 | `E555_FREQ_DUMP=PATH` | Write the processed weights (`fw`, `fwseg`, `fwcell`, `fwb`) for `freq_view.py --check`. |
+| `E555_DIVE_PLAIN=1` | With `--end_dive` and a cell-model table: plain dives, no guidance. Same roots, for measuring what the guidance buys. |
 
 ## example_run/
 
