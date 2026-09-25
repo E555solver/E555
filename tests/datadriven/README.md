@@ -361,14 +361,14 @@ the same boards is cheap, because the tree dies out within a few rows.
 Nothing past row N is scored or selected. A path ends only when:
 
 - a cell has no fitting piece;
-- a completed row fails the beam's colour-parity test (`parity_ok`);
-- with `--lambda_corners`, a completed row leaves the TL or the TR corner
-  without a single alive block. The corner test is the same catalog as
-  *Corner supply*. Alive counts only fall as pieces are used, so this cut is
-  exact.
+- a completed row fails the beam's colour-parity test (`parity_ok`).
 
-Clue pins are enforced as in the beam: the clue piece on its cell, and the colour
-it will sit on in the row below. **Every** board that completes the stop row is
+Nothing else is enforced. The row-13 corner clues and the top-corner blocks
+(`--lambda_corners`) never end a path, so any board that reaches row 12 is
+emitted; `--lambda_corners` only adds its tally to the report. Clue pins the
+search passes through (the centre clue, when N is below its row) are enforced
+as in the beam: the clue piece on its cell, and the colour it will sit on in
+the row below. **Every** board that completes the stop row is
 emitted, best root first. Only exact duplicate boards are dropped; there is no
 per-configuration cap.
 
@@ -388,7 +388,7 @@ bin/E555_beamer_datadriven SEED ROT --clue_center --pin_clue 1 --start_row 4 --n
     about 17 s per configuration.
   - It emitted 104 row-11 boards, from every configuration.
 - **Log.** `--verbose` adds a `[dfs]` line per configuration: roots, roots that
-  emitted, nodes, parity and corner cuts, and boards completing each row. The run
+  emitted, nodes, parity cuts, and boards completing each row. The run
   summary always carries the totals.
 - **Stopping.** `--time_limit` and Ctrl-C stop the search mid-root. Boards found
   so far are still written, and the `[sweep]` reason says `time` or `interrupted`.
