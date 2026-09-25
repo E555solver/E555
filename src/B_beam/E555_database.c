@@ -1702,6 +1702,7 @@ bool read_one_border_row(const char *csv_path, uint32_t want, uint8_t spins[NUM_
    nothing touches the chain database. */
 
 bool     g_tc_clued = false;
+bool     g_tc_pool_top_right = false;
 uint8_t  g_tc_slots = 0;
 int      g_tc_blk_n[4][2];
 TcBlock  g_tc_blk[4][2][TC_MAX_BLOCKS];
@@ -1728,6 +1729,12 @@ static bool tc_reserved_clue(uint16_t p) {
     return false;
 }
 
+/* Pooled top/right edges: a witness may not be one of the block's own pieces. */
+static bool tc_in_cells(const Oriented *w, const Oriented *const cell[], int n) {
+    for (int q = 0; q < n; q++) if (cell[q]->piece_id == w->piece_id) return true;
+    return false;
+}
+
 static void tc_add_block(int s, int k, const Oriented *const cell[], int n,
                          const Oriented *top, int ntop, const Oriented *corner,
                          const Oriented *c_in_a, const Oriented *c_in_b) {
@@ -1736,6 +1743,7 @@ static void tc_add_block(int s, int k, const Oriented *const cell[], int n,
     for (int u = 0; u < ntop; u++) {                         /* w1 (row 15, near) */
         const Oriented *w1 = &top[u];
         if (tc_toward(w1, k) != tc_away(corner, k) || w1->bottom != c_in_a->top) continue;
+        if (g_tc_pool_top_right && tc_in_cells(w1, cell, n)) continue;
         if (!c_in_b) {
             if (b.nwit < TC_MAX_WIT) { b.wit[b.nwit][0] = w1->piece_id; b.wit[b.nwit][1] = TC_NO_PIECE; b.nwit++; }
             else s_tc_wit_truncated = true;
@@ -1744,6 +1752,7 @@ static void tc_add_block(int s, int k, const Oriented *const cell[], int n,
         for (int v = 0; v < ntop; v++) {                     /* w2 (row 15, far) */
             const Oriented *w2 = &top[v];
             if (v == u || tc_toward(w2, k) != tc_away(w1, k) || w2->bottom != c_in_b->top) continue;
+            if (g_tc_pool_top_right && tc_in_cells(w2, cell, n)) continue;
             if (b.nwit < TC_MAX_WIT) { b.wit[b.nwit][0] = w1->piece_id; b.wit[b.nwit][1] = w2->piece_id; b.nwit++; }
             else s_tc_wit_truncated = true;
         }
@@ -1757,7 +1766,7 @@ static void tc_add_block(int s, int k, const Oriented *const cell[], int n,
 }
 
 uint8_t tc_build(uint8_t orient_mask, bool clued, const char *label) {
-    Oriented side[2][EDGE_LEN], top[EDGE_LEN], corner[2];
+    Oriented side[2][2 * EDGE_LEN], top[2 * EDGE_LEN], corner[2];
     int nside[2] = {0, 0}, ntop = 0;
     bool have[2] = {false, false};
     for (int p = 0; p < NUM_PIECES; p++) {
@@ -1774,6 +1783,14 @@ uint8_t tc_build(uint8_t orient_mask, bool clued, const char *label) {
     if (!have[0] || !have[1] || ntop != EDGE_LEN || nside[0] != EDGE_LEN || nside[1] != EDGE_LEN)
         fatal("--lambda_corners: %s does not deal 14 pieces to the top, left and right "
               "sides with both top corners", label);
+    if (g_tc_pool_top_right) {           /* each top/right edge may serve either side */
+        const int nt0 = ntop, nr0 = nside[TC_TR];
+        Oriented o;
+        for (int i = 0; i < nr0; i++)
+            if (orient_with_zero_side(side[TC_TR][i].piece_id, 0, &o)) top[ntop++] = o;
+        for (int i = 0; i < nt0; i++)
+            if (orient_with_zero_side(top[i].piece_id, 1, &o)) side[TC_TR][nside[TC_TR]++] = o;
+    }
 
     g_tc_clued = clued;
     g_tc_slots = clued ? (uint8_t)(orient_mask & 0xF) : 1u;
@@ -1888,6 +1905,14 @@ static bool tc_blocks_compatible(const TcBlock *a, const TcBlock *b) {
             for (int x = 0; x < 2 && !clash; x++)
                 for (int y = 0; y < 2 && !clash; y++)
                     if (a->wit[u][x] != TC_NO_PIECE && a->wit[u][x] == b->wit[v][y]) clash = true;
+            /* Pooled top/right edges: a witness of one block may be a piece of
+               the other. Never true when the sides are dealt, so unchanged there. */
+            for (int x = 0; x < 2 && !clash; x++)
+                for (int j = 0; j < b->n && !clash; j++)
+                    if (a->wit[u][x] == b->pid[j]) clash = true;
+            for (int y = 0; y < 2 && !clash; y++)
+                for (int i = 0; i < a->n && !clash; i++)
+                    if (b->wit[v][y] == a->pid[i]) clash = true;
             if (!clash) return true;
         }
     return false;

@@ -122,6 +122,7 @@ static bool     g_backtrack_row_set = false;
 static inline uint32_t gen_stop_row(void) { return g_backtrack_row ? g_backtrack_row : g_stop_row; }
 /* --end_dive M (0 = off): stop-row boards are completed by M random dives
    each and emitted by score (>= --emit_score S) instead of written as found. */
+#define DV_M_DEFAULT 20000         /* --end_dive without a value */
 static uint32_t g_end_dive       = 0;
 static int      g_emit_score     = 450;
 static int      g_end_polish     = -1;    /* --end_polish R; -1 = off */
@@ -3651,15 +3652,16 @@ static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
    nothing on it moves. Score = connected edges out of 480.
 
      stage 1  M/10 dives per root; best board kept
-     stage 2  roots whose stage-1 best is >= S-4, or at or above their
-              configuration's median stage-1 best, get the other M - M/10
+     stage 2  roots whose stage-1 best is >= S-4 get the other M - M/10; if
+              that is under 20% of the configuration's roots, its top 10% by
+              stage-1 best do too
      polish   (--end_polish R) each root within 6 of S: its 16 best distinct
               dives are hill-climbed (best swap or re-rotation, repeated),
               then R kick-and-polish rounds (3 random swaps, re-polish, keep
               if not worse) run over 8 walks from the best polished boards
      keep     roots whose best is >= S (--emit_score), in memory
-     emit     when the completions file closes (end of a border row, end of
-              run): sorted by score, exact duplicates dropped, at most
+     emit     after each configuration (so a killed run keeps what is done):
+              sorted by score, exact duplicates dropped, at most
               --max_emitted, as "config_id, score, pos[256], rot[256]"
 
    LEARNING DIVES. The dive never overrides its safety order (fewest breaks,
@@ -3714,7 +3716,8 @@ static int      g_dv_polish  = 0;      /* E555_DIVE_POLISH=K: polish each root's
 static int      g_dv_ils     = 0;      /* E555_DIVE_ILS=R: R kick-and-polish rounds on the best */
 static int      g_dv_kick    = 3;      /* E555_DIVE_KICK: random swaps per kick */
 static int      g_dv_margin  = 4;      /* stage 2 for stage-1 best >= S - margin */
-static int      g_dv_median  = 1;      /* ...or at/above the configuration median */
+#define DV_S2_MIN_SHARE 0.20    /* if S - margin promotes fewer than this share... */
+#define DV_S2_TOP_SHARE 0.10    /* ...also promote this top share by stage-1 best */
 static int      g_dv_ils_full = 0;     /* E555_DIVE_ILS_FULL=1: full-scan polish after kicks */
 #define DV_STARTS_MAX 16
 static int      g_dv_ils_starts = 8;   /* E555_DIVE_STARTS: kick-and-polish walks per root */
@@ -4182,8 +4185,9 @@ static size_t   g_dv_ncfg = 0, g_dv_cfgcap = 0;
 static struct {
     uint64_t roots, stage2, dives, kept, written, dup;
     uint64_t arm_n, pol_gain, pol_roots;
+    uint64_t brk_tl, brk_tr, brk_seam, brk_rest, clean_tl, clean_tr;
     double   arm_win[DV_NARMS];
-    double   arm_sum[DV_NARMS], t;
+    double   arm_sum[DV_NARMS], t, t_s1, t_s2, t_pol;
     int      best;
     uint64_t hist[DV_EDGES + 1];
 } g_dv_run = { .best = -1 };
@@ -4229,7 +4233,6 @@ static void dv_read_env(void) {
     if ((v = getenv("E555_DIVE_ILS")))    g_dv_ils = atoi(v);
     if ((v = getenv("E555_DIVE_KICK")))   g_dv_kick = atoi(v);
     if ((v = getenv("E555_DIVE_MARGIN"))) g_dv_margin = atoi(v);
-    if ((v = getenv("E555_DIVE_MEDIAN"))) g_dv_median = atoi(v);
     if ((v = getenv("E555_DIVE_ILS_FULL"))) g_dv_ils_full = atoi(v);
     if ((v = getenv("E555_DIVE_STARTS"))) g_dv_ils_starts = atoi(v);
     if (g_dv_ils_starts < 1 || g_dv_ils_starts > DV_STARTS_MAX) fatal("E555_DIVE_STARTS must be 1..%d", DV_STARTS_MAX);
@@ -4665,8 +4668,10 @@ static void dv_run_config(void) {
         }
     }
 
+    const double t_s1 = omp_get_wtime();
     #pragma omp parallel for schedule(dynamic, 1) num_threads(nt)
     for (size_t i = 0; i < n; i++) dv_stage1(&q[i], work[omp_get_thread_num()], n1);
+    const double d_s1 = omp_get_wtime() - t_s1;
 
     /* Median of the stage-1 bests, and the arms' pooled mean best. */
     int *sc = xmalloc(n * sizeof *sc);
@@ -4706,14 +4711,35 @@ static void dv_run_config(void) {
         g_dv_run.arm_n += ns;
     }
 
-    size_t n_s2 = 0;
+    /* Stage 2: every root whose stage-1 best is >= S - margin; if that is fewer
+       than 20% of the roots, also the top 10% by stage-1 best (at least one;
+       ties by queue order). */
+    size_t n_s2 = 0, n_scored = 0;
     size_t *sel = xmalloc(n * sizeof *sel);
     for (size_t i = 0; i < n; i++) {
-        q[i].stage2 = q[i].best >= 0 && n2 > 0 &&
-                      ((g_dv_median && q[i].best >= median)
-                       || q[i].best >= g_emit_score - g_dv_margin);
-        if (q[i].stage2) sel[n_s2++] = i;
+        q[i].stage2 = q[i].best >= 0 && n2 > 0 && q[i].best >= g_emit_score - g_dv_margin;
+        n_scored += q[i].best >= 0;
+        if (q[i].stage2) n_s2++;
     }
+    if (n2 > 0 && n_scored && (double)n_s2 < DV_S2_MIN_SHARE * (double)n_scored) {
+        size_t want = (size_t)ceil(DV_S2_TOP_SHARE * (double)n_scored);
+        if (want < 1) want = 1;
+        size_t m = 0;
+        for (size_t i = 0; i < n; i++) if (q[i].best >= 0) sel[m++] = i;
+        /* stable selection of the top `want`: best descending, queue order */
+        for (size_t a = 0; a < want && a < m; a++) {
+            size_t b = a;
+            for (size_t c = a + 1; c < m; c++)
+                if (q[sel[c]].best > q[sel[b]].best) b = c;
+            const size_t t = sel[b];
+            memmove(&sel[a + 1], &sel[a], (b - a) * sizeof *sel);
+            sel[a] = t;
+            q[t].stage2 = true;
+        }
+    }
+    n_s2 = 0;
+    for (size_t i = 0; i < n; i++) if (q[i].stage2) sel[n_s2++] = i;
+    const double t_s2 = omp_get_wtime();
     if (!dv_time_up()) {
         #pragma omp parallel for schedule(dynamic, 1) num_threads(nt)
         for (size_t j = 0; j < n_s2; j++)
@@ -4722,6 +4748,8 @@ static void dv_run_config(void) {
         n_s2 = 0;                          /* stopped: stage 2 never ran */
     }
     free(sel);
+    const double d_s2 = omp_get_wtime() - t_s2;
+    const double t_pol = omp_get_wtime();
 
     /* Polish (E555_DIVE_POLISH=K): hill-climb each root's K best dives, then
        (E555_DIVE_ILS=R) R rounds of kick-and-polish on the best of them. */
@@ -4822,6 +4850,8 @@ static void dv_run_config(void) {
         }
         g_dv_run.pol_gain += pol_gain; g_dv_run.pol_roots += pol_roots;
     }
+    const double d_pol = omp_get_wtime() - t_pol;
+    g_dv_run.t_s1 += d_s1; g_dv_run.t_s2 += d_s2; g_dv_run.t_pol += d_pol;
     for (size_t i = 0; i < n; i++) {
         free(q[i].top); free(q[i].top_s); free(q[i].top_fp);
         q[i].top = NULL; q[i].top_s = NULL; q[i].top_fp = NULL; q[i].ntop = 0;
@@ -4895,9 +4925,9 @@ static void dv_run_config(void) {
     if (best > g_dv_run.best) g_dv_run.best = best;
     if (g_verbose) {
         printf("[dive] %s roots=%zu stage1_best=%d median=%d stage2=%zu best=%d "
-               "kept>=%d:%" PRIu64 " dives=%" PRIu64 " t=%.2fs",
+               "kept>=%d:%" PRIu64 " dives=%" PRIu64 " t=%.2fs (t1=%.2f t2=%.2f tpol=%.2f)",
                g_config_id_str, n, s1_best, median, n_s2, best, g_emit_score, kept,
-               dives, dt);
+               dives, dt, d_s1, d_s2, d_pol);
         if (g_dv_guided && ns) {
             printf(" arms(mean best)");
             for (int a = 0; a < g_dv_narms; a++) printf(" b%g:%.1f", g_dv_beta[a], arm_sum[a]);
@@ -4911,6 +4941,7 @@ static void dv_run_config(void) {
    boards of border row `row` read from FILE (lines "r<row>b...", any stage's
    CSV), one configuration per run of equal config ids. For measuring dive
    settings on identical roots, and for re-diving an earlier run's output. */
+static void dv_flush(FILE *fp);
 static void dv_replay_row(uint32_t row) {
     FILE *f = fopen(g_dv_roots_path, "r");
     if (!f) fatal("cannot read E555_DIVE_ROOTS %s: %s", g_dv_roots_path, strerror(errno));
@@ -4925,13 +4956,13 @@ static void dv_replay_row(uint32_t row) {
         if (!c2 || (size_t)(c1 - line) >= sizeof cur) continue;
         const size_t idl = (size_t)(c1 - line);
         if (strncmp(cur, line, idl) || cur[idl]) {
-            if (g_dv_qn) { strcpy(g_config_id_str, cur); dv_run_config(); }
+            if (g_dv_qn) { strcpy(g_config_id_str, cur); dv_run_config(); dv_flush(g_completions_fp); }
             memcpy(cur, line, idl); cur[idl] = 0;
         }
         dv_queue_tail(c2);
         nroots++;
     }
-    if (g_dv_qn && !g_stop) { strcpy(g_config_id_str, cur); dv_run_config(); }
+    if (g_dv_qn && !g_stop) { strcpy(g_config_id_str, cur); dv_run_config(); dv_flush(g_completions_fp); }
     g_dv_qn = 0;
     free(line); fclose(f);
     printf("[dive] replayed %zu saved board(s) of border row %u from %s\n",
@@ -4946,8 +4977,37 @@ static int dv_cmp_keep(const void *a, const void *b) {
 }
 
 /* Write the kept boards to fp, best first, and forget them. */
+/* Where a written board's broken edges sit: the top-left and top-right 4x4
+   corner blocks (rows 12-15), the seam between the stop row and the row above
+   it, and everything else. Summed into the run summary. */
+static void dv_break_places(const DvKeep *kp) {
+    Oriented c[NUM_PIECES];
+    for (int x = 0; x < NUM_PIECES; x++) c[x] = g_dv_or[kp->pid[x]][kp->rot[x]];
+    uint64_t tl = 0, tr = 0;
+    for (int x = 0; x < NUM_PIECES; x++) {
+        const int r = x / PUZZLE_SIDE, col = x % PUZZLE_SIDE;
+        for (int d = 0; d < 2; d++) {                  /* right, then up */
+            const int y = d ? (r < PUZZLE_SIDE - 1 ? x + PUZZLE_SIDE : -1)
+                            : (col < PUZZLE_SIDE - 1 ? x + 1 : -1);
+            if (y < 0) continue;
+            const bool broken = d ? c[x].top != c[y].bottom : c[x].right != c[y].left;
+            if (!broken) continue;
+            const int ry = y / PUZZLE_SIDE, cy = y % PUZZLE_SIDE;
+            const bool in_tl = r >= PUZZLE_SIDE - 4 && ry >= PUZZLE_SIDE - 4 && col <= 3 && cy <= 3;
+            const bool in_tr = r >= PUZZLE_SIDE - 4 && ry >= PUZZLE_SIDE - 4
+                            && col >= PUZZLE_SIDE - 4 && cy >= PUZZLE_SIDE - 4;
+            if (in_tl) tl++;
+            else if (in_tr) tr++;
+            else if (d && (uint32_t)r == g_stop_row) g_dv_run.brk_seam++;
+            else g_dv_run.brk_rest++;
+        }
+    }
+    g_dv_run.brk_tl += tl; g_dv_run.brk_tr += tr;
+    g_dv_run.clean_tl += !tl; g_dv_run.clean_tr += !tr;
+}
+
 static void dv_flush(FILE *fp) {
-    if (!g_dv_kn) return;
+    if (!g_dv_kn || !fp) return;
     qsort(g_dv_keep, g_dv_kn, sizeof *g_dv_keep, dv_cmp_keep);
     size_t hsz = 64;
     while (hsz < 2 * g_dv_kn) hsz <<= 1;
@@ -4973,6 +5033,7 @@ static void dv_flush(FILE *fp) {
         fwrite(line, 1, (size_t)(p - line), fp);
         g_dv_run.written++;
         g_dv_run.hist[kp->score]++;
+        dv_break_places(kp);
     }
     free(line); free(hs);
     for (size_t c = 0; c < g_dv_ncfg; c++) free(g_dv_cfg[c]);
@@ -5543,6 +5604,21 @@ static bool score_diag_corr(double n, double sx, double sxx,
     return true;
 }
 
+/* "[time] run started|ended <local date and time>", with the wall time at the end. */
+static void print_time_stamp(const char *what, double wall) {
+    char buf[64];
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S %Z", &tmv);
+    printf("[time] run %s %s", what, buf);
+    if (wall >= 0.0) {
+        const long w = (long)(wall + 0.5);
+        printf(" (wall %ld:%02ld:%02ld)", w / 3600, (w / 60) % 60, w % 60);
+    }
+    printf("\n");
+}
+
 static void print_summary(double wall_total, double init_s, double sweep_s) {
     printf("\n================= run summary =================\n");
     printf("[sum] wall %.1fs = init %.1fs (DB build %.1fs, sort %.1fs) + sweep %.1fs\n",
@@ -5595,6 +5671,22 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
             printf("[sum] end dive polish: %" PRIu64 " board(s) improved, +%" PRIu64
                    " edges in all (%d kick-and-polish rounds per board)\n",
                    g_dv_run.pol_roots, g_dv_run.pol_gain, g_dv_ils);
+        {
+            const double tt = g_dv_run.t_s1 + g_dv_run.t_s2 + g_dv_run.t_pol;
+            const double w = wall_total > 0.0 ? wall_total : 1.0;
+            printf("[sum] end dive time: stage 1 %.1fs, stage 2 %.1fs, polish %.1fs = %.1fs "
+                   "(%.0f%% of the run's %.1fs wall time)\n",
+                   g_dv_run.t_s1, g_dv_run.t_s2, g_dv_run.t_pol, tt, 100.0 * tt / w, wall_total);
+        }
+        if (g_dv_run.written) {
+            const double W = (double)g_dv_run.written;
+            printf("[sum] breaks by place over %" PRIu64 " written board(s), per board: "
+                   "TL 4x4 %.2f (%.0f%% clean), TR 4x4 %.2f (%.0f%% clean), "
+                   "seam r%u/r%u %.2f, rest %.2f\n", g_dv_run.written,
+                   g_dv_run.brk_tl / W, 100.0 * g_dv_run.clean_tl / W,
+                   g_dv_run.brk_tr / W, 100.0 * g_dv_run.clean_tr / W,
+                   g_stop_row, g_stop_row + 1, g_dv_run.brk_seam / W, g_dv_run.brk_rest / W);
+        }
         printf("[sum] end dive scores written:");
         int shown = 0;
         for (int sc = DV_EDGES; sc >= 0 && shown < 16; sc--)
@@ -5734,6 +5826,9 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
     if (g_learning)
         printf("[sum] learned unique boards counted: %" PRIu64 "\n",
                g_stats.emitted_total);
+    else if (g_end_dive)
+        printf("[sum] stop-row boards dived: %" PRIu64 " (written >= %d: %" PRIu64 ")\n",
+               g_dv_run.roots, g_emit_score, g_dv_run.written);
     else
         printf("[sum] emitted complete boards: %" PRIu64 "\n",
                g_stats.emitted_total);
@@ -5743,6 +5838,7 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
             printf("%s%s %zu", k ? ", " : "", g_part_name[k], g_part_total[k]);
         printf(")\n");
     }
+    print_time_stamp("ended", wall_total);
     fflush(stdout);
 }
 
@@ -5929,18 +6025,19 @@ static void usage(const char *a0) {
 "                         else. EVERY board completing the stop row is\n"
 "                         emitted (exact duplicates dropped); pair with --max_emitted.\n"
 "                         Not with --learn; --incomplete_top is ignored with a warning\n"
-"  --end_dive M           complete every stop-row board (beam or --backtrack_row) to\n"
+"  --end_dive [M]         complete every stop-row board (beam or --backtrack_row) to\n"
 "                         256 pieces with greedy random dives that allow broken edges\n"
 "                         (the backtracker's stuck mode: MRV, minimal breaks, LCV):\n"
-"                         M/10 dives each, then M-M/10 more, learning from each\n"
-"                         board's own best dives (cross-entropy rounds), for boards\n"
-"                         whose stage-1 best is >= S-4 or at/above their\n"
-"                         configuration's median. Boards whose best scores >= S are\n"
-"                         written instead of the stop-row boards, best first, as\n"
-"                         config_id, connected edges, pos, rot, when the completions\n"
-"                         file closes. With --table and --freq_model cell the table\n"
-"                         steers the stage-1 dives. --max_emitted then caps the\n"
-"                         written boards instead of stopping the search\n"
+"                         M/10 dives each (M defaults to 20000), then M-M/10 more,\n"
+"                         learning from each board's own best dives (cross-entropy\n"
+"                         rounds), for boards whose stage-1 best is >= S-4 -- or, if\n"
+"                         that is under 20%% of a configuration's boards, also its\n"
+"                         top 10%%. Boards whose best scores >= S are written instead\n"
+"                         of the stop-row boards after each configuration, best\n"
+"                         first, as config_id, connected edges, pos, rot. With\n"
+"                         --table and --freq_model cell the table steers the stage-1\n"
+"                         dives. --max_emitted then caps the written boards instead\n"
+"                         of stopping the search\n"
 "  --end_polish R         with --end_dive: polish each board's 16 best dives (best\n"
 "                         swap/re-rotation, repeated) and then run R kick-and-polish\n"
 "                         rounds (3 random swaps, re-polish, keep if not worse) over 8\n"
@@ -5973,8 +6070,11 @@ static void usage(const char *a0) {
 "                         TL block can use, and scores each child by the blocks per\n"
 "                         corner still buildable from unused pieces: -3/+1/+2/+3 for\n"
 "                         0/1/2/3+, times F in units of the row's score SD. Bare flag\n"
-"                         = 0.5; absent = 0 (off). Needs a rotations file and\n"
-"                         --stop_row <= 12; works with or without --table\n"
+"                         = 0.5; absent = 0 (off). Needs a rotations file (not\n"
+"                         --random_edges) and --stop_row <= 12; works with or\n"
+"                         without --table. With --free_edges the top and right edge\n"
+"                         pieces are pooled: either may fill the TR block or top\n"
+"                         border\n"
 "  --clue_center          force the published center clue piece onto its cell, at its\n"
 "                         orientation's spin (piece 138; one of the 4 center cells)\n"
 "  --clue_corners         force the two published corner clues the beam can reach,\n"
@@ -6241,7 +6341,8 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
             if (g_emit_count) printf(" emitted=%zu", g_emit_count);
             if (g_incomplete_top && g_partial_count)
                 printf(" partials=%zu part_total=%zu", g_partial_count, g_partial_total);
-            if (g_emit_count) printf(" sol_total=%" PRIu64, g_solution_idx);
+            if (g_emit_count && g_end_dive) printf(" written=%" PRIu64, g_dv_run.written);
+            else if (g_emit_count) printf(" sol_total=%" PRIu64, g_solution_idx);
             printf(" wall=%.1fs\n", wall);
             fflush(stdout);
             return;
@@ -6285,7 +6386,8 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
     sweep_flush();
     printf("[sweep] %sl%ld %s emitted=%zu", group, li, key, g_emit_count);
     if (g_incomplete_top) printf(" partials=%zu part_total=%zu", g_partial_count, g_partial_total);
-    printf(" sol_total=%" PRIu64 " wall=%.1fs\n", g_solution_idx, wall);
+    if (g_end_dive) printf(" written=%" PRIu64 " wall=%.1fs\n", g_dv_run.written, wall);
+    else            printf(" sol_total=%" PRIu64 " wall=%.1fs\n", g_solution_idx, wall);
     fflush(stdout);
 }
 
@@ -6346,8 +6448,15 @@ int main(int argc, char *argv[]) {
             int v = atoi(argv[++i]);
             g_backtrack_row = v > 0 ? (uint32_t)v : 0; g_backtrack_row_set = true;
         }
-        else if (!strcmp(argv[i], "--end_dive") && i+1 < argc) {
-            long v = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--end_dive")) {
+            /* The value is optional, as for --lambda_corners: a bare --end_dive
+               means DV_M_DEFAULT dives per board. */
+            long v = DV_M_DEFAULT;
+            if (i + 1 < argc) {
+                char *end = NULL;
+                long w = strtol(argv[i + 1], &end, 10);
+                if (end != argv[i + 1] && *end == '\0') { v = w; i++; }
+            }
             if (v < 10 || v > 1000000000L) fatal("--end_dive must be in 10..1000000000");
             g_end_dive = (uint32_t)v;
         }
@@ -6441,9 +6550,12 @@ int main(int argc, char *argv[]) {
             fatal("--lambda_corners is a search-phase option: steering the learning "
                   "phase would bias the table the search relies on, and its turned "
                   "passes put other corners at the top");
-        if (g_random_edges || g_free_edges)
-            fatal("--lambda_corners needs a rotations file without --random_edges "
-                  "or --free_edges: the catalog is built from the sides it deals");
+        if (g_random_edges)
+            fatal("--lambda_corners needs a rotations file, not --random_edges: the "
+                  "catalog is built from the sides it deals");
+        /* --free_edges: any unused edge may end a row, so the catalog pools the
+           pieces dealt to the top and to the right (E555_database.c). */
+        g_tc_pool_top_right = g_free_edges;
         if (g_stop_row > (uint32_t)(PUZZLE_SIDE - 4))
             fatal("--lambda_corners needs --stop_row 12 or below: rows 13-14 hold the "
                   "corner blocks it protects");
@@ -6573,6 +6685,7 @@ int main(int argc, char *argv[]) {
     g_freq_pure  = (getenv("E555_FREQ_PURE") != NULL);
 
     printf("\n=== E555 beamer (data-driven fork) ===\n\n");
+    print_time_stamp("started", -1.0);
     if (g_print_cmd) print_cmd(argv[0], seed_path, csv_path, resume);
     printf("[cfg] seed_file=%s rotations_file=%s out_dir=%s\n",
            seed_path, csv_path ? csv_path : "(none: --random_edges)", g_out_dir);
@@ -6595,7 +6708,7 @@ int main(int argc, char *argv[]) {
                g_backtrack_row, g_backtrack_row, g_backtrack_row, g_stop_row);
     if (g_end_dive) {
         printf("[cfg] end_dive=%u (stage 1 %u dives per stop-row board, stage 2 %u more for "
-               "boards >= S-4 or at/above their configuration's median) emit_score=%d "
+               "boards >= S-4, or the top 10%% if that is under 20%%) emit_score=%d "
                "stage-1 table prior=%s\n", g_end_dive, g_end_dive / 10,
                g_end_dive - g_end_dive / 10, g_emit_score,
                (g_table_path && g_freq_model == FREQ_MODEL_CELL) ? "on (cell model)" : "off");
@@ -6844,7 +6957,7 @@ int main(int argc, char *argv[]) {
                 if (g_max_wall_sec > 0.0) { double ge = t_start + g_max_wall_sec; if (ge < slice_end) slice_end = ge; }
 
                 BeamResult br = beam_search_config(&ctx, scratch, cfg_hash, slice_end);
-                if (g_end_dive) dv_run_config();
+                if (g_end_dive) { dv_run_config(); dv_flush(g_completions_fp); }
                 /* emitted/partials are this config's unique boards; sol_total and
                    part_total are the run totals written so far. */
                 { char grp[64]; snprintf(grp, sizeof grp, "rndb%zu", bi);
@@ -7056,7 +7169,7 @@ int main(int argc, char *argv[]) {
                 if (g_pass_deadline > 0.0 && g_pass_deadline < slice_end) slice_end = g_pass_deadline;
 
                 BeamResult br = beam_search_config(&ctx, scratch, cfg_hash, slice_end);
-                if (g_end_dive) dv_run_config();
+                if (g_end_dive) { dv_run_config(); dv_flush(g_completions_fp); }
                 if (g_learning) freq_close_config();
                 /* emitted/partials are this config's unique boards; sol_total and
                    part_total are the run totals written so far. */

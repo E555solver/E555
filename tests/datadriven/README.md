@@ -26,7 +26,7 @@ Learning and searching are separate invocations of the same binary.
 | `--freq_model M` | The beam's spatial resolution. `segment` (default) pools the 5-5-5 A/B/C bins; `cell` uses exact cells. See *Choosing `--freq_model`*. |
 | `--lambda_corners [F]` | Search only, with or without a table: keep the blocks around the two row-13 clues buildable. See *Corner supply*. |
 | `--backtrack_row N` | Search only: stop the beam at row N, then search every row-N candidate exhaustively up to `--stop_row` and emit every board that completes it. See *Backtracking to the stop row*. |
-| `--end_dive M` | Search only: complete every stop-row board to 256 pieces with M random dives that allow broken edges, and write the best completion per board, sorted by connected edges. See *Finishing boards with random dives*. |
+| `--end_dive [M]` | Search only: complete every stop-row board to 256 pieces with M random dives (default 20000) that allow broken edges, and write the best completion per board, sorted by connected edges. See *Finishing boards with random dives*. |
 | `--emit_score S` | With `--end_dive`: the connected edges (of 480) a dived board needs to be written. Default 450. |
 | `--end_polish R` | With `--end_dive`: hill-climb each board's 16 best dives, then R kick-and-polish rounds. The largest single gain measured. See *Finishing boards with random dives*. |
 
@@ -318,7 +318,12 @@ signature already covers.
 
 **Flag forms.** Absent → off, with outputs byte-identical to before. A bare
 `--lambda_corners` → 0.5. `--lambda_corners F` → F. It needs a rotations file
-(not `--random_edges` or `--free_edges`) and `--stop_row 12` or below. With
+(not `--random_edges`) and `--stop_row 12` or below. Under `--free_edges`,
+where any unused edge piece may end a row, the catalog pools the 28 edge pieces
+dealt to the top and to the right: each may fill a TR block side cell or serve
+as a top-border witness, a witness is never one of its own block's pieces, and
+a TL/TR pair is joint only when neither block's witness is the other's piece
+(a switch in `E555_database.c` that only this fork turns on). With
 `--clue_corners` it uses the clue catalog of the frame being searched; this fork
 searches one frame per pass, so that is `--pin_clue`'s, or frame 0 without it. It is refused under `--learn`, because steering the
 learning would bias the table the search relies on, and in the turned passes
@@ -404,7 +409,7 @@ bin/E555_beamer_datadriven SEED ROT --clue_center --pin_clue 1 --start_row 4 --n
 - **Clue frames.** Search mode runs a single clue frame per pass, so every root
   already belongs to one orientation.
 
-## Finishing boards with random dives (`--end_dive M`)
+## Finishing boards with random dives (`--end_dive [M]`)
 
 A stop-row board covers rows 0..stop_row only, so its real quality is unknown
 until the top is filled. With `--end_dive M`, each stop-row board is finished
@@ -432,9 +437,12 @@ connected edges out of 480.
 **Two stages per configuration** (one bottom × left column):
 
 1. Every distinct stop-row board gets `M/10` dives and keeps its best.
-2. A board goes on if its stage-1 best is at least `S-4`, **or** at or above the
-   configuration's median stage-1 best. It gets the other `M - M/10` dives, and
-   these **learn from the board's own best dives** (below).
+2. A board goes on if its stage-1 best is at least `S-4`. If that is fewer than
+   20% of the configuration's boards, its top 10% by stage-1 best (at least
+   one; ties in the order found) go on as well. They get the other `M - M/10`
+   dives, and these **learn from the board's own best dives** (below).
+
+`M` defaults to 20000 (`--end_dive` alone).
 
 **Polish** (`--end_polish R`, off by default). Every board whose best dive is
 within 6 of `S` is then improved by local search over the cells the dives
@@ -448,11 +456,13 @@ filled:
   re-examined), keep the result if it is not worse;
 - `R = 0` polishes only.
 
-Boards whose best is at least `S` (`--emit_score`, default 450) are kept in
-memory. When the completions file closes (the end of a border row, or the end
-of the run) they are written to it:
+Boards whose best is at least `S` (`--emit_score`, default 450) are written to
+the completions file **after each configuration**, so a killed job loses at most
+the configuration in flight:
 
-- sorted by score, best first (ties in the order the boards were found);
+- sorted by score within the configuration, best first (ties in the order the
+  boards were found); re-sort a whole file with `sort -t, -k2,2nr` or
+  `tools/E555_rank.py`;
 - exact duplicate boards dropped;
 - at most `--max_emitted` dived boards in the whole run. The budget caps the
   written boards and no longer stops the search; `--incomplete_top` partials
@@ -544,13 +554,14 @@ were replayed for every setting, so differences are paired per board.
   |---|---|---|---|---|
   | median or `S-2` (first version) | 3 | 88% | 0 | 88% |
   | `S-2` only | 8 | 42% | 2 | 16% |
-  | **median or `S-4` (new default)** | **0** | 93% | **0** | 88% |
+  | median or `S-4` (second version) | 0 | 93% | 0 | 88% |
   | `S-4` only | 2 | 76% | 0 | 42% |
 
   With few boards per configuration (typical at row 11) the median admits 85-92%
-  of them, so stage 2 saves little. When `S` is high for the boards (454 here),
-  `E555_DIVE_MEDIAN=0` (`S-4` alone) cut the dives to 42% with nothing lost; at
-  452 it lost 2 of 36.
+  of them, so it saved little. The current rule is `S-4`, plus the top 10% when
+  `S-4` admits fewer than 20% (so a configuration whose boards all sit well
+  below `S` still refines its best few); it was chosen after this table and not
+  measured on it.
 
 ### Measured: complete runs
 
@@ -574,15 +585,21 @@ the smaller settings for (d). `tools/E555_viewer.py` confirms the best boards
 at 458/480 (221 solid pieces) and 456/480.
 
 - **Log.** `--verbose` adds a `[dive]` line per configuration: roots, stage-1
-  best and median, roots in stage 2, best, boards kept, dives, time, and the
-  arm means when guided. The run summary always carries the totals and the
-  scores written.
+  best and median, roots in stage 2, best, boards kept, dives, time split into
+  stage 1 / stage 2 / polish, and the arm means when guided. The run summary
+  always carries the totals, the time spent in stage 1, stage 2 and polish (and
+  their share of the wall time), the scores written, and where the written
+  boards' breaks sit: the TL and TR 4×4 corner blocks (rows 12-15, with the
+  share of boards clean there), the seam between the stop row and the row
+  above, and the rest. The log opens and closes with `[time] run started|ended`
+  and the local date and time.
 - **Time.** `--time_limit` bounds the beam and the exhaustive search; the dives
   of that configuration then run in full. `--wall_time` and Ctrl-C stop the
   dives, and every board that already has a score is still written.
-- **Crash.** Kept boards live in memory until the file closes, so a killed run
-  (SIGKILL) loses the current border row's dived boards, and `--resume` will
-  not redo those configurations.
+- **Crash.** Kept boards are written after each configuration, so a killed run
+  (SIGKILL) loses only the configuration in flight. Set `--wall_time` a little
+  under a cluster job's limit so the run also ends its last configuration
+  cleanly.
 - **Deterministic.** Each dive's random stream is keyed by its board and its
   index, so the output does not depend on the thread count.
 - **Not with `--learn`.** `--incomplete_top` partials are still written, not
@@ -604,7 +621,7 @@ records for each edge piece. A different border is fatal.
 | `E555_DIVE_PLAIN=1` | With `--end_dive`: plain dives, no learning. For measuring what the learning buys. |
 | `E555_DIVE_ROOTS=FILE` | With `--end_dive`: skip the beam and dive the saved stop-row boards of the border row from `FILE` (any completions CSV). Measures dive settings on identical boards, or re-dives an earlier run. Not with `--random_edges`. |
 | `E555_DIVE_TRACE=FILE` | With `--end_dive`: one line per board and stage segment with the histogram of its dive scores. |
-| `E555_DIVE_*` tuning | `STAGE1` (share of M, 0.1), `ROUNDS` (18), `S2BETA` (2), `BETAS` (stage-1 arms), `NOPRIOR` (1 flat, 2 prior in stage 1 only), `GAMMA` (0.3), `ELITE` (0.05), `CLIP` (2), `LCV` (8), `MARGIN` (4), `MEDIAN` (1), `POLISH` (dives polished), `ILS` (kick rounds), `KICK` (3), `STARTS` (8), `ILS_FULL` (full rescan after a kick). Defaults are the measured ones. |
+| `E555_DIVE_*` tuning | `STAGE1` (share of M, 0.1), `ROUNDS` (18), `S2BETA` (2), `BETAS` (stage-1 arms), `NOPRIOR` (1 flat, 2 prior in stage 1 only), `GAMMA` (0.3), `ELITE` (0.05), `CLIP` (2), `LCV` (8), `MARGIN` (4), `POLISH` (dives polished), `ILS` (kick rounds), `KICK` (3), `STARTS` (8), `ILS_FULL` (full rescan after a kick). Defaults are the measured ones. |
 
 ## example_run/
 
