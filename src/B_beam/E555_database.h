@@ -694,10 +694,6 @@ bool    tc_left_ok(const LeftOrder *lft);
    whose TL and TR both keep a block alive against `used` (the pieces already
    spent or reserved before the search starts). */
 uint8_t tc_config(const LeftOrder *lft, const uint64_t used[4]);
-/* The piece-disjoint TL x TR table of slot s for the current configuration:
-   entry [i * g_tc_live_n[s][TC_TR] + j] is 1 when live TL block i and live TR
-   block j can be built together. Valid until the next tc_config. */
-const uint8_t *tc_compat_table(int s);
 
 /* u_row: tc_acc(rest of score) per child, tc_close_row per row; tc_unit(row) is
    the previous row's spread, else this row's, else the nearest measured row,
@@ -723,9 +719,12 @@ static inline bool tc_alive(int s, int k, int i, const uint64_t used[4],
     /* Pooled top/right edges: a top-border witness may already sit on the right
        column, so the block also needs one witness pair still unused. Never the
        case when the sides are dealt (witnesses are top pieces, the right column
-       takes right pieces), so the stock tools are unchanged. */
+       takes right pieces), so the stock tools are unchanged. A block whose
+       witness list was truncated (TC_MAX_WIT) may have a free pair that was not
+       stored, so it is never killed this way. */
     if (g_tc_pool_top_right) {
         const TcBlock *b = &g_tc_blk[s][k][L->blk];
+        if (b->nwit >= TC_MAX_WIT) return true;
         bool free_pair = false;
         for (int u = 0; u < b->nwit && !free_pair; u++)
             free_pair = !used_test(used, b->wit[u][0]) &&

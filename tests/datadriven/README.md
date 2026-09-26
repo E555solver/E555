@@ -370,31 +370,28 @@ Nothing past row N is scored or selected. A path ends only when:
 
 - a cell has no fitting piece;
 - a completed row fails the beam's colour-parity test (`parity_ok`);
-- under `--lambda_corners`, the root or a completed row leaves the two top
-  corners unclosable (the *corner cut*, below).
+- under `--lambda_corners`, the root or a completed row leaves neither top
+  corner closable (the *corner cut*, below).
 
 **The corner cut.** With `--lambda_corners`, the root and every completed row
-must keep some TL block and some TR block of the board's clue frame alive, with
-the two piece-disjoint. That is the same *joint* test as the stop-row report
-(see *Corner supply*):
+must keep at least one top corner closable: some TL block or some TR block of
+the board's clue frame still alive (the alive test of *Corner supply*):
 - none of the block's pieces is used;
-- under `--free_edges`, a pair of top-border witnesses is still free;
+- under `--free_edges`, a pair of top-border witnesses is still free (a block
+  whose witness list hit the 32-pair cap is never killed this way);
 - at row 12, the block meets row 12's tops.
 
-So every emitted board has both corners closable, and the report shows 100%
-joint. Each level keeps only its parent's surviving blocks, because a used
-piece never comes back, so the test gets cheaper as the search climbs; the node rate showed no clear
-change in these runs.
+A path ends only when **both** corners are dead. A board with one dead corner
+goes on and is emitted, and its dead corner is left to the dives. The beam's
+corner term (rows below N) is unchanged. Each level keeps only its parent's
+surviving blocks, because a used piece never comes back, so the test gets
+cheaper as the search climbs.
 
-Measured on border r16178, width 50,000, 1 thread, with the plain 3-cell blocks
-(`--clue_center --pin_clue 1`, no `--clue_corners`), 6 configurations:
-- without the cut: 95 boards, 69 of them joint;
-- with the cut: exactly those 69 boards, with 3% fewer nodes.
-
-With the clue blocks (`--clue_corners`) the cut is much stronger. On 5 × 15
-configurations of the same border it cut 23 million rows and ran the search 2.4×
-faster. All 11 boards the old search emitted had dead corners, and the cut
-removed every one.
+A first version cut as soon as the two corners could not both be closed (no
+piece-disjoint TL+TR pair). With the clue blocks that cut nearly everything: on
+5 × 15 configurations of border r16178 it emitted nothing, and on a real run
+only 0.5% of row-11 boards had such a pair. The present rule keeps every board
+that can still close one corner.
 
 The row-13 corner clues themselves are never pinned, so without
 `--lambda_corners` any board that reaches the stop row is emitted. Clue pins the
@@ -411,7 +408,7 @@ bin/E555_beamer_datadriven SEED ROT --clue_center --pin_clue 1 --start_row 4 --n
 
 - **Output volume.** The number of emitted boards can be very large when the
   stop row is close to N: 2,048 row-5 roots gave 123,355 row-8 boards. Use
-  `--max_emitted`. It is checked after each tile of 32 × threads roots, so the
+  `--max_emitted`. It is checked after each tile of 8 × threads roots, so the
   final count can overshoot by one tile.
 - **Measured** on border r16178, clued (`--pin_clue 1`), width 50,000, 4 threads,
   6 configurations:
@@ -421,7 +418,11 @@ bin/E555_beamer_datadriven SEED ROT --clue_center --pin_clue 1 --start_row 4 --n
   - It emitted 104 row-11 boards, from every configuration.
 - **Log.** `--verbose` adds a `[dfs]` line per configuration: roots, roots that
   emitted, nodes, parity cuts, corner cuts (`cut_corner`, under
-  `--lambda_corners`), and boards completing each row. The run
+  `--lambda_corners`), and boards completing each row.
+- **Threads.** Roots go to the threads a tile of 8 × threads at a time, and
+  each thread allocates and zeroes its own search context. On a two-socket
+  machine, pin the threads so that memory stays next to them:
+  `OMP_PROC_BIND=close OMP_PLACES=cores`. The run
   summary always carries the totals.
 - **Stopping.** `--time_limit` and Ctrl-C stop the search mid-root. Boards found
   so far are still written, and the `[sweep]` reason says `time` or `interrupted`.

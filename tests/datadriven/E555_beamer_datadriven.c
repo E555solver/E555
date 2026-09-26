@@ -45,8 +45,8 @@
  *   The beam stops at row N, expanded as a stop row, and every row-N candidate
  *   is then searched exhaustively, cell by cell in row-major order, up to
  *   --stop_row: parity at every row and clue pins, and under --lambda_corners
- *   both top corners still closable (a piece-disjoint TL+TR block pair alive)
- *   at every row. Every completing board is emitted,
+ *   at least one top corner still closable (a TL or TR block alive) at every
+ *   row. Every completing board is emitted,
  *   exact duplicates aside and without the EMIT_MAX cap. See backtrack_emit.
  *
  * END DIVES (--end_dive M --emit_score S)
@@ -5132,12 +5132,12 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
    nothing about them constrains row 12. Each completed row is committed with
    commit_row and must pass parity_ok, the beam's own exact test.
 
-   Under --lambda_corners every committed row (and the root) must also keep the
-   top corners buildable: in the board's clue frame, some TL block and some TR
-   block are still alive (none of their pieces used, a top-border witness pair
-   free under --free_edges, the row-12 junction met at row 12) and the two are
-   piece-disjoint -- the "joint" of the stop-row report. A row that loses that
-   ends the path, so every emitted board has both corners closable. Each level
+   Under --lambda_corners every committed row (and the root) must also keep at
+   least one top corner buildable: in the board's clue frame, some TL block or
+   some TR block is still alive (none of its pieces used, a top-border witness
+   pair free under --free_edges, the row-12 junction met at row 12). Only a row
+   that kills BOTH corners ends the path; the beam's corner term is unchanged,
+   and every emitted board keeps at least one corner closable. Each level
    keeps the alive blocks of its parent's lists only (a used piece never comes
    back), so the test gets cheaper as the search climbs.
 
@@ -5206,12 +5206,14 @@ static void bt_row(BtCtx *x, int row);
 
 /* The corner cut. Filters the parent level's alive lists (every live block at
    the root) against board t, stores them at `row`, and returns whether some
-   slot the board may still use keeps a piece-disjoint TL+TR pair alive. */
+   slot the board may still use keeps at least one corner (TL or TR) alive. A
+   path ends only when both corners are dead; one dead corner is left to the
+   dives. */
 static bool bt_corners_ok(BtCtx *x, int row, const BeamEntry *t) {
     const bool at12 = (row == PUZZLE_SIDE - 4);
     const bool root = (row == x->root_row);
     const int orient = ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) : -1;
-    bool joint = false;
+    bool any = false;
     for (int s = 0; s < 4; s++) {
         x->cn[row][s][TC_TL] = x->cn[row][s][TC_TR] = 0;
         if (!(g_tc_slots & (1u << s))) continue;
@@ -5229,18 +5231,9 @@ static bool bt_corners_ok(BtCtx *x, int row, const BeamEntry *t) {
             }
             x->cn[row][s][k] = (uint16_t)n;
         }
-        if (joint) continue;
-        const int ntl = x->cn[row][s][TC_TL], ntr = x->cn[row][s][TC_TR];
-        if (!ntl || !ntr) continue;
-        const uint8_t *compat = tc_compat_table(s);
-        const size_t stride = (size_t)g_tc_live_n[s][TC_TR];
-        for (int a = 0; a < ntl && !joint; a++) {
-            const uint8_t *rowp = compat + (size_t)x->cl[row][s][TC_TL][a] * stride;
-            for (int b = 0; b < ntr; b++)
-                if (rowp[x->cl[row][s][TC_TR][b]]) { joint = true; break; }
-        }
+        if (x->cn[row][s][TC_TL] || x->cn[row][s][TC_TR]) any = true;
     }
-    return joint;
+    return any;
 }
 
 /* Row `row` is complete in x->rows[row]: commit, test, then go up or emit. */
@@ -5371,13 +5364,25 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     const int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
     if (g_bt_nctx < nt) {
         g_bt_ctx = xrealloc(g_bt_ctx, (size_t)nt * sizeof *g_bt_ctx);
-        for (int t = g_bt_nctx; t < nt; t++) {
-            g_bt_ctx[t] = xmalloc(sizeof(BtCtx));
-            memset(g_bt_ctx[t], 0, sizeof(BtCtx));
+        /* Each thread allocates and zeroes its own context, so first touch puts
+           it in the memory of the socket that thread runs on (two-socket
+           machines; pair with OMP_PROC_BIND=close OMP_PLACES=cores). */
+        const int have = g_bt_nctx;
+        for (int t = have; t < nt; t++) g_bt_ctx[t] = NULL;
+        #pragma omp parallel num_threads(nt)
+        {
+            const int t = omp_get_thread_num();
+            if (t >= have && t < nt) {
+                BtCtx *c = xmalloc(sizeof(BtCtx));
+                memset(c, 0, sizeof(BtCtx));
+                g_bt_ctx[t] = c;
+            }
         }
+        for (int t = have; t < nt; t++)            /* fewer threads than asked */
+            if (!g_bt_ctx[t]) { g_bt_ctx[t] = xmalloc(sizeof(BtCtx)); memset(g_bt_ctx[t], 0, sizeof(BtCtx)); }
         g_bt_nctx = nt;
     }
-    const uint32_t tile_n = 32u * (uint32_t)nt;
+    const uint32_t tile_n = 8u * (uint32_t)nt;
     BtOut *outs = xmalloc((size_t)tile_n * sizeof *outs);
     memset(outs, 0, (size_t)tile_n * sizeof *outs);
     uint64_t fill[EDGE_LEN + 1] = {0}, nodes = 0, cut_p = 0, cut_c = 0, emitted = 0;
@@ -6077,9 +6082,9 @@ static void usage(const char *a0) {
 "                         cell in row-major order, up to --stop_row: the fixed left\n"
 "                         column, right edges from the border's own pool, clue pins\n"
 "                         enforced and colour parity checked at every row; with\n"
-"                         --lambda_corners, a path also ends once the two top\n"
-"                         corners can no longer both be closed (no piece-disjoint\n"
-"                         TL+TR block pair alive). EVERY board completing the stop row is\n"
+"                         --lambda_corners, a path also ends once NEITHER top\n"
+"                         corner can be closed (no TL and no TR block alive).\n"
+"                         EVERY board completing the stop row is\n"
 "                         emitted (exact duplicates dropped); pair with --max_emitted.\n"
 "                         Not with --learn; --incomplete_top is ignored with a warning\n"
 "  --end_dive [M]         complete every stop-row board (beam or --backtrack_row) to\n"
