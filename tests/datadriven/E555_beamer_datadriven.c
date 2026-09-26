@@ -44,8 +44,9 @@
  * BACKTRACKING (--backtrack_row N)
  *   The beam stops at row N, expanded as a stop row, and every row-N candidate
  *   is then searched exhaustively, cell by cell in row-major order, up to
- *   --stop_row: parity at every row and clue pins, nothing else. Every
- *   completing board is emitted,
+ *   --stop_row: parity at every row and clue pins, and under --lambda_corners
+ *   both top corners still closable (a piece-disjoint TL+TR block pair alive)
+ *   at every row. Every completing board is emitted,
  *   exact duplicates aside and without the EMIT_MAX cap. See backtrack_emit.
  *
  * END DIVES (--end_dive M --emit_score S)
@@ -5129,9 +5130,16 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
    enabled orientation pinned on the row and may also go on unpinned only while
    row < g_clue_last_assign. The row-13 corner clues are never pinned, so
    nothing about them constrains row 12. Each completed row is committed with
-   commit_row and must pass parity_ok, the beam's own exact test. That is the
-   only cut: the top-corner catalog (--lambda_corners) is tallied for the
-   report, never used to end a path.
+   commit_row and must pass parity_ok, the beam's own exact test.
+
+   Under --lambda_corners every committed row (and the root) must also keep the
+   top corners buildable: in the board's clue frame, some TL block and some TR
+   block are still alive (none of their pieces used, a top-border witness pair
+   free under --free_edges, the row-12 junction met at row 12) and the two are
+   piece-disjoint -- the "joint" of the stop-row report. A row that loses that
+   ends the path, so every emitted board has both corners closable. Each level
+   keeps the alive blocks of its parent's lists only (a used piece never comes
+   back), so the test gets cheaper as the search climbs.
 
    Nothing is scored and nothing is selected: every board that completes the
    stop row is emitted. Roots are searched in the beam's rank order, a tile at a
@@ -5153,14 +5161,18 @@ typedef struct {
     int8_t    pin_kind[EDGE_LEN + 1][PUZZLE_SIDE];   /* -1 or PIN_PIECE / PIN_TOPCOLOR */
     uint16_t  pin_val[EDGE_LEN + 1][PUZZLE_SIDE];
     uint8_t   flags[EDGE_LEN + 1];        /* orientation tag row r commits with */
-    uint64_t  nodes, fill[EDGE_LEN + 1], cut_parity;
+    uint64_t  nodes, fill[EDGE_LEN + 1], cut_parity, cut_corner;
+    /* --lambda_corners: alive live-block indices per level, slot and corner. */
+    uint16_t  cn[EDGE_LEN + 1][4][2];
+    uint16_t  cl[EDGE_LEN + 1][4][2][TC_MAX_BLOCKS];
+    int       root_row;
     double    deadline;
     bool      abort;
     BtOut    *out;
 } BtCtx;
 
 static struct {
-    uint64_t roots, roots_emitting, nodes, cut_parity, emitted;
+    uint64_t roots, roots_emitting, nodes, cut_parity, cut_corner, emitted;
     uint64_t fill[EDGE_LEN + 1];
     double   t;
 } g_bt_run;
@@ -5192,6 +5204,45 @@ static void bt_out_push(BtOut *o, const BtCtx *x, int stop) {
 
 static void bt_row(BtCtx *x, int row);
 
+/* The corner cut. Filters the parent level's alive lists (every live block at
+   the root) against board t, stores them at `row`, and returns whether some
+   slot the board may still use keeps a piece-disjoint TL+TR pair alive. */
+static bool bt_corners_ok(BtCtx *x, int row, const BeamEntry *t) {
+    const bool at12 = (row == PUZZLE_SIDE - 4);
+    const bool root = (row == x->root_row);
+    const int orient = ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) : -1;
+    bool joint = false;
+    for (int s = 0; s < 4; s++) {
+        x->cn[row][s][TC_TL] = x->cn[row][s][TC_TR] = 0;
+        if (!(g_tc_slots & (1u << s))) continue;
+        if (g_tc_clued && orient >= 0 && s != orient) continue;
+        for (int k = 0; k < 2; k++) {
+            if (at12 && g_tc_clued && t->rtop[k ? PUZZLE_SIDE - 3 : 2] != g_tc_clue_bottom[s][k])
+                continue;
+            const int n_src = root ? g_tc_live_n[s][k] : x->cn[row - 1][s][k];
+            const uint16_t *src = x->cl[row - 1][s][k];
+            uint16_t *dst = x->cl[row][s][k];
+            int n = 0;
+            for (int q = 0; q < n_src; q++) {
+                const int i = root ? q : src[q];
+                if (tc_alive(s, k, i, t->used, t->rtop, at12)) dst[n++] = (uint16_t)i;
+            }
+            x->cn[row][s][k] = (uint16_t)n;
+        }
+        if (joint) continue;
+        const int ntl = x->cn[row][s][TC_TL], ntr = x->cn[row][s][TC_TR];
+        if (!ntl || !ntr) continue;
+        const uint8_t *compat = tc_compat_table(s);
+        const size_t stride = (size_t)g_tc_live_n[s][TC_TR];
+        for (int a = 0; a < ntl && !joint; a++) {
+            const uint8_t *rowp = compat + (size_t)x->cl[row][s][TC_TL][a] * stride;
+            for (int b = 0; b < ntr; b++)
+                if (rowp[x->cl[row][s][TC_TR][b]]) { joint = true; break; }
+        }
+    }
+    return joint;
+}
+
 /* Row `row` is complete in x->rows[row]: commit, test, then go up or emit. */
 static void bt_close_row(BtCtx *x, int row) {
     BeamEntry *t = &x->lvl[row];
@@ -5200,6 +5251,7 @@ static void bt_close_row(BtCtx *x, int row) {
     t->depth = (uint16_t)row;
     t->flags = x->flags[row];
     if (!parity_ok(t)) { x->cut_parity++; return; }
+    if (g_corners_on && !bt_corners_ok(x, row, t)) { x->cut_corner++; return; }
     x->fill[row]++;
     if ((uint32_t)row == g_stop_row) { bt_out_push(x->out, x, row); return; }
     bt_row(x, row + 1);
@@ -5328,7 +5380,7 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     const uint32_t tile_n = 32u * (uint32_t)nt;
     BtOut *outs = xmalloc((size_t)tile_n * sizeof *outs);
     memset(outs, 0, (size_t)tile_n * sizeof *outs);
-    uint64_t fill[EDGE_LEN + 1] = {0}, nodes = 0, cut_p = 0, emitted = 0;
+    uint64_t fill[EDGE_LEN + 1] = {0}, nodes = 0, cut_p = 0, cut_c = 0, emitted = 0;
     uint64_t roots = 0, roots_emitting = 0;
     bool aborted = false;
     const double t0 = omp_get_wtime();
@@ -5348,15 +5400,16 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
             *r = beam[pe->parent];
             commit_row(r, N, &pe->mv);
             r->depth = (uint16_t)N; r->flags = pe->flags;
-            x->out = o; x->deadline = deadline;
+            x->out = o; x->deadline = deadline; x->root_row = N;
+            if (g_corners_on && !bt_corners_ok(x, N, r)) { x->cut_corner++; continue; }
             bt_row(x, N + 1);
         }
         for (int t = 0; t < nt; t++) {
             BtCtx *x = g_bt_ctx[t];
-            nodes += x->nodes; cut_p += x->cut_parity;
+            nodes += x->nodes; cut_p += x->cut_parity; cut_c += x->cut_corner;
             for (int r = 0; r <= EDGE_LEN; r++) fill[r] += x->fill[r];
             if (x->abort) aborted = true;
-            x->nodes = x->cut_parity = 0;
+            x->nodes = x->cut_parity = x->cut_corner = 0;
             memset(x->fill, 0, sizeof x->fill);
             x->abort = false;
         }
@@ -5383,7 +5436,7 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     int deepest = N;
     for (int r = N + 1; r <= (int)g_stop_row; r++) if (fill[r]) deepest = r;
     g_bt_run.roots += roots; g_bt_run.roots_emitting += roots_emitting;
-    g_bt_run.nodes += nodes; g_bt_run.cut_parity += cut_p;
+    g_bt_run.nodes += nodes; g_bt_run.cut_parity += cut_p; g_bt_run.cut_corner += cut_c;
     g_bt_run.emitted += emitted; g_bt_run.t += dt;
     for (int r = 0; r <= EDGE_LEN; r++) g_bt_run.fill[r] += fill[r];
 
@@ -5405,6 +5458,7 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     if (g_verbose) {
         printf("[dfs] %s roots=%" PRIu64 " emitting=%" PRIu64 " nodes=%" PRIu64
                " cut_parity=%" PRIu64, g_config_id_str, roots, roots_emitting, nodes, cut_p);
+        if (g_corners_on) printf(" cut_corner=%" PRIu64, cut_c);
         printf(" reached");
         for (int r = N + 1; r <= (int)g_stop_row; r++) printf(" r%d:%" PRIu64, r, fill[r]);
         printf(" emitted=%" PRIu64 "%s t=%.2fs\n", emitted, aborted ? " (stopped early)" : "", dt);
@@ -5652,6 +5706,7 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
                g_backtrack_row, g_bt_run.roots, g_bt_run.roots_emitting, g_bt_run.nodes,
                g_bt_run.t > 0 ? (double)g_bt_run.nodes / g_bt_run.t / 1e6 : 0.0,
                g_bt_run.cut_parity);
+        if (g_corners_on) printf(" cut_corner=%" PRIu64, g_bt_run.cut_corner);
         printf(" emitted=%" PRIu64 " time=%.1fs\n", g_bt_run.emitted, g_bt_run.t);
         printf("[sum] backtrack boards completing each row:");
         for (int r = (int)g_backtrack_row + 1; r <= (int)g_stop_row; r++)
@@ -6021,8 +6076,10 @@ static void usage(const char *a0) {
 "                         row, then search every row-N candidate EXHAUSTIVELY, cell by\n"
 "                         cell in row-major order, up to --stop_row: the fixed left\n"
 "                         column, right edges from the border's own pool, clue pins\n"
-"                         enforced and colour parity checked at every row, nothing\n"
-"                         else. EVERY board completing the stop row is\n"
+"                         enforced and colour parity checked at every row; with\n"
+"                         --lambda_corners, a path also ends once the two top\n"
+"                         corners can no longer both be closed (no piece-disjoint\n"
+"                         TL+TR block pair alive). EVERY board completing the stop row is\n"
 "                         emitted (exact duplicates dropped); pair with --max_emitted.\n"
 "                         Not with --learn; --incomplete_top is ignored with a warning\n"
 "  --end_dive [M]         complete every stop-row board (beam or --backtrack_row) to\n"

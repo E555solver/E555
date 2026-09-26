@@ -1964,6 +1964,8 @@ uint8_t tc_config(const LeftOrder *lft, const uint64_t used[4]) {
     return live;
 }
 
+const uint8_t *tc_compat_table(int s) { return s_tc_compat[s & 3]; }
+
 /* u_row: per-thread sums, reduced in a fixed thread order at the end of a row. */
 #define TC_MIN_SAMPLES 64.0
 static double s_tc_acc[TC_MAX_THREADS][8];

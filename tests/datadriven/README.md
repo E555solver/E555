@@ -369,11 +369,35 @@ the same boards is cheap, because the tree dies out within a few rows.
 Nothing past row N is scored or selected. A path ends only when:
 
 - a cell has no fitting piece;
-- a completed row fails the beam's colour-parity test (`parity_ok`).
+- a completed row fails the beam's colour-parity test (`parity_ok`);
+- under `--lambda_corners`, the root or a completed row leaves the two top
+  corners unclosable (the *corner cut*, below).
 
-Nothing else is enforced. The row-13 corner clues and the top-corner blocks
-(`--lambda_corners`) never end a path, so any board that reaches row 12 is
-emitted; `--lambda_corners` only adds its tally to the report. Clue pins the
+**The corner cut.** With `--lambda_corners`, the root and every completed row
+must keep some TL block and some TR block of the board's clue frame alive, with
+the two piece-disjoint. That is the same *joint* test as the stop-row report
+(see *Corner supply*):
+- none of the block's pieces is used;
+- under `--free_edges`, a pair of top-border witnesses is still free;
+- at row 12, the block meets row 12's tops.
+
+So every emitted board has both corners closable, and the report shows 100%
+joint. Each level keeps only its parent's surviving blocks, because a used
+piece never comes back, so the test gets cheaper as the search climbs; the node rate showed no clear
+change in these runs.
+
+Measured on border r16178, width 50,000, 1 thread, with the plain 3-cell blocks
+(`--clue_center --pin_clue 1`, no `--clue_corners`), 6 configurations:
+- without the cut: 95 boards, 69 of them joint;
+- with the cut: exactly those 69 boards, with 3% fewer nodes.
+
+With the clue blocks (`--clue_corners`) the cut is much stronger. On 5 × 15
+configurations of the same border it cut 23 million rows and ran the search 2.4×
+faster. All 11 boards the old search emitted had dead corners, and the cut
+removed every one.
+
+The row-13 corner clues themselves are never pinned, so without
+`--lambda_corners` any board that reaches the stop row is emitted. Clue pins the
 search passes through (the centre clue, when N is below its row) are enforced
 as in the beam: the clue piece on its cell, and the colour it will sit on in
 the row below. **Every** board that completes the stop row is
@@ -396,7 +420,8 @@ bin/E555_beamer_datadriven SEED ROT --clue_center --pin_clue 1 --start_row 4 --n
     about 17 s per configuration.
   - It emitted 104 row-11 boards, from every configuration.
 - **Log.** `--verbose` adds a `[dfs]` line per configuration: roots, roots that
-  emitted, nodes, parity cuts, and boards completing each row. The run
+  emitted, nodes, parity cuts, corner cuts (`cut_corner`, under
+  `--lambda_corners`), and boards completing each row. The run
   summary always carries the totals.
 - **Stopping.** `--time_limit` and Ctrl-C stop the search mid-root. Boards found
   so far are still written, and the `[sweep]` reason says `time` or `interrupted`.
