@@ -127,6 +127,7 @@ static inline uint32_t gen_stop_row(void) { return g_backtrack_row ? g_backtrack
 static uint32_t g_end_dive       = 0;
 static int      g_emit_score     = 450;
 static int      g_end_polish     = -1;    /* --end_polish R; -1 = off */
+static int      g_corner_seeds   = 4;     /* --corner_seeds N; 0 = off */
 static bool     g_emit_score_set = false;
 static uint32_t g_beam_expand     = 4;
 static uint32_t g_beam_expand_row = 7;
@@ -4160,6 +4161,8 @@ typedef struct {
     int      *top_s;
     uint64_t *top_fp;
     int       ntop;
+    uint8_t   seeded;                /* corner seed: 1 = TL, 2 = TR, 3 = both */
+    uint32_t  origin;                /* queue index of the unseeded board it came from */
 } DvRoot;
 
 /* Trace segments: stage-1 arms first, then the stage-2 rounds. */
@@ -4173,6 +4176,7 @@ typedef struct {
     uint64_t seq, fp;
     uint32_t cfg;
     int      score;
+    uint8_t  seeded;
 } DvKeep;
 
 static DvRoot  *g_dv_q = NULL;       /* this configuration's roots */
@@ -4187,11 +4191,16 @@ static struct {
     uint64_t roots, stage2, dives, kept, written, dup;
     uint64_t arm_n, pol_gain, pol_roots;
     uint64_t brk_tl, brk_tr, brk_seam, brk_rest, clean_tl, clean_tr;
+    /* --corner_seeds */
+    uint64_t seed_boards, seed_roots, seed_pairs, seed_wins, seed_ties, seed_losses;
+    int64_t  seed_diff;
+    uint64_t seed_written, sbrk_tl, sbrk_tr, sclean_tl, sclean_tr;
+    int      seed_best, plain_best;
     double   arm_win[DV_NARMS];
     double   arm_sum[DV_NARMS], t, t_s1, t_s2, t_pol;
     int      best;
     uint64_t hist[DV_EDGES + 1];
-} g_dv_run = { .best = -1 };
+} g_dv_run = { .best = -1, .seed_best = -1, .plain_best = -1 };
 
 /* Experiment overrides, read once at start-up (README, environment table). */
 static const char *g_dv_roots_path = NULL;   /* E555_DIVE_ROOTS: replay saved boards */
@@ -4245,6 +4254,138 @@ static inline bool dv_time_up(void) {
     return g_stop || (g_dv_deadline > 0.0 && omp_get_wtime() >= g_dv_deadline);
 }
 
+/* -- Corner-seeded dives (--corner_seeds N) ----------------------------------
+   The dives fill rows 12-15 at random and never aim for the top-corner blocks
+   the corner catalog (--lambda_corners) still holds alive, so a board that
+   reaches the stop row with a corner closable rarely gets it closed. Here each
+   stop-row board with an alive block also gets up to N seeded copies: the
+   block's pieces and one free pair of top-border witnesses are placed on
+   their cells (the clued 2x3 around the row-13 clue, or the 3-cell corner),
+   so that corner is clean by construction, and the copy is dived like any
+   other board. The fixed cells never move, not even in the polish. The
+   unseeded board is dived as well, and the run summary compares the two.
+
+   Cells, TL (TR mirrors the column): clued pid[0] side (14,0), pid[1] side
+   (13,0), pid[2] in_a (14,1), pid[3] in_b (14,2), pid[4] in_c (13,1), w1
+   (15,1), w2 (15,2); unclued pid[0] side (14,0), pid[1] in_a (14,1), w1 (15,1).
+   The TL side cells belong to the configuration's left column, already on the
+   board; the block must name those very pieces. */
+
+#define DV_SEED_OPTS 256
+typedef struct { uint16_t pid[7]; uint8_t rot[7], cell[7]; uint8_t n; } DvSeed;
+
+static void dv_queue_copy(const DvRoot *src, const DvSeed *a, const DvSeed *b, uint8_t mask);
+
+/* Every (alive block, free witness pair) of corner k on board r, in slot s. */
+static int dv_seed_options(const DvRoot *r, int s, int k, const uint64_t used[4],
+                           const uint8_t rtop[PUZZLE_SIDE], bool at12, DvSeed *out) {
+    int nopt = 0;
+    if (at12 && g_tc_clued && rtop[k ? PUZZLE_SIDE - 3 : 2] != g_tc_clue_bottom[s][k]) return 0;
+    for (int i = 0; i < g_tc_live_n[s][k] && nopt < DV_SEED_OPTS; i++) {
+        if (!tc_alive(s, k, i, used, rtop, at12)) continue;
+        const TcBlock *b = &g_tc_blk[s][k][g_tc_live[s][k][i].blk];
+        static const uint8_t RC_CL[5][2] = { {14,0}, {13,0}, {14,1}, {14,2}, {13,1} };
+        static const uint8_t RC_UN[2][2] = { {14,0}, {14,1} };
+        DvSeed sd; sd.n = 0;
+        bool ok = true;
+        for (int q = 0; q < b->n && ok; q++) {
+            const uint8_t *rc = (b->n == 5) ? RC_CL[q] : RC_UN[q];
+            const int col = k ? PUZZLE_SIDE - 1 - rc[1] : rc[1];
+            const int x = rc[0] * PUZZLE_SIDE + col;
+            if (r->base_pid[x] != DV_EMPTY) {          /* the fixed left column */
+                ok = r->base_pid[x] == b->pid[q] && r->base_rot[x] == (b->spin[q] & 3);
+                continue;
+            }
+            if (used_test(used, b->pid[q])) { ok = false; break; }
+            sd.pid[sd.n] = b->pid[q]; sd.rot[sd.n] = b->spin[q] & 3; sd.cell[sd.n] = (uint8_t)x; sd.n++;
+        }
+        if (!ok) continue;
+        const int w1x = (PUZZLE_SIDE - 1) * PUZZLE_SIDE + (k ? PUZZLE_SIDE - 2 : 1);
+        const int w2x = (PUZZLE_SIDE - 1) * PUZZLE_SIDE + (k ? PUZZLE_SIDE - 3 : 2);
+        if (r->base_pid[w1x] != DV_EMPTY || (b->n == 5 && r->base_pid[w2x] != DV_EMPTY)) continue;
+        for (int u = 0; u < b->nwit && nopt < DV_SEED_OPTS; u++) {
+            const uint16_t w[2] = { b->wit[u][0], b->wit[u][1] };
+            if (used_test(used, w[0]) || (w[1] != TC_NO_PIECE && used_test(used, w[1]))) continue;
+            DvSeed o = sd;
+            bool wok = true;
+            for (int j = 0; j < 2 && wok; j++) {
+                if (w[j] == TC_NO_PIECE) continue;
+                int rot = -1;
+                for (int t = 0; t < 4; t++) if (g_dv_or[w[j]][t].top == 0) { rot = t; break; }
+                if (rot < 0) { wok = false; break; }
+                o.pid[o.n] = w[j]; o.rot[o.n] = (uint8_t)rot; o.cell[o.n] = (uint8_t)(j ? w2x : w1x); o.n++;
+            }
+            if (wok) out[nopt++] = o;
+        }
+    }
+    return nopt;
+}
+
+static bool dv_seeds_disjoint(const DvSeed *a, const DvSeed *b) {
+    for (int i = 0; i < a->n; i++)
+        for (int j = 0; j < b->n; j++)
+            if (a->pid[i] == b->pid[j] || a->cell[i] == b->cell[j]) return false;
+    return true;
+}
+
+static void dv_seed_corners(size_t qi) {
+    if (g_corner_seeds <= 0 || !g_corners_on || g_dv_roots_path) return;
+    const DvRoot *r = &g_dv_q[qi];
+    uint64_t used[4] = { 0, 0, 0, 0 };
+    for (int x = 0; x < NUM_PIECES; x++)
+        if (r->base_pid[x] != DV_EMPTY) used_set(used, r->base_pid[x]);
+    uint8_t rtop[PUZZLE_SIDE];
+    for (int c = 0; c < PUZZLE_SIDE; c++) {
+        const int x = (int)g_stop_row * PUZZLE_SIDE + c;
+        rtop[c] = r->base_pid[x] == DV_EMPTY ? 0 : g_dv_or[r->base_pid[x]][r->base_rot[x]].top;
+    }
+    const bool at12 = g_stop_row == (uint32_t)(PUZZLE_SIDE - 4);
+    /* The board's clue frame: the slot whose row-13 TL clue sits on (13,2). */
+    int s = -1;
+    for (int t = 0; t < 4 && s < 0; t++) {
+        if (!(g_tc_slots & (1u << t))) continue;
+        if (!g_tc_clued) { s = t; break; }
+        const int x = (PUZZLE_SIDE - 3) * PUZZLE_SIDE + 2;
+        if (r->base_pid[x] == g_clue[t][3].piece) s = t;
+    }
+    if (s < 0) return;
+    static DvSeed opt[2][DV_SEED_OPTS];            /* queued serially */
+    const int n0 = dv_seed_options(r, s, TC_TL, used, rtop, at12, opt[0]);
+    const int n1 = dv_seed_options(r, s, TC_TR, used, rtop, at12, opt[1]);
+    if (!n0 && !n1) return;
+    g_dv_run.seed_boards++;
+    /* Choose up to N distinct seedings: both corners where a disjoint pair is
+       found, alternating with one corner at a time. Drawn from a stream of the
+       board's own fingerprint, so the choice is reproducible. */
+    RNG rng = rng_for(r->fp, 0xC0u, 0x5EED5u, 0);
+    uint64_t seen[64]; int nseen = 0;
+    const DvRoot parent = *r;                     /* the queue may move */
+    for (int v = 0, tries = 0; v < g_corner_seeds && tries < 8 * g_corner_seeds; tries++) {
+        int a = -1, b = -1;
+        const bool want_both = n0 && n1 && (v % 2 == 0);
+        if (want_both) {
+            a = (int)rng_uniform(&rng, (uint32_t)n0);
+            for (int t = 0; t < 8 && b < 0; t++) {
+                const int c = (int)rng_uniform(&rng, (uint32_t)n1);
+                if (dv_seeds_disjoint(&opt[0][a], &opt[1][c])) b = c;
+            }
+            if (b < 0) continue;
+        } else if (n0 && (!n1 || (v / 2) % 2 == 0)) {
+            a = (int)rng_uniform(&rng, (uint32_t)n0);
+        } else {
+            b = (int)rng_uniform(&rng, (uint32_t)n1);
+        }
+        const uint64_t key = ((uint64_t)(a + 1) << 32) | (uint64_t)(b + 1);
+        bool dup = false;
+        for (int j = 0; j < nseen; j++) if (seen[j] == key) dup = true;
+        if (dup) continue;
+        if (nseen < 64) seen[nseen++] = key;
+        dv_queue_copy(&parent, a >= 0 ? &opt[0][a] : NULL, b >= 0 ? &opt[1][b] : NULL,
+                      (uint8_t)((a >= 0 ? 1 : 0) | (b >= 0 ? 2 : 0)));
+        v++;
+    }
+}
+
 /* Queue one stop-row board, given as the formatted tail format_board_tail
    writes (", pos" x 256, ", rot" x 256). */
 static void dv_queue_tail(const char *tail) {
@@ -4279,6 +4420,33 @@ static void dv_queue_tail(const char *tail) {
     r->seq = g_dv_seq++;
     r->best = -1;
     for (int a = 0; a < DV_NARMS; a++) r->arm_best[a] = -1;
+    r->origin = (uint32_t)(g_dv_qn - 1);
+    dv_seed_corners(g_dv_qn - 1);
+}
+
+static void dv_queue_copy(const DvRoot *src, const DvSeed *a, const DvSeed *b, uint8_t mask) {
+    if (g_dv_qn == g_dv_qcap) {
+        g_dv_qcap = g_dv_qcap ? g_dv_qcap * 2 : 256;
+        g_dv_q = xrealloc(g_dv_q, g_dv_qcap * sizeof *g_dv_q);
+    }
+    DvRoot *r = &g_dv_q[g_dv_qn++];
+    *r = *src;
+    const DvSeed *sd[2] = { a, b };
+    for (int k = 0; k < 2; k++)
+        if (sd[k])
+            for (int j = 0; j < sd[k]->n; j++) {
+                r->base_pid[sd[k]->cell[j]] = sd[k]->pid[j];
+                r->base_rot[sd[k]->cell[j]] = sd[k]->rot[j];
+            }
+    uint64_t h = 14695981039346656037ULL;
+    for (int x = 0; x < NUM_PIECES; x++) {
+        h ^= r->base_pid[x]; h *= 1099511628211ULL;
+        h ^= r->base_rot[x]; h *= 1099511628211ULL;
+    }
+    r->fp = splitmix64(h ^ g_master_seed);
+    r->seq = g_dv_seq++;
+    r->seeded = mask;
+    g_dv_run.seed_roots++;
 }
 
 /* Per-thread workspace. */
@@ -4917,8 +5085,29 @@ static void dv_run_config(void) {
             h ^= kp->rot[x]; h *= 1099511628211ULL;
         }
         kp->fp = h ? h : 1;
-        kp->seq = r->seq; kp->cfg = cfg; kp->score = r->best;
+        kp->seq = r->seq; kp->cfg = cfg; kp->score = r->best; kp->seeded = r->seeded;
         kept++;
+    }
+    /* --corner_seeds: each unseeded board against the best of its seeded
+       copies, which follow it in the queue. */
+    uint64_t c_pairs = 0, c_wins = 0, c_seeded = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (q[i].seeded) {
+            c_seeded++;
+            if (q[i].best > g_dv_run.seed_best) g_dv_run.seed_best = q[i].best;
+            continue;
+        }
+        if (q[i].best > g_dv_run.plain_best) g_dv_run.plain_best = q[i].best;
+        int bs = -1;
+        for (size_t j = i + 1; j < n && q[j].seeded && q[j].origin == q[i].origin; j++)
+            if (q[j].best > bs) bs = q[j].best;
+        if (bs < 0 || q[i].best < 0) continue;
+        c_pairs++; c_wins += bs > q[i].best;
+        g_dv_run.seed_pairs++;
+        g_dv_run.seed_wins += bs > q[i].best;
+        g_dv_run.seed_ties += bs == q[i].best;
+        g_dv_run.seed_losses += bs < q[i].best;
+        g_dv_run.seed_diff += bs - q[i].best;
     }
     const double dt = omp_get_wtime() - t0;
     g_dv_run.roots += n; g_dv_run.stage2 += n_s2; g_dv_run.dives += dives;
@@ -4929,6 +5118,9 @@ static void dv_run_config(void) {
                "kept>=%d:%" PRIu64 " dives=%" PRIu64 " t=%.2fs (t1=%.2f t2=%.2f tpol=%.2f)",
                g_config_id_str, n, s1_best, median, n_s2, best, g_emit_score, kept,
                dives, dt, d_s1, d_s2, d_pol);
+        if (c_seeded)
+            printf(" seeded=%" PRIu64 " (seeded beats plain on %" PRIu64 " of %" PRIu64 " boards)",
+                   c_seeded, c_wins, c_pairs);
         if (g_dv_guided && ns) {
             printf(" arms(mean best)");
             for (int a = 0; a < g_dv_narms; a++) printf(" b%g:%.1f", g_dv_beta[a], arm_sum[a]);
@@ -5005,6 +5197,11 @@ static void dv_break_places(const DvKeep *kp) {
     }
     g_dv_run.brk_tl += tl; g_dv_run.brk_tr += tr;
     g_dv_run.clean_tl += !tl; g_dv_run.clean_tr += !tr;
+    if (kp->seeded) {
+        g_dv_run.seed_written++;
+        g_dv_run.sbrk_tl += tl; g_dv_run.sbrk_tr += tr;
+        g_dv_run.sclean_tl += !tl; g_dv_run.sclean_tr += !tr;
+    }
 }
 
 static void dv_flush(FILE *fp) {
@@ -5746,6 +5943,25 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
                    g_dv_run.brk_tl / W, 100.0 * g_dv_run.clean_tl / W,
                    g_dv_run.brk_tr / W, 100.0 * g_dv_run.clean_tr / W,
                    g_stop_row, g_stop_row + 1, g_dv_run.brk_seam / W, g_dv_run.brk_rest / W);
+            if (g_dv_run.seed_written) {
+                const double S2 = (double)g_dv_run.seed_written;
+                printf("[sum]   of which corner-seeded %" PRIu64 ": TL 4x4 %.2f (%.0f%% clean), "
+                       "TR 4x4 %.2f (%.0f%% clean)\n", g_dv_run.seed_written,
+                       g_dv_run.sbrk_tl / S2, 100.0 * g_dv_run.sclean_tl / S2,
+                       g_dv_run.sbrk_tr / S2, 100.0 * g_dv_run.sclean_tr / S2);
+            }
+        }
+        if (g_corner_seeds > 0 && g_corners_on) {
+            printf("[sum] corner seeds: %" PRIu64 " of %" PRIu64 " stop-row boards had an alive "
+                   "block, %" PRIu64 " seeded copies dived; best seeded %d, best unseeded %d",
+                   g_dv_run.seed_boards, g_dv_run.roots - g_dv_run.seed_roots,
+                   g_dv_run.seed_roots, g_dv_run.seed_best, g_dv_run.plain_best);
+            if (g_dv_run.seed_pairs)
+                printf("; per board, best seeded copy vs unseeded: better %" PRIu64 ", equal %"
+                       PRIu64 ", worse %" PRIu64 ", mean %+.2f edges",
+                       g_dv_run.seed_wins, g_dv_run.seed_ties, g_dv_run.seed_losses,
+                       (double)g_dv_run.seed_diff / (double)g_dv_run.seed_pairs);
+            printf("\n");
         }
         printf("[sum] end dive scores written:");
         int shown = 0;
@@ -6105,6 +6321,11 @@ static void usage(const char *a0) {
 "                         rounds (3 random swaps, re-polish, keep if not worse) over 8\n"
 "                         walks; only boards whose best dive is within 6 of S. 0 =\n"
 "                         polish only. Measured +2..3 edges per board (README)\n"
+"  --corner_seeds N       with --end_dive and --lambda_corners: every stop-row board\n"
+"                         with an alive top-corner block also dives up to N copies\n"
+"                         (default 4, 0 = off) with a block and a free pair of top\n"
+"                         witnesses fixed on their cells, so that corner is clean;\n"
+"                         the unseeded board is dived too and the summary compares\n"
 "  --emit_score S         connected edges (of 480) a dived board needs to be written\n"
 "                         (default 450; only with --end_dive)\n"
 "  --beam_expand E        late-search width multiplier (default 4; 1 = no expansion)\n"
@@ -6294,6 +6515,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_backtrack_row) printf(" --backtrack_row %u", g_backtrack_row);
     if (g_end_dive) printf(" --end_dive %u --emit_score %d", g_end_dive, g_emit_score);
     if (g_end_dive && g_end_polish >= 0) printf(" --end_polish %d", g_end_polish);
+    if (g_end_dive && g_corners_on && g_corner_seeds != 4) printf(" --corner_seeds %d", g_corner_seeds);
     printf(" --beam_expand %u --beam_expand_row %u", g_beam_expand, g_beam_expand_row);
     printf(" --lambda_J %g --lambda_Mahalanobis %g", g_lambda_J, g_lambda_maha);
     if (g_lambda_corners > 0.0) printf(" --lambda_corners %g", g_lambda_corners);
@@ -6521,6 +6743,10 @@ int main(int argc, char *argv[]) {
             }
             if (v < 10 || v > 1000000000L) fatal("--end_dive must be in 10..1000000000");
             g_end_dive = (uint32_t)v;
+        }
+        else if (!strcmp(argv[i], "--corner_seeds") && i+1 < argc) {
+            g_corner_seeds = atoi(argv[++i]);
+            if (g_corner_seeds < 0 || g_corner_seeds > 64) fatal("--corner_seeds must be in 0..64");
         }
         else if (!strcmp(argv[i], "--end_polish") && i+1 < argc) {
             g_end_polish = atoi(argv[++i]);
@@ -6778,6 +7004,11 @@ int main(int argc, char *argv[]) {
             printf("[cfg] end_polish=%d (polish the %d best dives of each board within %d "
                    "of S, then %d kick-and-polish rounds over 8 walks)\n",
                    g_end_polish, DV_POLISH_TOP, DV_POLISH_MARGIN, g_end_polish);
+        if (g_corners_on)
+            printf("[cfg] corner_seeds=%d (%s)\n", g_corner_seeds, g_corner_seeds
+                   ? "each stop-row board with an alive top-corner block also dives up to "
+                     "that many copies with a block and its top witnesses fixed in place"
+                   : "off");
     }
     printf("[cfg] frac_rand=%.2f parent_cap=%u pool_factor=%u\n",
            g_frac_rand, g_parent_cap, g_pool_factor);

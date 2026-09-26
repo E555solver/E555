@@ -29,6 +29,7 @@ Learning and searching are separate invocations of the same binary.
 | `--end_dive [M]` | Search only: complete every stop-row board to 256 pieces with M random dives (default 20000) that allow broken edges, and write the best completion per board, sorted by connected edges. See *Finishing boards with random dives*. |
 | `--emit_score S` | With `--end_dive`: the connected edges (of 480) a dived board needs to be written. Default 450. |
 | `--end_polish R` | With `--end_dive`: hill-climb each board's 16 best dives, then R kick-and-polish rounds. The largest single gain measured. See *Finishing boards with random dives*. |
+| `--corner_seeds N` | With `--end_dive` and `--lambda_corners`: each stop-row board with an alive top-corner block also dives up to N copies (default 4, 0 = off) with the block and its top witnesses fixed in place. See *Corner-seeded dives*. |
 
 Both phases need `--clue_center`, `--pin_clue 1..4`, a rotations file and
 `--num_rows 1`. A table belongs to one seed, one clue frame and one border.
@@ -502,6 +503,50 @@ bin/E555_beamer_datadriven SEED ROT --clue_center --clue_corners --pin_clue 1 \
     --start_row 4 --num_rows 1 --beam_width 250000 --backtrack_row 5 --stop_row 11 \
     --end_dive 10000 --end_polish 20000 --emit_score 452
 ```
+
+**Corner-seeded dives (`--corner_seeds N`).** The dives fill rows 12–15 at
+random and never aim for the corner blocks that `--lambda_corners` kept alive.
+Measured on a real run: the beam and the corner cut left far fewer dead corners
+at row 11, yet the top-left and top-right 4×4 blocks still averaged 4.3–4.9
+breaks per written board, with none clean.
+
+With `--lambda_corners` on, every stop-row board that still has an alive block
+(the test of *Corner supply*, in the board's own clue frame) also gets up to N
+seeded copies (default 4):
+- **What is fixed.** The block's pieces and one free pair of top-border
+  witnesses sit on their cells:
+  - with `--clue_corners`: the 2×3 around the row-13 clue, i.e. sides (14,0)
+    and (13,0), inner (14,1), (14,2) and (13,1), witnesses (15,1) and (15,2);
+  - without: the 3-cell corner (14,0), (14,1), (15,1);
+  - TR mirrors the columns.
+
+  That corner is then clean by construction. The TL side cells are the
+  configuration's own left column, so a TL block must name those very pieces.
+- **Which seedings.** Copies alternate between seeding both corners (a
+  piece-disjoint TL+TR choice) and one corner at a time. They are drawn from the
+  board's own random stream, so they are reproducible, and duplicates are
+  skipped.
+- **How they are dived.** Each copy is dived exactly like any other board:
+  stage 1, stage 2 if it qualifies, polish. The fixed cells never move, not even
+  in the polish.
+- **The unseeded board is dived too.** A board can therefore write more than
+  one completion.
+
+A board with no alive block is dived as before. More boards per configuration
+also spread the dives over more threads, which helps when the corner cut leaves
+only a few boards.
+
+**What it reports.**
+- `[dive]` lines add `seeded=` and how many boards the seeded copies beat.
+- The run summary adds a `corner seeds` line:
+  - how many boards had an alive block, and how many copies were dived;
+  - the best seeded and best unseeded score;
+  - per board, the best seeded copy against the unseeded dive (better, equal,
+    worse, mean difference).
+- It also adds the corner breaks of the written seeded boards alone.
+
+Replayed boards (`E555_DIVE_ROOTS`) are never seeded, because the catalog's live
+lists belong to the configuration being searched.
 
 **Learning dives.** The dive never overrides its safety order (fewest breaks,
 fewest stranded cells). A weight `w(p,x)` per piece and open cell acts only
