@@ -85,7 +85,6 @@
 #include <math.h>
 #include <omp.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -184,27 +183,6 @@ static const LeftOrder   *g_cur_left   = NULL;
 /* Wide enough that snprintf cannot truncate the longest id the sweep can build
    ("r<row>b<bottom>#<lap>l<column>"), which -Wformat-truncation checks. */
 static char     g_config_id_str[96] = "c0";
-
-/* --backtrack_beam: the backtracker's roots are the row N-1 BEAM itself, so row
-   N is searched exhaustively too (no per-parent quota on the root row). */
-static bool     g_backtrack_beam   = false;
-
-/* E555_TRACE=DIR: lineage trace for studying what the beam's selection keeps.
-   beam.csv    every selected beam board: row, index, parent index one row down,
-               rank in the row's ranked unique pool, pool size, the band that
-               selected it (0 clue floor, 1 score, 2 random, 3 fill, 4 unpruned),
-               the ranking score and its raw parts (log fan-out, lambda_J*closure,
-               d2n before normalisation)
-   roots.csv   per backtracker root: nodes and boards completing each row
-   nodes.csv   backtracker boards completing rows N+1..stop: a 1-in-S sample
-               (E555_TRACE_SAMPLE, default 16) with the number of stop-row
-               boards found below each (kind 0), plus every level of every
-               stop-row board's path (kind 1)
-   Off unless the variable is set; nothing else changes. */
-static FILE    *g_tr_beam = NULL, *g_tr_roots = NULL, *g_tr_nodes = NULL;
-static uint32_t g_tr_sample = 16;
-static uint8_t *g_tr_band = NULL;         /* select_beam: band of sel[i] */
-static uint32_t g_tr_band_cap = 0;
 
 /* Exact-board dedup table (open addressing, power of two). Learning uses it
    before counting; search uses it only while writing the complete stop row.
@@ -3577,14 +3555,7 @@ static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t beam_n,
                             uint32_t target_K, uint32_t cap, double frac_rand_now,
                             RNG *rng) {
     const uint32_t K = target_K;
-    if (kept <= K) {
-        for (uint32_t i = 0; i < kept; i++) {
-            ctx->sel[i] = i;
-            if (g_tr_band) g_tr_band[i] = 4;
-        }
-        return kept;
-    }
-#define SEL_BAND(b_) do { if (g_tr_band) g_tr_band[n_sel] = (uint8_t)(b_); } while (0)
+    if (kept <= K) { for (uint32_t i = 0; i < kept; i++) ctx->sel[i] = i; return kept; }
     memset(ctx->taken, 0, kept);
     memset(ctx->offspring, 0, (size_t)beam_n*sizeof(uint32_t));
     uint32_t n_sel = 0, got = 0;
@@ -3608,7 +3579,6 @@ static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t beam_n,
                 if ((pe->flags & FLAG_ORIENT_MASK) != (uint8_t)o) continue;
                 if (cap && ctx->offspring[pe->parent] >= cap) continue;
                 ctx->offspring[pe->parent]++;
-                SEL_BAND(0);
                 ctx->taken[i] = 1; ctx->sel[n_sel++] = i; got_o++;
             }
         }
@@ -3622,22 +3592,19 @@ static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t beam_n,
     for (uint32_t i = 0; i < kept && got < k_top; i++) {
         uint32_t par = ctx->pool[ctx->keep[i]].parent;
         if (cap && ctx->offspring[par] >= cap) continue;
-        ctx->offspring[par]++; SEL_BAND(1); ctx->taken[i] = 1; ctx->sel[n_sel++] = i; got++;
+        ctx->offspring[par]++; ctx->taken[i] = 1; ctx->sel[n_sel++] = i; got++;
     }
     got = 0;
     uint64_t draws = (uint64_t)k_rand*32 + 1024;
     while (got < k_rand && draws-- > 0) {
         uint32_t i = rng_uniform(rng, kept);
         if (ctx->taken[i]) continue;
-        SEL_BAND(2);
         ctx->taken[i] = 1; ctx->sel[n_sel++] = i; got++;
     }
     for (uint32_t i = 0; i < kept && n_sel < K; i++) {
         if (ctx->taken[i]) continue;
-        SEL_BAND(3);
         ctx->taken[i] = 1; ctx->sel[n_sel++] = i;
     }
-#undef SEL_BAND
     return n_sel;
 }
 
@@ -5382,48 +5349,7 @@ typedef struct {
     uint64_t *fp;                         /* exact-board fingerprint */
     uint8_t  *cc;                         /* corner code (--lambda_corners) */
     uint32_t  n, ncap;
-    /* E555_TRACE: this root's nodes.csv lines, and its counts. */
-    char     *tb; size_t tlen, tcap;
-    uint64_t  tr_nodes, tr_fill[EDGE_LEN + 1];
 } BtOut;
-
-/* -- E555_TRACE: the score parts of a board, without the side effects -------- */
-
-/* score_child's log fan-out for a board with `row` committed; NAN where its
-   lookahead would reject the board. */
-static double trace_fanout(const BeamEntry *t, int row) {
-    const uint8_t *rt = t->rtop;
-    if (row + 1 >= PUZZLE_SIDE) return NAN;
-    for (int c = 1; c <= EDGE_LEN; c++) if (!color_is_inner(rt[c])) return NAN;
-    if (!color_is_edge_iface(rt[15])) return NAN;
-    int la = g_cur_left->right[row + 1];
-    if (!color_is_inner(la)) return NAN;
-    const Cell *cA = g_db[INNER_IDX(la)][INNER_IDX(rt[1])][INNER_IDX(rt[2])]
-                         [INNER_IDX(rt[3])][INNER_IDX(rt[4])][rt[5]];
-    if (!cA) return NAN;
-    uint64_t fB = db_seg_fanout(rt[6], rt[7], rt[8], rt[9], rt[10]);
-    uint64_t fC = db_seg_fanout(rt[11], rt[12], rt[13], rt[14], rt[15]);
-    if (!fB || !fC) return NAN;
-    return log((double)cA->n * (1.0 + (double)fB) * (1.0 + (double)fC));
-}
-
-static void trace_put(BtOut *o, const char *fmt, ...) {
-    if (o->tlen + 256 > o->tcap) {
-        o->tcap = o->tcap ? o->tcap * 2 : 1u << 16;
-        o->tb = xrealloc(o->tb, o->tcap);
-    }
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(o->tb + o->tlen, o->tcap - o->tlen, fmt, ap);
-    va_end(ap);
-    if (n > 0) o->tlen += (size_t)n;
-}
-
-static void trace_node_line(BtOut *o, uint32_t root, int kind, int row,
-                            const BeamEntry *t, uint64_t desc) {
-    trace_put(o, "%s,%u,%d,%d,%.5f,%.5f,%.5f,%" PRIu64 "\n", g_config_id_str, root, kind, row,
-              trace_fanout(t, row), g_lambda_J * closure_raw(t), maha_d2n(t, row), desc);
-}
 
 typedef struct {
     BeamEntry lvl[EDGE_LEN + 1];          /* lvl[r]: the board with row r committed */
@@ -5433,8 +5359,6 @@ typedef struct {
     uint16_t  pin_val[EDGE_LEN + 1][PUZZLE_SIDE];
     uint8_t   flags[EDGE_LEN + 1];        /* orientation tag row r commits with */
     uint64_t  nodes, fill[EDGE_LEN + 1], cut_parity, cut_corner;
-    uint64_t  tr_rng;                     /* E555_TRACE node sampling */
-    uint32_t  tr_root;
     /* --lambda_corners: alive live-block indices per level, slot and corner. */
     uint16_t  cn[EDGE_LEN + 1][4][2];
     uint16_t  cl[EDGE_LEN + 1][4][2][TC_MAX_BLOCKS];
@@ -5519,22 +5443,7 @@ static void bt_close_row(BtCtx *x, int row) {
     if (!parity_ok(t)) { x->cut_parity++; return; }
     if (g_corners_on && !bt_corners_ok(x, row, t)) { x->cut_corner++; return; }
     x->fill[row]++;
-    if ((uint32_t)row == g_stop_row) {
-        bt_out_push(x->out, x, row);
-        if (g_tr_nodes)
-            for (int r = x->root_row + 1; r <= row; r++)
-                trace_node_line(x->out, x->tr_root, 1, r, &x->lvl[r], 1);
-        return;
-    }
-    if (g_tr_nodes) {
-        x->tr_rng = splitmix64(x->tr_rng);
-        if (x->tr_rng % g_tr_sample == 0) {
-            const uint32_t before = x->out->n;
-            bt_row(x, row + 1);
-            trace_node_line(x->out, x->tr_root, 0, row, t, x->out->n - before);
-            return;
-        }
-    }
+    if ((uint32_t)row == g_stop_row) { bt_out_push(x->out, x, row); return; }
     bt_row(x, row + 1);
 }
 
@@ -5646,10 +5555,9 @@ static void bt_row(BtCtx *x, int row) {
 }
 
 /* Search every row-N candidate (ctx->keep[0..kept), rank order) to the stop row
-   and emit what completes it. Fills in the configuration's result. With
-   from_beam the roots are instead beam[0..kept), boards with row N committed. */
+   and emit what completes it. Fills in the configuration's result. */
 static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
-                           int N, double deadline, BeamResult *res, bool from_beam) {
+                           int N, double deadline, BeamResult *res) {
     const int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
     if (g_bt_nctx < nt) {
         g_bt_ctx = xrealloc(g_bt_ctx, (size_t)nt * sizeof *g_bt_ctx);
@@ -5685,33 +5593,18 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
         for (uint32_t k = 0; k < tile; k++) {
             BtCtx *x = g_bt_ctx[omp_get_thread_num()];
             BtOut *o = &outs[k];
-            o->n = 0; o->len = 0; o->tlen = 0; o->tr_nodes = 0;
-            memset(o->tr_fill, 0, sizeof o->tr_fill);
+            o->n = 0; o->len = 0;
             if (x->abort) continue;
+            const PoolEntry *pe = &ctx->pool[ctx->keep[base + k]];
+            collect_rows(ctx, &beam[pe->parent], x->rows);
+            x->rows[N] = pe->mv;
             BeamEntry *r = &x->lvl[N];
-            if (from_beam) {
-                collect_rows(ctx, &beam[base + k], x->rows);
-                *r = beam[base + k];
-            } else {
-                const PoolEntry *pe = &ctx->pool[ctx->keep[base + k]];
-                collect_rows(ctx, &beam[pe->parent], x->rows);
-                x->rows[N] = pe->mv;
-                *r = beam[pe->parent];
-                commit_row(r, N, &pe->mv);
-                r->depth = (uint16_t)N; r->flags = pe->flags;
-            }
+            *r = beam[pe->parent];
+            commit_row(r, N, &pe->mv);
+            r->depth = (uint16_t)N; r->flags = pe->flags;
             x->out = o; x->deadline = deadline; x->root_row = N;
-            x->tr_root = base + k;
-            x->tr_rng = splitmix64(((uint64_t)(base + k) << 20) ^ (uint64_t)N ^ 0x7ACEull);
-            const uint64_t nodes0 = x->nodes;
-            uint64_t fill0[EDGE_LEN + 1];
-            if (g_tr_roots) memcpy(fill0, x->fill, sizeof fill0);
             if (g_corners_on && !bt_corners_ok(x, N, r)) { x->cut_corner++; continue; }
             bt_row(x, N + 1);
-            if (g_tr_roots) {
-                o->tr_nodes = x->nodes - nodes0;
-                for (int q = 0; q <= EDGE_LEN; q++) o->tr_fill[q] = x->fill[q] - fill0[q];
-            }
         }
         for (int t = 0; t < nt; t++) {
             BtCtx *x = g_bt_ctx[t];
@@ -5726,13 +5619,6 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
             const BtOut *o = &outs[k];
             roots++;
             if (o->n) roots_emitting++;
-            if (g_tr_roots) {
-                fprintf(g_tr_roots, "%s,%u,%" PRIu64, g_config_id_str, base + k, o->tr_nodes);
-                for (int q = N + 1; q <= (int)g_stop_row; q++)
-                    fprintf(g_tr_roots, ",%" PRIu64, o->tr_fill[q]);
-                fputc('\n', g_tr_roots);
-            }
-            if (g_tr_nodes && o->tlen) fwrite(o->tb, 1, o->tlen, g_tr_nodes);
             for (uint32_t i = 0; i < o->n; i++) {
                 if (!htable_insert(o->fp[i])) continue;
                 const size_t end = (i + 1 < o->n) ? o->off[i + 1] : o->len;
@@ -5745,7 +5631,6 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     }
     for (uint32_t k = 0; k < tile_n; k++) {
         free(outs[k].buf); free(outs[k].off); free(outs[k].fp); free(outs[k].cc);
-        free(outs[k].tb);
     }
     free(outs);
 
@@ -5844,7 +5729,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
                 fflush(stdout);
             }
             double t0 = omp_get_wtime();
-            backtrack_emit(ctx, cur, kept, row, deadline, &res, false);
+            backtrack_emit(ctx, cur, kept, row, deadline, &res);
             g_stats.t_emit += omp_get_wtime() - t0;
             partials_budget_spent();
             break;
@@ -5871,10 +5756,6 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         RNG sel_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFFu, 1u);
         uint32_t eff_K = beam_eff_K(row);
         g_beam_unpruned = (kept <= eff_K);
-        if (g_tr_beam && g_tr_band_cap < eff_K) {
-            g_tr_band = xrealloc(g_tr_band, eff_K);
-            g_tr_band_cap = eff_K;
-        }
         uint32_t n_sel = select_beam(ctx, kept, beam_n, eff_K,
                                      parent_cap_eff(row), g_frac_rand, &sel_rng);
         g_stats.row_selected[row] += n_sel;
@@ -5892,23 +5773,6 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
                    g_config_id_str, row, pool_n, kept, beam_n, eff_K,
                    (double)ctx->pool[ctx->keep[0]].score, dt, (double)pool_n/dt/1e3);
             fflush(stdout);
-        }
-        if (g_tr_beam) {
-            for (uint32_t i = 0; i < beam_n; i++) {
-                const BeamEntry *b = &cur[i];
-                fprintf(g_tr_beam, "%s,%d,%u,%u,%u,%u,%u,%.5f,%.5f,%.5f,%.5f\n",
-                        g_config_id_str, row, i, ctx->log[row][i].parent_log, ctx->sel[i],
-                        kept, g_tr_band ? g_tr_band[i] : 9u,
-                        (double)ctx->pool[ctx->keep[ctx->sel[i]]].score,
-                        trace_fanout(b, row), g_lambda_J * closure_raw(b), maha_d2n(b, row));
-            }
-        }
-        if (g_backtrack_beam && (uint32_t)row + 1 == g_backtrack_row) {
-            double t0 = omp_get_wtime();
-            backtrack_emit(ctx, cur, beam_n, row, deadline, &res, true);
-            g_stats.t_emit += omp_get_wtime() - t0;
-            partials_budget_spent();
-            break;
         }
     }
     return res;
@@ -6041,14 +5905,13 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
     if (g_backtrack_row && g_bt_run.roots) {
         printf("[sum] backtrack from row %u: roots=%" PRIu64 " emitting=%" PRIu64
                " nodes=%" PRIu64 " (%.1f Mnodes/s) cut_parity=%" PRIu64,
-               g_backtrack_row - (g_backtrack_beam ? 1u : 0u),
-               g_bt_run.roots, g_bt_run.roots_emitting, g_bt_run.nodes,
+               g_backtrack_row, g_bt_run.roots, g_bt_run.roots_emitting, g_bt_run.nodes,
                g_bt_run.t > 0 ? (double)g_bt_run.nodes / g_bt_run.t / 1e6 : 0.0,
                g_bt_run.cut_parity);
         if (g_corners_on) printf(" cut_corner=%" PRIu64, g_bt_run.cut_corner);
         printf(" emitted=%" PRIu64 " time=%.1fs\n", g_bt_run.emitted, g_bt_run.t);
         printf("[sum] backtrack boards completing each row:");
-        for (int r = (int)g_backtrack_row + (g_backtrack_beam ? 0 : 1); r <= (int)g_stop_row; r++)
+        for (int r = (int)g_backtrack_row + 1; r <= (int)g_stop_row; r++)
             printf("  r%d:%" PRIu64, r, g_bt_run.fill[r]);
         printf("\n");
     }
@@ -6440,9 +6303,6 @@ static void usage(const char *a0) {
 "                         EVERY board completing the stop row is\n"
 "                         emitted (exact duplicates dropped); pair with --max_emitted.\n"
 "                         Not with --learn; --incomplete_top is ignored with a warning\n"
-"  --backtrack_beam       with --backtrack_row N: the roots are the row N-1 beam\n"
-"                         itself, so row N is searched exhaustively as well\n"
-"                         (no per-parent quota on the root row).\n"
 "  --end_dive [M]         complete every stop-row board (beam or --backtrack_row) to\n"
 "                         256 pieces with greedy random dives that allow broken edges\n"
 "                         (the backtracker's stuck mode: MRV, minimal breaks, LCV):\n"
@@ -6653,7 +6513,6 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_db_file) printf(" --db_file %s", g_db_file);
     printf(" --beam_width %u --stop_row %u", g_beam_width, g_stop_row);
     if (g_backtrack_row) printf(" --backtrack_row %u", g_backtrack_row);
-    if (g_backtrack_beam) printf(" --backtrack_beam");
     if (g_end_dive) printf(" --end_dive %u --emit_score %d", g_end_dive, g_emit_score);
     if (g_end_dive && g_end_polish >= 0) printf(" --end_polish %d", g_end_polish);
     if (g_end_dive && g_corners_on && g_corner_seeds != 4) printf(" --corner_seeds %d", g_corner_seeds);
@@ -6869,7 +6728,6 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--free_edges"))                g_free_edges = true;
         else if (!strcmp(argv[i], "--beam_width")  && i+1 < argc) g_beam_width = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--stop_row")    && i+1 < argc) g_stop_row = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--backtrack_beam"))           g_backtrack_beam = true;
         else if (!strcmp(argv[i], "--backtrack_row") && i+1 < argc) {
             int v = atoi(argv[++i]);
             g_backtrack_row = v > 0 ? (uint32_t)v : 0; g_backtrack_row_set = true;
@@ -6996,8 +6854,6 @@ int main(int argc, char *argv[]) {
     if (g_beam_expand_row < 2) fatal("--beam_expand_row must be >= 2");
     if (g_stop_row == 0 || g_stop_row > (uint32_t)MAX_DRILL_DEPTH)
         fatal("--stop_row must be in 1..%d (rows 14-15 belong to Stage C)", MAX_DRILL_DEPTH);
-    if (g_backtrack_beam && (!g_backtrack_row_set || g_backtrack_row < 2))
-        fatal("--backtrack_beam needs --backtrack_row 2 or above");
     if (g_backtrack_row_set) {
         if (g_backtrack_row == 0 || g_backtrack_row >= g_stop_row)
             fatal("--backtrack_row must be in 1..%u (below --stop_row %u)",
@@ -7134,11 +6990,7 @@ int main(int argc, char *argv[]) {
            g_fixed_corner_pid[2], g_fixed_corner_pid[3]);
     printf("[cfg] beam_width=%u stop_row=%u expand=%ux@row%u\n",
            g_beam_width, g_stop_row, g_beam_expand, g_beam_expand_row);
-    if (g_backtrack_row && g_backtrack_beam)
-        printf("[cfg] backtrack_row=%u backtrack_beam (beam through row %u, then an exhaustive "
-               "row-major search from every row-%u beam board to row %u)\n",
-               g_backtrack_row, g_backtrack_row - 1, g_backtrack_row - 1, g_stop_row);
-    else if (g_backtrack_row)
+    if (g_backtrack_row)
         printf("[cfg] backtrack_row=%u (beam through row %u, then an exhaustive "
                "row-major search of every row-%u candidate to row %u)\n",
                g_backtrack_row, g_backtrack_row, g_backtrack_row, g_stop_row);
@@ -7205,28 +7057,6 @@ int main(int argc, char *argv[]) {
 
     double t_start = omp_get_wtime();
     ensure_dir(g_out_dir);
-    {
-        const char *td = getenv("E555_TRACE"), *ts = getenv("E555_TRACE_SAMPLE");
-        if (td && *td) {
-            ensure_dir(td);
-            char path[4096];
-            snprintf(path, sizeof path, "%s/beam.csv", td);
-            if (!(g_tr_beam = fopen(path, "w"))) fatal("cannot write %s", path);
-            snprintf(path, sizeof path, "%s/roots.csv", td);
-            if (!(g_tr_roots = fopen(path, "w"))) fatal("cannot write %s", path);
-            snprintf(path, sizeof path, "%s/nodes.csv", td);
-            if (!(g_tr_nodes = fopen(path, "w"))) fatal("cannot write %s", path);
-            if (ts && atoi(ts) > 0) g_tr_sample = (uint32_t)atoi(ts);
-            fprintf(g_tr_beam, "cfg,row,idx,parent,rank,uniq,band,score,fan,clo,d2n\n");
-            fprintf(g_tr_roots, "cfg,root,nodes");
-            for (uint32_t q = (g_backtrack_beam ? g_backtrack_row : g_backtrack_row + 1);
-                 g_backtrack_row && q <= g_stop_row; q++)
-                fprintf(g_tr_roots, ",f%u", q);
-            fputc('\n', g_tr_roots);
-            fprintf(g_tr_nodes, "cfg,root,kind,row,fan,clo,d2n,desc\n");
-            printf("[cfg] E555_TRACE=%s (node sample 1/%u)\n", td, g_tr_sample);
-        }
-    }
     load_seed_and_catalog(seed_path);
     build_catalog_indices();
     build_inner_color_totals();
