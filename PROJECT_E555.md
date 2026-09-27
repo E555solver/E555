@@ -1206,8 +1206,9 @@ cell. The score is matched edges out of 480.
    16 best distinct dives hill-climbed -- the best re-rotation of one piece or
    swap of two (each with its best frame-legal spins), repeated until no move
    adds an edge -- and the 8 best distinct results then start 8 kick-and-polish
-   walks that share `R` rounds: 3 random swaps, a re-polish of just the cells
-   whose surroundings changed, and the result kept if it is not worse.
+   walks that share `R` rounds: 3 random swaps (the first cell of each drawn
+   from the cells with a broken edge), a re-polish of just the cells whose
+   surroundings changed, and the result kept if it is not worse.
    `R = 0` polishes only.
 
 Boards whose best reaches `S` are written **after each configuration** -- a killed
@@ -1235,15 +1236,19 @@ threads:
 | `--end_dive 2000` | 449.3 | 453 | 4 | 2 s |
 | `--end_dive 10000` | 450.5 | 455 | 9 | 8 s |
 | `--end_dive 50000` | 451.1 | 453 | 12 | 46 s |
-| `--end_dive 10000 --end_polish 5000` | 454.4 | 457 | 35 | 17 s |
-| `--end_dive 10000 --end_polish 20000` | **454.9** | **457** | **35** | 29 s |
+| `--end_dive 10000 --end_polish 5000` | 454.6 | 457 | 35 | 17 s |
+| `--end_dive 10000 --end_polish 20000` | **454.8** | **457** | **35** | 29 s |
 
 Polish is the largest single gain: `--end_dive 10000 --end_polish 20000` beat
-`--end_dive 50000` on every one of the 35 boards, by 3.8 edges on average, in
+`--end_dive 50000` on every one of the 35 boards, by 3.7 edges on average, in
 less time. Past about 10000 dives, time is better spent on kick rounds than on
 more dives. Earlier runs on 97 row-11 boards of another border agree: the
 learning rounds add about 1.5 edges per board over the same number of plain
 dives, and plain dives gain under 1 edge per tenfold more of them.
+Aiming each kick's first swap cell at a broken edge, rather than at any open
+cell, gained 0.08 edges per board over uniform kicks (113 boards better, 82
+worse, over 177 boards and several seeds and budgets) at the same cost; running
+16 walks instead of 8 on the same rounds did not help.
 
 **Parallelism and determinism.** The stages run as jobs on one queue shared by
 all threads: blocks of 32 dives, each learning round split the same way (the
