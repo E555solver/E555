@@ -148,6 +148,17 @@ produced the file, and the run cannot come back worse than what you handed it.
 Prefer more `--steps` to more `--restarts` here: the restarts share a starting
 point, so extra ones buy less than extra depth does.
 
+Leave `--row` out and the whole pool is refined, one row back per input row, in
+the same order, with each row's per-side trail gains printed as it finishes:
+
+```bash
+python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
+    --input rotations.csv --restarts 2 --steps 500000    # -> rotations_refined.csv
+```
+
+Without `--out` the annealer always picks a file for you: `FILE_refined.csv`
+beside the `--input`, or `rotations.csv` for a run from scratch.
+
 **`STEPS` has a floor of 250000.** Below it the annealer is not merely weaker --
 it often fails to place a legal border at all. Measured on the real seed: 8
 restarts x 3000 steps found 2 feasible borders, and 2 x 2000 returned one border

@@ -53,6 +53,18 @@ WARM START -- refining a border you already have
     is itself eligible to be the restart's best, so a refinement hands back
     that row or something better than it.
 
+    --input FILE without --row refines EVERY row of the file, and writes one
+    row back per input row, in input order: each row gets --restarts restarts
+    and only its best is kept. The (row, restart) jobs share one worker pool,
+    so --restarts 1 is one worker per row. Every row is checked, and its
+    schedule probed, in the parent before any restart runs, and each row is
+    run exactly as `--row N` would run it -- same seeds, same schedule -- so
+    any row of the result can be reproduced on its own with --row N and the
+    same --rng_seed. stdout gets one line per row, with the score and every
+    side's trail count before and after:
+
+        row  3  polish  score=    9.2658 ->    10.4890 (+1.2232)  TOP 483840->483840 (+0)  ...
+
 TEMPERATURE
 
     --T0/--Tf are resolved from the starting state unless given explicitly,
@@ -78,12 +90,18 @@ TEMPERATURE
 
 OUTPUT
 
-    With --out FILE, every restart's best border is appended to a rotations
-    CSV that Stage B reads directly: one `#` comment line with the per-side
-    trail counts, then `id, spin[0..255]` (the 60 border spins from the
-    search, zeros for the 196 inner pieces). That file is the deliverable and
-    is written in both output modes. A warm run adds `From=<file>:row<N>` to
-    each comment, so a refined pool still says what it was refined from.
+    Every restart's best border -- every row's best, when a whole file is
+    refined -- is appended to a rotations CSV that Stage B reads directly:
+    one `#` comment line with the per-side trail counts, then
+    `id, spin[0..255]` (the 60 border spins from the search, zeros for the
+    196 inner pieces). That file is the deliverable and is written in both
+    output modes. A warm run adds `From=<file>:row<N>` to each comment, so a
+    refined pool still says what it was refined from.
+
+    --out names the file. Without it the borders go to <stem>_refined.csv
+    beside the --input file, or to rotations.csv in the current directory on
+    a cold run -- there is always a file. (A run without --out used to print
+    its borders nowhere outside --verbose, and so lose every one of them.)
 
     On stdout the default is one line per restart -- score, the four trail
     counts, the step the best was found at, and the time:
@@ -103,7 +121,9 @@ PARALLELISM
     and the GIL would serialize it anyway). --threads 0, the default, uses
     every core. Each restart derives its own RNG seed from --rng_seed and its
     own index, so THE THREAD COUNT NEVER CHANGES THE RESULT, and the parent
-    emits every restart in restart order however the workers finish.
+    emits every restart in restart order however the workers finish. When a
+    whole file is refined the jobs are (row, restart) pairs, and the parent
+    writes each row once all its restarts are in, in input order.
 
 USAGE
 
@@ -114,6 +134,11 @@ USAGE
     # refine the row you liked out of that pool
     python3 -u E555_edge_annealer.py seed_Edge5.txt --out refined.csv \
       --input rotations.csv --row 3 --restarts 8 --steps 500000
+
+    # or refine every row of it, one output row per input row, in order
+    # (no --out: this writes rotations_refined.csv)
+    python3 -u E555_edge_annealer.py seed_Edge5.txt \
+      --input rotations.csv --restarts 2 --steps 500000 --threads 8
 
     # shape it instead: one rich side, three starved
     python3 -u E555_edge_annealer.py seed_Edge5.txt --out rotations.csv \
@@ -135,7 +160,7 @@ import re
 import time
 import random
 from collections import Counter, defaultdict, deque
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import CancelledError, ProcessPoolExecutor
 from dataclasses import dataclass, field, asdict, replace
 from enum import IntEnum
 from math import factorial
@@ -381,6 +406,21 @@ class RestartResult:
     best:    Optional[BestRecord]   # None = no feasible border found
     log:     List[str]
     elapsed: float
+    warning: Optional[str] = None   # the freeze warning, when the log has one
+
+@dataclass
+class RowPlan:
+    """One --input row of a whole-file refinement, settled in the parent
+    before any restart runs: the config its restarts get (its spins, its own
+    T0/Tf) and what its stdout line compares the result against."""
+    row:      int
+    lineno:   int
+    config:   AnnealingConfig
+    start:    Dict[Side, int]       # the row's own trail counts
+    baseline: Optional[float]       # its score now; None = not a usable border
+    kind:     str                   # "polish" or "search"
+    checked:  bool                  # its comment carried counts to verify
+    header:   List[str]             # warm start + schedule lines, for --verbose
 
 # =============================================================================
 # Mutable hot state (maintained incrementally)
@@ -1025,8 +1065,8 @@ def resolve_schedule(config: AnnealingConfig, state: RunState,
                      pieces_by_id: Dict[int, Piece], edge_ids: List[int],
                      inner_capacity: Counter, rng: random.Random,
                      t0_given: Optional[float],
-                     tf_given: Optional[float]) -> Tuple[float, float, List[str]]:
-    """(T0, Tf, lines for the header) for this run.
+                     tf_given: Optional[float]) -> Tuple[float, float, List[str], str]:
+    """(T0, Tf, lines for the header, "polish" or "search") for this run.
 
     Two schedules, ~50x apart, and which one is wanted does NOT follow from the
     scoring mode -- it follows from how far the starting border already sits
@@ -1058,7 +1098,9 @@ def resolve_schedule(config: AnnealingConfig, state: RunState,
     Decided ONCE, here in the parent, so the header, every restart and the
     --out marker all report the numbers the run actually used."""
     probe = probe_move_scale(state, pieces_by_id, edge_ids, inner_capacity, config, rng)
+    kind = "search"
     if probe.sigma is not None and probe.improving_fraction <= POLISH_FRACTION:
+        kind = "polish"
         t0 = POLISH_T0_PER_SIGMA * probe.sigma
         tf = t0 / POLISH_TF_RATIO
         why = (f"polishing: only {probe.improving}/{probe.feasible} feasible moves "
@@ -1080,7 +1122,7 @@ def resolve_schedule(config: AnnealingConfig, state: RunState,
         tf = tf if tf_given is None else tf_given
         lines.append("[cfg] schedule: overridden on the command line")
     lines.append(f"[cfg] schedule: T0={t0:g} Tf={tf:g}")
-    return t0, tf, lines
+    return t0, tf, lines, kind
 
 # =============================================================================
 # Rotation-vector computation (for output)
@@ -1160,7 +1202,26 @@ def best_line(restart: int, rec: BestRecord) -> str:
     return (f"BEST,Restart,{restart},Step,{rec.step},Score,{rec.score:.4f},"
             f"{best_counts_str(rec)},Rot,{','.join(map(str, rec.rot_vec))}")
 
-def append_rotations(restart: int, rec: BestRecord, out_path: str,
+def row_delta_str(plan: RowPlan, best: Optional[BestRecord], elapsed: float,
+                  width: int) -> str:
+    """A whole-file refinement's one line per row: the score and every side's
+    trail count before and after, so what the refinement bought shows side by
+    side. The rotations CSV gets no such note -- its comment keeps the one
+    form every reader of it parses."""
+    head = f"  row {plan.row:>{width}}  {plan.kind}"
+    if best is None:
+        return f"{head}  no feasible border found, nothing written  ({elapsed:.1f}s)"
+    if plan.baseline is None:
+        score = f"score={'infeasible':>10} -> {best.score:10.4f}"
+    else:
+        score = (f"score={plan.baseline:10.4f} -> {best.score:10.4f}"
+                 f" ({best.score - plan.baseline:+.4f})")
+    sides = "  ".join(
+        f"{SIDE_NAMES[s]} {plan.start[s]}->{best.euler_counts[s]}"
+        f" ({best.euler_counts[s] - plan.start[s]:+d})" for s in Side)
+    return f"{head}  {score}  {sides}  {elapsed:5.1f}s"
+
+def append_rotations(row_id: str, rec: BestRecord, out_path: str,
                      provenance: str = "") -> None:
     """Append a Stage-B-readable rotations row -- the 60 border spins padded
     with zeros to the full 256-spin vector -- under a `#` comment carrying
@@ -1174,15 +1235,20 @@ def append_rotations(restart: int, rec: BestRecord, out_path: str,
     with open(out_path, "a") as f:
         f.write(f"#  {best_counts_str(rec).replace(',', ' ')}  "
                 f"Score={rec.score:.4f}{provenance}\n")
-        f.write(f"r{restart}, " + ",".join(map(str, full)) + "\n")
+        f.write(f"{row_id}, " + ",".join(map(str, full)) + "\n")
 
 def print_header(pieces: Sequence[Piece], corner_ids: List[int], edge_ids: List[int],
-                 config: AnnealingConfig, extra: Sequence[str] = ()) -> None:
+                 config: AnnealingConfig, extra: Sequence[str] = (),
+                 per_row: bool = False) -> None:
+    """`per_row`: a whole-file refinement, where the spins and T0/Tf belong to
+    each row rather than to the run, and are reported with the rows."""
     print("\n=== E555 edge_annealer ===\n")
 
     if config.verbose:
         for k, v in asdict(config).items():
-            if k == "start_spins" and v is not None:
+            if per_row and k in ("T0", "Tf", "start_spins"):
+                v = "<per row>"
+            elif k == "start_spins" and v is not None:
                 v = f"<{len(v)} spins from --input>"
             print(f"[cfg] {k} = {v}")
         if config.target_scale:
@@ -1193,9 +1259,10 @@ def print_header(pieces: Sequence[Piece], corner_ids: List[int], edge_ids: List[
         print(f"[init] pieces={len(pieces)}  corners={corner_ids}  edges={len(edge_ids)}")
         return
 
+    temps = "T0/Tf per row" if per_row else f"T0={config.T0:g} Tf={config.Tf:g}"
     print(f"[cfg] seed={config.random_seed}  "
           f"restarts={config.restarts} x {config.steps_per_restart} steps  "
-          f"threads={config.threads}  T0={config.T0:g} Tf={config.Tf:g}  "
+          f"threads={config.threads}  {temps}  "
           f"tabu={config.tabu_length}  fix_corners={config.fix_corners}")
     if config.target_scale:
         targets = " ".join(f"{SIDE_NAMES[s]}={target_for(s, config):.0f}" for s in Side)
@@ -1398,7 +1465,16 @@ def anneal_one_restart(restart: int,
         if warning:
             log.append(warning)
 
-    return RestartResult(restart=restart, best=best, log=log, elapsed=elapsed)
+    return RestartResult(restart=restart, best=best, log=log, elapsed=elapsed,
+                         warning=warning)
+
+def anneal_row_job(job: Tuple[int, int, AnnealingConfig],
+                   **shared) -> Tuple[int, RestartResult]:
+    """One (row, restart) job of a whole-file refinement: the row's own config
+    rides along with the job, and the row index comes back with the result so
+    the parent can regroup the restarts by row."""
+    row, restart, config = job
+    return row, anneal_one_restart(restart, config=config, **shared)
 
 _STOP = False
 def _request_stop(signum, frame):
@@ -1408,6 +1484,37 @@ def _request_stop(signum, frame):
     global _STOP
     _STOP = True
     print("\n[Ctrl-C] finishing the current restart then stopping...", flush=True)
+
+def run_jobs(task, jobs: Sequence, workers: int, consume) -> bool:
+    """Run `task` over `jobs` and hand every result to `consume` in JOB order,
+    whatever order the workers finish in. Returns True if Ctrl-C cut it short.
+
+    ex.map yields in submission order, which is the whole ordering guarantee:
+    one slow job delays the REPORTING of the ones after it, not their
+    execution. On Ctrl-C the jobs still queued are cancelled -- left to the
+    pool's exit, every one of them would run to completion and then be thrown
+    away -- while the ones already running finish and are kept. Those are the
+    next jobs in order, so consuming up to the first cancelled one keeps the
+    output a clean prefix of the jobs."""
+    if workers == 1:
+        for job in jobs:
+            if _STOP:
+                return True
+            consume(task(job))
+        return False
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        results = ex.map(task, jobs)
+        for res in results:
+            consume(res)
+            if _STOP:
+                ex.shutdown(wait=True, cancel_futures=True)
+                try:
+                    for res in results:
+                        consume(res)
+                except CancelledError:
+                    pass
+                return True
+    return False
 
 def run_annealing(pieces: Sequence[Piece], config: AnnealingConfig,
                   out_path: Optional[str] = None, provenance: str = "",
@@ -1448,27 +1555,14 @@ def run_annealing(pieces: Sequence[Piece], config: AnnealingConfig,
             if baseline is not None and res.best.score >= baseline - 1e-12:
                 at_least += 1
             if out_path:
-                append_rotations(res.restart, res.best, out_path, provenance)
+                append_rotations(f"r{res.restart}", res.best, out_path, provenance)
 
     if workers > 1:
         print(f"[par] {config.restarts} restarts on {workers} worker processes")
     if not config.verbose:
         print()          # verbose restart blocks open with their own blank line
 
-    stopped = False
-    if workers == 1:
-        for restart in range(1, config.restarts + 1):
-            if _STOP: stopped = True; break
-            consume(task(restart))
-    else:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
-            # map yields in submission order, so the restarts are reported in
-            # order whatever order the workers actually finished them in. One
-            # slow restart therefore delays the REPORTING of the ones after it,
-            # not their execution.
-            for res in ex.map(task, range(1, config.restarts + 1)):
-                consume(res)
-                if _STOP: stopped = True; break
+    stopped = run_jobs(task, range(1, config.restarts + 1), workers, consume)
 
     wall = time.perf_counter() - wall0
     print(f"\n=== run summary ===")
@@ -1496,9 +1590,157 @@ def run_annealing(pieces: Sequence[Piece], config: AnnealingConfig,
     if out_path:
         print(f"[sum] rotations appended to {out_path}")
 
+def run_rows(pieces: Sequence[Piece], plans: Sequence[RowPlan],
+             config: AnnealingConfig, out_path: str, input_path: str,
+             header_extra: Sequence[str] = ()) -> None:
+    """Refine every row of --input: --restarts restarts per row, the best of
+    them written back, one output row per input row and in input order.
+
+    The jobs are (row, restart) pairs laid out row by row, so the pool keeps
+    every core busy however the rows and restarts divide, and run_jobs hands
+    them back in that same order. A row is complete -- written, and reported
+    -- the moment its last restart comes in, which makes the output file a
+    prefix of the input at every moment, Ctrl-C included."""
+    pieces_by_id  = {p.id: p for p in pieces}
+    corner_ids, edge_ids = classify_boundary_pieces(pieces)
+    inner_capacity = build_inner_capacity(pieces)
+
+    print_header(pieces, corner_ids, edge_ids, config, header_extra, per_row=True)
+
+    per_row = config.restarts
+    jobs    = [(p.row, r, p.config) for p in plans for r in range(1, per_row + 1)]
+    workers = max(1, min(config.threads, len(jobs)))
+    task = functools.partial(anneal_row_job,
+                             pieces_by_id=pieces_by_id,
+                             corner_ids=corner_ids,
+                             edge_ids=edge_ids,
+                             inner_capacity=inner_capacity)
+
+    by_row   = {p.row: p for p in plans}
+    arrived: Dict[int, List[RestartResult]] = defaultdict(list)
+    width    = len(str(plans[-1].row))
+    wall0    = time.perf_counter()
+    work_time = 0.0
+    ran = done = written = matched = improved = froze = 0
+    gained: Counter = Counter()
+    champion: Optional[Tuple[RowPlan, BestRecord]] = None
+
+    def consume(item: Tuple[int, RestartResult]) -> None:
+        """Everything that reaches stdout or the --out file happens here, in
+        the parent, one row at a time and in input order."""
+        nonlocal work_time, ran, done, written, matched, improved, froze, champion
+        row, res = item
+        work_time += res.elapsed
+        ran += 1
+        got = arrived[row]
+        got.append(res)
+        if len(got) < per_row:
+            return
+        del arrived[row]
+        plan = by_row[row]
+        done += 1
+
+        # Restart order, strict >: the first of equal scores wins, the same
+        # rule --row N applies, so a row here is the best --row N would give.
+        best: Optional[BestRecord] = None
+        for r in got:
+            if r.best is not None and (best is None or r.best.score > best.score):
+                best = r.best
+
+        if best is not None:
+            append_rotations(f"r{row}", best, out_path,
+                             f"  From={input_path}:row{row}")
+            written += 1
+            if plan.baseline is None or best.score >= plan.baseline - 1e-12:
+                matched += 1
+            if plan.baseline is None or best.score > plan.baseline + 1e-12:
+                improved += 1
+            gained.update(s for s in Side if best.euler_counts[s] > plan.start[s])
+            if champion is None or best.score > champion[1].score:
+                champion = (plan, best)
+
+        if config.verbose:
+            print(f"\n=== row {row} (line {plan.lineno}) ===")
+            print("\n".join(plan.header))
+            for r in got:
+                print("\n".join(r.log))
+            print()
+        print(row_delta_str(plan, best, sum(r.elapsed for r in got), width), flush=True)
+        # Counted, not printed per row: under a polishing schedule it fires on
+        # most rows, and would bury the table of deltas it sits in.
+        if any(r.warning for r in got):
+            froze += 1
+
+    if workers > 1:
+        print(f"[par] {len(plans)} rows x {per_row} restarts on {workers} worker processes")
+    print()
+
+    stopped = run_jobs(task, jobs, workers, consume)
+
+    wall = time.perf_counter() - wall0
+    print(f"\n=== run summary ===")
+    # Wall clock, and the mean cost of a restart -- see run_annealing for why
+    # the per-restart times are never summed into a total.
+    mean   = work_time / ran if ran else 0.0
+    detail = f"{workers} workers, " if workers > 1 else ""
+    print(f"[sum] {len(plans)} rows x {per_row} restarts = {len(jobs)} restarts in "
+          f"{wall:.1f}s = {wall/60:.2f} min  ({detail}{mean:.1f}s per restart)")
+    if stopped:
+        print(f"[sum] stopped early on Ctrl-C: the first {done} of {len(plans)} rows "
+              f"are finished and written, the rest are not")
+    # Seeding every restart's best from its starting row makes this a
+    # guarantee: a count short of the rows finished means the seeding broke
+    # (or an input row was not a usable border to begin with).
+    print(f"[sum] {matched}/{done} rows matched or beat their input row: "
+          f"{improved} improved, {written - improved} unchanged")
+    if written < done:
+        print(f"[sum] {done - written} row(s) found no feasible border and were not written")
+    if froze:
+        print(f"[warn] {froze}/{done} rows had a restart accept under 0.5% of moves in "
+              f"its last window: Tf froze the search early (--verbose shows which)")
+    print("[sum] rows where a side gained trails: "
+          + "  ".join(f"{SIDE_NAMES[s]}={gained[s]}" for s in Side))
+    if champion is not None:
+        plan, rec = champion
+        ec = rec.euler_counts
+        print(f"[sum] best: row {plan.row}  score={rec.score:.4f}  "
+              f"TOP={ec[Side.TOP]} RIGHT={ec[Side.RIGHT]} "
+              f"BOTTOM={ec[Side.BOTTOM]} LEFT={ec[Side.LEFT]}")
+    print(f"[sum] {written} row(s) appended to {out_path}, in input order")
+
 # =============================================================================
 # CLI
 # =============================================================================
+
+# Where a cold run's borders go when --out is not given: the name every
+# example and runner already hands Stage B.
+COLD_OUT = "rotations.csv"
+
+def default_out_path(input_path: Optional[str]) -> str:
+    """The rotations file when --out is not given. There is always one: the
+    borders are the whole deliverable, and a run that printed only summary
+    lines used to lose every one of them. A warm run writes beside its input,
+    FILE -> FILE_refined.csv, the FILE_tag naming E555_rotate.py and
+    E555_clean_csv.py use for their defaults."""
+    if not input_path:
+        return COLD_OUT
+    src = Path(input_path)
+    return str(src.with_name(f"{src.stem}_refined{src.suffix or '.csv'}"))
+
+def open_out(path: str, marker: str) -> None:
+    """Fail now, not after the first restart has already been computed: a bad
+    path or an unwritable directory used to surface minutes in, with the work
+    already done and nowhere to put it. Opening in append mode creates the
+    file if needed and leaves an existing one untouched.
+
+    Rows accumulate across runs, which is deliberate -- several short runs
+    build one border pool -- so every run opens with a `# run` marker, without
+    which there is no way to tell afterwards which rows came from which run."""
+    try:
+        with open(path, "a") as fh:
+            fh.write(marker + "\n")
+    except OSError as e:
+        raise SystemExit(f"[ERROR] cannot write --out {path}: {e}")
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -1508,7 +1750,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("seed_file", help="4-integer-per-line piece file")
     p.add_argument("--out", default=None, metavar="FILE",
                    help="append each restart's best border to this rotations "
-                        "CSV in the format Stage B reads (id + 256 spins)")
+                        "CSV in the format Stage B reads (id + 256 spins). "
+                        "Unset: <stem>_refined.csv beside --input, or "
+                        f"{COLD_OUT} in the current directory without it")
     p.add_argument("--verbose", action="store_true",
                    help="print the whole search -- full config, per-step "
                         "progress and the BEST lines -- instead of one "
@@ -1541,7 +1785,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--row", type=int, default=None, metavar="N",
                    help="which data row of --input to refine, numbered from 0 "
                         "over data rows only -- the same numbering the "
-                        "beamer's --start_row uses; unset means the first row")
+                        "beamer's --start_row uses. Unset: refine EVERY row, "
+                        "in parallel, and write the best of each row's "
+                        "restarts back in input order, one row per row")
 
     g = p.add_argument_group(
         "objective weights (with --target_scale: side target = weight x scale, "
@@ -1613,6 +1859,64 @@ def warm_start_report(path: str, row: int, lineno: int, comment: Optional[str],
                  "every restart refines this same border")
     return lines, state.score
 
+def plan_rows(path: str, rows: Sequence[Tuple[List[int], Optional[str], int]],
+              config: AnnealingConfig, pieces_by_id: Dict[int, Piece],
+              corner_ids: List[int], edge_ids: List[int], inner_capacity: Counter,
+              t0_given: Optional[float], tf_given: Optional[float]) -> List[RowPlan]:
+    """Every row of a whole-file refinement, checked and given its schedule
+    before any restart runs.
+
+    Each row gets exactly what `--row N` would give it -- the same starting
+    state, the same probe stream, so the same T0/Tf -- and its restarts then
+    draw the same seeds, which is what makes any row of the result
+    reproducible on its own. A row that fails a check stops the run here,
+    where it has cost nothing: the probe is ~0.08s a row, and no restart
+    starts until every row has passed."""
+    seed  = config.random_seed
+    plans: List[RowPlan] = []
+    for row, (spins, comment, lineno) in enumerate(rows):
+        cfg = replace(config, start_spins=tuple(spins), swap_corners=False)
+        try:
+            state = initial_state(pieces_by_id, corner_ids, edge_ids,
+                                  random.Random(restart_seed(seed, 1)), cfg, inner_capacity)
+        except SystemExit as e:
+            # border_from_spins names the piece; in a whole file, say the row.
+            raise SystemExit(f"[ERROR] {path} row {row} (line {lineno}): "
+                             f"{str(e.code).removeprefix('[ERROR] ')}")
+        report, baseline = warm_start_report(path, row, lineno, comment,
+                                             state, cfg, inner_capacity)
+        t0, tf, sched, kind = resolve_schedule(
+            cfg, state, pieces_by_id, edge_ids, inner_capacity,
+            random.Random(restart_seed(seed, 0)), t0_given, tf_given)
+        plans.append(RowPlan(row=row, lineno=lineno, config=replace(cfg, T0=t0, Tf=tf),
+                             start=state.euler_counts(), baseline=baseline, kind=kind,
+                             checked=counts_in_comment(comment) is not None,
+                             header=report + sched))
+    return plans
+
+def rows_header(path: str, plans: Sequence[RowPlan], config: AnnealingConfig,
+                overridden: bool) -> List[str]:
+    """The header of a whole-file refinement: what every row has in common,
+    plus any row that needs saying out loud. The per-row detail -- counts,
+    score, schedule -- goes with each row under --verbose."""
+    kinds = Counter(p.kind for p in plans)
+    lines = [f"[cfg] warm start: {path}, all {len(plans)} rows, best of "
+             f"{config.restarts} restart(s) each; one row written back per input "
+             f"row, in input order",
+             "[cfg] warm start: every row runs exactly as --row N would; corners "
+             "kept as given and never swapped"]
+    unchecked = sum(not p.checked for p in plans)
+    if unchecked:
+        lines.append(f"[cfg] warm start: {unchecked} row(s) carry no counts to "
+                     f"cross-check against")
+    lines.append(f"[cfg] schedule: per row -- polish {kinds['polish']}, "
+                 f"search {kinds['search']}"
+                 + ("; overridden on the command line" if overridden else ""))
+    for p in plans:
+        lines.extend(f"[warn] row {p.row}: {l.removeprefix('[warn] ')}"
+                     for l in p.header if l.startswith("[warn]"))
+    return lines
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -1622,7 +1926,9 @@ def main(argv=None) -> int:
         raise SystemExit(
             "[ERROR] --fix_corners and --input both decide where the corners go. "
             "A warm start keeps the corner seats its input row came with.")
-    row = args.row or 0
+    row      = args.row
+    all_rows = bool(args.input) and row is None
+    out_path = args.out or default_out_path(args.input)
 
     seed = args.random_seed if args.random_seed != 0 else random.randint(1_000_000, 9_999_999)
     # Resolve 0 here, like the seed, so the value the header reports is the
@@ -1634,6 +1940,7 @@ def main(argv=None) -> int:
     corner_ids, edge_ids = classify_boundary_pieces(pieces)
     inner_capacity = build_inner_capacity(pieces)
 
+    rows: List[Tuple[List[int], Optional[str], int]] = []
     start_spins: Optional[Tuple[int, ...]] = None
     comment: Optional[str] = None
     lineno = 0
@@ -1642,6 +1949,7 @@ def main(argv=None) -> int:
         rows = read_rotations(args.input)
         if not rows:
             raise SystemExit(f"[ERROR] --input {args.input} holds no data row")
+    if row is not None:
         if not 0 <= row < len(rows):
             raise SystemExit(
                 f"[ERROR] --row {row} is outside {args.input}: it holds {len(rows)} "
@@ -1664,7 +1972,7 @@ def main(argv=None) -> int:
         fix_corners          = args.fix_corners or 0,
         target_scale         = args.target_scale,
         start_spins          = start_spins,
-        swap_corners         = start_spins is None,
+        swap_corners         = not args.input,
     )
 
     # A target of w_side x scale only means something for a positive weight.
@@ -1676,6 +1984,25 @@ def main(argv=None) -> int:
                 f"got <= 0 for {', '.join(bad)}"
             )
 
+    header_extra: List[str] = []
+    if not args.out:
+        header_extra.append(f"[cfg] --out not given: appending to {out_path}")
+    marker = (f"# run {time.strftime('%Y-%m-%d %H:%M:%S')}  "
+              f"seed={config.random_seed} restarts={config.restarts} "
+              f"steps={config.steps_per_restart} ")
+
+    if all_rows:
+        plans = plan_rows(args.input, rows, config, pieces_by_id, corner_ids,
+                          edge_ids, inner_capacity, args.T0, args.Tf)
+        header_extra.extend(rows_header(args.input, plans, config,
+                                        args.T0 is not None or args.Tf is not None))
+        temps = " ".join(f"{k}=per-row" if v is None else f"{k}={v:g}"
+                         for k, v in (("T0", args.T0), ("Tf", args.Tf)))
+        open_out(out_path, marker + temps + f" input={args.input} rows=all({len(plans)})")
+        signal.signal(signal.SIGINT, _request_stop)
+        run_rows(pieces, plans, config, out_path, args.input, header_extra)
+        return 0
+
     # The starting state, and then the schedule it implies. Both are settled
     # here, once, in the parent: a worker is handed numbers, never a decision,
     # so the header, every restart and the --out marker cannot disagree. The
@@ -1684,43 +2011,27 @@ def main(argv=None) -> int:
     state = initial_state(pieces_by_id, corner_ids, edge_ids,
                           random.Random(restart_seed(seed, 1)), config, inner_capacity)
 
-    header_extra: List[str] = []
     baseline: Optional[float] = None
     if start_spins is not None:
         lines, baseline = warm_start_report(args.input, row, lineno, comment,
                                             state, config, inner_capacity)
         header_extra.extend(lines)
 
-    t0, tf, sched_lines = resolve_schedule(
+    t0, tf, sched_lines, _ = resolve_schedule(
         config, state, pieces_by_id, edge_ids, inner_capacity,
         random.Random(restart_seed(seed, 0)), args.T0, args.Tf)
     header_extra.extend(sched_lines)
     config = replace(config, T0=t0, Tf=tf)
 
-    if args.out:
-        # Fail now, not after the first restart has already been computed: a
-        # bad path or an unwritable directory used to surface minutes in, with
-        # the work already done and nowhere to put it. Opening in append mode
-        # creates the file if needed and leaves an existing one untouched.
-        try:
-            with open(args.out, "a") as fh:
-                # Rows accumulate across runs, which is deliberate -- several
-                # short runs build one border pool. Without a marker there is
-                # no way to tell afterwards which rows came from which run.
-                marker = (f"# run {time.strftime('%Y-%m-%d %H:%M:%S')}  "
-                          f"seed={config.random_seed} restarts={config.restarts} "
-                          f"steps={config.steps_per_restart} "
-                          f"T0={config.T0:g} Tf={config.Tf:g}")
-                if args.input:
-                    marker += f" input={args.input} row={row}"
-                fh.write(marker + "\n")
-        except OSError as e:
-            raise SystemExit(f"[ERROR] cannot write --out {args.out}: {e}")
+    marker += f"T0={config.T0:g} Tf={config.Tf:g}"
+    if args.input:
+        marker += f" input={args.input} row={row}"
+    open_out(out_path, marker)
 
     # Ctrl-C: let the workers finish the restart they are in and keep whatever
     # has already been written, instead of losing every in-flight restart.
     signal.signal(signal.SIGINT, _request_stop)
-    run_annealing(pieces, config, out_path=args.out, provenance=provenance,
+    run_annealing(pieces, config, out_path=out_path, provenance=provenance,
                   baseline=baseline, header_extra=header_extra)
     return 0
 

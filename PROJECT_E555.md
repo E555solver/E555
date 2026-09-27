@@ -244,6 +244,44 @@ python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
 Each appended comment carries `From=<file>:row<N>`, and the `# run` marker
 records the input and row, so a refined pool still says what it came from.
 
+**Refining the whole file.** Leave `--row` out and every row is refined:
+
+```bash
+python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
+    --input rotations.csv --restarts 2 --steps 500000 --threads 8
+    # no --out: writes rotations_refined.csv beside the input
+```
+
+- **One row back per input row, in input order.** Each row gets `--restarts`
+  restarts and only the best of them is written, under the usual comment
+  (counts, `Score=`, `From=<file>:row<N>`), with id `r<N>`. The output is
+  therefore a row-for-row refinement of the input, and the same file can be fed
+  straight back in.
+- **Parallel over `(row, restart)` jobs.** They share one worker pool, so every
+  core stays busy however rows and restarts divide; `--restarts 1` is one worker
+  per row. The parent writes a row the moment its last restart is in, so the
+  file is always a prefix of the input, and the thread count never changes it.
+- **Every row runs exactly as `--row N` would.** Same starting state, same
+  probe stream, so the same polish/search decision and `T0/Tf`, and the same
+  restart seeds. Row N of the result is the best of `--row N --restarts R` at
+  the same `--rng_seed`, so any row can be reproduced on its own. Every row is
+  checked against the seed file, and its schedule probed (~0.08 s a row), in
+  the parent before any restart runs; one bad row stops the run before any
+  work is spent.
+- **stdout shows what each row gained**, side by side -- the comment in the CSV
+  stays exactly as above:
+
+  ```
+    row  3  polish  score=    9.2658 ->    10.4890 (+1.2232)  TOP 483840->483840 (+0)  RIGHT 8640->17280 (+8640)  BOTTOM 2592->51840 (+49248)  LEFT 1152->3840 (+2688)    0.5s
+  ```
+
+  The summary counts the rows that matched or beat their input (all of them,
+  by construction), how many improved, and on how many rows each side gained
+  trails. A row whose input was not a usable border and that found no feasible
+  one is reported and not written.
+- **Ctrl-C** keeps every finished row: the jobs still queued are cancelled,
+  those already running finish, and the rows they complete are written.
+
 ### Temperature
 
 `--T0/--Tf` are normally left unset: the schedule is resolved from the starting
@@ -324,10 +362,14 @@ acceptance is pinned by the improving fraction rather than by `T`. From a cold
 random start no estimator can work -- **0 of 300** sampled moves land feasible
 -- which is exactly why that case falls back to the cliff anchor.
 
-**Output.** With `--out FILE` each restart's best border is appended to a
-rotations CSV that the beamer reads directly: a `#` comment with the per-side
-counts, then `id, spin[0..255]` (60 real spins + 196 zeros). That file is the
-deliverable and is written in both output modes.
+**Output.** Each restart's best border -- each row's best, when a whole file
+is refined -- is appended to a rotations CSV that the beamer reads directly: a
+`#` comment with the per-side counts, then `id, spin[0..255]` (60 real spins +
+196 zeros). That file is the deliverable and is written in both output modes.
+`--out FILE` names it; without `--out` it is `<stem>_refined.csv` beside the
+`--input` file, or `rotations.csv` in the current directory on a cold run.
+There is always a file: a run without `--out` used to print its borders
+nowhere outside `--verbose`, and so lose every one of them.
 
 On stdout the default is one line per restart -- score, the four trail counts,
 the step the best was found at, and the time -- so a 50-restart run is 50 lines.
@@ -350,11 +392,13 @@ worker per restart. Measured on an 8-thread laptop the gain is ~3x (8 restarts x
 steps from ~14 min to ~5.
 
 Key options: `--restarts`, `--steps`, `--rng_seed`, `--threads`, `--verbose`,
-`--input/--row` (refine an existing border), `--T0/--Tf` (normally left unset,
+`--input/--row` (refine an existing border, or every row of a file without
+`--row`), `--T0/--Tf` (normally left unset,
 see above), `--w_top/right/bottom/left` (all `+1` by default; per-side target
 multipliers with `--target_scale`, and signed weights in log-sum mode, where a
 negative weight minimizes a side), `--tabu`, `--fix_corners {0,1,2}`,
-`--target_scale`, `--out`.
+`--target_scale`, `--out` (default: `<stem>_refined.csv` beside `--input`,
+else `rotations.csv`).
 
 ---
 
@@ -1366,8 +1410,8 @@ diagnostic number the tool produces.
 signature by signature, and was the regression that made every prune
 trustworthy. It was removed with the exhaustive rewrite, and **the depth oracle
 that replaced it on the final side has no in-binary proof of its own** -- that
-is open work. What is checked today is narrower but still load-bearing: check 13
-`roundhouse_cache` runs the same board with and without `--no_transition_cache`
+is open work. What is checked today is narrower but still load-bearing: the gate's
+`roundhouse_cache` check runs the same board with and without `--no_transition_cache`
 and requires byte-identical output, because a wrong cached successor would not
 crash, it would silently refute live branches while the run still reported a
 clean proof.
@@ -1674,7 +1718,7 @@ written, and lists the file only when a board actually reached it.
 | `--ties N` | 1 | boards to emit at the deepest reach |
 | `--tie_depth N` | 2 | ties must differ at least N complete chain levels behind the newest placement, which drops cosmetic last-level variants |
 | `--target_ties N` | 0 = off | stop one input as soon as N such boards reach the endpoint |
-| `--no_transition_cache` | cache on | decode each chain record's successor on the fly instead of once at build time. A debugging switch: the two paths must produce identical output, which is what check 13 `roundhouse_cache` asserts |
+| `--no_transition_cache` | cache on | decode each chain record's successor on the fly instead of once at build time. A debugging switch: the two paths must produce identical output, which is what the gate's `roundhouse_cache` check asserts |
 | `--threads N` / `--verbose` | all / off | as Stage B |
 
 There are no aliases: one name per concept. `--reverse`, `--direction` and

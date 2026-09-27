@@ -78,6 +78,7 @@ ALL_STEPS=(
     "consensus|four turns of one board score identically, and --border_out runs"
     "annealer|Stage A short run: BEST lines, a beamer-format --out CSV, and spins that match their comment"
     "annealer_refine|Stage A warm start: every shipped row round-trips, and refining one cannot lose ground"
+    "annealer_rows|Stage A whole-file refine: every row in input order, thread-invariant, default --out"
     "sort_rotations|both comment forms sort alike, and --max_top turns every row onto its own best side"
     "finalizer_synth|REGRESSION: rediscovers the synthetic solution from row 10"
     "finalizer_rotations|re-imposes a matching rotations row's side assignment"
@@ -865,9 +866,11 @@ EOF
 
     # The schedule is probed once in the parent, so it must depend on
     # --rng_seed alone: same seed, same sigma, whatever the thread count.
+    # Every run names --out: without it the borders would land beside $IN.
     for t in 1 2; do
         python3 -u "$A" data/seed_Edge5.txt --input "$IN" --row 1 --rng_seed 42 \
-            --threads "$t" --restarts 1 --steps 1 2>&1 | grep "move scale sigma"
+            --threads "$t" --restarts 1 --steps 1 --out "$OUT/refine_sigma$t.csv" \
+            2>&1 | grep "move scale sigma"
     done > "$OUT/refine_sigma.txt"
     [ "$(sort -u "$OUT/refine_sigma.txt" | wc -l)" = "1" ] \
         || { cat "$OUT/refine_sigma.txt"; fail "the probe is not reproducible"; }
@@ -880,7 +883,7 @@ EOF
     # here sat stuck 35 points below what a hot one reached.
     python3 -u "$A" data/seed_Edge5.txt --input "$IN" --row 1 --restarts 1 --steps 1 \
         --target_scale 250 --w_top 60 --w_right 20 --w_bottom 20 --w_left 1 \
-        > "$OUT/refine_search.log" 2>&1 || { cat "$OUT/refine_search.log"; fail "target-mode warm start failed"; }
+        --out "$OUT/refine_search.csv" > "$OUT/refine_search.log" 2>&1 || { cat "$OUT/refine_search.log"; fail "target-mode warm start failed"; }
     grep -q "schedule: searching:" "$OUT/refine_search.log" \
         || { grep schedule "$OUT/refine_search.log"; fail "a row far from these weights still got the polishing schedule"; }
 
@@ -920,6 +923,116 @@ for i, (spins, comment, lineno) in enumerate(rows):
         f"row {i}: scored {state.score:.4f} below its input's {base:.4f}"
 print(f"ok: 3 refined rows, all provenant and none below the input's {base:.4f}")
 EOF
+}
+
+# --input without --row refines the WHOLE file: every row gets --restarts
+# restarts on a shared pool and the best of them is written back, one row per
+# input row. Three things can go wrong quietly there. The rows can come back
+# out of order -- the pool finishes jobs in any order it likes -- so the output
+# is checked row by row against its provenance, and a 1-worker run against a
+# 4-worker one. A row can come back as something --row N would never have
+# given, which would make the result unreproducible -- so row 5 is checked
+# against a --row 5 run at the same seed. And without --out the borders used
+# to go nowhere at all: the default file is checked for both a warm and a cold
+# run. Works on a copy of data/borders_annealed_fix12.csv inside $OUT, so the
+# default FILE_refined.csv lands there too.
+step_annealer_rows() {
+    local A=src/A_border/E555_edge_annealer.py
+    local IN="$OUT/rows_in.csv"
+    cp data/borders_annealed_fix12.csv "$IN"
+    rm -f "$OUT/rows_in_refined.csv" "$OUT"/rows_t*.csv "$OUT/rows_one.csv"
+    rm -rf "$OUT/rows_cold"
+
+    # No --out: the rows must land in rows_in_refined.csv, beside the input.
+    python3 -u "$A" data/seed_Edge5.txt --input "$IN" --restarts 2 --steps 3000 \
+        --rng_seed 42 --threads 3 > "$OUT/rows.log" 2>&1 \
+        || { cat "$OUT/rows.log"; fail "the whole-file refine failed"; }
+    [ -s "$OUT/rows_in_refined.csv" ] \
+        || { cat "$OUT/rows.log"; fail "no --out, and no default rows_in_refined.csv was written"; }
+    grep -q "12/12 rows matched or beat their input row" "$OUT/rows.log" \
+        || { cat "$OUT/rows.log"; fail "a row lost ground against its input"; }
+    [ "$(grep -cE '^  row +[0-9]+  (polish|search)  score=.* -> .*TOP [0-9]+->[0-9]+ \([-+][0-9]+\)' "$OUT/rows.log")" = 12 ] \
+        || { cat "$OUT/rows.log"; fail "expected 12 per-row lines with each side's trail change"; }
+
+    python3 - "$OUT/rows_in_refined.csv" "$IN" <<'EOF' || exit 1
+import sys
+sys.path.insert(0, "src/A_border")
+import E555_edge_annealer as A
+
+pieces = A.read_pieces("data/seed_Edge5.txt")
+pbi    = {p.id: p for p in pieces}
+cap    = A.build_inner_capacity(pieces)
+cfg    = A.AnnealingConfig()
+score  = lambda spins: A._build_run_state(pbi, *A.border_from_spins(pbi, spins), cap, cfg)
+
+src  = A.read_rotations(sys.argv[2])
+rows = A.read_rotations(sys.argv[1])
+assert len(rows) == len(src) == 12, f"expected 12 rows back, got {len(rows)}"
+ids = [l.split(",", 1)[0] for l in open(sys.argv[1])
+       if l.strip() and not l.lstrip().startswith("#")]
+assert ids == [f"r{i}" for i in range(12)], f"row ids out of order: {ids}"
+for i, (spins, comment, lineno) in enumerate(rows):
+    assert comment.rstrip().endswith(f"From={sys.argv[2]}:row{i}"), \
+        f"line {lineno}: expected row {i}'s provenance, got: {comment}"
+    assert spins[60:] == [0] * 196, f"row {i}: inner pads must stay zero"
+    state = score(spins)
+    assert A.hard_penalty(state.evals, state.inward_tally, cap, cfg) == 0.0, \
+        f"row {i}: emitted an unusable border"
+    got  = {A.SIDE_NAMES[s]: state.evals[s].euler_count for s in A.Side}
+    want = A.counts_in_comment(comment)
+    assert want == got, f"row {i}: comment {want} != recomputed {got}"
+    base = score(src[i][0]).score
+    assert state.score >= base - 1e-12, \
+        f"row {i}: scored {state.score:.4f} below its input's {base:.4f}"
+print("ok: 12 rows back in input order, each provenant, consistent and no worse than its input")
+EOF
+
+    # The pool must not decide the order, or anything else: 1 worker and 4
+    # have to write the same rows, byte for byte, once the dated markers go.
+    for t in 1 4; do
+        python3 -u "$A" data/seed_Edge5.txt --input "$IN" --restarts 2 --steps 3000 \
+            --rng_seed 42 --threads "$t" --out "$OUT/rows_t$t.csv" > "$OUT/rows_t$t.log" 2>&1 \
+            || { cat "$OUT/rows_t$t.log"; fail "the --threads $t whole-file refine failed"; }
+        grep -v '^# run' "$OUT/rows_t$t.csv" > "$OUT/rows_t$t.body"
+    done
+    cmp -s "$OUT/rows_t1.body" "$OUT/rows_t4.body" \
+        || fail "--threads 1 and --threads 4 wrote different rows"
+    grep -v '^# run' "$OUT/rows_in_refined.csv" | cmp -s - "$OUT/rows_t1.body" \
+        || fail "--threads 3 and --threads 1 wrote different rows"
+    echo "ok: 1, 3 and 4 workers write identical rows"
+
+    # Each row runs exactly as --row N would, so any row can be reproduced alone.
+    python3 -u "$A" data/seed_Edge5.txt --input "$IN" --row 5 --restarts 2 --steps 3000 \
+        --rng_seed 42 --out "$OUT/rows_one.csv" > "$OUT/rows_one.log" 2>&1 \
+        || { cat "$OUT/rows_one.log"; fail "the --row 5 run failed"; }
+    python3 - "$OUT/rows_t1.csv" "$OUT/rows_one.csv" <<'EOF' || exit 1
+import sys
+sys.path.insert(0, "src/A_border")
+import E555_edge_annealer as A
+
+pieces = A.read_pieces("data/seed_Edge5.txt")
+pbi    = {p.id: p for p in pieces}
+cap    = A.build_inner_capacity(pieces)
+cfg    = A.AnnealingConfig()
+score  = lambda spins: A._build_run_state(pbi, *A.border_from_spins(pbi, spins), cap, cfg).score
+
+whole = A.read_rotations(sys.argv[1])
+one   = A.read_rotations(sys.argv[2])
+assert len(one) == 2, f"expected the 2 restarts of --row 5, got {len(one)}"
+best  = max(one, key=lambda r: score(r[0]))      # max keeps the first of a tie
+assert whole[5][0] == best[0], "row 5 of the whole-file run is not the best of --row 5"
+print("ok: row 5 of the whole-file run is exactly the best of --row 5")
+EOF
+
+    # A cold run without --out writes rotations.csv in the working directory.
+    # Run from inside $OUT so the repository root stays clean.
+    mkdir -p "$OUT/rows_cold"
+    ( cd "$OUT/rows_cold" && python3 -u "$REPO/$A" "$REPO/data/seed_Edge5.txt" \
+        --restarts 1 --steps 500 --rng_seed 42 --threads 1 > cold.log 2>&1 ) \
+        || { cat "$OUT/rows_cold/cold.log"; fail "the cold run without --out failed"; }
+    grep -q '^# run ' "$OUT/rows_cold/rotations.csv" 2>/dev/null \
+        || fail "a cold run without --out did not write rotations.csv"
+    echo "ok: without --out, a cold run writes rotations.csv where it runs"
 }
 
 # The tool reads a score and four trail counts out of the annealer's PROSE, and
