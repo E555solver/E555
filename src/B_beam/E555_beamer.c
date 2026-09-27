@@ -655,21 +655,19 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
             pos[pid] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[pid] = rot;
         }
     }
-    /* --clue_corners: also show the two clue pieces the beam never reaches, but
-       ONLY where they land in empty space. Isolated they cost nothing and say
-       something -- the viewer makes it obvious the corners were pinned, and a
-       hole-free Stage C solve has to build around them. Touching a placed cell
-       they would assert an edge the search never chose and never scored, which
-       on a row-12 board is two near-certain breaks bolted onto the best partial
-       the run produced. So the attach yields to the board: a clue whose own cell
-       or whose cell below is filled is simply left off, and the board is emitted
-       as searched. There is no choice of orientation here -- the board committed
-       to one when it placed its row-2 corners. */
+    /* --clue_corners: also place the two row-13 clue pieces the beam never
+       reaches, so every emitted board carries all the clues its orientation
+       holds -- the viewer shows the corners pinned, and Stage C (and the end
+       dives) must build around them. On a row-12 board each touches row 12
+       with a junction the search did not choose; that edge may break, and it
+       is scored like any other. Only a searched row 13 (--stop_row 13) fills
+       their cells, and then they are left off. There is no choice of
+       orientation here -- the board committed to one when it placed its row-2
+       corners. */
     if (orient >= 0 && (g_clue_mask & CLUE_CORNERS))
         for (int k = 3; k < CLUE_N; k++) {
             const ClueCell *cc = &g_clue[orient][k];
-            if (cell_is_placed(cc->row,     cc->col, row, colmask)) continue;
-            if (cell_is_placed(cc->row - 1, cc->col, row, colmask)) continue;
+            if (cell_is_placed(cc->row, cc->col, row, colmask)) continue;
             pos[cc->piece]     = (uint32_t)(cc->row * PUZZLE_SIDE + cc->col);
             rot_arr[cc->piece] = cc->spin;
         }
@@ -4180,9 +4178,9 @@ int main(int argc, char *argv[]) {
     if (!(fabs(g_lambda_maha) <= 1e6)) fatal("--lambda_Mahalanobis in [-1e6,1e6]");
     if (!(fabs(g_lambda_J) <= 1e6))    fatal("--lambda_J in [-1e6,1e6]");
     /* No clue cap on --stop_row. Row 13's two clues are reserved, never pinned,
-       and the attach in format_board_tail now yields to whatever the search
-       placed -- so searching row 13 simply builds it from other pieces and the
-       clues are left off, rather than being written on top of them. */
+       and the attach in board_arrays yields to a searched row 13 -- which is
+       built from other pieces, so the clues are left off rather than written on
+       top of them. */
     if (!(g_tau_bottoms >= 0.0 && g_tau_bottoms <= 1e6)) fatal("--tau_bottoms in [0,1e6]");
     if (!(g_tau_columns >= 0.0 && g_tau_columns <= 1e6)) fatal("--tau_columns in [0,1e6]");
     if (g_frac_rand < 0.0 || g_frac_rand > 1.0) fatal("--frac_rand must be in [0,1]");
