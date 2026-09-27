@@ -3315,6 +3315,16 @@ static void read_checkpoint(const char *path) {
     int nf = fscanf(ck, "%u %u %u %llu", &br, &bi, &li, &sol);
     fclose(ck);
     if (nf < 3) { printf("[resume] checkpoint %s unreadable; starting fresh\n", path); return; }
+    /* The resumed run keeps the range it was given: it starts at the
+       checkpoint's border row and still ends where --start_row + --num_rows
+       ends, so a job that owns a slice of the rotations file never spills into
+       the next job's rows. A checkpoint outside that slice belongs to another
+       run. */
+    if (br < g_start_row || br >= g_start_row + g_num_rows)
+        fatal("--resume: %s is at border row %u, outside this run's rows %u..%u "
+              "(--start_row/--num_rows must be the original run's)",
+              path, br, g_start_row, g_start_row + g_num_rows - 1);
+    g_num_rows -= br - g_start_row;
     g_start_row = br;
     g_resume_bi = bi;
     g_resume_li = li;
@@ -3794,7 +3804,10 @@ static void usage(const char *a0) {
 "                         configuration in flight is always reported in full, so the\n"
 "                         final count can overshoot N by that configuration's output\n"
 "                         (0 = unlimited; default 0)\n"
-"  --resume               continue from <out_dir>/sweep_checkpoint.txt\n"
+"  --resume               continue from <out_dir>/sweep_checkpoint.txt. Give the\n"
+"                         original --start_row/--num_rows: the run ends where the\n"
+"                         original would have. A configuration cut by --wall_time or\n"
+"                         a signal before it wrote anything is run again\n"
 "\n"
 "Misc:\n"
 "  --threads N            OpenMP threads (default: all cores)\n"
@@ -4612,7 +4625,17 @@ int main(int argc, char *argv[]) {
                 if (g_completions_fp) fflush(g_completions_fp);
                 partial_outputs_flush();
                 partials_budget_announce();
-                write_checkpoint(ckpath, cur_row, (uint32_t)bi, (uint32_t)(li+1));
+                /* A config cut short by --wall_time or a signal before it wrote
+                   anything is not done: the checkpoint stays on it, so --resume
+                   runs it again. One that did write is kept as done, so a resume
+                   never appends its boards twice. */
+                const bool cut = !strcmp(br.reason, "interrupted") ||
+                                 (!strcmp(br.reason, "time") && g_max_wall_sec > 0.0 &&
+                                  omp_get_wtime() - t_start >= g_max_wall_sec);
+                size_t wrote = g_emit_count;
+                for (int k = 0; k < PART_N; k++) wrote += g_part_count[k];
+                const bool redo = cut && wrote == 0;
+                write_checkpoint(ckpath, cur_row, (uint32_t)bi, (uint32_t)(redo ? li : li + 1));
                 barren = (g_emit_count + g_part_count[PART_AB]
                           + g_part_count[PART_AC] + g_part_count[PART_BC] > 0)
                          ? 0 : barren + 1;

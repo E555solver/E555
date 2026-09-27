@@ -22,19 +22,20 @@
 # (the roundhouse partials that four checks share are built on demand). Leaving
 # check 1 out of the selection uses whatever is already in bin/.
 #
-# RUNTIME  about 4 minutes with SKIP_BEAMER=1. The four checks that need the
+# RUNTIME  about 4 minutes with SKIP_BEAMER=1. The five checks that need the
 # real 6.4 GB chain database -- beamer_micro, beamer_backtrack_dive,
-# example_beamer and pipeline_full -- share one cache and want ~8 GB of RAM.
+# beamer_resume, example_beamer and pipeline_full -- share one cache and want
+# ~8 GB of RAM.
 #
 # Environment switches:
 #   ARCH=generic    build for any CPU rather than the build host. Set it in CI
 #                   and containers; -march=native is the Makefile default.
-#   SKIP_BEAMER=1   skip the four database checks (low-RAM machines)
+#   SKIP_BEAMER=1   skip the five database checks (low-RAM machines)
 #   DB_FILE=path    keep the 6.4 GB chain database here (~6.5 GB on disk)
 #                   instead of under tests/out, so it survives the wipe and
 #                   every later run loads it rather than building it. The
-#                   four real-seed checks share one cache either way.
-#   DB_IN_MEMORY=1  never write the database to disk: each of the four checks
+#                   real-seed checks share one cache either way.
+#   DB_IN_MEMORY=1  never write the database to disk: each of the five checks
 #                   builds it in RAM and drops it (full-disk machines). Five
 #                   builds instead of one, so ~5x the database time, and each
 #                   build needs 8 GB free. Overrides DB_FILE.
@@ -101,6 +102,7 @@ ALL_STEPS=(
     "cpsat_chain|topper -> ender -> ender, each fed by the last"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
     "beamer_backtrack_dive|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly"
+    "beamer_resume|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
     "scripts_parse|every shipped script parses, and passes only flags that exist"
     "example_finalizer|examples/02 re-grows the synthetic board"
     "example_roundhouse|examples/03 refills one strip"
@@ -2165,6 +2167,31 @@ step_beamer_micro() {
     else
         echo "ok: run complete (this config went extinct -- normal for a micro-run)"
     fi
+}
+
+# --resume: one sweep over border rows 1..2, and the same sweep stopped by
+# --max_emitted inside row 2 and resumed. The resumed run must stay inside rows
+# 1..2 (a job that owns a slice of the rotations file must not spill into the
+# next job's rows), run exactly the configurations the first run did not, and
+# the two runs together must write exactly the uninterrupted sweep's boards.
+step_beamer_resume() {
+    if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv
+         --start_row 1 --num_rows 2 --top_bottoms 2 --top_columns 3 --beam_width 2000
+         --stop_row 6 --rng_seed 5 --threads 1 --verbose)
+    if [ -n "$GATE_DB" ]; then CMD+=(--db_file "$GATE_DB"); fi
+    "${CMD[@]}" --out_dir "$OUT/rs_ref" > "$OUT/rs_ref.log" || fail "reference sweep failed"
+    "${CMD[@]}" --out_dir "$OUT/rs_part" --max_emitted 80000 > "$OUT/rs_1.log" || fail "first half failed"
+    "${CMD[@]}" --out_dir "$OUT/rs_part" --resume > "$OUT/rs_2.log" || fail "resume failed"
+    grep -q '^\[resume\] start_row=2' "$OUT/rs_2.log" || fail "the resume did not start inside border row 2"
+    grep -q '^\[sweep\] r3' "$OUT/rs_2.log" && fail "the resumed run left its border rows"
+    grep -oE '^\[sweep\] r[0-9]+b[0-9]+l[0-9]+' "$OUT/rs_ref.log" > "$OUT/rs_ref.cfg"
+    cat "$OUT/rs_1.log" "$OUT/rs_2.log" | grep -oE '^\[sweep\] r[0-9]+b[0-9]+l[0-9]+' > "$OUT/rs_part.cfg"
+    cmp -s "$OUT/rs_ref.cfg" "$OUT/rs_part.cfg" || fail "stop + resume ran different configurations"
+    sort "$OUT"/rs_ref/beam_completions_*.csv > "$OUT/rs_ref.sorted"
+    sort "$OUT"/rs_part/beam_completions_*.csv > "$OUT/rs_part.sorted"
+    cmp -s "$OUT/rs_ref.sorted" "$OUT/rs_part.sorted" || fail "stop + resume wrote different boards"
+    echo "ok: $(wc -l < "$OUT/rs_ref.cfg") configurations and their boards, identical after a stop and --resume"
 }
 
 # The backtracker and the end dives, on a rotations row. Two runs share every

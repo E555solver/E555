@@ -1323,7 +1323,7 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--time_limit S` | 600 | wall-time slice per configuration |
 | `--wall_time S` | 0 | total budget (0 = unlimited) |
 | `--max_emitted N` | 0 | stop after N boards reported -- completions **plus** `--incomplete_top` partials (0 = unlimited); under `--end_dive` it caps the finished boards written instead, and never stops the search |
-| `--resume` | off | continue from the sweep checkpoint |
+| `--resume` | off | continue from the sweep checkpoint; give the original `--start_row`/`--num_rows` (and `--rng_seed` at tau > 0): the resumed run ends where the original would have, and a configuration that `--wall_time` or a signal cut before it wrote anything is run again |
 | `--threads N` | all | OpenMP threads |
 | `--rng_seed S` | random | master RNG seed |
 | `--verbose` | off | every `[sweep]` line, `[rank]`/`[bail]` lines, per-row `[beam]` lines, and the `[dfs]`/`[dive]` lines per configuration |
