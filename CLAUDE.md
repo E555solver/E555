@@ -9,15 +9,15 @@ E555 is a pipeline of solvers for Eternity II (16x16 edge-matching puzzle, 256 p
 ## Build
 
 ```bash
-make                      # bin/E555_beamer, E555_finalizer, E555_roundhouse, E555_backtracker
+make                      # bin/E555_beamer, E555_finalizer, E555_roundhouse, E555_backtracker, E555_diver
 make ARCH=generic         # use this in containers / CI / cloud sandboxes (default is -march=native)
-make beamer               # single target; also finalizer | roundhouse | backtracker | clean
+make beamer               # single target; also finalizer | roundhouse | backtracker | diver | clean
 pip install ortools       # only needed for src/C_tail/E555_topper.py and E555_ender.py
 ```
 
 - Flags are `-Wall -Wextra -O3 -fopenmp`. The test gate fails on **any** compiler warning.
 - Changing `ARCH`/`OPT`/`CC` forces a rebuild through `bin/.buildflags`. A binary built with `-march=native` dies with SIGILL on an older CPU.
-- beamer, finalizer and roundhouse all link `src/B_beam/E555_database.c`; the beamer also links `src/C_tail/E555_dive.c` (the end-dive engine, no argv of its own). The backtracker is standalone.
+- beamer, finalizer and roundhouse all link `src/B_beam/E555_database.c`; the beamer and the diver also link `src/C_tail/E555_dive.c` (the end-dive engine, no argv of its own), and the diver links `E555_database.c` too. The backtracker is standalone.
 - `tests/datadriven/` is a self-contained beamer fork with its own Makefile (`cd tests/datadriven && make ARCH=generic`).
 
 ## Tests
@@ -52,6 +52,7 @@ Stage B  src/B_beam/E555_beamer.c             5-5-5 chain DB + wide beam + colou
          src/B_beam/E555_roundhouse.c         rotate 90 deg, grow a W-wide strip; exhaustive, DP oracle
 Stage C  src/C_tail/E555_topper.py            CP-SAT break minimizer over bands / --holes masks
          src/C_tail/E555_backtracker.c        greedy dives + exhaustive DFS; --stop_row/--stop_column bands
+         src/C_tail/E555_diver.c              the beamer's --end_dive/--end_polish on any board file; no DB
          src/C_tail/E555_ender.py             CP-SAT closer, never returns a worse board
 tools/   viewer, rank (--rescore), rotate (--sink), distiller (--plan/--triage), extract_consensus, sort_rotations, clean_csv
 ```

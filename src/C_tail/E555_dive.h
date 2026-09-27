@@ -63,6 +63,10 @@ void     dv_init(const DvParams *p);
    edge piece to the side its g_spin gives it; otherwise any edge may take any
    border cell. */
 void     dv_frame(bool by_side);
+/* Turn corner seeding on or off for the boards queued next (it starts as
+   DvParams.seed_corners). A front-end turns it off for a batch the corner
+   catalog does not describe. */
+void     dv_seeding(bool on);
 /* Queue one board of the current batch: per cell, the piece (DV_EMPTY = open)
    and its rotation. Placed cells never move. With seeding on, seeded copies of
    the board are queued right after it (for the corner catalog of tc_config's

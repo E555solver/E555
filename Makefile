@@ -1,7 +1,7 @@
 # E555 -- Eternity II toolkit. Builds four executables into bin/.
 # Needs GCC or Clang with OpenMP, 64-bit POSIX.
 #
-#   make [all|beamer|finalizer|roundhouse|backtracker|clean]
+#   make [all|beamer|finalizer|roundhouse|backtracker|diver|clean]
 #   make ARCH=v3 | OPT=-O2 | ARCHFLAGS='-march=skylake-avx512' | CC=clang
 #
 #   ARCH     native (default)  -march=native                  build host only
@@ -36,12 +36,13 @@ LDLIBS = -lm
 B := src/B_beam
 C := src/C_tail
 
-.PHONY: all beamer finalizer roundhouse backtracker clean FORCE
-all: beamer finalizer roundhouse backtracker
+.PHONY: all beamer finalizer roundhouse backtracker diver clean FORCE
+all: beamer finalizer roundhouse backtracker diver
 beamer:      bin/E555_beamer
 finalizer:   bin/E555_finalizer
 roundhouse:  bin/E555_roundhouse
 backtracker: bin/E555_backtracker
+diver:       bin/E555_diver
 
 bin:
 	mkdir -p bin
@@ -64,6 +65,10 @@ bin/E555_roundhouse: $(B)/E555_roundhouse.c $(B)/E555_database.c $(B)/E555_datab
 
 bin/E555_backtracker: $(C)/E555_backtracker.c $(STAMP) | bin
 	$(CC) $(CFLAGS) $(C)/E555_backtracker.c -o $@ $(LDLIBS)
+
+bin/E555_diver: $(C)/E555_diver.c $(C)/E555_dive.c $(C)/E555_dive.h \
+                $(B)/E555_database.c $(B)/E555_database.h $(STAMP) | bin
+	$(CC) $(CFLAGS) $(B)/E555_database.c $(C)/E555_dive.c $(C)/E555_diver.c -o $@ $(LDLIBS)
 
 clean:
 	rm -rf bin

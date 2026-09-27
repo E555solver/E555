@@ -787,6 +787,8 @@ void dv_init(const DvParams *p) {
     dv_build_static();
 }
 
+void dv_seeding(bool on) { g_p.seed_corners = on; }
+
 uint64_t dv_written(void) { return g_dv_run.written; }
 uint64_t dv_boards(void)  { return g_dv_run.roots; }
 

@@ -71,6 +71,7 @@ data/seed_Edge5.txt
 │   E555_topper.py      break minimizer; herds breaks to the NEAREST    │
 │                       corner; --side opens any border band            │
 │   E555_backtracker    exact / bounded-mismatch DFS tail closer        │
+│   E555_diver          the beamer's end dives + polish on any board    │
 │   E555_ender.py       adaptive closer; profiles + true per-board budget│
 │   - laptop             - output → canonical board CSV, score /480     │
 └───────────────────────────────────────────────────────────────────────┘
@@ -1252,6 +1253,10 @@ seam above the stop row, the rest) and the corner-seed comparison.
 `--wall_time` and Ctrl-C stop the dives; every board that already has a score
 is still written.
 
+The same engine runs on its own as `E555_diver` (Stage C), for boards that
+already exist: a beam file written without `--end_dive`, partials from other
+tools, or another pass with more dives or polish.
+
 ### Determinism and reproducibility
 
 Runs are intentionally **not** reproducible unless `--rng_seed` is given: the
@@ -2175,7 +2180,7 @@ any, so a board carrying none gives it nothing to check and no choice to make.
 ---
 ## Stage C -- the tail toolbox
 
-Three tools, one canonical CSV, different philosophies. None of them has
+Four tools, one canonical CSV, different philosophies. None of them has
 closed a real 480/480 yet -- this is the open front of the project.
 
 ### E555_topper.py -- break minimizer ( the Stage C workhorse)
@@ -2506,6 +2511,64 @@ profile and costs about 12% of dive throughput and, now that nothing else
 dominates, **39%** of the DFS node rate (the last two rows of the table above).
 Prefer a non-generic `ARCH` wherever the CPU allows -- `generic` is for CI and
 containers, not for a real run.
+
+### E555_diver -- the beamer's end dives on any board file
+
+```bash
+bin/E555_diver seed.txt boards.csv output.csv [--end_dive M] [--end_polish R]
+               [--emit_score S] [--rotations FILE] [--corner_seeds N] [--clue_corners]
+               [--threads N] [--rng_seed S] [--wall_time S] [--max_emitted N]
+               [--print_cmd] [--verbose]
+```
+
+The finish of `E555_beamer --end_dive` (Stage B, "Finishing boards: end dives
+and polish"), for boards that already exist: a beam output written without
+`--end_dive`, a finalizer or roundhouse partial, a board with holes cut by
+hand, or dived boards to polish again under another `--rng_seed`. It links the
+same engine (`src/C_tail/E555_dive.{c,h}`), so the dives, the learning rounds,
+the polish and every tuned constant are the beamer's; only the front-end
+differs. It needs no chain database and starts in milliseconds.
+
+- **Input.** Any board CSV: the last 512 fields of a row are `pos[256]`,
+  `rot[256]`, a leading field is the config id, `#` and `%` lines are comments.
+  Every placed cell stays where it is; the open cells are dived. A complete
+  board has nothing to dive and is skipped, as is a row that is not a board
+  (a cell outside 0..255, two pieces on one cell) or one whose open cells
+  cannot take its unused pieces (corners, edges and inner pieces must balance).
+- **Batches.** Consecutive rows with the same config id are dived together,
+  as the beamer dives one configuration, because stage 2 is chosen relative to
+  the batch. A beamer file therefore replays configuration by configuration.
+  Boards are written after every batch.
+- **Frame.** Without `--rotations` any unused edge piece may take any open
+  border cell. With `--rotations FILE` a beamer id `r<N>b...` names the
+  rotations row its border came from, and edge pieces are held to the sides
+  row N deals them, exactly as in the beamer. A board that cannot be finished
+  that way is dived with free edges in a run of its own, with a note; an id
+  that names no row (finalizer `p...`, random-border `rndb...`, anything else)
+  is dived with free edges.
+- **Corner seeds** (`--corner_seeds N`, needs `--rotations`, default off):
+  the beamer's corner-seeded copies, from the corner catalog of each board's
+  rotations row and its own column 0; `--clue_corners` picks the 2x3 clue
+  template.
+- **Defaults.** `--end_dive 10000`, polish off, `--emit_score 450`,
+  `--rng_seed 1` (a re-run reproduces the file). Output is independent of
+  `--threads`: every dive's random stream is keyed by its board and the seed.
+- **Output.** Canonical rows `config_id, score, pos[256], rot[256]`, best first
+  within each batch, exact duplicates dropped, the matched edges in the score
+  field; `output.csv.outputs.txt` lists the file. `--wall_time`, Ctrl-C and
+  `--max_emitted` stop after the batch in flight, which is still written.
+
+`examples/10_diver_quickstart.sh` runs it on `data/board_partial_row12.csv`.
+Its output is complete boards with broken edges, which is what the ender and
+the backtracker (with a holes mask) repair.
+
+**Extending.** The diver is the front-end only: reading, batching, the frame
+choice and writing. A new dive policy, move or stage belongs in the engine's
+layers (`E555_dive.c`: problem, dive, learning, local search, batch,
+seeders, reporting), where the beamer gets it too. A new way of choosing what
+to dive -- a holes mask that reopens placed cells, reopened rows, another
+seeder -- belongs in the diver, as preparation of the board it hands to
+`dv_add()`.
 
 ### E555_ender.py -- the closer, two neighbourhoods ( power tool)
 
@@ -2898,6 +2961,7 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
 | Stage C (all) | output CSV | **canonical**: `config_id, score, pos[256], rot[256]` (514) |
 | backtracker | `<out>.checkpoint.csv`, `<out>.status.csv`, `<out>.best_*.csv` | canonical rows / diagnostic sidecars |
 | backtracker | `<out>.stop_row<N>.csv` / `<out>.stop_col<N>.csv` (`_rev` when reversed) | every completed stop band, canonical 514-field layout |
+| diver | the output CSV named as the third positional argument, plus `<out>.outputs.txt` | canonical 514-field layout, the input's config ids, matched edges in the score field |
 
 ---
 
@@ -2905,7 +2969,8 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
 
 ```bash
 make                        # bin/E555_beamer, bin/E555_finalizer,
-                            # bin/E555_roundhouse, bin/E555_backtracker
+                            # bin/E555_roundhouse, bin/E555_backtracker,
+                            # bin/E555_diver
 pip install ortools         # only for topper / ender
 
 # Portability: `make` compiles for THIS cpu (-march=native), which is fastest
@@ -2992,6 +3057,8 @@ tools to the same-seed-same-threads contract.
 | `src/B_beam/E555_roundhouse.c` | Strip solver: board rotation, width-W chain DB, relaxed DP oracle, exhaustive/sampling strip search, 3-round spiral. |
 | `src/C_tail/E555_topper.py` | CP-SAT break minimizer, nearest-corner pull, `--side` bands + sliding window, or an explicit `--holes` mask. |
 | `src/C_tail/E555_backtracker.c` | Exact/bounded-mismatch DFS tail closer. |
+| `src/C_tail/E555_dive.c/.h` | End-dive engine shared by the beamer (`--end_dive`) and the diver: dives, cross-entropy learning, polish, corner seeding, job scheduler. |
+| `src/C_tail/E555_diver.c` | Front-end that runs the end-dive engine on any board file: input, batching by config id, frame choice, output. |
 | `src/C_tail/E555_ender.py` | CP-SAT closer: adaptive portfolio of focused then broad neighbourhoods, driven by `--profile` and a true `--board_time_limit`. |
 | `tools/E555_viewer.py` | Board viewer/differ + bucas URL. |
 | `tools/E555_rank.py` | Ranks/sorts board CSVs by compactness, solidity, clean rows; `--rescore` rewrites them canonically; `--diverse K` picks independent roots. |

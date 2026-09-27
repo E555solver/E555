@@ -78,6 +78,7 @@ value. Copy that line and you have the run, without this script in the middle.
 | `04b_CP-SAT_ender_overnight.sh` | ender | deduplicate and shard a large full-board corpus over several ender processes | `pip install ortools`, hours |
 | `04c_CP-SAT_ender_elite.sh` | ender | pick diverse elites and give each repeated `deep` or ten-hour `superdeep` passes | `pip install ortools`, hours |
 | `05_backtracker_dives.sh` | backtracker | greedy dives to triage, exhaustive DFS to prove | minutes to overnight |
+| `10_diver_quickstart.sh` | diver | finish partial boards with the beamer's end dives and polish, from any board file | seconds to minutes |
 | `06_roundhouse_both_ways.sh` | roundhouse | chain two roundhouse passes per board, once each way round, so the two spirals cover all four sides | seconds to minutes |
 | `08_distiller_quickstart.sh` | distiller (+ backtracker) | triage a corpus: rank thousands of >=450 boards by how much repair headroom is left, then write the Stage C commands to attack the best of them | seconds to minutes |
 | `07_barebones_chain.sh` | all four | the whole chain in six calls, no arguments and no indirection: what the tools are actually invoked with | 8 GB RAM, ~15 min |
@@ -179,7 +180,9 @@ from there is cheap because the tree dies out within a few rows. `END_DIVE=10000
 END_POLISH=20000` then completes every stop-row board to all 256 pieces with
 random dives, polishes the best, and writes the best completion per board with
 its matched-edge count (out of 480) in field 2 -- so for these files field 2 IS
-a score. Only boards reaching `--emit_score` (450) are written.
+a score. Only boards reaching `--emit_score` (450) are written. To run the same
+finish again on boards you already have (more dives, a polish pass, another
+seed), use `10_diver_quickstart.sh`.
 
 **Reproducibility.** The beam is reproducible from `--rng_seed` together with
 `--threads`, not from the seed alone. The work partition follows the thread

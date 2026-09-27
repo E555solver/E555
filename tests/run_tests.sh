@@ -94,6 +94,7 @@ ALL_STEPS=(
     "backtracker_stop_band|--stop_row/--stop_column emit exact, finalizer-shaped bands"
     "backtracker_breakcount|break classes agree with the per-candidate scan they replaced"
     "backtracker_clues|--clue_center/--clue_corners force the hints on, or drop the board"
+    "diver|E555_diver finishes held boards: identical at 1 and 4 threads, scores recount, placed cells untouched"
     "whirlpool_lap|one whirlpool lap: turn, re-cut rows 0..5, re-grow to row 11"
     "clue_orient|a band carrying no clue is searched at all four orientations"
     "band_with_frame|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
@@ -106,6 +107,7 @@ ALL_STEPS=(
     "example_bothways|examples/06 runs both chains over one board, ids intact"
     "example_cpsat|examples/04a, scout -> promote -> polish -> close"
     "example_backtracker|examples/05 dives on the example board"
+    "example_diver|examples/10 finishes the row-12 partial into a complete board"
     "pipeline_topper_sweep|pipeline/topper_sweep.sh through a two-pass plan"
     "example_beamer|examples/01 both ways, random and annealed borders"
     "pipeline_full|pipeline/run_pipeline.sh, all seven stages"
@@ -196,7 +198,7 @@ step_compile() {
     make clean >/dev/null
     make all 2> "$OUT/warnings.txt"
     if [ -s "$OUT/warnings.txt" ]; then cat "$OUT/warnings.txt"; fail "compiler warnings"; fi
-    echo "ok: 4 binaries, no warnings"
+    echo "ok: 5 binaries, no warnings"
 }
 
 step_viewer() {
@@ -1824,6 +1826,90 @@ PY
     echo "ok: all four orientations land, the board wins, both conflicts drop unwritten"
 }
 
+# The diver on held boards of the synthetic puzzle. The input covers what the
+# front-end decides for itself: a beamer id "r0b..." whose boards fit rotations
+# row 0 (dealt edges, corner seeding on), an "r1b..." id whose row deals every
+# border piece to another side (the boards cannot fit it and must fall back to
+# free edges), an id naming no row, a complete board (nothing to dive) and a
+# row with two pieces on one cell (skipped). Every written board must be
+# complete, its score must recount, and its placed cells must be exactly one
+# input board's of the same id -- dives and polish fill holes, never move a
+# piece. Two runs at 1 and 4 threads must write the same bytes: every dive's
+# stream is keyed by its board, and the polish candidates by (score, dive).
+step_diver() {
+    python3 - data/synth_seed.txt data/synth_solution_480.csv "$OUT/dv_in.csv" "$OUT/dv_rot.csv" <<'EOF' || exit 1
+import sys
+seed = [list(map(int, l.split())) for l in open(sys.argv[1]) if l.strip() and not l.startswith("#")]
+f = [x.strip() for x in open(sys.argv[2]).read().strip().split(",")]
+pos, rot = list(map(int, f[-512:-256])), list(map(int, f[-256:]))
+border = [0 in p for p in seed]
+spins = [rot[p] if border[p] else 0 for p in range(256)]
+turned = [(s + 1) % 4 if border[p] else 0 for p, s in enumerate(spins)]
+open(sys.argv[4], "w").write("# row 0: the solution's border; row 1: every border piece turned once\n"
+                             "r0," + ",".join(map(str, spins)) + "\nr1," + ",".join(map(str, turned)) + "\n")
+def board(id_, blank, dup=False):
+    p = [999 if pos[i] in blank else pos[i] for i in range(256)]
+    r = [0 if pos[i] in blank else rot[i] for i in range(256)]
+    if dup:
+        a, b = [i for i in range(256) if p[i] != 999][:2]
+        p[b] = p[a]
+    return ", ".join([id_, "0"] + [str(x) for x in p + r])
+box   = lambda r0, r1, c0, c1: {r * 16 + c for r in range(r0, r1) for c in range(c0, c1)}
+rows  = lambda a, b: box(a, b, 0, 16)
+inner = lambda a, b: box(a, b, 1, 16)            # keeps column 0, as the beamer writes it
+out = ["# E555_diver gate boards"]
+out += [board("r0b0l0", inner(8, 16)), board("r0b0l0", inner(9, 16)),
+        board("r0b0l0", inner(7, 16)), board("r0b0l0", inner(8, 16) | box(3, 6, 3, 9))]
+out += [board("r1b0l0", inner(8, 16)), board("r1b0l0", inner(10, 16))]
+out += [board("p3r0l5", rows(7, 16)), board("p3r0l5", box(4, 12, 2, 14))]
+out += [board("done", set()), board("bad", rows(13, 16), dup=True)]
+open(sys.argv[3], "w").write("\n".join(out) + "\n")
+EOF
+    for t in 1 4; do
+        bin/E555_diver data/synth_seed.txt "$OUT/dv_in.csv" "$OUT/dv_out$t.csv" \
+            --rotations "$OUT/dv_rot.csv" --corner_seeds 2 --end_dive 400 --end_polish 20 \
+            --emit_score 0 --threads $t --print_cmd --verbose > "$OUT/dv_$t.log" \
+            || fail "E555_diver failed at $t thread(s)"
+    done
+    cmp -s "$OUT/dv_out1.csv" "$OUT/dv_out4.csv" || fail "1 and 4 threads wrote different boards"
+    [ -s "$OUT/dv_out1.csv.outputs.txt" ] || fail "no outputs.txt"
+    grep -q "2 board(s) do not fit rotations row 1" "$OUT/dv_1.log" || fail "the misfit boards did not fall back to free edges"
+    grep -q "1 already complete" "$OUT/dv_1.log" || fail "the complete board was not recognized"
+    grep -q "two pieces on one cell" "$OUT/dv_1.log" || fail "the malformed row was not skipped"
+    grep -q "seeded=" "$OUT/dv_1.log" || fail "corner seeding did not run on the r0 batch"
+    python3 - data/synth_seed.txt "$OUT/dv_in.csv" "$OUT/dv_out1.csv" <<'EOF' || exit 1
+import sys
+seed = [list(map(int, l.split())) for l in open(sys.argv[1]) if l.strip() and not l.startswith("#")]
+def rows(path):
+    for l in open(path):
+        if l.strip() and l[0] not in "#%":
+            f = [x.strip() for x in l.split(",")]
+            yield f[0], int(f[1]), list(map(int, f[-512:-256])), list(map(int, f[-256:]))
+def cells(pos, rot):
+    return {pos[p]: (p, rot[p]) for p in range(256) if pos[p] != 999}
+held = {}
+for id_, _, pos, rot in rows(sys.argv[2]):
+    held.setdefault(id_, []).append(cells(pos, rot))
+n = 0
+for id_, score, pos, rot in rows(sys.argv[3]):
+    c = cells(pos, rot)
+    if len(c) != 256 or sorted(pos) != list(range(256)):
+        sys.exit("!!! %s: a written board is not complete" % id_)
+    side = lambda x, d: seed[c[x][0]][(d + c[x][1]) % 4]   # seed sides: top right bottom left
+    m = sum(side(x, 1) == side(x + 1, 3) for x in range(256) if x % 16 < 15) \
+      + sum(side(x, 0) == side(x + 16, 2) for x in range(240))
+    if m != score:
+        sys.exit("!!! %s: score field %d, recount %d" % (id_, score, m))
+    if not any(all(c[x] == v for x, v in h.items()) for h in held.get(id_, [])):
+        sys.exit("!!! %s: a written board moved a placed piece" % id_)
+    n += 1
+if n < 8:
+    sys.exit("!!! only %d boards written" % n)
+print("ok: %d finished boards, complete, scores recount, placed cells untouched" % n)
+EOF
+    echo "ok: identical at 1 and 4 threads; misfit, complete and malformed rows handled"
+}
+
 # One whirlpool lap: turn the board, re-cut rows 0..5 exactly, re-grow to row 11.
 # The assertions are the lap's geometry, which is what a rotation-sense error
 # would silently break: a turned rows-0..10 board must have 11 complete COLUMNS
@@ -2294,6 +2380,17 @@ step_example_backtracker() {
     echo "ok: examples/05 dived and wrote a canonical board"
 }
 
+step_example_diver() {
+    bash examples/10_diver_quickstart.sh OUT="$OUT/ex10.csv" END_DIVE=500 END_POLISH=50 \
+        THREADS=4 > "$OUT/ex10.log" \
+        || { tail -5 "$OUT/ex10.log"; fail "examples/10 exited non-zero"; }
+    [ -s "$OUT/ex10.csv" ] || fail "examples/10 emitted nothing"
+    nf=$(awk -F, '!/^ *[#%]/{print NF; exit}' "$OUT/ex10.csv")
+    [ "$nf" = "514" ] || fail "examples/10 wrote $nf fields, want 514"
+    grep -q "placed=256" "$OUT/ex10.log" || fail "examples/10 did not finish the board"
+    echo "ok: examples/10 finished the partial into a canonical 256-piece board"
+}
+
 # Two passes: one that unsets the outer rows, one that fills them back in. That
 # is one complete GROUP, so the group prune at the end of the plan runs -- the
 # part of this script that decides which board survives.
@@ -2528,7 +2625,7 @@ else
     echo "[cfg] ${#SEL[@]} of $TOTAL checks selected: ${SEL[*]}"
 fi
 if ! has_step 1; then
-    for b in beamer finalizer roundhouse backtracker; do
+    for b in beamer finalizer roundhouse backtracker diver; do
         [ -x "bin/E555_$b" ] || { echo "!!! bin/E555_$b is missing: run make, or include check 1"; exit 1; }
     done
     echo "[cfg] check 1 not selected, using the binaries already in bin/"
