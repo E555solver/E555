@@ -1269,6 +1269,83 @@ The same engine runs on its own as `E555_diver` (Stage C), for boards that
 already exist: a beam file written without `--end_dive`, partials from other
 tools, or another pass with more dives or polish.
 
+### Settings for reaching row 11 (measured)
+
+Measured on `data/borders_annealed_fix12.csv` with `--clue_center`, 4 threads,
+`--rng_seed 1`, the chain database warm in the page cache. Counts are
+configurations reaching row 11; "per core-hour" is per hour of one core.
+
+**Width and backtrack row** (32 configurations: border rows 0-3, 2 bottoms x 4
+columns; the last two rows were cut short and are rates over 12 and 20):
+
+| `--beam_width` | `--backtrack_row` | reach row 11 | row-11 boards | s/config | reach per core-hour | boards per core-hour |
+|---|---|---|---|---|---|---|
+| 10000 | off | 0/32 | 0 | 0.9 | 0 | 0 |
+| 10000 | 8 | 0/32 | 0 | 0.8 | 0 | 0 |
+| 10000 | 7 | 2/32 | 6 | 0.8 | ~74 | ~210 |
+| **10000** | **6** | **16/32** | 47 | **1.0** | **~470** | **~1300** |
+| 10000 | 5 | 12/12 | 238 | 23 | ~38 | ~760 |
+| 250000 | 6 | 20/20 | 496 | 31 | ~29 | ~710 |
+
+The beam alone rarely reaches row 11; the exhaustive search does. A narrow beam
+to row 6 and the search from there is the cheapest way to row 11 by an order of
+magnitude, but it loses about half the configurations: the ones it misses are
+not dead -- backtracking from row 5, or a 250k beam to row 6, takes every one of
+them to row 11 with 20-25 boards each, at ~25x the cost per configuration. A
+wide beam stops being width-limited near row 7 anyway (it keeps every
+candidate from there), so width beyond ~100k mostly buys time.
+
+**Where the centre clue sits** (`--pin_clue`; 64 configurations, border rows
+0-7, width 10000). Pins 1-2 put the centre clue on row 7, pins 3-4 on row 8;
+left or right makes no difference.
+
+| `--backtrack_row` | pin 0 (all frames) | pin 1 (row 7) | pin 2 (row 7) | pin 3 (row 8) | pin 4 (row 8) |
+|---|---|---|---|---|---|
+| 6 | 35/64, 87 s | 19/64, 57 s | 22/64, 58 s | 6/64, 60 s | 2/64, 60 s |
+| 7 | 6/64, 68 s | 7/64, 54 s | 8/64, 53 s | 0/64, 64 s | 0/64, 63 s |
+
+With the search starting at row 5 (16 configurations), a row-8 clue is no
+harder to satisfy -- pin 2: 12/16 configurations, 74 boards, 48 s; pin 3: 12/16,
+75 boards, 214 s -- but it costs 4.4x the search, because a row-7 clue prunes
+the tree a row earlier and, from `--backtrack_row 6`, also steers the beam's row 6
+(a clue fixes a colour on the row below it). A row-8 frame needs
+`--backtrack_row 5`; from row 6 it mostly dies. Unpinned, the run finds what the
+four pinned runs find together (35 of their 36 configurations) for 87 s instead
+of 4 x 58 s: leave `--pin_clue` at 0 unless the frame is known.
+
+**Breadth and tau** (288 configurations: border rows 4-7, 6 bottoms x 12
+columns, width 10000, `--backtrack_row 6`):
+
+| selection | reach row 11 | boards | time |
+|---|---|---|---|
+| tau 0 | 159/288 | 721 | 355 s |
+| `--tau_bottoms 0.1 --tau_columns 0.1` | 168/288 | 731 | 343 s |
+| `--tau_bottoms 2 --tau_columns 2` | 144/288 | 589 | 323 s |
+
+Neither rank predicts yield here: bottoms 0-5 reached row 11 in 21-29 of 48
+configurations each, columns 0-11 in 9-18 of 24, with no trend. The border row
+does: 19/72 on row 4, 67/72 on row 5. So spend the budget on border rows first,
+and take bottoms and columns freely within a row. The ranks of the leading
+bottoms and columns differ by well under 1 nat, so tau works on a small scale:
+0.1 keeps about half the picks in the greedy top 10 at no measured cost; 2 is
+close to a uniform draw over every bottom and column.
+
+**Recommended.** A first pass over as many border rows as there are machines to
+spread them over:
+
+```bash
+bin/E555_beamer seed_Edge5.txt rotations.csv --start_row R --num_rows N \
+    --clue_center --beam_width 10000 --backtrack_row 6 --stop_row 11 \
+    --top_bottoms 6 --top_columns 12 --tau_bottoms 0.1 --tau_columns 0.1 \
+    --rng_seed S --db_file chain.db --out_dir beam_R
+```
+
+and, where a border is worth more depth, the same configurations again with
+`--backtrack_row 5`, which also covers the row-8 clue frames. Read the database
+file once after a machine boots (`cat chain.db > /dev/null`): a cold cache made
+the first configurations 5-10x slower. `--resume` continues a killed job inside
+its own `--start_row`/`--num_rows` range.
+
 ### Determinism and reproducibility
 
 Runs are intentionally **not** reproducible unless `--rng_seed` is given: the
