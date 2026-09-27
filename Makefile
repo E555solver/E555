@@ -52,8 +52,9 @@ $(STAMP): FORCE | bin
 	@echo '$(CC) $(CFLAGS)' | cmp -s - $@ || echo '$(CC) $(CFLAGS)' > $@
 FORCE:
 
-bin/E555_beamer: $(B)/E555_beamer.c $(B)/E555_database.c $(B)/E555_database.h $(B)/E555_beamer.h $(STAMP) | bin
-	$(CC) $(CFLAGS) $(B)/E555_database.c $(B)/E555_beamer.c -o $@ $(LDLIBS)
+bin/E555_beamer: $(B)/E555_beamer.c $(B)/E555_database.c $(B)/E555_database.h $(B)/E555_beamer.h \
+                 $(C)/E555_dive.c $(C)/E555_dive.h $(STAMP) | bin
+	$(CC) $(CFLAGS) $(B)/E555_database.c $(C)/E555_dive.c $(B)/E555_beamer.c -o $@ $(LDLIBS)
 
 bin/E555_finalizer: $(B)/E555_finalizer.c $(B)/E555_database.c $(B)/E555_database.h $(B)/E555_beamer.h $(STAMP) | bin
 	$(CC) $(CFLAGS) $(B)/E555_database.c $(B)/E555_finalizer.c -o $@ $(LDLIBS)

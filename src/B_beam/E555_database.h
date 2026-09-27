@@ -669,10 +669,10 @@ typedef struct {
 } TcLive;
 
 extern bool     g_tc_clued;                    /* catalog built with the clue template */
-/* Off in every stock tool. When set, tc_build pools the edge pieces dealt to
-   the top and to the right: each may fill a TR side cell or witness the top
-   border (the datadriven fork sets it under --free_edges, where any unused
-   edge may end a row). */
+/* When set, tc_build pools the edge pieces dealt to the top and to the right:
+   each may fill a TR side cell or witness the top border. The beamer sets it
+   under --free_edges, where any unused edge may end a row; with the sides
+   dealt (off) every tool's catalog is unchanged. */
 extern bool     g_tc_pool_top_right;
 extern uint8_t  g_tc_slots;                    /* slots built: orientations, or bit 0 */
 extern int      g_tc_blk_n[4][2];
