@@ -1246,9 +1246,9 @@ more dives. Earlier runs on 97 row-11 boards of another border agree: the
 learning rounds add about 1.5 edges per board over the same number of plain
 dives, and plain dives gain under 1 edge per tenfold more of them.
 Aiming each kick's first swap cell at a broken edge, rather than at any open
-cell, gained 0.08 edges per board over uniform kicks (113 boards better, 82
-worse, over 177 boards and several seeds and budgets) at the same cost; running
-16 walks instead of 8 on the same rounds did not help.
+cell, gained 0.08 edges per board over uniform kicks at the same cost (177
+boards under several seeds and budgets; 113 of the paired comparisons better,
+82 worse); running 16 walks instead of 8 on the same rounds did not help.
 
 **Parallelism and determinism.** The stages run as jobs on one queue shared by
 all threads: blocks of 32 dives, each learning round split the same way (the
@@ -2555,19 +2555,27 @@ differs. It needs no chain database and starts in milliseconds.
   border cell. With `--rotations FILE` a beamer id `r<N>b...` names the
   rotations row its border came from, and edge pieces are held to the sides
   row N deals them, exactly as in the beamer. A board that cannot be finished
-  that way is dived with free edges in a run of its own, with a note; an id
-  that names no row (finalizer `p...`, random-border `rndb...`, anything else)
-  is dived with free edges.
+  that way is dived with free edges in a run of its own, with a note -- which
+  is what every board of a beamer `--free_edges` run does; an id that names no
+  row (finalizer `p...`, random-border `rndb...`, anything else) is dived with
+  free edges.
 - **Corner seeds** (`--corner_seeds N`, needs `--rotations`, default off):
   the beamer's corner-seeded copies, from the corner catalog of each board's
-  rotations row and its own column 0; `--clue_corners` picks the 2x3 clue
-  template.
+  rotations row and its own column 0 (pooled over the top and right edges for
+  boards dived with free edges, as under the beamer's `--free_edges`);
+  `--clue_corners` picks the 2x3 clue template. Corner seeding is off unless
+  asked for, whereas the beamer's `--lambda_corners` turns on 4 by default.
 - **Defaults.** `--end_dive 10000`, polish off, `--emit_score 450`,
   `--rng_seed 1` (a re-run reproduces the file). Output is independent of
   `--threads`: every dive's random stream is keyed by its board and the seed.
-  Given a beamer stop-row file and the beamer run's `--rng_seed`, dive flags
-  and `--rotations`, the diver writes the rows of that run's own `--end_dive`
-  file byte for byte (the gate checks it, corner seeds included).
+  Given a beamer stop-row file (written without `--end_dive`), the diver
+  writes the rows of the matching `--end_dive` run's file byte for byte when
+  it gets the same `--rng_seed`, `--end_dive`/`--end_polish`/`--emit_score`,
+  the rotations file as `--rotations`, and, if the run used `--lambda_corners`,
+  `--corner_seeds 4` (or the run's value) plus `--clue_corners` if the run had
+  it. Checked for dealt sides and for `--free_edges` (the gate checks the
+  first); a `--random_edges` file names no row, so it replays without
+  `--rotations`.
 - **Output.** Canonical rows `config_id, score, pos[256], rot[256]`, best first
   within each batch, exact duplicates dropped, the matched edges in the score
   field; `output.csv.outputs.txt` lists the file. `--wall_time`, Ctrl-C and

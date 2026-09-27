@@ -22,8 +22,10 @@
  * its border came from, and the edge pieces are held to the sides that row
  * deals them, as in the beamer. A board that cannot be completed that way (its
  * edges do not sit where row N deals them) is dived with free edges instead, in
- * a run of its own under the same id. An id that names no row -- finalizer,
- * random-border or hand-made boards -- is dived with free edges.
+ * a run of its own under the same id -- which is how a beamer --free_edges
+ * file replays, its corner seeds drawn from the row's pooled top/right catalog
+ * as in the beamer. An id that names no row -- finalizer, random-border or
+ * hand-made boards -- is dived with free edges.
  *
  * Every dive's random stream is keyed by its board and --rng_seed, so output
  * does not depend on --threads or on where a batch starts.
@@ -138,6 +140,18 @@ static long dr_id_row(const char *id) {
 static long g_row = -2;            /* the row g_spin holds; -2 = none yet */
 static bool g_row_ok = false;      /* found in the file */
 static bool g_row_seed = false;    /* its corner catalog can seed */
+static bool g_row_pooled = false;  /* the catalog pools the top and right edges */
+
+/* The corner catalog of the loaded row. Pooled is the beamer's --free_edges
+   catalog: any unused top or right edge may fill a TR side cell or witness the
+   top border, as a free-edge dive may put it there. */
+static void dr_build_catalog(bool pooled) {
+    char lab[64];
+    snprintf(lab, sizeof lab, "rotations row %ld%s", g_row, pooled ? " (free edges)" : "");
+    g_tc_pool_top_right = pooled;
+    g_row_pooled = pooled;
+    g_row_seed = tc_build(g_clue_orients, (g_clue_mask & CLUE_CORNERS) != 0, lab) != 0;
+}
 
 static void dr_load_row(long row) {
     if (row == g_row) return;
@@ -153,11 +167,7 @@ static void dr_load_row(long row) {
     memcpy(g_spin, spins, sizeof g_spin);
     classify_deal_from_rotations();
     g_row_ok = true;
-    if (g_seeds > 0) {
-        char lab[48];
-        snprintf(lab, sizeof lab, "rotations row %ld", row);
-        g_row_seed = tc_build(g_clue_orients, (g_clue_mask & CLUE_CORNERS) != 0, lab) != 0;
-    }
+    if (g_seeds > 0) dr_build_catalog(false);
 }
 
 /* tc_config for the board's column 0. Its live lists depend only on the pieces
@@ -165,11 +175,12 @@ static void dr_load_row(long row) {
 static void dr_corner_config(const DrBoard *b) {
     static int last_hi = -2, last_lo = -2;
     static long last_row = -2;
+    static bool last_pooled = false;
     const int xh = (PUZZLE_SIDE - 2) * PUZZLE_SIDE, xl = (PUZZLE_SIDE - 3) * PUZZLE_SIDE;
     const int hi = b->pid[xh] == DV_EMPTY ? -1 : b->pid[xh];
     const int lo = b->pid[xl] == DV_EMPTY ? -1 : b->pid[xl];
-    if (hi == last_hi && lo == last_lo && last_row == g_row) return;
-    last_hi = hi; last_lo = lo; last_row = g_row;
+    if (hi == last_hi && lo == last_lo && last_row == g_row && last_pooled == g_row_pooled) return;
+    last_hi = hi; last_lo = lo; last_row = g_row; last_pooled = g_row_pooled;
     static Oriented col[PUZZLE_SIDE];
     LeftOrder lft;
     memset(&lft, 0, sizeof lft);
@@ -242,8 +253,12 @@ static void dr_batch(void) {
                    "edges\n", g_batch.id, k, row);
         nf = k;
     }
+    if (nd && g_seeds > 0 && g_row_pooled) dr_build_catalog(false);
     dr_run(dealt, nd, true, framed && g_row_seed);
-    if (!g_stop) dr_run(freed, nf, false, false);
+    /* Free-edge boards of a named row -- a beamer --free_edges run -- seed from
+       the row's pooled catalog, as the beamer did. */
+    if (nf && framed && g_seeds > 0 && !g_row_pooled) dr_build_catalog(true);
+    if (!g_stop) dr_run(freed, nf, false, framed && g_row_seed);
     free(dealt);
     g_batch.n = 0;
 }
