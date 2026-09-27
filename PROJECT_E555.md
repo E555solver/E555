@@ -2553,6 +2553,9 @@ differs. It needs no chain database and starts in milliseconds.
 - **Defaults.** `--end_dive 10000`, polish off, `--emit_score 450`,
   `--rng_seed 1` (a re-run reproduces the file). Output is independent of
   `--threads`: every dive's random stream is keyed by its board and the seed.
+  Given a beamer stop-row file and the beamer run's `--rng_seed`, dive flags
+  and `--rotations`, the diver writes the rows of that run's own `--end_dive`
+  file byte for byte (the gate checks it, corner seeds included).
 - **Output.** Canonical rows `config_id, score, pos[256], rot[256]`, best first
   within each batch, exact duplicates dropped, the matched edges in the score
   field; `output.csv.outputs.txt` lists the file. `--wall_time`, Ctrl-C and
