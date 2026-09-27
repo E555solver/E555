@@ -65,6 +65,51 @@ WARM START -- refining a border you already have
 
         row  3  polish  score=    9.2658 ->    10.4890 (+1.2232)  TOP 483840->483840 (+0)  ...
 
+DOUBLE DECKER -- two-tall border segments (--double_decker [SIDES])
+
+    A classic side is scored by the orderings of its 14 edge pieces. With
+    --double_decker, the named sides (comma list; bare = all four) are scored
+    as two-tall STRIPS instead: every edge piece is paired with the inner piece
+    it touches -- a domino -- and the side's count is the orderings of the whole
+    strip, the edge row and the first inner row together. That is again an
+    Euler trail, over (frame colour, inner colour) pairs, so the same exact
+    BEST count applies. The border that comes out is one whose requested sides
+    can be completed two rows deep in many ways, not only one row deep; the
+    outer two rings are exactly where the best known boards still break.
+
+    Every corner next to a two-tall side becomes a fixed 2x2 BLOCK -- the corner
+    piece, the edge piece on each side of it and the inner piece diagonal to it
+    -- because the second ring's corner cells touch two sides at once. A strip
+    runs between the blocks at its ends; a classic side next to a block keeps
+    that block's edge fixed at its end. The inner pieces are drawn from all but
+    the five Eternity II clue pieces, whose cells are elsewhere.
+
+    The counts are exact for the pairing the search found -- a WITNESS -- and so
+    a lower bound on what the border allows. The search moves between feasible
+    witnesses only: every move re-fills the strips it touches from scratch (a
+    fresh frame order, a fresh inner row found by a bounded depth-first search),
+    because a single changed partner almost never leaves a strip balanced.
+    A cold restart first runs the classic walk for --decker_warmup (0.3) of its
+    steps to find a usable border, then builds the witness on it; a warm start
+    builds it on the input row, and cannot come back below that seed witness.
+    A double-decker step costs ~0.36 ms against ~0.03 for a classic one.
+
+    Each written border then carries its witness:
+      - the comment gains `Decker=12/8/4/4` (the two-tall counts, TOP/RIGHT/
+        BOTTOM/LEFT, `-` for a classic side) and `Board=dd<seed>_r<N>`; TOP=..
+        and the rest stay the CLASSIC counts of the spins, so every reader of
+        the file reads it as before, and Score= is the double-decker objective;
+      - the row's inner pieces that the witness places carry spin 1 instead of
+        0 -- nothing reads an inner spin out of a rotations row today, so this
+        only marks them, for a later reservation;
+      - one board per row goes to --decker_out (default <out stem>_decker.csv),
+        in the beamer's own line format and under the Board= name: the full
+        border ring plus the two-tall sides' first inner ring, 999 elsewhere.
+        The finalizer loads it in fixed-sides mode at --finalize_from 0, and at
+        1 when BOTTOM is two tall (rows 0 and 1 are then complete).
+    E555_sort_rotations.py never turns such a row and E555_rotate.py refuses
+    the file: a turn would leave the board, the flags and Decker= behind.
+
 TEMPERATURE
 
     --T0/--Tf are resolved from the starting state unless given explicitly,
@@ -139,6 +184,11 @@ USAGE
     # (no --out: this writes rotations_refined.csv)
     python3 -u E555_edge_annealer.py seed_Edge5.txt \
       --input rotations.csv --restarts 2 --steps 500000 --threads 8
+
+    # make the top two rows rich, with a witness board per border
+    # (writes rotations_refined.csv and rotations_refined_decker.csv)
+    python3 -u E555_edge_annealer.py seed_Edge5.txt \
+      --input rotations.csv --double_decker TOP --restarts 2 --steps 100000
 
     # shape it instead: one rich side, three starved
     python3 -u E555_edge_annealer.py seed_Edge5.txt --out rotations.csv \
@@ -274,6 +324,16 @@ class AnnealingConfig:
     # instead of one summary line per restart.
     verbose: bool = False
 
+    # --double_decker: the sides scored as two-tall strips (empty = classic),
+    # the share of a cold restart spent in the classic warm-up, the weight of
+    # one broken match inside a corner block, and an explicit schedule for the
+    # double-decker phase of a cold restart (None = probed in the worker).
+    decker_sides:         Tuple[int, ...] = ()
+    decker_warmup:        float = 0.3
+    block_penalty_weight: float = 10.0
+    decker_T0:            Optional[float] = None
+    decker_Tf:            Optional[float] = None
+
     def w_side(self, side: Side) -> float:
         return {Side.TOP: self.w_top, Side.RIGHT: self.w_right,
                 Side.BOTTOM: self.w_bottom, Side.LEFT: self.w_left}[side]
@@ -395,6 +455,13 @@ class BestRecord:
     euler_counts: Dict[Side, int]
     rot_vec:      List[int]   # rotations for pieces 1..60
     step:         int
+    # --double_decker only. euler_counts stays the CLASSIC count of the border
+    # (what the comment's TOP=.. fields and every reader of them expect);
+    # dd_counts is the objective's own per-side count, board the witness
+    # layout as 0-based (pos, rot) vectors, flags the inner pieces it placed.
+    dd_counts:    Optional[Dict[Side, int]] = None
+    board:        Optional[Tuple[List[int], List[int]]] = None
+    flags:        Tuple[int, ...] = ()
 
 @dataclass
 class RestartResult:
@@ -737,7 +804,14 @@ def evaluate_side(side: Side, arc_list: List[SideArc], start: int, end: int) -> 
     1.32x under flat weights, the pipeline's 2/3/0/1 and --target_scale 250)
     and is exactly equivalence-preserving: same best score, same step, same
     four counts and the same 60 spins in all three."""
-    graph = [(a.source_color, a.target_color) for a in arc_list]
+    return evaluate_graph(side, [(a.source_color, a.target_color) for a in arc_list],
+                          start, end, arc_list)
+
+def evaluate_graph(side: Side, graph: List[Tuple[int, int]], start: int, end: int,
+                   arc_list: Sequence[SideArc] = ()) -> SideEvaluation:
+    """evaluate_side on bare (source, target) pairs. The node labels are only
+    compared, so any ints do: frame colours on a classic side, (frame, inner)
+    pairs packed by decker_node on a double-decker strip."""
     penalty, out, inn = _euler_balance(graph, start, end)
     if penalty:
         return SideEvaluation(side=side, start_color=start, end_color=end, arcs=arc_list,
@@ -761,23 +835,35 @@ def hard_penalty(evals: Dict[Side, SideEvaluation],
     no SideEvaluation can see on its own."""
     hard = 0.0
     for side in Side:
-        se = evals[side]
-        hard += config.balance_penalty_weight * se.balance_penalty
-        if se.balance_penalty == 0 and not se.weakly_connected:
-            hard += config.disconnected_penalty_weight
-        if se.balance_penalty == 0 and se.weakly_connected and se.euler_count == 0:
-            hard += config.infeasible_euler_penalty_weight
+        hard += side_penalty(evals[side], config)
+    return hard + inventory_penalty(inward_tally, inner_capacity, config)
 
-    for color in set(inner_capacity) | set(inward_tally):
+def side_penalty(se: SideEvaluation, config: AnnealingConfig) -> float:
+    """What makes one side unusable: unbalanced degrees, a disconnected graph,
+    or no Euler trail at all."""
+    hard = config.balance_penalty_weight * se.balance_penalty
+    if se.balance_penalty == 0 and not se.weakly_connected:
+        hard += config.disconnected_penalty_weight
+    if se.balance_penalty == 0 and se.weakly_connected and se.euler_count == 0:
+        hard += config.infeasible_euler_penalty_weight
+    return hard
+
+def inventory_penalty(tally: Counter, capacity: Counter, config: AnnealingConfig) -> float:
+    """The inner-colour inventory check. `tally` counts the colours the placed
+    pieces show the unfilled region, `capacity` the colours on the pieces left
+    to fill it: every shown colour must be matched by a leftover face, and what
+    is left over pairs up among the leftovers themselves, so it must be even.
+    Every term is a multiple of 0.5, so the sum is exact in any order."""
+    hard = 0.0
+    for color in set(capacity) | set(tally):
         if color == 0:
             continue
-        ic = inner_capacity.get(color, 0)
-        be = inward_tally.get(color, 0)
+        ic = capacity.get(color, 0)
+        be = tally.get(color, 0)
         if be > ic:
             hard += config.infeasible_inventory_penalty_weight * (be - ic)
         elif (ic - be) % 2:
             hard += config.infeasible_inventory_penalty_weight * 0.5
-
     return hard
 
 def target_for(side: Side, config: AnnealingConfig) -> float:
@@ -1055,6 +1141,12 @@ def probe_move_scale(state: RunState, pieces_by_id: Dict[int, Piece],
             deltas.append(d)
             if d > 0.0:
                 improving += 1
+    return move_probe(deltas, improving, cands, need)
+
+def move_probe(deltas: List[float], improving: int, cands: int,
+               need: int = PROBE_MIN_SAMPLES) -> MoveProbe:
+    """The MoveProbe for a sample of feasible score changes -- shared by the
+    classic probe and the double decker's, which sample different moves."""
     if len(deltas) < need:
         return MoveProbe(None, improving, len(deltas), cands)
     mean = sum(deltas) / len(deltas)
@@ -1065,7 +1157,8 @@ def resolve_schedule(config: AnnealingConfig, state: RunState,
                      pieces_by_id: Dict[int, Piece], edge_ids: List[int],
                      inner_capacity: Counter, rng: random.Random,
                      t0_given: Optional[float],
-                     tf_given: Optional[float]) -> Tuple[float, float, List[str], str]:
+                     tf_given: Optional[float],
+                     probe: Optional[MoveProbe] = None) -> Tuple[float, float, List[str], str]:
     """(T0, Tf, lines for the header, "polish" or "search") for this run.
 
     Two schedules, ~50x apart, and which one is wanted does NOT follow from the
@@ -1096,8 +1189,11 @@ def resolve_schedule(config: AnnealingConfig, state: RunState,
     destructive error, mistaking a search for a polish only under-explores.
 
     Decided ONCE, here in the parent, so the header, every restart and the
-    --out marker all report the numbers the run actually used."""
-    probe = probe_move_scale(state, pieces_by_id, edge_ids, inner_capacity, config, rng)
+    --out marker all report the numbers the run actually used. A double
+    decker hands in its own `probe` (dd_probe), which samples its own moves;
+    the rule that reads it is the same."""
+    if probe is None:
+        probe = probe_move_scale(state, pieces_by_id, edge_ids, inner_capacity, config, rng)
     kind = "search"
     if probe.sigma is not None and probe.improving_fraction <= POLISH_FRACTION:
         kind = "polish"
@@ -1186,7 +1282,12 @@ def restart_str(restart: int, config: AnnealingConfig,
     head = f"  restart {restart:>{w}}/{config.restarts}"
     if rec is None:
         return f"{head}  no feasible border found  ({elapsed:.1f}s)"
-    counts = "  ".join(f"{SIDE_NAMES[s]}={rec.euler_counts[s]:>6}" for s in Side)
+    if rec.dd_counts is not None:
+        # The objective's own counts; a star marks a two-tall side.
+        counts = "  ".join(f"{SIDE_NAMES[s]}={rec.dd_counts[s]:>6}"
+                           f"{'*' if s in config.decker_sides else ' '}" for s in Side)
+    else:
+        counts = "  ".join(f"{SIDE_NAMES[s]}={rec.euler_counts[s]:>6}" for s in Side)
     return (f"{head}  score={rec.score:10.4f}  {counts}"
             f"  step={rec.step:>7}  {elapsed:5.1f}s")
 
@@ -1222,7 +1323,7 @@ def row_delta_str(plan: RowPlan, best: Optional[BestRecord], elapsed: float,
     return f"{head}  {score}  {sides}  {elapsed:5.1f}s"
 
 def append_rotations(row_id: str, rec: BestRecord, out_path: str,
-                     provenance: str = "") -> None:
+                     provenance: str = "", extra: str = "") -> None:
     """Append a Stage-B-readable rotations row -- the 60 border spins padded
     with zeros to the full 256-spin vector -- under a `#` comment carrying
     the per-side counts. Called only from the parent process, so the comment
@@ -1232,9 +1333,14 @@ def append_rotations(row_id: str, rec: BestRecord, out_path: str,
     still says where it came from once it outlives the shell that made it --
     the same posture E555_sort_rotations.py takes with its Turn= note."""
     full = list(rec.rot_vec) + [0] * (N_SPINS - len(rec.rot_vec))
+    # A double decker marks the inner pieces its witness placed with spin 1.
+    # Nothing reads an inner piece's spin out of a rotations row, so the mark
+    # rides through every existing reader; `extra` is its Decker=/Board= note.
+    for pid in rec.flags:
+        full[pid - 1] = 1
     with open(out_path, "a") as f:
         f.write(f"#  {best_counts_str(rec).replace(',', ' ')}  "
-                f"Score={rec.score:.4f}{provenance}\n")
+                f"{extra}Score={rec.score:.4f}{provenance}\n")
         f.write(f"{row_id}, " + ",".join(map(str, full)) + "\n")
 
 def print_header(pieces: Sequence[Piece], corner_ids: List[int], edge_ids: List[int],
@@ -1246,6 +1352,9 @@ def print_header(pieces: Sequence[Piece], corner_ids: List[int], edge_ids: List[
 
     if config.verbose:
         for k, v in asdict(config).items():
+            if not config.decker_sides and (k.startswith("decker_")
+                                            or k == "block_penalty_weight"):
+                continue                    # a classic run's dump stays as it was
             if per_row and k in ("T0", "Tf", "start_spins"):
                 v = "<per row>"
             elif k == "start_spins" and v is not None:
@@ -1277,6 +1386,922 @@ def print_header(pieces: Sequence[Piece], corner_ids: List[int], edge_ids: List[
           f"{len(edge_ids)} edges, {len(pieces) - len(corner_ids) - len(edge_ids)} inner")
 
 # =============================================================================
+# Double decker -- two-tall border segments (--double_decker)
+# =============================================================================
+#
+# A classic side is scored by the orderings of its 14 edge pieces. A double-
+# decker side pairs every edge piece with the inner piece it touches -- a
+# DOMINO -- and is scored by the orderings of the whole two-tall strip. That is
+# again an Euler trail, over (frame colour, inner colour) pairs this time, so
+# count_euler_trails counts it exactly: decker_node packs a pair into one int
+# (frame colours are 1..5 and inner colours 6..22, so frame<<5|inner is unique).
+#
+# The four corners of the second ring overlap: (14,1) touches both the top edge
+# at (15,1) and the left edge at (14,0). So every corner next to a double-decker
+# side becomes an explicit 2x2 BLOCK -- the corner piece, the two edge pieces
+# beside it (a on the top/bottom side, b on the left/right side) and the inner
+# piece q diagonal to it. A strip runs between the blocks at its two ends; a
+# classic side next to a blocked corner keeps that block's edge fixed at its
+# end and counts the orderings of the rest.
+
+# The five Eternity II clue pieces (1-based ids; g_clue in E555_database.c).
+# Their cells are fixed and none is on the second ring, so a witness that used
+# one could never stand in a clue run -- they are kept out of the pool.
+CLUE_PIECES = frozenset({139, 181, 208, 249, 255})
+
+# Faces are indexed like Side. Along a side the trail runs as edge_arc runs
+# it: top and bottom left to right, left and right top to bottom. DD_SRC and
+# DD_DST are the faces an arc leaves and enters by, DD_INWARD the face an edge
+# shows the board. A partner touches its edge with its own face `s` (a top
+# edge's partner with its TOP face, and so on), so a partner attached by seed
+# face f sits at rotation (f - s) mod 4, and shows the centre DD_INWARD[s].
+DD_SRC    = {Side.TOP: Side.LEFT,  Side.BOTTOM: Side.LEFT,
+             Side.LEFT: Side.TOP,  Side.RIGHT: Side.TOP}
+DD_DST    = {Side.TOP: Side.RIGHT, Side.BOTTOM: Side.RIGHT,
+             Side.LEFT: Side.BOTTOM, Side.RIGHT: Side.BOTTOM}
+DD_INWARD = {Side.TOP: Side.BOTTOM, Side.BOTTOM: Side.TOP,
+             Side.LEFT: Side.RIGHT, Side.RIGHT: Side.LEFT}
+# The corners a side's trail starts and ends at.
+DD_ENDS   = {Side.TOP: (Corner.TL, Corner.TR), Side.BOTTOM: (Corner.BL, Corner.BR),
+             Side.LEFT: (Corner.TL, Corner.BL), Side.RIGHT: (Corner.TR, Corner.BR)}
+# A side's 14 frame cells, (row, col) bottom-up, in trail order.
+DD_CELLS  = {Side.TOP:    [(15, c) for c in range(1, 15)],
+             Side.BOTTOM: [(0, c) for c in range(1, 15)],
+             Side.LEFT:   [(r, 0) for r in range(14, 0, -1)],
+             Side.RIGHT:  [(r, 15) for r in range(14, 0, -1)]}
+DD_STEP   = {Side.TOP: (1, 0), Side.RIGHT: (0, 1), Side.BOTTOM: (-1, 0), Side.LEFT: (0, -1)}
+
+def _opp(d: int) -> Side:
+    return Side((d + 2) % 4)
+
+def decker_node(frame: int, inner: int) -> int:
+    return (frame << 5) | inner
+
+@dataclass(frozen=True)
+class CornerGeom:
+    """One corner's 2x2 block. a_dir runs from the corner along a_side (and
+    from b to q), b_dir along b_side (and from a to q). The block holds when
+
+        C[a_dir] = A[opp a_dir]   C[b_dir] = B[opp b_dir]
+        Q[opp b_dir] = A[b_dir]   Q[opp a_dir] = B[a_dir]
+
+    and a_side's trail meets it at (A[a_dir], Q[a_dir]), b_side's at
+    (B[b_dir], Q[b_dir]) -- the frame colour alone on a classic side."""
+    cell:   Tuple[int, int]
+    a_side: Side
+    b_side: Side
+    a_dir:  Side
+    b_dir:  Side
+
+    def at(self, *dirs: Side) -> Tuple[int, int]:
+        r, c = self.cell
+        for d in dirs:
+            r, c = r + DD_STEP[d][0], c + DD_STEP[d][1]
+        return r, c
+
+DD_CORNERS = {
+    Corner.TL: CornerGeom((15, 0),  Side.TOP,    Side.LEFT,  Side.RIGHT, Side.BOTTOM),
+    Corner.TR: CornerGeom((15, 15), Side.TOP,    Side.RIGHT, Side.LEFT,  Side.BOTTOM),
+    Corner.BR: CornerGeom((0, 15),  Side.BOTTOM, Side.RIGHT, Side.LEFT,  Side.TOP),
+    Corner.BL: CornerGeom((0, 0),   Side.BOTTOM, Side.LEFT,  Side.RIGHT, Side.TOP),
+}
+
+class DeckerContext:
+    """Everything a double-decker search reads and never changes: the piece
+    rotations, which sides are two tall, which corners are blocked, and the
+    indices the seeding and the moves draw partners and corner pieces from.
+    Built per restart in the worker -- a few milliseconds."""
+
+    def __init__(self, pieces_by_id: Dict[int, Piece], corner_ids: List[int],
+                 edge_ids: List[int], sides: Sequence[int]):
+        self.pieces_by_id = pieces_by_id
+        self.edge_ids   = list(edge_ids)
+        self.corner_ids = list(corner_ids)
+        self.dd = {s: (int(s) in set(int(x) for x in sides)) for s in Side}
+        self.blocked = {k: self.dd[g.a_side] or self.dd[g.b_side]
+                        for k, g in DD_CORNERS.items()}
+        self.blocked_corners = [k for k in Corner if self.blocked[k]]
+        self.rot = {pid: tuple(rotate_sides(p.sides, r) for r in range(4))
+                    for pid, p in pieces_by_id.items()}
+        self.edge_spin = {pid: {s: find_rotation_for_edge_side(pieces_by_id[pid], s)
+                                for s in Side} for pid in edge_ids}
+        self.edge_rot = {pid: {s: self.rot[pid][self.edge_spin[pid][s]] for s in Side}
+                         for pid in edge_ids}
+        self.inward = {pid: self.edge_rot[pid][Side.TOP][Side.BOTTOM] for pid in edge_ids}
+        # An edge's two frame colours, read the same way on every side: two
+        # edges with the same pair can trade sides without changing either
+        # side's frame, so both strips stay fillable.
+        pair = {pid: (self.edge_rot[pid][Side.TOP][Side.LEFT],
+                      self.edge_rot[pid][Side.TOP][Side.RIGHT]) for pid in edge_ids}
+        self.twins = {pid: [q for q in edge_ids if q != pid and pair[q] == pair[pid]]
+                      for pid in edge_ids}
+        self.corner_spin = {(pid, k): find_rotation_for_corner(pieces_by_id[pid], k)
+                            for pid in corner_ids for k in Corner}
+        self.corner_rot = {key: self.rot[key[0]][spin] for key, spin in self.corner_spin.items()}
+        inner = sorted(pid for pid, p in pieces_by_id.items() if p.zero_count == 0)
+        self.total_capacity = build_inner_capacity([pieces_by_id[p] for p in inner])
+        self.pool = [pid for pid in inner if pid not in CLUE_PIECES]
+        # colour -> (piece, seed face) with that colour on that face
+        self.face_index: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        # side -> (inward colour, colour on the arc's source face)
+        #      -> (piece, face, colour on the arc's target face)
+        self.strip_index: Dict[Side, Dict[Tuple[int, int], List[Tuple[int, int, int]]]] = \
+            {s: defaultdict(list) for s in Side}
+        # side -> (inward, source, target colour) -> (piece, face): the last
+        # cell of a strip, which has to close onto the far block exactly
+        self.strip_end: Dict[Side, Dict[Tuple[int, int, int], List[Tuple[int, int]]]] = \
+            {s: defaultdict(list) for s in Side}
+        # corner -> (Q[opp b_dir], Q[opp a_dir]) -> (piece, rotation)
+        self.q_index: Dict[Corner, Dict[Tuple[int, int], List[Tuple[int, int]]]] = \
+            {k: defaultdict(list) for k in Corner}
+        for pid in self.pool:
+            sides = pieces_by_id[pid].sides
+            for f in range(4):
+                self.face_index[sides[f]].append((pid, f))
+                for s in Side:
+                    P = self.rot[pid][(f - s) % 4]
+                    self.strip_index[s][(P[s], P[DD_SRC[s]])].append((pid, f, P[DD_DST[s]]))
+                    self.strip_end[s][(P[s], P[DD_SRC[s]], P[DD_DST[s]])].append((pid, f))
+            for k, g in DD_CORNERS.items():
+                for r in range(4):
+                    Q = self.rot[pid][r]
+                    self.q_index[k][(Q[_opp(g.b_dir)], Q[_opp(g.a_dir)])].append((pid, r))
+        # The move mix. A two-tall strip is a chain over (frame, inner) pairs,
+        # so changing one partner or swapping one domino almost always breaks
+        # its balance: measured from a feasible witness, 0 of 3000 such moves
+        # stayed feasible and every restart handed back its seed. So every
+        # move that touches a strip RE-FILLS it (dd_refill: a fresh frame
+        # order, a fresh inner row by dd_fill_strip), which is feasible by
+        # construction, and the walk moves between feasible witnesses:
+        #   refill  re-fill one strip in place
+        #   swap    two edges trade sides, then the strips they touch re-fill
+        #   block   a corner block takes a new edge and/or a new q, then the
+        #           strips on both its sides re-fill
+        #   same    a partner is swapped for a piece showing its strip the same
+        #           two colours -- the count stays, the colours the centre sees
+        #           change, which is what repairs the inventory check
+        self.dd_sides = [s for s in Side if self.dd[s]]
+        mix = [("refill", 0.35), ("swap", 0.35), ("block", 0.20), ("same", 0.10)]
+        total = sum(w for _, w in mix)
+        acc, self.moves = 0.0, []
+        for name, w in mix:
+            acc += w / total
+            self.moves.append((name, acc))
+
+@dataclass
+class DeckerState:
+    """A border plus its double-decker witness: which edge sits on which side,
+    each blocked corner's (a, b, q, q_rot), and each strip edge's partner as
+    (inner piece, seed face touching the edge). States are cloned before a
+    move and never changed after they are evaluated, so a best can be kept by
+    reference."""
+    corner_pos: Dict[int, Corner]                     # shared, never changed
+    seat:       Dict[Corner, int]                     # shared, never changed
+    edge_side:  Dict[int, Side]
+    block:      Dict[Corner, Tuple[int, int, int, int]]
+    partner:    Dict[int, Tuple[int, int]]
+    used:       set
+    capacity:   Counter
+    evals:      Dict[Side, SideEvaluation] = field(default_factory=dict)
+    side_tally: Dict[Side, Tuple[int, ...]] = field(default_factory=dict)
+    q_tally:    Dict[Corner, Tuple[int, ...]] = field(default_factory=dict)
+    block_bad:  Dict[Corner, int] = field(default_factory=dict)
+    hard:       float = 0.0
+    score:      float = 0.0
+
+    def clone(self) -> "DeckerState":
+        return DeckerState(self.corner_pos, self.seat, dict(self.edge_side),
+                           dict(self.block), dict(self.partner), set(self.used),
+                           Counter(self.capacity), dict(self.evals),
+                           dict(self.side_tally), dict(self.q_tally),
+                           dict(self.block_bad), self.hard, self.score)
+
+def dd_use(ctx: DeckerContext, st: DeckerState, pid: int) -> None:
+    st.used.add(pid)
+    for c in ctx.pieces_by_id[pid].sides:
+        st.capacity[c] -= 1
+
+def dd_release(ctx: DeckerContext, st: DeckerState, pid: int) -> None:
+    st.used.discard(pid)
+    for c in ctx.pieces_by_id[pid].sides:
+        st.capacity[c] += 1
+
+def dd_block_edges(st: DeckerState) -> set:
+    return {e for a, b, _, _ in st.block.values() for e in (a, b)}
+
+def dd_endpoint(ctx: DeckerContext, st: DeckerState, s: Side, k: Corner) -> int:
+    """Where side s's trail meets corner k: a block's edge (and q, on a
+    two-tall side), or the plain corner piece exactly as corner_endpoints
+    reads it."""
+    g = DD_CORNERS[k]
+    d = g.a_dir if g.a_side == s else g.b_dir
+    if not ctx.blocked[k]:
+        return ctx.corner_rot[(st.seat[k], k)][d]
+    a, b, q, qr = st.block[k]
+    e = a if g.a_side == s else b
+    frame = ctx.edge_rot[e][s][d]
+    return decker_node(frame, ctx.rot[q][qr][d]) if ctx.dd[s] else frame
+
+def dd_side_arcs(ctx: DeckerContext, st: DeckerState, s: Side
+                 ) -> Tuple[List[Tuple[int, int, int]], Tuple[int, ...]]:
+    """Side s's arcs as (source, target, edge id) and the colours its pieces
+    show the unfilled region: an edge's inward face on a classic side, the
+    partner's far face on a two-tall one. Block edges are left out -- the
+    block holds them, and q meets their inward faces."""
+    fixed = {st.block[k][0 if DD_CORNERS[k].a_side == s else 1]
+             for k in DD_ENDS[s] if ctx.blocked[k]}
+    src, dst, inw = DD_SRC[s], DD_DST[s], DD_INWARD[s]
+    arcs: List[Tuple[int, int, int]] = []
+    tally: List[int] = []
+    two_tall = ctx.dd[s]
+    for pid, side in st.edge_side.items():
+        if side != s or pid in fixed:
+            continue
+        E = ctx.edge_rot[pid][s]
+        if two_tall:
+            p, f = st.partner[pid]
+            P = ctx.rot[p][(f - s) % 4]
+            arcs.append((decker_node(E[src], P[src]), decker_node(E[dst], P[dst]), pid))
+            tally.append(P[inw])
+        else:
+            arcs.append((E[src], E[dst], pid))
+            tally.append(E[inw])
+    return arcs, tuple(tally)
+
+def dd_eval_corner(ctx: DeckerContext, st: DeckerState, k: Corner
+                   ) -> Tuple[int, Tuple[int, ...]]:
+    """(broken matches inside corner k's block, colours q shows the unfilled
+    region -- its faces along a classic side, which no strip meets)."""
+    g = DD_CORNERS[k]
+    a, b, q, qr = st.block[k]
+    C = ctx.corner_rot[(st.seat[k], k)]
+    A = ctx.edge_rot[a][g.a_side]
+    B = ctx.edge_rot[b][g.b_side]
+    Q = ctx.rot[q][qr]
+    bad = ((C[g.a_dir] != A[_opp(g.a_dir)]) + (C[g.b_dir] != B[_opp(g.b_dir)])
+           + (Q[_opp(g.b_dir)] != A[g.b_dir]) + (Q[_opp(g.a_dir)] != B[g.a_dir]))
+    tally = tuple(Q[d] for side, d in ((g.a_side, g.a_dir), (g.b_side, g.b_dir))
+                  if not ctx.dd[side])
+    return bad, tally
+
+def dd_refresh(ctx: DeckerContext, st: DeckerState, sides: Sequence[Side],
+               corners: Sequence[Corner], config: AnnealingConfig) -> None:
+    """Re-evaluate the named sides and corners, then the state's totals."""
+    for s in sides:
+        arcs, tally = dd_side_arcs(ctx, st, s)
+        st.evals[s] = evaluate_graph(s, [(u, v) for u, v, _ in arcs],
+                                     dd_endpoint(ctx, st, s, DD_ENDS[s][0]),
+                                     dd_endpoint(ctx, st, s, DD_ENDS[s][1]))
+        st.side_tally[s] = tally
+    for k in corners:
+        st.block_bad[k], st.q_tally[k] = dd_eval_corner(ctx, st, k)
+    tally: Counter = Counter()
+    for t in st.side_tally.values():
+        tally.update(t)
+    for t in st.q_tally.values():
+        tally.update(t)
+    hard = sum(side_penalty(st.evals[s], config) for s in Side)
+    hard += config.block_penalty_weight * sum(st.block_bad.values())
+    hard += inventory_penalty(tally, st.capacity, config)
+    st.hard = hard
+    st.score = compute_score(st.evals, tally, st.capacity, config, hard=hard)
+
+def dd_counts(st: DeckerState) -> Dict[Side, int]:
+    return {s: st.evals[s].euler_count for s in Side}
+
+def euler_trail(arcs: Sequence[Tuple[int, int, int]], start: int, end: int,
+                rng: random.Random) -> Optional[List[int]]:
+    """One Euler trail from start to end over labelled arcs, as its labels in
+    order (Hierholzer, with the choices shuffled so repeated calls sample
+    different trails). None when the arcs admit no such trail."""
+    adj: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+    for u, v, lab in arcs:
+        adj[u].append((v, lab))
+    for u in list(adj):
+        rng.shuffle(adj[u])
+    stack: List[Tuple[int, Optional[int]]] = [(start, None)]
+    path: List[int] = []
+    while stack:
+        u, lab = stack[-1]
+        if adj[u]:
+            v, nxt = adj[u].pop()
+            stack.append((v, nxt))
+        else:
+            stack.pop()
+            if lab is not None:
+                path.append(lab)
+    path.reverse()
+    if len(path) != len(arcs):
+        return None
+    # Hierholzer from `start` ends wherever the degrees force it; check that is
+    # `end`, and that the walk is a walk, so a bad graph cannot pass as a trail.
+    where = {lab: (u, v) for u, v, lab in arcs}
+    node = start
+    for lab in path:
+        u, v = where[lab]
+        if u != node:
+            return None
+        node = v
+    return path if node == end else None
+
+def dd_blank(ctx: DeckerContext, edge_side: Dict[int, Side],
+             corner_pos: Dict[int, Corner]) -> DeckerState:
+    return DeckerState(corner_pos=dict(corner_pos),
+                       seat={k: pid for pid, k in corner_pos.items()},
+                       edge_side=dict(edge_side), block={}, partner={}, used=set(),
+                       capacity=Counter(ctx.total_capacity))
+
+def dd_sample_partner(ctx: DeckerContext, st: DeckerState, edge: int,
+                      rng: random.Random) -> Optional[Tuple[int, int]]:
+    """A random unused (piece, face) that shows `edge` its inward colour."""
+    opts = ctx.face_index.get(ctx.inward[edge], ())
+    if not opts:
+        return None
+    for _ in range(16):
+        o = opts[rng.randrange(len(opts))]
+        if o[0] not in st.used:
+            return o
+    free = [o for o in opts if o[0] not in st.used]
+    return free[rng.randrange(len(free))] if free else None
+
+def dd_fill_strip(ctx: DeckerContext, st: DeckerState, s: Side, middle: List[int],
+                  start_inner: int, end_inner: int, rng: random.Random,
+                  budget: int = 4000, loops: bool = False) -> bool:
+    """Give every edge of a two-tall strip a partner, left to right along the
+    frame order `middle`, so the inner row chains from start_inner to
+    end_inner: a bounded depth-first search. About 2.7 partners fit each cell,
+    so a strip of 12 almost always fills at once."""
+    chosen: List[Tuple[int, int, int]] = []
+    taken: set = set()
+    spent = [0]
+    dst = DD_DST[s]
+    seen = {decker_node(ctx.edge_rot[middle[0]][s][DD_SRC[s]], start_inner)} if middle else set()
+
+    def dfs(i: int, prev: int) -> bool:
+        spent[0] += 1
+        if spent[0] > budget:
+            return False
+        e = middle[i]
+        if i == len(middle) - 1:
+            # The last cell must close onto the far block exactly: look it up
+            # rather than trying every piece that merely fits on the left.
+            opts = ctx.strip_end[s].get((ctx.inward[e], prev, end_inner), ())
+            n = len(opts)
+            o = rng.randrange(n) if n else 0
+            for j in range(n):
+                p, f = opts[(o + j) % n]
+                if p not in st.used and p not in taken:
+                    chosen.append((e, p, f))
+                    return True
+            return False
+        opts = ctx.strip_index[s].get((ctx.inward[e], prev), ())
+        n = len(opts)
+        o = rng.randrange(n) if n else 0
+        order = [opts[(o + j) % n] for j in range(n)]
+        frame = ctx.edge_rot[e][s][dst]
+        if loops:
+            # Loops are what orderings are made of: a node the row has already
+            # visited can be left again by another arc, so try those first.
+            order.sort(key=lambda x: decker_node(frame, x[2]) not in seen)
+        for p, f, nxt in order:
+            if p in st.used or p in taken:
+                continue
+            taken.add(p)
+            chosen.append((e, p, f))
+            node = decker_node(frame, nxt)
+            new = node not in seen
+            seen.add(node)
+            if dfs(i + 1, nxt):
+                return True
+            if new:
+                seen.discard(node)
+            taken.discard(p)
+            chosen.pop()
+        return False
+
+    if not middle:
+        return start_inner == end_inner
+    if not dfs(0, start_inner):
+        return False
+    for e, p, f in chosen:
+        st.partner[e] = (p, f)
+        dd_use(ctx, st, p)
+    return True
+
+DD_SEED_TRIES = 64
+
+def dd_seed(ctx: DeckerContext, edge_side: Dict[int, Side],
+            corner_pos: Dict[int, Corner], rng: random.Random,
+            config: AnnealingConfig) -> Optional[DeckerState]:
+    """A double-decker state for a border, built to be feasible when it can be.
+
+    Each side gets a random classic trail; its end arcs become the block edges,
+    which therefore meet their corner's frame colours by construction. q comes
+    from the index of pieces whose two faces fit those edges, and each two-tall
+    strip is filled along its trail by dd_fill_strip. When no attempt succeeds
+    -- the border itself not being a usable one, most often -- the state is
+    completed with random compatible choices and the search has to repair it.
+    None only when not even that is possible (a colour with no partner left)."""
+    seat = {k: pid for pid, k in corner_pos.items()}
+    plain = {}
+    for s in Side:
+        arcs = [(ctx.edge_rot[pid][s][DD_SRC[s]], ctx.edge_rot[pid][s][DD_DST[s]], pid)
+                for pid, side in edge_side.items() if side == s]
+        ends = tuple(ctx.corner_rot[(seat[k], k)][DD_CORNERS[k].a_dir
+                                                   if DD_CORNERS[k].a_side == s
+                                                   else DD_CORNERS[k].b_dir]
+                     for k in DD_ENDS[s])
+        plain[s] = (arcs, ends)
+
+    trails: Dict[Side, List[int]] = {}
+    for _ in range(DD_SEED_TRIES):
+        trails = {}
+        for s in Side:
+            t = euler_trail(plain[s][0], plain[s][1][0], plain[s][1][1], rng)
+            if t is None:
+                break
+            trails[s] = t
+        if len(trails) < len(Side):
+            break                                   # not a usable border: repair
+        st = dd_blank(ctx, edge_side, corner_pos)
+        ok = True
+        for k in ctx.blocked_corners:
+            g = DD_CORNERS[k]
+            a = trails[g.a_side][0 if DD_ENDS[g.a_side][0] == k else -1]
+            b = trails[g.b_side][0 if DD_ENDS[g.b_side][0] == k else -1]
+            A, B = ctx.edge_rot[a][g.a_side], ctx.edge_rot[b][g.b_side]
+            opts = [o for o in ctx.q_index[k].get((A[g.b_dir], B[g.a_dir]), ())
+                    if o[0] not in st.used]
+            if not opts:
+                ok = False
+                break
+            q, qr = opts[rng.randrange(len(opts))]
+            dd_use(ctx, st, q)
+            st.block[k] = (a, b, q, qr)
+        for s in Side:
+            if not ok:
+                break
+            if not ctx.dd[s]:
+                continue
+            k0, k1 = DD_ENDS[s]
+            inner = []
+            for k in (k0, k1):
+                g = DD_CORNERS[k]
+                _, _, q, qr = st.block[k]
+                inner.append(ctx.rot[q][qr][g.a_dir if g.a_side == s else g.b_dir])
+            ok = dd_fill_strip(ctx, st, s, trails[s][1:-1], inner[0], inner[1], rng)
+        if ok:
+            dd_refresh(ctx, st, list(Side), ctx.blocked_corners, config)
+            return st
+
+    # Repair start: blocks from the trail ends where there are trails, else any
+    # edge of the side; q and the partners at random among the fitting pieces.
+    st = dd_blank(ctx, edge_side, corner_pos)
+    taken: set = set()
+    for k in ctx.blocked_corners:
+        g = DD_CORNERS[k]
+        pick = []
+        for side in (g.a_side, g.b_side):
+            if side in trails:
+                e = trails[side][0 if DD_ENDS[side][0] == k else -1]
+            else:
+                e = None
+            if e is None or e in taken:
+                cands = sorted(pid for pid, sd in edge_side.items()
+                               if sd == side and pid not in taken)
+                e = cands[rng.randrange(len(cands))]
+            taken.add(e)
+            pick.append(e)
+        a, b = pick
+        A, B = ctx.edge_rot[a][g.a_side], ctx.edge_rot[b][g.b_side]
+        opts = [o for o in ctx.q_index[k].get((A[g.b_dir], B[g.a_dir]), ())
+                if o[0] not in st.used]
+        if opts:
+            q, qr = opts[rng.randrange(len(opts))]
+        else:
+            free = [p for p in ctx.pool if p not in st.used]
+            q, qr = free[rng.randrange(len(free))], rng.randrange(4)
+        dd_use(ctx, st, q)
+        st.block[k] = (a, b, q, qr)
+    blocked = dd_block_edges(st)
+    for pid in sorted(edge_side):
+        if ctx.dd[edge_side[pid]] and pid not in blocked:
+            o = dd_sample_partner(ctx, st, pid, rng)
+            if o is None:
+                return None
+            st.partner[pid] = o
+            dd_use(ctx, st, o[0])
+    dd_refresh(ctx, st, list(Side), ctx.blocked_corners, config)
+    return st
+
+# Share of re-fills that try loop-closing partners first (see dd_fill_strip).
+# A random inner row rarely revisits a (frame, inner) node, and without
+# revisits a strip has exactly one ordering. Measured over 3 seeds x 6 rows of
+# data/annealer_MaxSides.csv x 2 restarts x 15k steps, all four sides two
+# tall, mean best score: never 2.17, half the time 2.34, always 2.32 -- always
+# biasing costs diversity, never biasing leaves most strips at one ordering.
+DD_LOOP_BIAS = 0.5
+
+def dd_refill(ctx: DeckerContext, st: DeckerState, s: Side, rng: random.Random,
+              tries: int = 4) -> bool:
+    """Ruin and recreate two-tall strip s between the blocks that hold its ends:
+    release its partners, draw a fresh frame order of its middle edges, and
+    fill the inner row along it. False when the frame admits no order between
+    the blocks or no inner row fits -- the caller then drops the move."""
+    ends = []
+    for k in DD_ENDS[s]:
+        g = DD_CORNERS[k]
+        a, b, q, qr = st.block[k]
+        e = a if g.a_side == s else b
+        d = g.a_dir if g.a_side == s else g.b_dir
+        ends.append((e, ctx.edge_rot[e][s][d], ctx.rot[q][qr][d]))
+    fixed = {ends[0][0], ends[1][0]}
+    middle = [pid for pid, side in st.edge_side.items() if side == s and pid not in fixed]
+    for pid in middle:
+        o = st.partner.pop(pid, None)
+        if o is not None:
+            dd_release(ctx, st, o[0])
+    src, dst = DD_SRC[s], DD_DST[s]
+    arcs = [(ctx.edge_rot[pid][s][src], ctx.edge_rot[pid][s][dst], pid) for pid in middle]
+    for _ in range(tries):
+        order = euler_trail(arcs, ends[0][1], ends[1][1], rng)
+        if order is None:
+            return False
+        if dd_fill_strip(ctx, st, s, order, ends[0][2], ends[1][2], rng,
+                         loops=rng.random() < DD_LOOP_BIAS):
+            return True
+    return False
+
+def dd_propose(ctx: DeckerContext, st: DeckerState, rng: random.Random,
+               config: AnnealingConfig) -> Optional[Tuple[DeckerState, Optional[frozenset]]]:
+    """One candidate move, evaluated, as (candidate, tabu pair or None); None
+    when the drawn move cannot be made here. The state itself is untouched."""
+    x = rng.random()
+    kind = next(name for name, acc in ctx.moves if x < acc or acc >= 1.0 - 1e-12)
+    cand = st.clone()
+    touched: set = set()
+    corners: Tuple[Corner, ...] = ()
+    pair = None
+
+    if kind == "refill":
+        s = ctx.dd_sides[rng.randrange(len(ctx.dd_sides))]
+        if not dd_refill(ctx, cand, s, rng):
+            return None
+        touched = {s}
+
+    elif kind == "swap":
+        # Half the swaps trade TWINS -- two edges with the same frame pair --
+        # which leaves both frames as they were, so both strips always re-fill
+        # and only the colours the edges show the board change. The other half
+        # are free swaps, which change a frame and mostly unbalance it (~3%
+        # re-fill), but are the only way the frame composition itself moves.
+        blocked = dd_block_edges(cand)
+        free = [e for e in ctx.edge_ids if e not in blocked]
+        e1 = free[rng.randrange(len(free))]
+        twins = [t for t in ctx.twins[e1]
+                 if t not in blocked and cand.edge_side[t] != cand.edge_side[e1]]
+        if twins and rng.random() < 0.5:
+            e2 = twins[rng.randrange(len(twins))]
+        else:
+            e2 = free[rng.randrange(len(free))]
+            if e2 == e1:
+                return None
+        s1, s2 = cand.edge_side[e1], cand.edge_side[e2]
+        if s1 == s2:
+            return None
+        cand.edge_side[e1], cand.edge_side[e2] = s2, s1
+        for e in (e1, e2):                   # an edge now on a classic side
+            if not ctx.dd[cand.edge_side[e]] and e in cand.partner:
+                dd_release(ctx, cand, cand.partner.pop(e)[0])
+        touched = {s1, s2}
+        pair = frozenset((e1, e2))
+
+    elif kind == "block":
+        k = ctx.blocked_corners[rng.randrange(len(ctx.blocked_corners))]
+        g = DD_CORNERS[k]
+        a, b, q, qr = cand.block[k]
+        touched = {g.a_side, g.b_side}
+        if rng.random() < 0.5:
+            # A new block edge, one that meets the corner piece's frame colour;
+            # the old one takes its place and side.
+            which = rng.randrange(2)
+            old, s_old, d = ((a, g.a_side, g.a_dir) if which == 0
+                             else (b, g.b_side, g.b_dir))
+            need = ctx.corner_rot[(cand.seat[k], k)][d]
+            blocked = dd_block_edges(cand)
+            opts = [e for e in ctx.edge_ids
+                    if e not in blocked and ctx.edge_rot[e][s_old][_opp(d)] == need]
+            if not opts:
+                return None
+            e = opts[rng.randrange(len(opts))]
+            s_e = cand.edge_side[e]
+            cand.edge_side[e], cand.edge_side[old] = s_old, s_e
+            o = cand.partner.pop(e, None)
+            if o is not None:
+                dd_release(ctx, cand, o[0])
+            a, b = (e, b) if which == 0 else (a, e)
+            touched.add(s_e)
+        # A q that fits the block's two edges; its other two faces start the
+        # strips on either side, which then re-fill.
+        dd_release(ctx, cand, q)
+        A, B = ctx.edge_rot[a][g.a_side], ctx.edge_rot[b][g.b_side]
+        opts = [o for o in ctx.q_index[k].get((A[g.b_dir], B[g.a_dir]), ())
+                if o[0] not in cand.used]
+        if not opts:
+            return None
+        q, qr = opts[rng.randrange(len(opts))]
+        dd_use(ctx, cand, q)
+        cand.block[k] = (a, b, q, qr)
+        corners = (k,)
+
+    else:                                               # same
+        edges = list(cand.partner)
+        if not edges:
+            return None
+        e = edges[rng.randrange(len(edges))]
+        s = cand.edge_side[e]
+        p, f = cand.partner[e]
+        P = ctx.rot[p][(f - s) % 4]
+        src, dst = DD_SRC[s], DD_DST[s]
+        opts = [o for o in ctx.strip_end[s].get((ctx.inward[e], P[src], P[dst]), ())
+                if o[0] not in cand.used]
+        if not opts:
+            return None
+        o = opts[rng.randrange(len(opts))]
+        dd_release(ctx, cand, p)
+        dd_use(ctx, cand, o[0])
+        cand.partner[e] = o
+        touched = {s}
+
+    if kind in ("swap", "block"):
+        for s in sorted(touched):
+            if ctx.dd[s] and not dd_refill(ctx, cand, s, rng):
+                return None
+    dd_refresh(ctx, cand, sorted(touched), corners, config)
+    return cand, pair
+
+# A double-decker move re-fills strips and costs ~1 ms, 30x a classic one, so
+# its probe samples fewer; about two thirds of them land feasible, which still
+# leaves several hundred score changes to measure the spread over.
+DD_PROBE_CANDIDATES = 600
+
+def dd_probe(ctx: DeckerContext, st: DeckerState, config: AnnealingConfig,
+             rng: random.Random, cands: int = DD_PROBE_CANDIDATES) -> MoveProbe:
+    """probe_move_scale over the double decker's own moves."""
+    deltas: List[float] = []
+    improving = 0
+    for _ in range(cands):
+        prop = dd_propose(ctx, st, rng, config)
+        if prop is not None and prop[0].hard == 0.0:
+            d = prop[0].score - st.score
+            deltas.append(d)
+            if d > 0.0:
+                improving += 1
+    return move_probe(deltas, improving, cands)
+
+def dd_layout(ctx: DeckerContext, st: DeckerState, rng: random.Random
+              ) -> Tuple[List[int], List[int], List[int]]:
+    """One concrete layout of a feasible state: 0-based (pos, rot) vectors in
+    the board format every stage reads (999 = not placed), plus the inner
+    pieces placed. Each side takes one random trail of the ones counted.
+    Raises if any two placed neighbours disagree -- that would be a bug."""
+    pos = [999] * N_SPINS
+    rot = [0] * N_SPINS
+    placed_inner: List[int] = []
+
+    def put(pid: int, cell: Tuple[int, int], spin: int) -> None:
+        pos[pid - 1] = cell[0] * 16 + cell[1]
+        rot[pid - 1] = spin
+
+    for pid, k in st.corner_pos.items():
+        put(pid, DD_CORNERS[k].cell, ctx.corner_spin[(pid, k)])
+    for k in ctx.blocked_corners:
+        g = DD_CORNERS[k]
+        a, b, q, qr = st.block[k]
+        put(a, g.at(g.a_dir), ctx.edge_spin[a][g.a_side])
+        put(b, g.at(g.b_dir), ctx.edge_spin[b][g.b_side])
+        put(q, g.at(g.a_dir, g.b_dir), qr)
+        placed_inner.append(q)
+    for s in Side:
+        arcs, _ = dd_side_arcs(ctx, st, s)
+        k0, k1 = DD_ENDS[s]
+        order = euler_trail(arcs, dd_endpoint(ctx, st, s, k0),
+                            dd_endpoint(ctx, st, s, k1), rng)
+        cells = DD_CELLS[s][(1 if ctx.blocked[k0] else 0):(13 if ctx.blocked[k1] else 14)]
+        if order is None or len(order) != len(cells):
+            raise AssertionError(f"double decker: no trail to lay out on {SIDE_NAMES[s]}")
+        dr, dc = DD_STEP[DD_INWARD[s]]
+        for pid, cell in zip(order, cells):
+            put(pid, cell, ctx.edge_spin[pid][s])
+            if ctx.dd[s]:
+                p, f = st.partner[pid]
+                put(p, (cell[0] + dr, cell[1] + dc), (f - s) % 4)
+                placed_inner.append(p)
+    bad = board_mismatches(ctx.pieces_by_id, pos, rot)
+    if bad:
+        raise AssertionError(f"double decker: the laid-out witness has {bad} broken edge(s)")
+    return pos, rot, sorted(placed_inner)
+
+def board_mismatches(pieces_by_id: Dict[int, Piece], pos: Sequence[int],
+                     rot: Sequence[int]) -> int:
+    """Broken edges between placed neighbours of a 0-based (pos, rot) board."""
+    grid: Dict[int, Tuple[int, int, int, int]] = {}
+    for i, cell in enumerate(pos):
+        if cell != 999:
+            grid[cell] = rotate_sides(pieces_by_id[i + 1].sides, rot[i])
+    bad = 0
+    for cell, S in grid.items():
+        r, c = divmod(cell, 16)
+        if c < 15 and cell + 1 in grid and S[Side.RIGHT] != grid[cell + 1][Side.LEFT]:
+            bad += 1
+        if r < 15 and cell + 16 in grid and S[Side.TOP] != grid[cell + 16][Side.BOTTOM]:
+            bad += 1
+    return bad
+
+def dd_best_record(ctx: DeckerContext, st: DeckerState, step: int,
+                   inner_capacity: Counter, config: AnnealingConfig,
+                   rng: random.Random) -> BestRecord:
+    """A feasible state as the record every writer takes: the border's spins
+    and CLASSIC counts (so the comment's TOP=.. fields stay what the spins
+    say), the double-decker counts, the witness layout and its flags."""
+    rs = _build_run_state(ctx.pieces_by_id, st.edge_side, st.corner_pos,
+                          inner_capacity, config)
+    pos, rot, placed = dd_layout(ctx, st, rng)
+    return BestRecord(score=st.score, euler_counts=rs.euler_counts(),
+                      rot_vec=rotation_vector(ctx.pieces_by_id, rs), step=step,
+                      dd_counts=dd_counts(st), board=(pos, rot), flags=tuple(placed))
+
+def dd_state_str(st: DeckerState, config: AnnealingConfig) -> str:
+    return "  ".join(f"{SIDE_NAMES[s]}{'*' if s in config.decker_sides else ''}"
+                     f"={st.evals[s].euler_count}/{'OK' if st.evals[s].feasible else 'bad'}"
+                     for s in Side) + (f"  blocks-bad={sum(st.block_bad.values())}"
+                                       if st.block_bad else "")
+
+def anneal_decker(ctx: DeckerContext, st: DeckerState, steps: int,
+                  t0: float, tf: float, config: AnnealingConfig, rng: random.Random,
+                  log: List[str]) -> Tuple[Optional[DeckerState], int, Optional[float]]:
+    """The double decker's walk: the classic loop's schedule, tabu, candidate
+    harvesting and reporting, over dd_propose's moves. Returns (best feasible
+    state or None, the step it was found at, last window's acceptance)."""
+    best: Optional[DeckerState] = st if st.hard == 0.0 else None
+    best_step = 0
+    accepted_window = step_window = feasible_seen = 0
+    acc_last: Optional[float] = None
+    tabu_q: deque = deque()
+    tabu_set: set = set()
+    if config.verbose:
+        log.append(progress_str("  double decker, initial", st.score, st.evals, config)
+                   + f"  hard={st.hard:g}")
+    for step in range(1, steps + 1):
+        temperature = t0 * (tf / t0) ** (step / steps) if t0 > 0 else 0.0
+        prop = dd_propose(ctx, st, rng, config)
+        if prop is not None:
+            cand, pair = prop
+            ok = cand.hard == 0.0
+            new_best = ok and (best is None or cand.score > best.score)
+            tabu_reject = (pair is not None and config.tabu_length > 0
+                           and pair in tabu_set and not new_best)
+            if not tabu_reject:
+                delta = cand.score - st.score
+                if delta >= 0 or (temperature > 0 and
+                                  rng.random() < math.exp(delta / temperature)):
+                    st = cand
+                    accepted_window += 1
+                    if pair is not None and config.tabu_length > 0 and pair not in tabu_set:
+                        tabu_q.append(pair)
+                        tabu_set.add(pair)
+                        while len(tabu_q) > config.tabu_length:
+                            tabu_set.discard(tabu_q.popleft())
+            if ok:
+                feasible_seen += 1
+                if new_best:
+                    best, best_step = cand, step
+            step_window += 1
+        if config.report_every and step % config.report_every == 0:
+            acc_last = accepted_window / step_window if step_window else 0.0
+            if config.verbose:
+                log.append(f"  step {step:>7}  T={temperature:7.3g}  acc={acc_last:5.1%}  "
+                           f"feas={feasible_seen:>5}  score={st.score:10.4f}  "
+                           f"{dd_state_str(st, config)}")
+            accepted_window = step_window = 0
+    if step_window:
+        acc_last = accepted_window / step_window
+    return best, best_step, acc_last
+
+def anneal_decker_restart(restart: int, pieces_by_id: Dict[int, Piece],
+                          corner_ids: List[int], edge_ids: List[int],
+                          inner_capacity: Counter,
+                          config: AnnealingConfig) -> RestartResult:
+    """One --double_decker restart, in a worker.
+
+    Cold: a classic walk over the first --decker_warmup of the steps finds a
+    usable border, dd_seed builds the double decker on it, and the schedule for
+    the rest is probed right here (a cold restart's border is its own, so there
+    is nothing for the parent to decide it from). Warm: the row is seeded the
+    way the parent seeded it to probe, and the parent's T0/Tf are used."""
+    t_start = time.perf_counter()
+    log: List[str] = []
+    ctx = DeckerContext(pieces_by_id, corner_ids, edge_ids, config.decker_sides)
+    seed = config.random_seed
+    if config.verbose:
+        log.append(f"\nRestart {restart}/{config.restarts} (double decker)")
+
+    if config.start_spins is None:
+        warm = max(1, int(round(config.decker_warmup * config.steps_per_restart)))
+        classic = replace(config, steps_per_restart=warm, decker_sides=(), verbose=False)
+        first = anneal_one_restart(restart, pieces_by_id, corner_ids, edge_ids,
+                                   inner_capacity, classic)
+        if config.verbose:
+            log.append(f"  classic warm-up, {warm} steps: " +
+                       (f"score={first.best.score:.4f}  {best_counts_str(first.best)}"
+                        if first.best is not None else "no usable border"))
+        if first.best is None:
+            elapsed = time.perf_counter() - t_start
+            log.append(restart_str(restart, config, None, elapsed))
+            return RestartResult(restart=restart, best=None, log=log, elapsed=elapsed)
+        edge_side, corner_pos = border_from_spins(pieces_by_id, first.best.rot_vec)
+        steps = config.steps_per_restart - warm
+        st = dd_seed(ctx, edge_side, corner_pos,
+                     random.Random(f"decker-seed:{seed}:{restart}"), config)
+        rng = random.Random(f"decker:{seed}:{restart}")
+        if st is not None:
+            t0, tf, lines, _ = resolve_schedule(
+                config, None, pieces_by_id, edge_ids, inner_capacity, None,
+                config.decker_T0, config.decker_Tf,
+                probe=dd_probe(ctx, st, config,
+                               random.Random(f"decker-probe:{seed}:{restart}")))
+            if config.verbose:
+                log.extend("  " + line for line in lines)
+    else:
+        edge_side, corner_pos = border_from_spins(pieces_by_id, config.start_spins)
+        st = dd_seed(ctx, edge_side, corner_pos,
+                     random.Random(restart_seed(seed, 1)), config)
+        steps = config.steps_per_restart
+        rng = random.Random(restart_seed(seed, restart))
+        t0, tf = config.T0, config.Tf
+
+    best, best_step, acc_last = (None, 0, None)
+    if st is not None:
+        best, best_step, acc_last = anneal_decker(ctx, st, steps, t0, tf,
+                                                  config, rng, log)
+    elapsed = time.perf_counter() - t_start
+    rec = None
+    if best is not None:
+        rec = dd_best_record(ctx, best, best_step, inner_capacity, config,
+                             random.Random(f"decker-layout:{seed}:{restart}"))
+    warning = None
+    if acc_last is not None and acc_last < 0.005:
+        warning = (f"  [warn] {acc_last:.1%} of moves accepted in the last window:"
+                   f" Tf={tf:g} froze the search early")
+    if config.verbose:
+        if warning:
+            log.append(warning)
+        if rec is not None:
+            log.append(f"  restart best: score={rec.score:.4f}  "
+                       f"{dd_state_str(best, config)}")
+            log.append(best_line(restart, rec))
+        else:
+            log.append("  restart best: no feasible double decker found")
+        log.append(f"  time: {elapsed:.1f}s")
+    else:
+        log.append(restart_str(restart, config, rec, elapsed))
+        if warning:
+            log.append(warning)
+    return RestartResult(restart=restart, best=rec, log=log, elapsed=elapsed,
+                         warning=warning)
+
+def decker_token(rec: BestRecord, config: AnnealingConfig) -> str:
+    """The Decker= value: each two-tall side's count, TOP/RIGHT/BOTTOM/LEFT,
+    '-' for a classic side. No side names, so no comment parser can take it
+    for one of the TOP=.. fields."""
+    return "/".join(str(rec.dd_counts[s]) if s in config.decker_sides else "-"
+                    for s in Side)
+
+def board_name(config: AnnealingConfig, row_id: str) -> str:
+    return f"dd{config.random_seed}_{row_id}"
+
+def append_board(name: str, rec: BestRecord, path: str) -> None:
+    """One witness board, in the beamer's own line format (E555_beamer.c:
+    `config_id, sol_idx, pos[256], rot[256]`), which the finalizer reads."""
+    pos, rot = rec.board
+    with open(path, "a") as f:
+        f.write(f"{name}, 0, " + ", ".join(map(str, pos)) + ", "
+                + ", ".join(map(str, rot)) + "\n")
+
+def write_best(row_id: str, rec: BestRecord, out_path: str, provenance: str,
+               config: AnnealingConfig, decker_out: Optional[str]) -> Optional[str]:
+    """Append one written border -- and, for a double decker, its witness
+    board under the name its comment carries. Returns that name."""
+    if rec.board is None or not decker_out:
+        append_rotations(row_id, rec, out_path, provenance)
+        return None
+    name = board_name(config, row_id)
+    append_board(name, rec, decker_out)
+    append_rotations(row_id, rec, out_path, provenance,
+                     extra=f"Decker={decker_token(rec, config)}  Board={name}  ")
+    return name
+
+# =============================================================================
 # Main annealing loop
 # =============================================================================
 
@@ -1296,6 +2321,9 @@ def anneal_one_restart(restart: int,
     """One independent annealing walk. This runs in a worker process, so it
     prints nothing and touches no file: everything it has to say goes into
     the returned log for the parent to replay in restart order."""
+    if config.decker_sides:
+        return anneal_decker_restart(restart, pieces_by_id, corner_ids, edge_ids,
+                                     inner_capacity, config)
     log: List[str] = []
     t0  = time.perf_counter()
     rng = random.Random(restart_seed(config.random_seed, restart))
@@ -1519,7 +2547,8 @@ def run_jobs(task, jobs: Sequence, workers: int, consume) -> bool:
 def run_annealing(pieces: Sequence[Piece], config: AnnealingConfig,
                   out_path: Optional[str] = None, provenance: str = "",
                   baseline: Optional[float] = None,
-                  header_extra: Sequence[str] = ()) -> None:
+                  header_extra: Sequence[str] = (),
+                  decker_out: Optional[str] = None) -> None:
     pieces_by_id  = {p.id: p for p in pieces}
     corner_ids, edge_ids = classify_boundary_pieces(pieces)
     inner_capacity = build_inner_capacity(pieces)
@@ -1555,7 +2584,8 @@ def run_annealing(pieces: Sequence[Piece], config: AnnealingConfig,
             if baseline is not None and res.best.score >= baseline - 1e-12:
                 at_least += 1
             if out_path:
-                append_rotations(f"r{res.restart}", res.best, out_path, provenance)
+                write_best(f"r{res.restart}", res.best, out_path, provenance,
+                           config, decker_out)
 
     if workers > 1:
         print(f"[par] {config.restarts} restarts on {workers} worker processes")
@@ -1580,19 +2610,26 @@ def run_annealing(pieces: Sequence[Piece], config: AnnealingConfig,
         # Seeding best from the starting state makes this a guarantee, not a
         # hope: every restart hands back the input row or something better. A
         # count below the restart total means the seeding is broken.
+        what = ("seeded double decker's" if config.decker_sides else "input row's")
         print(f"[sum] {at_least}/{config.restarts} restarts matched or beat the "
-              f"input row's {baseline:.4f}")
+              f"{what} {baseline:.4f}")
     if champion is not None:
         ec = champion.best.euler_counts
         print(f"[sum] best: restart {champion.restart}  score={champion.best.score:.4f}  "
               f"TOP={ec[Side.TOP]} RIGHT={ec[Side.RIGHT]} "
-              f"BOTTOM={ec[Side.BOTTOM]} LEFT={ec[Side.LEFT]}")
+              f"BOTTOM={ec[Side.BOTTOM]} LEFT={ec[Side.LEFT]}"
+              + (f"  Decker={decker_token(champion.best, config)}  "
+                 f"Board={board_name(config, f'r{champion.restart}')}"
+                 if champion.best.dd_counts is not None else ""))
     if out_path:
         print(f"[sum] rotations appended to {out_path}")
+    if decker_out:
+        print(f"[sum] witness boards appended to {decker_out}")
 
 def run_rows(pieces: Sequence[Piece], plans: Sequence[RowPlan],
              config: AnnealingConfig, out_path: str, input_path: str,
-             header_extra: Sequence[str] = ()) -> None:
+             header_extra: Sequence[str] = (),
+             decker_out: Optional[str] = None) -> None:
     """Refine every row of --input: --restarts restarts per row, the best of
     them written back, one output row per input row and in input order.
 
@@ -1647,9 +2684,10 @@ def run_rows(pieces: Sequence[Piece], plans: Sequence[RowPlan],
             if r.best is not None and (best is None or r.best.score > best.score):
                 best = r.best
 
+        name = None
         if best is not None:
-            append_rotations(f"r{row}", best, out_path,
-                             f"  From={input_path}:row{row}")
+            name = write_best(f"r{row}", best, out_path,
+                              f"  From={input_path}:row{row}", config, decker_out)
             written += 1
             if plan.baseline is None or best.score >= plan.baseline - 1e-12:
                 matched += 1
@@ -1665,7 +2703,9 @@ def run_rows(pieces: Sequence[Piece], plans: Sequence[RowPlan],
             for r in got:
                 print("\n".join(r.log))
             print()
-        print(row_delta_str(plan, best, sum(r.elapsed for r in got), width), flush=True)
+        print(row_delta_str(plan, best, sum(r.elapsed for r in got), width)
+              + (f"  Decker={decker_token(best, config)}  Board={name}" if name else ""),
+              flush=True)
         # Counted, not printed per row: under a polishing schedule it fires on
         # most rows, and would bury the table of deltas it sits in.
         if any(r.warning for r in got):
@@ -1691,7 +2731,8 @@ def run_rows(pieces: Sequence[Piece], plans: Sequence[RowPlan],
     # Seeding every restart's best from its starting row makes this a
     # guarantee: a count short of the rows finished means the seeding broke
     # (or an input row was not a usable border to begin with).
-    print(f"[sum] {matched}/{done} rows matched or beat their input row: "
+    what = "their seeded double decker" if config.decker_sides else "their input row"
+    print(f"[sum] {matched}/{done} rows matched or beat {what}: "
           f"{improved} improved, {written - improved} unchanged")
     if written < done:
         print(f"[sum] {done - written} row(s) found no feasible border and were not written")
@@ -1707,6 +2748,8 @@ def run_rows(pieces: Sequence[Piece], plans: Sequence[RowPlan],
               f"TOP={ec[Side.TOP]} RIGHT={ec[Side.RIGHT]} "
               f"BOTTOM={ec[Side.BOTTOM]} LEFT={ec[Side.LEFT]}")
     print(f"[sum] {written} row(s) appended to {out_path}, in input order")
+    if decker_out:
+        print(f"[sum] their witness boards appended to {decker_out}, same order")
 
 # =============================================================================
 # CLI
@@ -1812,7 +2855,67 @@ def build_parser() -> argparse.ArgumentParser:
                         "so all four sides matter equally no matter how large "
                         "their targets are (omit for the linear objective)")
 
+    g = p.add_argument_group("double decker -- two-tall border segments")
+    g.add_argument("--double_decker", nargs="?", const="TOP,RIGHT,BOTTOM,LEFT",
+                   default=None, metavar="SIDES",
+                   help="score these sides (comma list; bare = all four) as "
+                        "two-tall strips: every edge piece paired with the inner "
+                        "piece it touches, and the side's count is the orderings "
+                        "of the whole strip. Writes a witness board of the outer "
+                        "two rings per border, flags its inner pieces with spin 1 "
+                        "and notes Decker=/Board= in the comment")
+    # SUPPRESS, not None: the help states the real default, and main can still
+    # tell a --decker_warmup given without --double_decker.
+    g.add_argument("--decker_warmup", type=float, default=argparse.SUPPRESS, metavar="F",
+                   help="share of a cold restart's steps spent in the classic "
+                        "walk that finds the border the double decker starts "
+                        f"from (default {AnnealingConfig.decker_warmup})")
+    g.add_argument("--decker_out", default=None, metavar="FILE",
+                   help="append the witness boards here, in the beamer's board "
+                        "format (valid finalizer input). Unset: <out stem>"
+                        "_decker.csv beside the rotations file")
+
     return p
+
+def parse_decker_sides(text: str) -> Tuple[int, ...]:
+    by_name = {v: k for k, v in SIDE_NAMES.items()}
+    sides = set()
+    for tok in text.split(","):
+        name = tok.strip().upper()
+        if name not in by_name:
+            raise SystemExit(f"[ERROR] --double_decker: unknown side '{tok.strip()}' "
+                             f"(use TOP, RIGHT, BOTTOM, LEFT)")
+        sides.add(int(by_name[name]))
+    return tuple(sorted(sides))
+
+def default_decker_path(out_path: str) -> str:
+    """The witness boards sit beside the rotations file they belong to."""
+    src = Path(out_path)
+    return str(src.with_name(f"{src.stem}_decker{src.suffix or '.csv'}"))
+
+def decker_warm_plan(config: AnnealingConfig, pieces_by_id: Dict[int, Piece],
+                     corner_ids: List[int], edge_ids: List[int],
+                     inner_capacity: Counter, t0_given: Optional[float],
+                     tf_given: Optional[float]
+                     ) -> Tuple[float, float, List[str], str, Optional[float]]:
+    """A warm start's double decker, seeded exactly as each of its restarts will
+    seed it, and the schedule probed from it: (T0, Tf, header lines, schedule
+    kind, the seed's score when it is a usable witness, else None)."""
+    ctx = DeckerContext(pieces_by_id, corner_ids, edge_ids, config.decker_sides)
+    edge_side, corner_pos = border_from_spins(pieces_by_id, config.start_spins)
+    st = dd_seed(ctx, edge_side, corner_pos,
+                 random.Random(restart_seed(config.random_seed, 1)), config)
+    if st is None:
+        raise SystemExit("[ERROR] --double_decker: no inner piece is left to pair "
+                         "with some edge of this border")
+    t0, tf, lines, kind = resolve_schedule(
+        config, None, pieces_by_id, edge_ids, inner_capacity, None, t0_given, tf_given,
+        probe=dd_probe(ctx, st, config, random.Random(restart_seed(config.random_seed, 0))))
+    baseline = st.score if st.hard == 0.0 else None
+    head = [f"[cfg] double decker: seeded on this border  {dd_state_str(st, config)}  "
+            + (f"score={st.score:.4f}" if baseline is not None
+               else f"not yet usable (hard={st.hard:g}); the search repairs it first")]
+    return t0, tf, head + lines, kind, baseline
 
 def warm_start_report(path: str, row: int, lineno: int, comment: Optional[str],
                       state: RunState, config: AnnealingConfig,
@@ -1885,9 +2988,14 @@ def plan_rows(path: str, rows: Sequence[Tuple[List[int], Optional[str], int]],
                              f"{str(e.code).removeprefix('[ERROR] ')}")
         report, baseline = warm_start_report(path, row, lineno, comment,
                                              state, cfg, inner_capacity)
-        t0, tf, sched, kind = resolve_schedule(
-            cfg, state, pieces_by_id, edge_ids, inner_capacity,
-            random.Random(restart_seed(seed, 0)), t0_given, tf_given)
+        if cfg.decker_sides:
+            t0, tf, sched, kind, baseline = decker_warm_plan(
+                cfg, pieces_by_id, corner_ids, edge_ids, inner_capacity,
+                t0_given, tf_given)
+        else:
+            t0, tf, sched, kind = resolve_schedule(
+                cfg, state, pieces_by_id, edge_ids, inner_capacity,
+                random.Random(restart_seed(seed, 0)), t0_given, tf_given)
         plans.append(RowPlan(row=row, lineno=lineno, config=replace(cfg, T0=t0, Tf=tf),
                              start=state.euler_counts(), baseline=baseline, kind=kind,
                              checked=counts_in_comment(comment) is not None,
@@ -1929,6 +3037,15 @@ def main(argv=None) -> int:
     row      = args.row
     all_rows = bool(args.input) and row is None
     out_path = args.out or default_out_path(args.input)
+
+    decker_sides = parse_decker_sides(args.double_decker) if args.double_decker else ()
+    warmup_given = getattr(args, "decker_warmup", None)
+    if not decker_sides and (args.decker_out or warmup_given is not None):
+        raise SystemExit("[ERROR] --decker_out and --decker_warmup belong to --double_decker")
+    warmup = warmup_given if warmup_given is not None else AnnealingConfig.decker_warmup
+    if not 0.0 < warmup < 1.0:
+        raise SystemExit("[ERROR] --decker_warmup must lie strictly between 0 and 1")
+    decker_out = (args.decker_out or default_decker_path(out_path)) if decker_sides else None
 
     seed = args.random_seed if args.random_seed != 0 else random.randint(1_000_000, 9_999_999)
     # Resolve 0 here, like the seed, so the value the header reports is the
@@ -1973,6 +3090,10 @@ def main(argv=None) -> int:
         target_scale         = args.target_scale,
         start_spins          = start_spins,
         swap_corners         = not args.input,
+        decker_sides         = decker_sides,
+        decker_warmup        = warmup,
+        decker_T0            = args.T0,
+        decker_Tf            = args.Tf,
     )
 
     # A target of w_side x scale only means something for a positive weight.
@@ -1990,6 +3111,16 @@ def main(argv=None) -> int:
     marker = (f"# run {time.strftime('%Y-%m-%d %H:%M:%S')}  "
               f"seed={config.random_seed} restarts={config.restarts} "
               f"steps={config.steps_per_restart} ")
+    if decker_sides:
+        names = ",".join(SIDE_NAMES[Side(s)] for s in decker_sides)
+        blocked = [CORNER_NAMES[k] for k, g in DD_CORNERS.items()
+                   if g.a_side in decker_sides or g.b_side in decker_sides]
+        header_extra.append(
+            f"[cfg] double decker: {names} two tall; corner blocks at {' '.join(blocked)}"
+            + ("" if args.input else
+               f"; each restart spends {warmup:.0%} of its steps in a classic warm-up"))
+        header_extra.append(f"[cfg] double decker: witness boards -> {decker_out}")
+        marker = marker.replace("# run ", f"# run double_decker={names} ", 1)
 
     if all_rows:
         plans = plan_rows(args.input, rows, config, pieces_by_id, corner_ids,
@@ -1999,8 +3130,11 @@ def main(argv=None) -> int:
         temps = " ".join(f"{k}=per-row" if v is None else f"{k}={v:g}"
                          for k, v in (("T0", args.T0), ("Tf", args.Tf)))
         open_out(out_path, marker + temps + f" input={args.input} rows=all({len(plans)})")
+        if decker_out:
+            open_out(decker_out, marker + temps + f" input={args.input} rows=all({len(plans)})")
         signal.signal(signal.SIGINT, _request_stop)
-        run_rows(pieces, plans, config, out_path, args.input, header_extra)
+        run_rows(pieces, plans, config, out_path, args.input, header_extra,
+                 decker_out=decker_out)
         return 0
 
     # The starting state, and then the schedule it implies. Both are settled
@@ -2017,9 +3151,17 @@ def main(argv=None) -> int:
                                             state, config, inner_capacity)
         header_extra.extend(lines)
 
-    t0, tf, sched_lines, _ = resolve_schedule(
-        config, state, pieces_by_id, edge_ids, inner_capacity,
-        random.Random(restart_seed(seed, 0)), args.T0, args.Tf)
+    if decker_sides and start_spins is not None:
+        # A warm double decker: seeded here exactly as each restart will seed
+        # it, so the schedule and the no-loss baseline are the witness's own.
+        t0, tf, sched_lines, _, baseline = decker_warm_plan(
+            config, pieces_by_id, corner_ids, edge_ids, inner_capacity, args.T0, args.Tf)
+    else:
+        # Classic -- or a cold double decker, whose classic warm-up runs on
+        # this schedule and whose own phase is probed per restart.
+        t0, tf, sched_lines, _ = resolve_schedule(
+            config, state, pieces_by_id, edge_ids, inner_capacity,
+            random.Random(restart_seed(seed, 0)), args.T0, args.Tf)
     header_extra.extend(sched_lines)
     config = replace(config, T0=t0, Tf=tf)
 
@@ -2027,12 +3169,14 @@ def main(argv=None) -> int:
     if args.input:
         marker += f" input={args.input} row={row}"
     open_out(out_path, marker)
+    if decker_out:
+        open_out(decker_out, marker)
 
     # Ctrl-C: let the workers finish the restart they are in and keep whatever
     # has already been written, instead of losing every in-flight restart.
     signal.signal(signal.SIGINT, _request_stop)
     run_annealing(pieces, config, out_path=out_path, provenance=provenance,
-                  baseline=baseline, header_extra=header_extra)
+                  baseline=baseline, header_extra=header_extra, decker_out=decker_out)
     return 0
 
 if __name__ == "__main__":

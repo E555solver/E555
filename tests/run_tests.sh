@@ -79,6 +79,7 @@ ALL_STEPS=(
     "annealer|Stage A short run: BEST lines, a beamer-format --out CSV, and spins that match their comment"
     "annealer_refine|Stage A warm start: every shipped row round-trips, and refining one cannot lose ground"
     "annealer_rows|Stage A whole-file refine: every row in input order, thread-invariant, default --out"
+    "annealer_decker|Stage A --double_decker: exact strip counts, witness boards the finalizer can load"
     "sort_rotations|both comment forms sort alike, and --max_top turns every row onto its own best side"
     "finalizer_synth|REGRESSION: rediscovers the synthetic solution from row 10"
     "finalizer_rotations|re-imposes a matching rotations row's side assignment"
@@ -1033,6 +1034,146 @@ EOF
     grep -q '^# run ' "$OUT/rows_cold/rotations.csv" 2>/dev/null \
         || fail "a cold run without --out did not write rotations.csv"
     echo "ok: without --out, a cold run writes rotations.csv where it runs"
+}
+
+# --double_decker scores sides as two-tall strips and writes, beside every
+# border, a witness board of the outer two rings. Everything about that is easy
+# to get subtly wrong -- a corner block read from the wrong face, a strip laid
+# out backwards, a flag on the wrong piece -- and all of it would still look
+# plausible. So: the strip counts are checked against brute force, and every
+# output is re-derived from the files alone by tests/check_decker.py, which
+# shares nothing with the annealer's double-decker geometry. Each witness must
+# also be something the finalizer will load (fin_load_partial's checks), since
+# that is what it is for.
+step_annealer_decker() {
+    local A=src/A_border/E555_edge_annealer.py
+    rm -rf "$OUT/decker" && mkdir -p "$OUT/decker"
+
+    # Exact counting: windows of real laid-out strips, every ordering tried.
+    python3 - <<'EOF' || exit 1
+import itertools, random, sys
+from dataclasses import replace
+sys.path.insert(0, "src/A_border")
+import E555_edge_annealer as A
+
+pieces = A.read_pieces("data/seed_Edge5.txt")
+pbi = {p.id: p for p in pieces}
+corners, edges = A.classify_boundary_pieces(pieces)
+rows = A.read_rotations("data/borders_annealed_fix12.csv")
+checked = 0
+for sides in ((0, 1, 2, 3), (0,)):
+    cfg = replace(A.AnnealingConfig(), decker_sides=sides)
+    ctx = A.DeckerContext(pbi, corners, edges, sides)
+    for k in (1, 4):
+        st = A.dd_seed(ctx, *A.border_from_spins(pbi, rows[k][0]), random.Random(k), cfg)
+        assert st is not None and st.hard == 0.0, f"row {k}: no feasible seed"
+        for s in A.Side:
+            arcs, _ = A.dd_side_arcs(ctx, st, s)
+            k0, k1 = A.DD_ENDS[s]
+            order = A.euler_trail(arcs, A.dd_endpoint(ctx, st, s, k0),
+                                  A.dd_endpoint(ctx, st, s, k1), random.Random(3))
+            by = {lab: (u, v) for u, v, lab in arcs}
+            for w in (5, 6):
+                for i in range(0, len(order) - w + 1, 3):
+                    win = [by[lab] for lab in order[i:i + w]]
+                    start, end = win[0][0], win[-1][1]
+                    brute = 0
+                    for perm in itertools.permutations(win):
+                        node = start
+                        for u, v in perm:
+                            if u != node:
+                                break
+                            node = v
+                        else:
+                            brute += node == end
+                    got = A.count_euler_trails(win, start, end)
+                    assert brute == got, f"{A.SIDE_NAMES[s]} window {i}+{w}: {got} != {brute}"
+                    checked += 1
+print(f"ok: {checked} strip windows count exactly what brute force counts")
+EOF
+
+    # Cold, all four sides: the classic warm-up, then the double decker. Rows
+    # 0 and 1 are complete, so the finalizer takes it at --finalize_from 1.
+    for t in 1 2; do
+        python3 -u "$A" data/seed_Edge5.txt --double_decker --restarts 2 --steps 10000 \
+            --rng_seed 11 --threads "$t" --out "$OUT/decker/cold$t.csv" \
+            > "$OUT/decker/cold$t.log" 2>&1 \
+            || { cat "$OUT/decker/cold$t.log"; fail "the cold --double_decker run failed"; }
+    done
+    python3 tests/check_decker.py "$OUT/decker/cold1.csv" "$OUT/decker/cold1_decker.csv" \
+        TOP,RIGHT,BOTTOM,LEFT 1 || fail "the cold double-decker outputs do not check out"
+    for f in cold cold_decker; do
+        cmp -s <(grep -v '^# run' "$OUT/decker/${f/cold/cold1}.csv") \
+               <(grep -v '^# run' "$OUT/decker/${f/cold/cold2}.csv") \
+            || fail "--threads 1 and 2 wrote different ${f}.csv"
+    done
+    echo "ok: 1 and 2 workers write identical rows and boards"
+
+    # The real loader, not a copy of it: the finalizer reads, validates and
+    # locks the first witness, then starts building its database -- which is
+    # where this stops it. Seeing its [sweep] line is the proof. SIGKILL,
+    # because it takes SIGTERM as "stop after this step", and this step is
+    # a database build.
+    local log="$OUT/decker/finalizer.log" pid i
+    ( cd "$OUT/decker" && exec "$REPO/bin/E555_finalizer" "$REPO/data/seed_Edge5.txt" \
+        cold1_decker.csv cold1.csv --finalize_from 1 --stop_row 3 --num_rows 1 \
+        --out_dir . ) > "$log" 2>&1 &
+    pid=$!
+    for i in $(seq 1 150); do
+        grep -q '\[sweep\] line 0:' "$log" && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.2
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    grep -q "\[sweep\] line 0: source 'dd11_r[0-9]*'  depth=1  lock rows 0..1  mode=fixed" "$log" \
+        || { cat "$log"; fail "the finalizer did not load a witness board at --finalize_from 1"; }
+    echo "ok: the finalizer loads a witness board, locks rows 0..1 and fixes its sides"
+
+    # TOP only, refining one row: row 14 is the whole second ring, 14 flags.
+    python3 -u "$A" data/seed_Edge5.txt --input data/borders_annealed_fix12.csv --row 4 \
+        --double_decker TOP --restarts 2 --steps 3000 --rng_seed 42 \
+        --out "$OUT/decker/top.csv" > "$OUT/decker/top.log" 2>&1 \
+        || { cat "$OUT/decker/top.log"; fail "the --double_decker TOP refine failed"; }
+    grep -q "2/2 restarts matched or beat the seeded double decker" "$OUT/decker/top.log" \
+        || { cat "$OUT/decker/top.log"; fail "a double-decker refine lost ground against its seed"; }
+    python3 tests/check_decker.py "$OUT/decker/top.csv" "$OUT/decker/top_decker.csv" TOP 0 \
+        || fail "the TOP double-decker outputs do not check out"
+    python3 - "$OUT/decker/top_decker.csv" <<'EOF' || exit 1
+import sys
+for line in open(sys.argv[1]):
+    if line.lstrip().startswith("#"):
+        continue
+    pos = [int(x) for x in line.split(",")[2:258]]
+    inner = sorted(c for p, c in enumerate(pos) if c != 999 and p >= 60)
+    assert inner == [14 * 16 + c for c in range(1, 15)], f"inner cells {inner}"
+print("ok: --double_decker TOP places exactly row 14's 14 inner pieces")
+EOF
+
+    # The whole file, TOP and LEFT, no --out: both files land beside the
+    # input, one row and one board per input row, in input order.
+    cp data/borders_annealed_fix12.csv "$OUT/decker/in.csv"
+    python3 -u "$A" data/seed_Edge5.txt --input "$OUT/decker/in.csv" --double_decker TOP,LEFT \
+        --restarts 1 --steps 800 --rng_seed 42 --threads 3 > "$OUT/decker/rows.log" 2>&1 \
+        || { cat "$OUT/decker/rows.log"; fail "the whole-file --double_decker run failed"; }
+    python3 tests/check_decker.py "$OUT/decker/in_refined.csv" "$OUT/decker/in_refined_decker.csv" \
+        TOP,LEFT 0 || fail "the whole-file double-decker outputs do not check out"
+    [ "$(grep -o 'From=[^ ]*' "$OUT/decker/in_refined.csv" | sed 's/.*:row//' | tr '\n' ' ')" \
+      = "0 1 2 3 4 5 6 7 8 9 10 11 " ] || fail "whole-file double-decker rows out of input order"
+    echo "ok: 12 rows and 12 boards, in input order"
+
+    # A turn would leave the witness behind: sort_rotations keeps such rows
+    # unturned, and E555_rotate --rotations refuses the file.
+    python3 tools/E555_sort_rotations.py "$OUT/decker/top.csv" --max_left \
+        -o "$OUT/decker/turned.csv" > "$OUT/decker/turned.log" 2>&1 \
+        || { cat "$OUT/decker/turned.log"; fail "sort_rotations failed on a double-decker file"; }
+    grep -q "Turn=" "$OUT/decker/turned.csv" && fail "sort_rotations turned a double-decker row"
+    grep -q "left unturned" "$OUT/decker/turned.log" || fail "sort_rotations did not say why"
+    if python3 tools/E555_rotate.py "$OUT/decker/top.csv" 1 --rotations \
+            --out "$OUT/decker/rot.csv" > "$OUT/decker/rot.log" 2>&1; then
+        fail "E555_rotate turned a double-decker file"
+    fi
+    echo "ok: neither turning tool moves a double-decker row"
 }
 
 # The tool reads a score and four trail counts out of the annealer's PROSE, and
