@@ -2573,9 +2573,9 @@ differs. It needs no chain database and starts in milliseconds.
   it gets the same `--rng_seed`, `--end_dive`/`--end_polish`/`--emit_score`,
   the rotations file as `--rotations`, and, if the run used `--lambda_corners`,
   `--corner_seeds 4` (or the run's value) plus `--clue_corners` if the run had
-  it. Checked for dealt sides and for `--free_edges` (the gate checks the
-  first); a `--random_edges` file names no row, so it replays without
-  `--rotations`.
+  it. A `--random_edges` file names no row, so it replays without
+  `--rotations`. Checked for all three border modes (the gate checks dealt
+  sides).
 - **Output.** Canonical rows `config_id, score, pos[256], rot[256]`, best first
   within each batch, exact duplicates dropped, the matched edges in the score
   field; `output.csv.outputs.txt` lists the file. `--wall_time`, Ctrl-C and
