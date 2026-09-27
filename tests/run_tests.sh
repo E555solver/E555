@@ -22,21 +22,21 @@
 # (the roundhouse partials that four checks share are built on demand). Leaving
 # check 1 out of the selection uses whatever is already in bin/.
 #
-# RUNTIME  about 4 minutes with SKIP_BEAMER=1. The three checks that need the
-# real 6.4 GB chain database -- beamer_micro, example_beamer and pipeline_full
-# -- share one cache and want ~8 GB of RAM.
+# RUNTIME  about 4 minutes with SKIP_BEAMER=1. The four checks that need the
+# real 6.4 GB chain database -- beamer_micro, beamer_backtrack_dive,
+# example_beamer and pipeline_full -- share one cache and want ~8 GB of RAM.
 #
 # Environment switches:
 #   ARCH=generic    build for any CPU rather than the build host. Set it in CI
 #                   and containers; -march=native is the Makefile default.
-#   SKIP_BEAMER=1   skip the three database checks (low-RAM machines)
+#   SKIP_BEAMER=1   skip the four database checks (low-RAM machines)
 #   DB_FILE=path    keep the 6.4 GB chain database here (~6.5 GB on disk)
 #                   instead of under tests/out, so it survives the wipe and
 #                   every later run loads it rather than building it. The
-#                   three real-seed checks share one cache either way.
-#   DB_IN_MEMORY=1  never write the database to disk: each of the three checks
-#                   builds it in RAM and drops it (full-disk machines). Four
-#                   builds instead of one, so ~4x the database time, and each
+#                   four real-seed checks share one cache either way.
+#   DB_IN_MEMORY=1  never write the database to disk: each of the four checks
+#                   builds it in RAM and drops it (full-disk machines). Five
+#                   builds instead of one, so ~5x the database time, and each
 #                   build needs 8 GB free. Overrides DB_FILE.
 #
 # This gate proves the tools find the RIGHT answer.
@@ -49,8 +49,8 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO"
 OUT=tests/out
 
-# The three checks that use the real seed each rebuilt the 6.4 GB chain database
-# from scratch: 78 s of build apiece, four builds across the run, and most of
+# The four checks that use the real seed each rebuilt the 6.4 GB chain database
+# from scratch: 78 s of build apiece, five builds across the run, and most of
 # the gate's wall time. They now share one cache, written by whichever runs
 # first and mmapped by the rest. Only the beamer's full inner database is
 # shareable -- the finalizer's is rebuilt per configuration without the locked
@@ -59,7 +59,7 @@ OUT=tests/out
 # It lives under tests/out, so it is wiped with everything else and never
 # outlives a run; DB_FILE=path in the environment points them at a cache that
 # does, which turns the build into a load on every future run. SKIP_BEAMER=1
-# skips all three, so nothing is built at all. DB_IN_MEMORY=1 empties GATE_DB:
+# skips all four, so nothing is built at all. DB_IN_MEMORY=1 empties GATE_DB:
 # the tools and scripts all omit --db_file for an empty path and build in RAM,
 # so a drive with no room for 6.5 GB can still run every check.
 if [ "${DB_IN_MEMORY:-0}" = "1" ]; then GATE_DB=""
@@ -99,6 +99,7 @@ ALL_STEPS=(
     "band_with_frame|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
     "cpsat_chain|topper -> ender -> ender, each fed by the last"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
+    "beamer_backtrack_dive|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount"
     "scripts_parse|every shipped script parses, and passes only flags that exist"
     "example_finalizer|examples/02 re-grows the synthetic board"
     "example_roundhouse|examples/03 refills one strip"
@@ -2080,6 +2081,75 @@ step_beamer_micro() {
     fi
 }
 
+# The backtracker and the end dives, on a rotations row. Two runs share every
+# setting but --end_dive, at one thread so the beam is exactly repeatable:
+#  - the plain run writes stop-row boards; every pair of placed cells that
+#    touch must match (the backtracker's rows AND the fixed frame it writes
+#    above the stop row), and the frame must be there;
+#  - the dived run writes complete boards (256 pieces each). Their score field
+#    must equal a recount of matched edges, and rows 0..stop_row of each must
+#    be exactly one of the plain run's boards -- the dives and the polish may
+#    only fill the top, never touch what the search placed.
+# --lambda_corners with the default --corner_seeds also sends seeded copies
+# through the same checks, their extra fixed corner cells above the stop row.
+step_beamer_backtrack_dive() {
+    if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv
+         --num_rows 1 --top_bottoms 1 --top_columns 1 --beam_width 2000
+         --backtrack_row 8 --stop_row 10 --lambda_corners --rng_seed 7 --threads 1)
+    if [ -n "$GATE_DB" ]; then CMD+=(--db_file "$GATE_DB"); fi
+    "${CMD[@]}" --out_dir "$OUT/btd_plain" > "$OUT/btd_plain.log" \
+        || { tail -5 "$OUT/btd_plain.log"; fail "backtrack run exited non-zero"; }
+    "${CMD[@]}" --end_dive 100 --end_polish 50 --emit_score 0 --out_dir "$OUT/btd_dive" \
+        > "$OUT/btd_dive.log" \
+        || { tail -5 "$OUT/btd_dive.log"; fail "end-dive run exited non-zero"; }
+    grep -q "^\[sum\] backtrack from row 8" "$OUT/btd_plain.log" || fail "no backtrack summary"
+    grep -q "^\[sum\] end dives:" "$OUT/btd_dive.log" || fail "no end-dive summary"
+    python3 - data/seed_Edge5.txt "$OUT/btd_plain/beam_completions_0_10.csv" \
+              "$OUT/btd_dive/beam_completions_0_10.csv" <<'EOF' || exit 1
+import sys
+seed = [list(map(int, l.split())) for l in open(sys.argv[1]) if l.strip()]
+def boards(p):
+    for l in open(p):
+        if not l.strip() or l[0] in "#%": continue
+        v = [x.strip() for x in l.split(",")]
+        yield int(v[1]), list(map(int, v[-512:-256])), list(map(int, v[-256:]))
+def cells(pos, rot):
+    return {pos[p]: (p, rot[p]) for p in range(256) if pos[p] != 999}
+def side(c, x, d):
+    p, r = c[x]; return seed[p][(d + r) % 4]
+def matched_broken(c):
+    m = b = 0
+    for x in c:
+        r, col = divmod(x, 16)
+        for y, d, e in ((x + 1, 1, 3), (x + 16, 0, 2)):
+            if (d == 1 and col == 15) or (d == 0 and r == 15) or y not in c: continue
+            if side(c, x, d) == side(c, y, e): m += 1
+            else: b += 1
+    return m, b
+STOP = 10
+plain = set()
+for _, pos, rot in boards(sys.argv[2]):
+    c = cells(pos, rot)
+    _, broken = matched_broken(c)
+    assert broken == 0, "a stop-row board has a broken edge"
+    assert all(r * 16 in c for r in range(16)) and 255 in c, "the fixed frame is missing"
+    plain.add(tuple(sorted((x, v) for x, v in c.items() if x < 16 * (STOP + 1))))
+assert plain, "the backtrack run wrote no board"
+n = 0
+for score, pos, rot in boards(sys.argv[3]):
+    assert sorted(pos) == list(range(256)), "a dived board is not complete"
+    c = cells(pos, rot)
+    assert matched_broken(c)[0] == score, "score field is not the matched-edge count"
+    core = tuple(sorted((x, v) for x, v in c.items() if x < 16 * (STOP + 1)))
+    assert core in plain, "a dived board changed the rows the search placed"
+    n += 1
+assert n >= len(plain), "fewer dived boards than stop-row boards"
+print("ok: %d stop-row boards legal with the frame; %d dived boards complete, "
+      "scores recount, cores untouched" % (len(plain), n))
+EOF
+}
+
 # =============================================================================
 # The shipped scripts. Everything above calls bin/* and the Python tools
 # directly, which is how two scripts that could not complete a run at all came
@@ -2452,7 +2522,7 @@ ls -A | grep -vxE 'bin|logs' > "$OUT/root_before.txt"   # for no_stray_output
 
 echo "=== E555 release gate ==="
 if [ "${#SEL[@]}" -eq "$TOTAL" ]; then
-    echo "[cfg] all $TOTAL checks; about 4 min, plus ~20 min for the three"\
+    echo "[cfg] all $TOTAL checks; about 4 min, plus ~20 min for the four"\
          "database checks unless SKIP_BEAMER=1"
 else
     echo "[cfg] ${#SEL[@]} of $TOTAL checks selected: ${SEL[*]}"

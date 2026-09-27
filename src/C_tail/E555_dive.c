@@ -741,6 +741,7 @@ typedef struct {
     uint32_t dives;
     bool     stage2;
     uint8_t  seeded;                 /* corner seed: 1 = TL, 2 = TR, 3 = both */
+    int8_t   top_row;                /* highest row with every row below it full; -1 none */
     uint32_t origin;                 /* queue index of the unseeded board it came from */
     /* Run state of the batch in flight (NULL / 0 between batches). */
     DvTop        *top;               /* polish candidates, when polishing */
@@ -756,6 +757,7 @@ typedef struct {
     uint32_t cfg;
     int      score;
     uint8_t  seeded;
+    int8_t   top_row;
 } DvKeep;
 
 static DvRoot  *g_dv_q = NULL;       /* this batch's roots */
@@ -773,11 +775,12 @@ static struct {
     uint64_t seed_boards, seed_roots, seed_pairs, seed_wins, seed_ties, seed_losses;
     int64_t  seed_diff;
     uint64_t seed_written, sbrk_tl, sbrk_tr, sclean_tl, sclean_tr;
+    int      top_min, top_max;       /* top full rows of the written boards */
     int      seed_best, plain_best;
     double   t, t_s1, t_s2, u_s1, u_s2, jt_s2, jt_pol;
     int      best;
     uint64_t hist[DV_EDGES + 1];
-} g_dv_run = { .best = -1, .seed_best = -1, .plain_best = -1 };
+} g_dv_run = { .best = -1, .seed_best = -1, .plain_best = -1, .top_min = PUZZLE_SIDE, .top_max = -1 };
 
 void dv_init(const DvParams *p) {
     g_p = *p;
@@ -899,12 +902,13 @@ static void dv_seed_corners(size_t qi) {
     uint64_t used[4] = { 0, 0, 0, 0 };
     for (int x = 0; x < NUM_PIECES; x++)
         if (r->base_pid[x] != DV_EMPTY) used_set(used, r->base_pid[x]);
+    if (r->top_row < 0 || r->top_row > PUZZLE_SIDE - 4) return;   /* the blocks' rows are full */
     uint8_t rtop[PUZZLE_SIDE];
     for (int c = 0; c < PUZZLE_SIDE; c++) {
-        const int x = (int)g_p.stop_row * PUZZLE_SIDE + c;
+        const int x = r->top_row * PUZZLE_SIDE + c;
         rtop[c] = r->base_pid[x] == DV_EMPTY ? 0 : g_dv_or[r->base_pid[x]][r->base_rot[x]].top;
     }
-    const bool at12 = g_p.stop_row == (uint32_t)(PUZZLE_SIDE - 4);
+    const bool at12 = r->top_row == PUZZLE_SIDE - 4;
     /* The board's clue frame: the slot whose row-13 TL clue sits on (13,2). */
     int s = -1;
     for (int t = 0; t < 4 && s < 0; t++) {
@@ -957,10 +961,58 @@ void dv_add(const uint16_t pid[NUM_PIECES], const uint8_t rot[NUM_PIECES]) {
         r->base_pid[x] = pid[x];
         r->base_rot[x] = pid[x] == DV_EMPTY ? 0 : (uint8_t)(rot[x] & 3);
     }
+    r->top_row = -1;
+    for (int row = 0; row < PUZZLE_SIDE; row++) {
+        bool full = true;
+        for (int c = 0; c < PUZZLE_SIDE && full; c++)
+            full = pid[row * PUZZLE_SIDE + c] != DV_EMPTY;
+        if (!full) break;
+        r->top_row = (int8_t)row;
+    }
     dv_root_key(r);
     r->best = -1;
     r->origin = (uint32_t)(g_dv_qn - 1);
     dv_seed_corners(g_dv_qn - 1);
+}
+
+/* Can every dive of this board complete under the current frame? A stuck cell
+   takes any unused piece its class allows, so a dive fails only when some class
+   of open cells has fewer candidates than cells: inner cells need the unused
+   inner pieces, corner cells the unused corners, and border cells the unused
+   edge pieces -- side by side when edges are held to their sides. */
+bool dv_fits(const uint16_t pid[NUM_PIECES]) {
+    bool used[NUM_PIECES] = { false };
+    for (int x = 0; x < NUM_PIECES; x++) {
+        if (pid[x] == DV_EMPTY) continue;
+        if (pid[x] >= NUM_PIECES || used[pid[x]]) return false;
+        used[pid[x]] = true;
+    }
+    int open[DV_CLASSES] = { 0 }, have[DV_CLASSES] = { 0 };
+    int open_edge = 0, have_edge = 0, open_corner = 0, have_corner = 0;
+    bool pooled = false;
+    for (int x = 0; x < NUM_PIECES; x++) if (pid[x] == DV_EMPTY) open[dv_cls(x)]++;
+    for (int p = 0; p < NUM_PIECES; p++) {
+        if (used[p]) continue;
+        const int kind = dv_piece_kind(p);
+        if (kind == 0) { have[0]++; continue; }
+        if (kind == 2) { have_corner++; continue; }
+        have_edge++;
+        int nk = 0, k1 = -1;
+        for (int k = 1; k < DV_CLASSES; k++)
+            if (g_dv_pclass[p] >> k & 1u) { nk++; k1 = k; }
+        if (nk == 1) have[k1]++; else pooled = true;
+    }
+    for (int k = 1; k < DV_CLASSES; k++) {
+        const bool corner = (k / 3) != 0 && (k % 3) != 0;
+        if (corner) open_corner += open[k]; else open_edge += open[k];
+    }
+    if (open[0] != have[0] || open_corner != have_corner || open_edge != have_edge) return false;
+    if (pooled) return true;
+    for (int k = 1; k < DV_CLASSES; k++) {
+        const bool corner = (k / 3) != 0 && (k % 3) != 0;
+        if (!corner && open[k] != have[k]) return false;
+    }
+    return true;
 }
 
 /* -- Per-thread workspace: one root's board, forward-checking prototype and the
@@ -1639,6 +1691,7 @@ void dv_run(const char *id) {
         }
         kp->fp = h ? h : 1;
         kp->seq = r->seq; kp->cfg = cfg; kp->score = r->best; kp->seeded = r->seeded;
+        kp->top_row = r->top_row;
         kept++;
     }
     /* Corner seeds: each unseeded board against the best of its seeded copies,
@@ -1710,7 +1763,7 @@ static void dv_break_places(const DvKeep *kp) {
                             && col >= PUZZLE_SIDE - 4 && cy >= PUZZLE_SIDE - 4;
             if (in_tl) tl++;
             else if (in_tr) tr++;
-            else if (d && (uint32_t)r == g_p.stop_row) g_dv_run.brk_seam++;
+            else if (d && r == kp->top_row) g_dv_run.brk_seam++;
             else g_dv_run.brk_rest++;
         }
     }
@@ -1757,6 +1810,8 @@ void dv_flush(FILE *fp) {
         fwrite(line, 1, (size_t)(p - line), fp);
         g_dv_run.written++;
         g_dv_run.hist[kp->score]++;
+        if (kp->top_row < g_dv_run.top_min) g_dv_run.top_min = kp->top_row;
+        if (kp->top_row > g_dv_run.top_max) g_dv_run.top_max = kp->top_row;
         dv_break_places(kp);
     }
     free(line); free(hs);
@@ -1794,12 +1849,17 @@ void dv_print_summary(double wall_total) {
     }
     if (g_dv_run.written) {
         const double W = (double)g_dv_run.written;
+        char seam[32];
+        if (g_dv_run.top_min == g_dv_run.top_max)
+            snprintf(seam, sizeof seam, "r%d/r%d", g_dv_run.top_min, g_dv_run.top_min + 1);
+        else
+            snprintf(seam, sizeof seam, "above the top full row");
         printf("[sum] breaks by place over %" PRIu64 " written board(s), per board: "
                "TL 4x4 %.2f (%.0f%% clean), TR 4x4 %.2f (%.0f%% clean), "
-               "seam r%u/r%u %.2f, rest %.2f\n", g_dv_run.written,
+               "seam %s %.2f, rest %.2f\n", g_dv_run.written,
                g_dv_run.brk_tl / W, 100.0 * g_dv_run.clean_tl / W,
                g_dv_run.brk_tr / W, 100.0 * g_dv_run.clean_tr / W,
-               g_p.stop_row, g_p.stop_row + 1, g_dv_run.brk_seam / W, g_dv_run.brk_rest / W);
+               seam, g_dv_run.brk_seam / W, g_dv_run.brk_rest / W);
         if (g_dv_run.seed_written) {
             const double S2 = (double)g_dv_run.seed_written;
             printf("[sum]   of which corner-seeded %" PRIu64 ": TL 4x4 %.2f (%.0f%% clean), "

@@ -50,7 +50,6 @@ typedef struct {
     int      polish;           /* R: kick-and-polish rounds; < 0 = no polish */
     int      corner_seeds;     /* seeded copies per board with an alive corner block */
     bool     seed_corners;     /* the tc_* catalog is built and seeding may use it */
-    uint32_t stop_row;         /* top row of the queued boards (reports, seeding) */
     uint64_t master_seed;      /* keys every board's random streams */
     uint64_t max_written;      /* cap on boards written by dv_flush; 0 = none */
     double   deadline;         /* absolute omp_get_wtime(); 0 = none */
@@ -66,8 +65,14 @@ void     dv_init(const DvParams *p);
 void     dv_frame(bool by_side);
 /* Queue one board of the current batch: per cell, the piece (DV_EMPTY = open)
    and its rotation. Placed cells never move. With seeding on, seeded copies of
-   the board are queued right after it. */
+   the board are queued right after it (for the corner catalog of tc_config's
+   last call). The board's top row -- the highest row with every row below it
+   full -- is where seeding reads the exposed tops. */
 void     dv_add(const uint16_t pid[NUM_PIECES], const uint8_t rot[NUM_PIECES]);
+/* Under the current dv_frame, can a board's dives always complete? False when
+   a piece is placed twice or a class of open cells lacks candidates (a board
+   whose edges do not sit on the sides the frame deals them). */
+bool     dv_fits(const uint16_t pid[NUM_PIECES]);
 /* Dive, learn and polish the queued batch; keep the boards >= S under `id`. */
 void     dv_run(const char *id);
 /* Write the kept boards, best first, as "id, score, pos[256], rot[256]", and

@@ -17,7 +17,7 @@ pip install ortools       # only needed for src/C_tail/E555_topper.py and E555_e
 
 - Flags are `-Wall -Wextra -O3 -fopenmp`. The test gate fails on **any** compiler warning.
 - Changing `ARCH`/`OPT`/`CC` forces a rebuild through `bin/.buildflags`. A binary built with `-march=native` dies with SIGILL on an older CPU.
-- beamer, finalizer and roundhouse all link `src/B_beam/E555_database.c`. The backtracker is standalone.
+- beamer, finalizer and roundhouse all link `src/B_beam/E555_database.c`; the beamer also links `src/C_tail/E555_dive.c` (the end-dive engine, no argv of its own). The backtracker is standalone.
 - `tests/datadriven/` is a self-contained beamer fork with its own Makefile (`cd tests/datadriven && make ARCH=generic`).
 
 ## Tests
@@ -34,7 +34,7 @@ bash tests/run_tests.sh roundhouse_cache                # by name
 
 - The `ALL_STEPS` array at the top of `run_tests.sh` is the only list of checks. Each entry `name|label` has a matching `step_name` function. To add a check, add both.
 - Each check runs on its own and never depends on an earlier check's artifacts. If check 1 (`compile`) isn't selected, the checks use whatever is already in `bin/`.
-- `beamer_micro`, `example_beamer` and `pipeline_full` need the real 6.4 GB chain database (~8 GB RAM). Set `SKIP_BEAMER=1` to skip them, `DB_FILE=path` to keep a persistent DB cache, or `DB_IN_MEMORY=1` to avoid writing it to disk.
+- `beamer_micro`, `beamer_backtrack_dive`, `example_beamer` and `pipeline_full` need the real 6.4 GB chain database (~8 GB RAM). Set `SKIP_BEAMER=1` to skip them, `DB_FILE=path` to keep a persistent DB cache, or `DB_IN_MEMORY=1` to avoid writing it to disk.
 - Key regressions: the finalizer and roundhouse must rediscover `data/synth_solution_480.csv` (seed `data/synth_seed.txt`), and `viewer` must score it 480/480.
 - `no_stray_output` fails if any check leaves a file in the repo root, so tools that write to the working directory must run from inside `tests/out`.
 - `scripts_parse` (`tests/check_script_flags.py`) collects each binary's accepted flags from its `strcmp(argv[i], "--x")` sites. Every `--flag` that a script in `pipeline/`, `examples/` or `tests/` passes must be in that set. If you rename or remove a C flag, update every script that uses it.
@@ -45,7 +45,9 @@ bash tests/run_tests.sh roundhouse_cache                # by name
 ```
 Stage A  src/A_border/E555_edge_annealer.py   Euler-trail simulated annealing -> rotations.csv (border spins)
                                                (optional: beamer --random_edges samples borders itself)
-Stage B  src/B_beam/E555_beamer.c             5-5-5 chain DB + wide beam + colour/Mahalanobis heuristic
+Stage B  src/B_beam/E555_beamer.c             5-5-5 chain DB + wide beam + colour/Mahalanobis heuristic;
+                                               --backtrack_row exhaustive tail, --end_dive/--end_polish finish
+                                               boards to 256 pieces (engine: src/C_tail/E555_dive.c)
          src/B_beam/E555_finalizer.c          restart the beam from a partial, locked below a row (reduced DB)
          src/B_beam/E555_roundhouse.c         rotate 90 deg, grow a W-wide strip; exhaustive, DP oracle
 Stage C  src/C_tail/E555_topper.py            CP-SAT break minimizer over bands / --holes masks
@@ -54,7 +56,7 @@ Stage C  src/C_tail/E555_topper.py            CP-SAT break minimizer over bands 
 tools/   viewer, rank (--rescore), rotate (--sink), distiller (--plan/--triage), extract_consensus, sort_rotations, clean_csv
 ```
 
-- **One CSV dialect connects everything.** A canonical board row is `config_id, score, pos[256], rot[256]` (514 fields). `pos[p]` is the cell of piece `p`, with 999 meaning unplaced. Readers take the **last 512 fields** as pos+rot and treat any leading fields as metadata, so Stage B rows (which carry a solution index in slot 2) and the legacy 515-field rows parse everywhere. Lines starting with `#` or `%` are comments. Any stage's output can feed any other stage, or itself. `tools/E555_rank.py --out F --rescore` rewrites rows canonically.
+- **One CSV dialect connects everything.** A canonical board row is `config_id, score, pos[256], rot[256]` (514 fields). `pos[p]` is the cell of piece `p`, with 999 meaning unplaced. Readers take the **last 512 fields** as pos+rot and treat any leading fields as metadata, so Stage B rows (which carry a solution index in slot 2, or the score under `--end_dive`) and the legacy 515-field rows parse everywhere. Lines starting with `#` or `%` are comments. Any stage's output can feed any other stage, or itself. `tools/E555_rank.py --out F --rescore` rewrites rows canonically.
 - **Geometry conventions** (PROJECT_E555.md, "Conventions"): rows and columns are 0-indexed **bottom-up** (row 0 is the bottom border), and cell = `row*16 + col`. Rotations are CCW quarter-turns `s ∈ {0..3}`: side `d` of the rotated piece reads seed side `(d+s) mod 4`.
 - **Seed files** (`data/seed_Edge5.txt` is the real puzzle, `data/synth_seed.txt` is synthetic) list 4 colours per piece. Most tools take `--seed_file`.
 - **Stage B always grows upward.** The whirlpool (`pipeline/run_pipeline_whirlpool.sh`) turns the board 90° and uses `backtracker --stop_row N --with_frame` to convert complete columns back into complete rows. That lets the finalizer re-search buried rows.

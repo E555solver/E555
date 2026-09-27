@@ -27,6 +27,12 @@ DB_FILE=                # cache the 6.4 GB chain database here (~6.5 GB on
                         # build it in memory every time
 RNG_SEED=1              # fixed so the run repeats; see the note in the README
 CLUES=0                 # 1 = hold the published Eternity II clue pieces
+BACKTRACK_ROW=0         # N > 0: the beam stops at row N and every row-N board
+                        # is searched exhaustively up to STOP_ROW; 0 = off
+END_DIVE=0              # M > 0: finish every stop-row board to 256 pieces with
+                        # M dives each and write the best; 0 = off
+END_POLISH=-1           # R >= 0 (with END_DIVE): polish the best dives, then R
+                        # kick-and-polish rounds; -1 = off
 
 ANNEAL=0                # 1 = search for good borders with Stage A first
 BORDERS=4               # border rows handed to the beamer (ANNEAL=1)
@@ -80,8 +86,12 @@ else
 fi
 
 DB_ARG=(); [ -n "$DB_FILE" ] && DB_ARG=(--db_file "$DB_FILE")
+FINISH_ARG=()
+[ "$BACKTRACK_ROW" -gt 0 ] && FINISH_ARG+=(--backtrack_row "$BACKTRACK_ROW")
+[ "$END_DIVE" -gt 0 ]      && FINISH_ARG+=(--end_dive "$END_DIVE")
+[ "$END_DIVE" -gt 0 ] && [ "$END_POLISH" -ge 0 ] && FINISH_ARG+=(--end_polish "$END_POLISH")
 
-bin/E555_beamer "$SEED" "${BORDER_ARG[@]}" "${CLUE_ARG[@]}" "${DB_ARG[@]}" \
+bin/E555_beamer "$SEED" "${BORDER_ARG[@]}" "${CLUE_ARG[@]}" "${DB_ARG[@]}" "${FINISH_ARG[@]}" \
     --beam_width "$BEAM_WIDTH" --stop_row "$STOP_ROW" \
     --wall_time "$MAX_WALL" --threads "$THREADS" --rng_seed "$RNG_SEED" \
     --out_dir "$OUT_DIR" --print_cmd --verbose

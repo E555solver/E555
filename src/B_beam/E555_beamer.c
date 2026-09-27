@@ -4379,7 +4379,7 @@ int main(int argc, char *argv[]) {
         DvParams dp = {
             .dives = g_end_dive, .emit_score = g_emit_score, .polish = g_end_polish,
             .corner_seeds = g_corner_seeds, .seed_corners = g_corners_on,
-            .stop_row = g_stop_row, .master_seed = g_master_seed,
+            .master_seed = g_master_seed,
             .max_written = g_max_partials,
             .deadline = g_max_wall_sec > 0.0 ? t_start + g_max_wall_sec : 0.0,
             .threads = g_nthreads, .stop = &g_stop,

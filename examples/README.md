@@ -172,6 +172,15 @@ maximize/minimize sign rather than a per-side target, which is what lets
 `--target_scale` back makes every weight a target that must be positive, and
 `--w_bottom 0` stops meaning anything.
 
+**Finishing what the beam reaches.** `BACKTRACK_ROW=8` stops the beam at row 8
+and searches every row-8 board exhaustively up to `STOP_ROW`. Past row 7 or so
+the beam keeps only a small share of the legal boards, and the exhaustive search
+from there is cheap because the tree dies out within a few rows. `END_DIVE=10000
+END_POLISH=20000` then completes every stop-row board to all 256 pieces with
+random dives, polishes the best, and writes the best completion per board with
+its matched-edge count (out of 480) in field 2 -- so for these files field 2 IS
+a score. Only boards reaching `--emit_score` (450) are written.
+
 **Reproducibility.** The beam is reproducible from `--rng_seed` together with
 `--threads`, not from the seed alone. The work partition follows the thread
 count, and a beam that keeps a bounded number of candidates keeps a different
