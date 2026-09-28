@@ -3089,6 +3089,21 @@ static bool fin_clue_viable(int orient, const int pos[NUM_PIECES],
             }
             continue;
         }
+        /* A clue right under locked top rows meets them: its top is row T's
+           bottom there. The row-13 pair is never searched, only attached, so
+           nothing else would ever check it -- every board would carry the break,
+           and the dives cannot move an attached clue. */
+        if (g_top_T < PUZZLE_SIDE && cc->row == g_top_T - 1) {
+            uint8_t top = g_cat[g_clue_ci[orient][k]].top;
+            if (g_grid[g_top_T][cc->col].bottom != top) {
+                if (explain)
+                    printf("[skip] line %u: locked top cell (%d,%d) exposes colour %u downward, but\n"
+                           "       clue %d of orientation %d sits under it with top %u\n",
+                           want, g_top_T, cc->col, g_grid[g_top_T][cc->col].bottom,
+                           k, orient, top);
+                return false;
+            }
+        }
         if (used_test(g_lock_mask, cc->piece)) {             /* locked somewhere else */
             if (explain)
                 printf("[skip] line %u: clue piece %u is locked at cell %d, but clue %d of\n"
@@ -4606,8 +4621,8 @@ int main(int argc, char *argv[]) {
            14 has built them already, from the input. */
         g_corners_on = g_corners_req && !(g_ring_kept && g_top_T <= EDGE_LEN);
         if (g_corners_req && !g_corners_on)
-            printf("[corner] line %u: the top rows are locked from the input, so the corners "
-                   "are already built -- --lambda_corners has nothing to add here\n", line);
+            printf("[corner] line %u: rows 14-15 are locked from the input, so the corner "
+                   "blocks' pieces there are fixed -- --lambda_corners is off for this line\n", line);
         if (g_corners_req && g_free_edges) {
             printf("[corner] line %u: free mode, so the sides are unknown and no corner "
                    "catalog exists -- skipped (--lambda_corners)\n", line);
@@ -4692,7 +4707,15 @@ int main(int argc, char *argv[]) {
                 uint64_t *tried = xmalloc(run_l * sizeof(uint64_t));
 
                 uint32_t barren = 0;      /* consecutive columns that reported nothing */
-                for (uint32_t rep = 0; rep < g_finalize_repeats && !g_stop; rep++) {
+                /* A fixed column searched exhaustively from the lock has no
+                   randomness left: a repeat would write the same boards again. */
+                uint32_t reps = g_finalize_repeats;
+                if (!cols_free && g_backtrack_row_set && g_backtrack_row == g_finalize_from && reps > 1) {
+                    printf("[note] line %u: --finalize_repeats %u ignored -- the column is fixed and "
+                           "the search from the lock is exhaustive, so one pass\n", line, reps);
+                    reps = 1;
+                }
+                for (uint32_t rep = 0; rep < reps && !g_stop; rep++) {
                     size_t tried_n = 0;
                     LeftOrder lft;
                     for (size_t li = 0; li < run_l && !g_stop; li++) {

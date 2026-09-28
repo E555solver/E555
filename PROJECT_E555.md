@@ -1771,9 +1771,13 @@ a board that already exists at the top, not only at the bottom:
   top. At `T = 15` this is the old row-14 rule made exact per column.
 - **A gap** (`--stop_row < T-1`) is simply left open: the locked pieces are
   reserved, so the search never spends them, and `--end_dive` fills the gap.
-- **Corners.** With `T <= 14` the input has already built the top corners, so
-  `--lambda_corners` has nothing to measure and is off for that line (a
-  `[corner]` note says so). With `T = 15` the catalog is pruned to the blocks
+- **Corners.** With `T <= 14` the corner blocks' pieces on rows 14-15 are the
+  input's, so `--lambda_corners` is off for that line (a `[corner]` note says
+  so). Under `--clue_corners` the clued block's row-13 cells are still open,
+  but its row-14 inner pieces are locked, so every catalog block would read as
+  dead and the term could only say zero. A row-13 clue whose top does not meet
+  the locked row 14 makes that orientation non-viable, since the attached clue
+  would carry a break no search or dive could remove. With `T = 15` the catalog is pruned to the blocks
   whose side pieces and top-border witnesses are the ring's own, and corner
   seeding has nothing to place (its witness cells are filled).
 - **`--free_top`** turns all of it off: sides only, nothing above the stop row
