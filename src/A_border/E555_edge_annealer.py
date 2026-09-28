@@ -2429,7 +2429,7 @@ def anneal_decker_restart(restart: int, pieces_by_id: Dict[int, Piece],
                      random.Random(f"decker-seed:{seed}:{restart}"), config)
         rng = random.Random(f"decker:{seed}:{restart}")
         if st is not None:
-            t0, tf, lines, _ = resolve_schedule(
+            t0, tf, lines, kind = resolve_schedule(
                 config, None, pieces_by_id, edge_ids, inner_capacity, None,
                 config.decker_T0, config.decker_Tf,
                 probe=dd_probe(ctx, st, config,
@@ -2437,6 +2437,10 @@ def anneal_decker_restart(restart: int, pieces_by_id: Dict[int, Piece],
                 plateau=(DD_PLATEAU_T0, DD_PLATEAU_TF))
             if config.verbose:
                 log.extend("  " + line for line in lines)
+            else:
+                given = config.decker_T0 is not None or config.decker_Tf is not None
+                log.append(f"  restart {restart}: double-decker schedule T0={t0:.3g} "
+                           f"Tf={tf:.3g} ({'--T0/--Tf' if given else 'probed, ' + kind})")
     else:
         edge_side, corner_pos = border_from_spins(pieces_by_id, config.start_spins)
         st = dd_seed(ctx, edge_side, corner_pos,
@@ -3031,7 +3035,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Initial temperature; left unset the schedule is "
                         "resolved from the starting state -- calibrated to it "
                         "when it has a feasible neighbourhood, anchored to the "
-                        "feasibility cliff when it does not")
+                        "feasibility cliff when it does not. Under --double_decker "
+                        "it sets the double-decker phase only (a cold run's classic "
+                        "warm-up keeps its own schedule), whose score is a mean log "
+                        "layout count: 0.03-0.1 measured best, 0.3 and up clearly "
+                        "worse, and the probe usually lands in range")
     g.add_argument("--Tf",       type=float, default=None,
                    help="Final temperature; unset, as --T0")
 
@@ -3401,9 +3409,22 @@ def main(argv=None) -> int:
         # it, so the schedule and the no-loss baseline are the witness's own.
         t0, tf, sched_lines, _, baseline = decker_warm_plan(
             config, pieces_by_id, corner_ids, edge_ids, inner_capacity, args.T0, args.Tf)
+    elif decker_sides:
+        # A cold double decker: this schedule is only its classic warm-up's,
+        # which has to cross the border's feasibility cliff, so --T0/--Tf do
+        # not touch it -- they set the double-decker phase, whose scores are
+        # log layout counts on a scale ~100x smaller (config.decker_T0/Tf;
+        # otherwise probed per restart, see anneal_decker_restart).
+        t0, tf, sched_lines, _ = resolve_schedule(
+            config, state, pieces_by_id, edge_ids, inner_capacity,
+            random.Random(restart_seed(seed, 0)), None, None)
+        sched_lines = [l.replace("[cfg] schedule:", "[cfg] warm-up schedule:") for l in sched_lines]
+        sched_lines.append("[cfg] double-decker schedule: "
+                           + (f"T0={args.T0 if args.T0 is not None else 'probed'} "
+                              f"Tf={args.Tf if args.Tf is not None else 'probed'}"
+                              if args.T0 is not None or args.Tf is not None
+                              else "probed per restart after its warm-up (shown per restart)"))
     else:
-        # Classic -- or a cold double decker, whose classic warm-up runs on
-        # this schedule and whose own phase is probed per restart.
         t0, tf, sched_lines, _ = resolve_schedule(
             config, state, pieces_by_id, edge_ids, inner_capacity,
             random.Random(restart_seed(seed, 0)), args.T0, args.Tf)

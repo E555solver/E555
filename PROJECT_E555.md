@@ -359,6 +359,37 @@ border's potential.
   that gave 1-2 layouts, against 188-980 at T0 = 0.1. T0 = 0.3 gave 24-368,
   0.045 gave 80-192 and 0.02 gave 113-315; on row 5, which probes as
   polishing (T0 = 0.0455: 372-1888), T0 = 0.1 gave 540-2038.
+- **Temperatures.** A cold run has two phases with two schedules. The
+  classic warm-up (`--decker_warmup`, 30% of the steps) finds a usable border
+  and runs on the classic schedule, the header's `T0=11.25 Tf=9`, sized to
+  cross the feasibility cliff. The double-decker phase that follows is probed
+  per restart over its own moves and printed per restart (`restart N:
+  double-decker schedule ...`). `--T0/--Tf` set the double-decker phase only;
+  they used to set the warm-up as well, so a value picked for the double
+  decker also froze the search for a border. The double-decker score is the
+  mean over two-tall sides of each side's log layout count -- doubling one
+  side's count moves it by 0.69 / (number of two-tall sides) -- so its moves
+  are ~0.1-0.5 and acceptance swings fast between T = 0.3 and 1. Measured
+  (Tf = T0/20; cold: bare flag, 3 seeds x 4 restarts x 60000 steps; warm:
+  `borders_annealed_fix12.csv` rows 4 and 5, TOP, `--decker_keep_border`, 4 x
+  20000), mean best score per restart:
+
+  | double-decker T0 | cold, all four sides | warm TOP row 4 | warm TOP row 5 |
+  |---|---|---|---|
+  | probed | 1.199 | 5.611 | 5.785 |
+  | 0.03 | 1.227 | 5.623 | 5.779 |
+  | 0.1 | 1.072 | 5.611 | 5.850 |
+  | 0.3 | 0.904 | 5.504 | 5.714 |
+  | 1 | 0.592 | 5.374 | 5.671 |
+  | 3 | 0.509 | 5.280 | 5.625 |
+
+  The probe lands at 0.006-0.05 on cold restarts (it reads a freshly seeded
+  reserve as near an optimum and polishes) and at 0.04-0.1 on these warm rows,
+  which is within the spread of the best cell: the cold restarts' standard
+  deviation, 0.22-0.32, is larger than any difference between 0.03, 0.1 and
+  the probe, so more restarts buy more than tuning T0 there. From 0.3 up the
+  walk is too hot. One cold restart in 12 per setting never became feasible
+  (score -85): its warm-up border admitted no double decker, at every T0.
 - **The border.** A layout contains an order of the edge row, so a side with
   more edge orders scores more easily, and classic counts are no longer given
   away for nothing: over the 6-row bench with TOP two tall (2 seeds), 7 side
