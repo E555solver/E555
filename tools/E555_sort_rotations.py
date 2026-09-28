@@ -262,9 +262,10 @@ def orient(borders, dst, want_max, flag, seed):
             continue
         if "Decker=" in (b["comment"] or ""):
             # A double-decker row belongs to a witness board laid out for THIS
-            # orientation: its spin-1 flags mark inner pieces of the sides it
-            # named, and its Decker= counts are in side order. A turn would
-            # move the border under all three.
+            # orientation: its side codes (inner spins 1 = TOP, 2 = BOTTOM,
+            # 3 = LEFT/RIGHT) mark the reserves of the sides it named, and its
+            # Decker= counts are in side order. A turn would move the border
+            # under all three. Sorting and --top copy the row verbatim.
             warn(f"line {b['lineno']}: a --double_decker row (Decker=) is left "
                  "unturned; turning it would leave its witness board, flags and "
                  "Decker= sides behind")

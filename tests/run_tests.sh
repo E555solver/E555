@@ -1233,6 +1233,33 @@ EOF
         fail "E555_rotate turned a double-decker file"
     fi
     echo "ok: neither turning tool moves a double-decker row"
+
+    # Sorting (not turning) a bare-flag file -- all four sides, codes 1, 2 and
+    # 3 -- copies every row and the comment above it verbatim.
+    python3 tools/E555_sort_rotations.py "$OUT/decker/in_refined.csv" --sort top,-min_side \
+        --top 5 -o "$OUT/decker/sorted.csv" > "$OUT/decker/sorted.log" 2>&1 \
+        || { cat "$OUT/decker/sorted.log"; fail "sort_rotations failed on a double-decker file"; }
+    python3 - "$OUT/decker/cold1.csv" "$OUT/decker/in_refined.csv" "$OUT/decker/sorted.csv" <<'EOF' || exit 1
+import sys, subprocess
+def rows(p):
+    out, pend = {}, None
+    for l in open(p):
+        l = l.rstrip("\n")
+        if l.startswith("#"):
+            pend = l
+        elif l.strip():
+            out[l.split(",")[0].strip()] = (pend, l)
+    return out
+src, got = rows(sys.argv[2]), rows(sys.argv[3])
+assert len(got) == 5, f"--top 5 kept {len(got)}"
+assert all(got[k] == src[k] for k in got), "a sorted row or its comment changed"
+# and the four-sided cold file, whose codes include 3
+out = subprocess.run([sys.executable, "tools/E555_sort_rotations.py", sys.argv[1]],
+                     capture_output=True, text=True, check=True).stdout
+row = [l for l in out.splitlines() if l.strip() and not l.startswith("#")][0]
+assert "3" in {x.strip() for x in row.split(",")[61:]}, "code 3 lost in sorting"
+print("ok: sort_rotations sorts double-decker files verbatim, side codes 1-3 included")
+EOF
 }
 
 # The tool reads a score and four trail counts out of the annealer's PROSE, and
