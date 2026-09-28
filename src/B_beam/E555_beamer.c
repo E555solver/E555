@@ -154,6 +154,14 @@ static uint32_t g_pool_factor     = 8;
 static const char *g_out_dir      = "beam_out";
 static const char *g_db_file      = NULL;
 static bool     g_random_edges    = false;
+/* --reserve_decker: hold the rotations row's double-decker TOP reserve (the
+   inner pieces Stage A marked with spin 1) out of every board, as the row-13
+   clue pair is held -- they are row 14's, which the beam never reaches. Set per
+   border row by reserve_decker_row; all zero when nothing is held. */
+static bool     g_reserve_decker  = false;
+static uint64_t g_reserve[4];
+static int      g_reserve_n       = 0;
+static uint32_t g_reserve_rows_skipped = 0;
 
 static uint32_t g_start_row        = 0;
 static uint32_t g_num_rows         = 0;   /* rows to sweep; 0 = every remaining row of rotation.csv */
@@ -318,11 +326,92 @@ static uint32_t parent_cap_eff(int row) {
 
 /* -- Board state operations ------------------------------------------------- */
 
+/* The used set the top-corner catalog should see: the board's own, minus the
+   held reserve. The reserve is row 14's supply -- its two block inner pieces
+   are the TL/TR blocks' own -- so to the corner count it is still free. */
+static inline const uint64_t *tc_used(const uint64_t *used, uint64_t buf[4]) {
+    if (!g_reserve_n) return used;
+    for (int k = 0; k < 4; k++) buf[k] = used[k] & ~g_reserve[k];
+    return buf;
+}
+
+/* --reserve_decker for one border row: read `Decker=a/b/c/d` (TOP, RIGHT,
+   BOTTOM, LEFT; `-` for a classic side) off the row's Stage A comment and, when
+   TOP is the only two-tall side, hold every inner piece whose spin is 1 -- the
+   TOP reserve plus the TL/TR block inner pieces, all bound for row 14. Returns
+   false when the row must be skipped: another side is two tall too (the spins
+   do not say which piece is whose, and the beam places those strips itself),
+   or the held pieces leave the beam too few for --stop_row. A row with no
+   two-tall TOP holds nothing and runs as usual. */
+static bool reserve_decker_row(uint32_t row, const char *comment, const uint8_t spins[NUM_PIECES]) {
+    memset(g_reserve, 0, sizeof g_reserve);
+    g_reserve_n = 0;
+    if (!g_reserve_decker) return true;
+    const char *d = NULL;
+    for (const char *q = comment ? strstr(comment, "Decker=") : NULL; q; q = strstr(q + 1, "Decker="))
+        if (q == comment || q[-1] == ' ' || q[-1] == '\t' || q[-1] == '#') { d = q + 7; break; }
+    bool two[4] = { false, false, false, false };
+    int n = 0;
+    if (d) {
+        for (n = 0; n < 4 && *d && *d != ' ' && *d != '\t' && *d != '\n' && *d != '\r'; n++) {
+            two[n] = *d != '-';
+            while (*d && *d != '/' && *d != ' ' && *d != '\t' && *d != '\n' && *d != '\r') d++;
+            if (*d == '/') d++;
+        }
+    }
+    if (!d || n != 4) {
+        printf("[reserve] border row %u: no Decker= in its comment -- nothing to hold\n", row);
+        return true;
+    }
+    if (!two[0]) {
+        printf("[reserve] border row %u: TOP is not two tall -- nothing to hold\n", row);
+        return true;
+    }
+    if (two[1] || two[2] || two[3]) {
+        printf("[reserve] border row %u: skipped -- sides other than TOP are two tall, and the "
+               "spins do not say which marked piece is TOP's\n", row);
+        g_reserve_rows_skipped++;
+        return false;
+    }
+    for (int i = 0; i < EXPECTED_INNER; i++) {
+        const int pid = g_inner_ids[i];
+        if (spins[pid] != 1) continue;
+        used_set(g_reserve, (uint16_t)pid);
+        g_reserve_n++;
+    }
+    for (int k = 0; k < CLUE_N; k++)
+        for (int o = 0; o < 4; o++)
+            if (used_test(g_reserve, g_clue[o][k].piece))
+                fatal("--reserve_decker: border row %u marks clue piece %u as reserved",
+                      row, g_clue[o][k].piece);
+    /* 196 inner pieces; rows 1..stop take 14 each, the held pieces none, and
+       neither do the row-13 clue pair under --clue_corners. */
+    const int held_clues = (g_clue_mask & CLUE_CORNERS) ? 2 : 0;
+    const int avail = EXPECTED_INNER - g_reserve_n - held_clues;
+    const int need  = EDGE_LEN * (int)g_stop_row;
+    if (need > avail) {
+        printf("[reserve] border row %u: skipped -- holding %d piece(s)%s leaves %d inner pieces, "
+               "and rows 1..%u need %d\n", row, g_reserve_n,
+               held_clues ? " and the row-13 clue pair" : "", avail, g_stop_row, need);
+        memset(g_reserve, 0, sizeof g_reserve);
+        g_reserve_n = 0;
+        g_reserve_rows_skipped++;
+        return false;
+    }
+    printf("[reserve] border row %u: holding %d TOP piece(s) for row 14; %d inner pieces left "
+           "for rows 1..%u (slack %d)\n", row, g_reserve_n, avail, g_stop_row, avail - need);
+    if (avail - need < EDGE_LEN)
+        printf("[reserve] border row %u: less than one row of slack -- the pieces left over "
+               "for rows %u..13 are dictated by the reserve\n", row, g_stop_row + 1);
+    fflush(stdout);
+    return true;
+}
+
 /* Initialize a beam board to the bare border of (bottom, left) config. */
 static void beam_init_border(BeamEntry *p, const BottomOrder *bot, const LeftOrder *lft) {
     memset(p, 0, sizeof *p);
     p->log_idx = UINT32_MAX;
-    for (int k = 0; k < 4; k++) p->used[k] = bot->used[k] | lft->used[k];
+    for (int k = 0; k < 4; k++) p->used[k] = bot->used[k] | lft->used[k] | g_reserve[k];
     used_set(p->used, g_cTR.piece_id);          /* top-right corner: Stage C */
 
     for (int c = 0; c < PUZZLE_SIDE; c++) p->rtop[c] = (uint8_t)bot->rtop0[c];
@@ -1294,8 +1383,9 @@ static inline double corner_term(const BeamEntry *t, int row, bool at_stop, doub
     }
     const bool at12 = at_stop && row == PUZZLE_SIDE - 4;
     const int orient = ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) : -1;
+    uint64_t ub[4];
     return g_lambda_corners * g_corner_u
-         * (double)tc_step_sum(orient, t->used, t->rtop, at12);
+         * (double)tc_step_sum(orient, tc_used(t->used, ub), t->rtop, at12);
 }
 
 /* The emitted board's used set and exposed tops, for the stop-row report. */
@@ -1312,7 +1402,8 @@ static uint8_t corner_emit_code(const BeamEntry *parent, const RowChoice *mv,
     }
     used_set(used, g_edge_term[mv->rterm].piece_id);
     rtop[PUZZLE_SIDE - 1] = g_edge_term[mv->rterm].top;
-    return tc_board_code(orient, used, rtop, row == PUZZLE_SIDE - 4);
+    uint64_t ub[4];
+    return tc_board_code(orient, tc_used(used, ub), rtop, row == PUZZLE_SIDE - 4);
 }
 
 /* ====================== end top-corner supply ============================== */
@@ -1538,7 +1629,7 @@ static inline bool chain_pin_ok(const uint16_t ci[], int count, int pin_idx,
 
 static void border_used_mask(const BottomOrder *bot, const LeftOrder *lft,
                              uint64_t used[4]) {
-    for (int k = 0; k < 4; k++) used[k] = bot->used[k] | lft->used[k];
+    for (int k = 0; k < 4; k++) used[k] = bot->used[k] | lft->used[k] | g_reserve[k];
     used_set(used, g_cTR.piece_id);
     for (int k = 0; k < CLUE_N; k++) {
         if (!clue_on(k)) continue;
@@ -1547,8 +1638,14 @@ static void border_used_mask(const BottomOrder *bot, const LeftOrder *lft,
     }
 }
 
+/* Can row 1 be filled at all on this (bottom, column)? Under --clue_corners,
+   with the row-2 corner clues' colours pinned; under --reserve_decker, from the
+   pieces the reserve leaves -- which is not a given: a reserve can hold every
+   piece that fits some (left, bottom) pair, and cell (1,1) has both fixed by
+   the border (measured: 12 of 16 configurations dead at row 1 without this). */
 static bool row1_corner_compatible(const BottomOrder *bot, const LeftOrder *lft) {
-    if (!(g_clue_mask & CLUE_CORNERS)) return true;
+    const bool clues = (g_clue_mask & CLUE_CORNERS) != 0;
+    if (!clues && !g_reserve_n) return true;
 
     const int la_A = lft->right[1];
     const int *rt = bot->rtop0;
@@ -1565,10 +1662,13 @@ static bool row1_corner_compatible(const BottomOrder *bot, const LeftOrder *lft)
     uint64_t used0[4];
     border_used_mask(bot, lft, used0);
 
-    for (int o = 0; o < 4; o++) {
-        if (!(g_clue_orients & (1u << o))) continue;
-        int pin_idx[3], pin_kind[3]; uint16_t pin_val[3];
-        if (!clue_pins_for(1, o, pin_idx, pin_kind, pin_val)) continue;
+    for (int o = 0; o < (clues ? 4 : 1); o++) {
+        int pin_idx[3] = { -1, -1, -1 }, pin_kind[3] = { PIN_PIECE, PIN_PIECE, PIN_PIECE };
+        uint16_t pin_val[3] = { 0, 0, 0 };
+        if (clues) {
+            if (!(g_clue_orients & (1u << o))) continue;
+            if (!clue_pins_for(1, o, pin_idx, pin_kind, pin_val)) continue;
+        }
 
         for (uint32_t ja = 0; ja < cA->n; ja++) {
             uint32_t wa = rec_load(cA->rec, ja, g_rec_bytes_inner);
@@ -1621,7 +1721,7 @@ static void corner_compat_cache_init(size_t nb) {
     free(g_corner_compat_cache);
     g_corner_compat_cache = NULL;
     g_corner_compat_nb = nb;
-    if (!nb || !(g_clue_mask & CLUE_CORNERS)) return;
+    if (!nb || !((g_clue_mask & CLUE_CORNERS) || g_reserve_n)) return;
     if (g_left_n) {
         for (size_t i = 1; i < g_left_n; i++)
             if (memcmp(g_lefts[i].used, g_lefts[0].used,
@@ -1654,7 +1754,7 @@ static size_t clue_filter_ranked_lefts(size_t b_idx, const BottomOrder *bot,
                                        size_t ordinary_viable) {
     g_border_stats.bottoms_ranked++;
     g_border_stats.columns_ordinary_viable += ordinary_viable;
-    const bool clues = (g_clue_mask & CLUE_CORNERS) != 0;
+    const bool clues = (g_clue_mask & CLUE_CORNERS) != 0 || g_reserve_n;
     if (!clues && !g_corners_on) {
         g_border_stats.columns_clue_compatible += ordinary_viable;
         return ordinary_viable;
@@ -2718,8 +2818,9 @@ static void bt_out_push(BtNode *o, const BtCtx *x, int stop) {
     const int orient = ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) : -1;
     o->off[o->n] = o->len;
     o->fp[o->n]  = board_fingerprint(x->rows, stop);
+    uint64_t ub[4];
     o->cc[o->n]  = g_corners_on
-                 ? tc_board_code(orient, t->used, t->rtop, stop == PUZZLE_SIDE - 4) : 0;
+                 ? tc_board_code(orient, tc_used(t->used, ub), t->rtop, stop == PUZZLE_SIDE - 4) : 0;
     o->len += (size_t)prepare_board(x->rows, stop, orient, o->buf + o->len);
     o->n++;
 }
@@ -2747,9 +2848,11 @@ static bool bt_corners_ok(BtCtx *x, int row, const BeamEntry *t) {
             const uint16_t *src = x->cl[row - 1][s][k];
             uint16_t *dst = x->cl[row][s][k];
             int n = 0;
+            uint64_t ub[4];
+            const uint64_t *tu = tc_used(t->used, ub);
             for (int q = 0; q < n_src; q++) {
                 const int i = root ? q : src[q];
-                if (tc_alive(s, k, i, t->used, t->rtop, at12)) dst[n++] = (uint16_t)i;
+                if (tc_alive(s, k, i, tu, t->rtop, at12)) dst[n++] = (uint16_t)i;
             }
             x->cn[row][s][k] = (uint16_t)n;
         }
@@ -3168,7 +3271,10 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
     g_beam_unpruned = false;          /* row 1 keeps the one-child economy */
     memset(ctx->log_n, 0, sizeof ctx->log_n);
     maha_reset_config();
-    if (g_corners_on) { corner_reset_config(); (void)tc_config(g_cur_left, cur[0].used); }
+    if (g_corners_on) {
+        uint64_t ub[4];
+        corner_reset_config(); (void)tc_config(g_cur_left, tc_used(cur[0].used, ub));
+    }
     g_stats.configs++;
 
     const uint32_t last_row = gen_stop_row();
@@ -3391,6 +3497,9 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         printf("\n");
     }
     if (g_end_dive) dv_print_summary(wall_total);
+    if (g_reserve_decker && g_reserve_rows_skipped)
+        printf("[sum] --reserve_decker skipped %u border row(s); see the [reserve] notes\n",
+               g_reserve_rows_skipped);
     if (g_border_stats.bottoms_ranked) {
         printf("[sum] border prefilter: bottom-slots=%" PRIu64
                " no-clue-column=%" PRIu64
@@ -3685,6 +3794,13 @@ static void usage(const char *a0) {
 "  --clue_corners         force the two published corner clues the beam can reach,\n"
 "                         both on row 2; the row-13 pair is only reserved, never pinned,\n"
 "                         and constrains no searched row. Clue pieces leave the database\n"
+"  --reserve_decker       hold each rotations row's double-decker TOP reserve out of the\n"
+"                         beam: the inner pieces Stage A --double_decker marked with\n"
+"                         spin 1 (the reserve and the TL/TR block inner pieces), all\n"
+"                         bound for row 14. Read per row from its Decker= comment: a\n"
+"                         row with TOP classic holds nothing; a row with another side\n"
+"                         two tall, or whose held pieces leave rows 1..--stop_row too\n"
+"                         few, is skipped with a note. Not with --random_edges\n"
 "  --pin_clue N           search ONE of the four clue frames instead of hedging over all\n"
 "                         four. The five clues are one rigid body, so naming where the\n"
 "                         CENTRE clue sits names the whole set. Rows are 0-indexed\n"
@@ -3844,6 +3960,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
        contradiction -- the line stays correct if the implication ever changes. */
     if (g_clue_mask & CLUE_CENTER)  printf(" --clue_center");
     if (g_clue_mask & CLUE_CORNERS) printf(" --clue_corners");
+    if (g_reserve_decker) printf(" --reserve_decker");
     if (!g_free_demand)   printf(" --no_free_demand");
     for (int k = 0; k < 4; k++)
         if (g_fixed_corner_pid[k] >= 0) printf(" %s %d", corner[k], g_fixed_corner_pid[k]);
@@ -4108,6 +4225,7 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--no_free_demand"))            g_free_demand = false;
         else if (!strcmp(argv[i], "--clue_center"))               g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(argv[i], "--clue_corners"))              g_clue_mask |= CLUE_CORNERS;
+        else if (!strcmp(argv[i], "--reserve_decker"))            g_reserve_decker = true;
         else if (!strcmp(argv[i], "--pin_clue")    && i+1 < argc) g_pin_clue = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bc_window")   && i+1 < argc) {
             unsigned nb = 0, nc = 0;
@@ -4165,6 +4283,8 @@ int main(int argc, char *argv[]) {
             fatal("--lambda_corners needs --stop_row 12 or below: rows 13-14 hold the "
                   "corner blocks it protects");
     }
+    if (g_reserve_decker && g_random_edges)
+        fatal("--reserve_decker reads a rotations row; --random_edges has none");
     if (g_beam_width == 0) fatal("--beam_width must be positive");
     if (g_beam_width > (1u << 24)) fatal("--beam_width above 2^24 not supported");
     if (g_beam_expand < 1 || g_beam_expand > 64) fatal("--beam_expand must be in 1..64");
@@ -4506,6 +4626,7 @@ int main(int argc, char *argv[]) {
         if (!read_one_border_row(csv_path, cur_row, spins)) { printf("[sweep] border row %u not found; stopping.\n", cur_row); break; }
         /* The row as the file has it, with its Stage A comment, so the log alone
            is enough to rebuild the rotations file. */
+        bool held_ok = true;
         {
             char *row_txt, *cmt_txt;
             if (read_border_row_text(csv_path, cur_row, &row_txt, &cmt_txt)) {
@@ -4514,8 +4635,10 @@ int main(int argc, char *argv[]) {
                 printf("%s\n", row_txt);
                 fflush(stdout);
             }
+            held_ok = reserve_decker_row(cur_row, cmt_txt, spins);
             free(row_txt); free(cmt_txt);
         }
+        if (!held_ok) continue;
         memcpy(g_spin, spins, sizeof g_spin);
 
         classify_deal_from_rotations();
@@ -4590,9 +4713,12 @@ int main(int argc, char *argv[]) {
             size_t run_l = viable < cap_l ? viable : cap_l;
             g_border_stats.columns_run += run_l;
             if (g_verbose) {
-                printf("[rank] %s: columns %zu -> %zu ordinary -> %zu clue-compatible, "
+                printf("[rank] %s: columns %zu -> %zu ordinary -> %zu %s, "
                        "%zu distinct ordinary rank(s), run %zu\n",
-                       blab, nl, ordinary_viable, viable, distinct, run_l);
+                       blab, nl, ordinary_viable, viable,
+                       (g_clue_mask & CLUE_CORNERS) ? "clue-compatible"
+                       : g_reserve_n ? "row-1-viable with the reserve held" : "clue-compatible",
+                       distinct, run_l);
                 fflush(stdout);
             }
             if (run_l == 0) {                /* no column completes row 1 with it */

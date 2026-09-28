@@ -103,7 +103,7 @@ ALL_STEPS=(
     "band_with_frame|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
     "cpsat_chain|topper -> ender -> ender, each fed by the last"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
-    "beamer_backtrack_dive|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly"
+    "beamer_backtrack_dive|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --reserve_decker holds its pieces"
     "beamer_resume|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
     "scripts_parse|every shipped script parses, and passes only flags that exist"
     "example_finalizer|examples/02 re-grows the synthetic board"
@@ -2521,6 +2521,55 @@ step_beamer_backtrack_dive() {
         > "$OUT/btd_dive.log" \
         || { tail -5 "$OUT/btd_dive.log"; fail "end-dive run exited non-zero"; }
     grep -q "^\[sum\] backtrack from row 8" "$OUT/btd_plain.log" || fail "no backtrack summary"
+
+    # --reserve_decker: mark 8 inner pieces the way Stage A --double_decker
+    # does (spin 1, Decker= in the row's comment), then run the same search
+    # holding them (stop row 9: at width 2000 even 8 held pieces end this
+    # configuration at row 10). No stop-row board may place a held piece. A second row that
+    # names another two-tall side is skipped with a note.
+    python3 - data/borders_annealed_fix12.csv "$OUT/btd_rsv.csv" <<'EOF' || exit 1
+import sys
+seed = [list(map(int, l.split())) for l in open("data/seed_Edge5.txt") if l.strip()]
+inner = [p for p in range(256) if 0 not in seed[p]]
+clues = {138, 207, 254, 180, 248}                # piece ids are 0-based here
+rows = [l for l in open(sys.argv[1]) if l.strip() and l[0] not in "#%"]
+f = [x.strip() for x in rows[0].split(",")]
+spins = f[1:]
+held = [p for p in inner if p not in clues][3::23][:8]    # 26 held kills the beam by row 10
+for p in held:
+    spins[p] = "1"
+with open(sys.argv[2], "w") as o:
+    for dk in ("12/-/-/-", "12/5/-/-"):
+        o.write(f"#  TOP=1 RIGHT=1 BOTTOM=1 LEFT=1  Decker={dk}  Board=t\n")
+        o.write(f[0] + ", " + ", ".join(spins) + "\n")
+open(sys.argv[2] + ".held", "w").write(",".join(map(str, held)))
+EOF
+    RSV=(bin/E555_beamer data/seed_Edge5.txt "$OUT/btd_rsv.csv"
+         --num_rows 2 --top_bottoms 1 --top_columns 1 --beam_width 2000
+         --backtrack_row 7 --stop_row 9 --lambda_corners --rng_seed 7 --threads 1
+         --reserve_decker)
+    if [ -n "$GATE_DB" ]; then RSV+=(--db_file "$GATE_DB"); fi
+    "${RSV[@]}" --out_dir "$OUT/btd_rsv" > "$OUT/btd_rsv.log" \
+        || { tail -5 "$OUT/btd_rsv.log"; fail "--reserve_decker run exited non-zero"; }
+    grep -q "^\[reserve\] border row 0: holding 8 TOP piece(s) for row 14" "$OUT/btd_rsv.log" \
+        || { grep reserve "$OUT/btd_rsv.log"; fail "--reserve_decker did not hold row 0's 8 pieces"; }
+    grep -q "^\[reserve\] border row 1: skipped -- sides other than TOP" "$OUT/btd_rsv.log" \
+        || fail "--reserve_decker did not skip a row with a second two-tall side"
+    python3 - "$OUT/btd_rsv/beam_completions_0_9.csv" "$OUT/btd_rsv.csv.held" <<'EOF' || exit 1
+import sys, os
+held = set(map(int, open(sys.argv[2]).read().split(",")))
+n = 0
+if os.path.exists(sys.argv[1]):
+    for l in open(sys.argv[1]):
+        if not l.strip() or l[0] in "#%":
+            continue
+        pos = list(map(int, l.split(",")[-512:-256]))
+        bad = [p for p in held if pos[p] != 999]
+        assert not bad, f"a stop-row board places held piece(s) {bad}"
+        n += 1
+assert n > 0, "the held run wrote no stop-row board"
+print(f"ok: --reserve_decker held 8 pieces on {n} stop-row board(s) and skipped the two-sided row")
+EOF
     grep -q "^\[sum\] end dives:" "$OUT/btd_dive.log" || fail "no end-dive summary"
     # The diver replaying the plain run's boards is the same finish, so it must
     # write the dived run's rows byte for byte -- corner seeds included, and at

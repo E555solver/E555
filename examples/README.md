@@ -173,7 +173,10 @@ Each row's comment then carries `Decker=` (how many two-row layouts its reserve
 of 24 pieces allows, exactly), `DeckerPool=` (the bound with every piece free)
 and `Board=`, the name of its witness board in `rotations_refined_decker.csv`
 -- the border plus row 14, in the beamer's board format, ready for the viewer
-or the finalizer. The reserved pieces carry spin 1 in the rotations row.
+or the finalizer. The reserved pieces carry spin 1 in the rotations row, and
+the beamer's `--reserve_decker` holds them out of the beam for row 14 -- at the
+default reserve size that costs the beam about two rows of reach (measured in
+PROJECT_E555.md, *Holding the double-decker reserve*).
 `--decker_reserve K` changes the reserve size, `--decker_keep_border` keeps
 the border exactly as it was, and the bare flag scores all four sides.
 
