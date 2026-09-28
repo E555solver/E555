@@ -288,77 +288,106 @@ A classic side is scored by the orderings of its 14 edge pieces, and nothing in
 that says whether the row *inside* them can be filled. That is where boards
 fail: the shipped `best_463.csv` boards have 5–9 broken edges inside the outer
 two rings, and `board_example_462.csv` has 9. With `--double_decker` the named
-sides (a comma list; the bare flag means all four) become **two-tall strips**:
-each edge piece is paired with the inner piece it touches, and the side's count
-is the number of orderings of the whole strip. That is again an Euler trail --
-over (frame colour, inner colour) pairs, packed `frame<<5 | inner` -- so the
-same exact BEST count applies.
+sides (a comma list; the bare flag means all four) are scored by their **two
+rows**: every order of the edges, times every way to put an inner piece under
+each so the inner row chains as well, drawn from a **reserve** of
+`--decker_reserve` inner pieces (24 by default, 12–32) that the search picks
+for that side, each used at most once. The count is exact, and it is the side's
+`Decker=` figure. The border and the reserves are searched together.
 
 ```bash
 python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
-    --input rotations.csv --double_decker TOP --restarts 2 --steps 100000
+    --input rotations.csv --double_decker TOP --restarts 2 --steps 20000
     # -> rotations_refined.csv and rotations_refined_decker.csv
+    # add --decker_keep_border to keep every border exactly as it is
 ```
 
-- **Corner blocks.** The second ring's corner cells touch two sides at once
-  ((14,1) sits under the top edge at (15,1) and beside the left edge at (14,0)),
-  so every corner next to a two-tall side is an explicit 2×2 block: the corner,
-  the edge beside it on each side, and the inner piece `q` diagonal to it. A
-  strip runs between the blocks at its two ends; a classic side next to a block
-  keeps the block's edge fixed at its end and counts the orderings of the rest.
-  The inner pieces come from all but the five clue pieces, whose cells lie
-  elsewhere.
-- **A witness, not an estimate.** The count is exact for the pairing found, so
-  it is a lower bound on what the border allows. `tests/check_decker.py`
-  recounts it from the witness board alone, and brute force agrees on every
-  strip window the gate tries.
-- **The search moves between feasible witnesses.** A two-tall strip is a chain,
-  and one changed piece almost never leaves it balanced: from a feasible
-  witness, 0 of 3000 single-piece moves (a new partner, a domino swap, a
-  changed block) stayed feasible. So every move
-  re-fills the strips it touches -- a fresh frame order and a fresh inner row,
-  found by a bounded depth-first search that looks the last cell up directly --
-  and swaps prefer *twins*, edges with the same frame pair, which keep both
-  frames balanced. Half the re-fills try loop-closing partners first: without
-  revisits a strip has exactly one ordering. Over 3 seeds × 6 rows × 2 restarts
-  × 15k steps the mean best score was 2.17 never biasing, 2.34 half the time,
-  2.32 always. The schedule is the probed one, as for classic refinement: on
-  the same six rows at 15k steps (measured before twins and the loop bias),
-  it scored 2.40 against 2.32 colder and 2.21 / 2.11 / 1.63 at a fixed
-  T0 = 0.1 / 0.3 / 1, and 60k steps reached 2.67 -- more steps still pay. A
-  step costs ~0.36 ms against ~0.03 ms for a classic one.
+**Why a reserve, and why not the 12 pieces that fill the strip.** Pairing each
+edge with one inner piece and counting the reorderings -- this option's first
+design -- gave 6–36 on real borders, and re-pairing the same 12 pieces gave not
+one layout more: each fits only under its own edge, so a fixed pairing is a
+rigid block. Counted against the free pool instead, one top strip (row 3 of
+`data/annealer_MaxSides.csv`) has:
+
+| inner pieces allowed | exact layouts |
+|---|---|
+| the 12 pieces of one layout | 24 |
+| a searched set of 20 / 24 / 30 | ~208 / ~256 / ~1,094 |
+| the 24 or 30 most-used pieces, unsearched | 0–67 |
+| the whole free pool (pieces may repeat: a bound) | ~1e8 |
+
+So the reserve is larger than the strip and is optimized as a set; a larger one
+allows more layouts, and every reserved piece is one a later stage would have
+to hold back. `DeckerPool=` reports the whole-pool bound beside it, as the
+border's potential.
+
+- **Counting.** `ReserveCounter` walks (placed-edge mask, used-piece mask,
+  frontier node) with memoization: ~1,000 states and ~1 ms at K = 24, 5–9 ms
+  at K = 30. Rotations of one piece that happen to look alike count as
+  different placements. The gate checks it against a plain exhaustive search
+  on 108 pieces of real strips, and `tests/check_decker.py` recounts every
+  written `Decker=` from the witness file by a search of its own.
+- **Corner blocks.** The second ring's corner cells touch two sides at once, so
+  every corner next to a two-tall side is a fixed 2×2 block: the corner, the
+  edge beside it on each side, and the inner piece diagonal to it. A strip runs
+  between the blocks at its two ends; a classic side next to a block keeps the
+  block's edge fixed at its end. The five clue pieces are never reserved.
+- **The search.** Moves swap a reserve piece (85% of the time for one that
+  chains with what is already reserved, `dd_targets`), trade pieces between
+  two-tall sides, change a block, or move edges between sides -- a swap into a
+  two-tall side also brings in a piece that meets the incoming edge. Measured
+  on 6 rows × 2 restarts × 6000 steps × 2 seeds, mean log reserve count per
+  two-tall side (TOP only / all four sides): the move mix reserve .70, block
+  .10, swap .10, exchange .10 scored 5.44 / 2.41, against 4.97 / 2.11 with
+  more border moves and 5.02 / 1.95 with more still; targeted draws scored
+  4.97 / 2.11 at 85%, 4.69 / 1.93 at 60%, 4.62 / 1.57 never. With all four
+  sides two tall the reserves compete for the same pieces (96 of 191), which
+  is why their counts stay lower. The schedule is probed as for classic
+  refinement.
+- **The border.** A layout contains an order of the edge row, so a side with
+  more edge orders scores more easily, and classic counts are no longer given
+  away for nothing: over the 6-row bench with TOP two tall (2 seeds), 7 side
+  counts rose, 39 held and 2 fell -- both RIGHT, a classic neighbour, which is
+  scored on its orders with the block edge fixed rather than on its full
+  count. When they must not move at all, `--decker_keep_border` forbids every
+  move that changes a side's edge set, and the spins that come back are the
+  input's (the gate checks this).
 - **Cold and warm.** A cold restart spends `--decker_warmup` (0.3) of its steps
-  in the classic walk to find a usable border, then builds the witness on it.
-  A warm start builds it on the input row and, as for classic refinement,
-  cannot come back below that seed witness. Whole-file mode works the same way,
-  row by row.
+  in the classic walk to find a usable border, then seeds the blocks and the
+  reserves on it: one fillable inner row, grown greedily to K. A warm start
+  seeds on the input row and cannot come back below that seed. Whole-file mode
+  works the same way, row by row.
 
 What each written border carries:
 
-- **The comment** gains `Decker=12/8/4/4` (the two-tall counts in TOP/RIGHT/
-  BOTTOM/LEFT order, `-` for a classic side) and `Board=dd<seed>_r<N>`, next to
-  the trail counts. `TOP=..` and the rest stay the classic counts of the spins,
-  so `--input`'s cross-check and `E555_sort_rotations.py` read the row as
-  before; neither new token contains a side name. `Score=` is the
-  double-decker objective.
-- **The rotations row** gives the inner pieces its witness places spin 1
-  instead of 0. Nothing reads an inner spin out of a rotations row today
-  (`classify_deal_from_rotations`, `fin_rot_row_valid`, `fin_rot_match` all
-  skip them), so this only marks them, for a later reservation.
+- **The comment** gains `Decker=416/-/-/-` (the reserves' exact counts in
+  TOP/RIGHT/BOTTOM/LEFT order, `-` for a classic side), `DeckerPool=` (the
+  whole-pool bounds) and `Board=dd<seed>_r<N>`, next to the trail counts.
+  `TOP=..` and the rest stay the classic counts of the spins, so `--input`'s
+  cross-check and `E555_sort_rotations.py` read the row as before; no new
+  token contains a side name. `Score=` is the double-decker objective.
+- **The rotations row** gives spin 1 instead of 0 to every reserved piece and
+  every block's inner piece. Nothing reads an inner spin out of a rotations
+  row today (`classify_deal_from_rotations`, `fin_rot_row_valid`,
+  `fin_rot_match` all skip them), so this only marks them, for a later
+  reservation.
 - **The witness board** goes to `--decker_out` (default `<out stem>_decker.csv`),
-  one per row and under the `Board=` name, in the beamer's own line format:
-  the whole border ring plus the two-tall sides' first inner ring, 999
-  elsewhere. The finalizer loads it in fixed-sides mode at `--finalize_from 0`,
-  and at 1 when BOTTOM is two tall (rows 0 and 1 are then complete); the gate
-  runs the real loader on one.
+  one per row under the `Board=` name, in the beamer's own line format, after
+  a `#` line naming each side's reserve: the whole border ring plus the
+  two-tall sides' first inner ring -- one layout drawn uniformly from the
+  counted ones -- and 999 elsewhere. The finalizer loads it in fixed-sides mode
+  at `--finalize_from 0`, and at 1 when BOTTOM is two tall (rows 0 and 1 are
+  then complete); the gate runs the real loader on one.
 - **No turns.** `E555_sort_rotations.py` leaves such rows unturned and
   `E555_rotate.py --rotations` refuses the file: a turn would leave the board,
   the flags and the `Decker=` side order behind.
 
-Known limits: the finalizer returns everything above `--finalize_from` to the
-pool, so the witness's upper rows are information (and the flags) until a
-reservation uses them; clue orientation is not modelled (the pieces at row 14,
-columns 2 and 13, sit on the row-13 clues in two of the four orientations).
+Known limits: each corner block holds one fixed inner piece, so only the
+strips between them are flexible; K stops at 32 because the exact count grows
+with it; the finalizer returns everything above `--finalize_from` to the pool,
+so the reserves are information (and flags) until a reservation uses them;
+clue orientation is not modelled (row 14, columns 2 and 13, sit on the row-13
+clues in two of the four orientations).
 
 ### Temperature
 
@@ -471,8 +500,8 @@ steps from ~14 min to ~5.
 
 Key options: `--restarts`, `--steps`, `--rng_seed`, `--threads`, `--verbose`,
 `--input/--row` (refine an existing border, or every row of a file without
-`--row`), `--double_decker [SIDES]`, `--decker_warmup`, `--decker_out` (two-tall
-sides, above), `--T0/--Tf` (normally left unset,
+`--row`), `--double_decker [SIDES]`, `--decker_reserve`, `--decker_keep_border`,
+`--decker_warmup`, `--decker_out` (two-tall sides, above), `--T0/--Tf` (normally left unset,
 see above), `--w_top/right/bottom/left` (all `+1` by default; per-side target
 multipliers with `--target_scale`, and signed weights in log-sum mode, where a
 negative weight minimizes a side), `--tabu`, `--fix_corners {0,1,2}`,
@@ -2741,8 +2770,8 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
 
 | producer | file | layout |
 |---|---|---|
-| Stage A | `rotations.csv` | `# comment` lines + `id, spin[0..255]` (60 border spins, 196 zeros; 1 on the witness's inner pieces under `--double_decker`) |
-| Stage A | `--decker_out`, default `<out stem>_decker.csv` | `Board=` name, `0, pos[256], rot[256]` (514, the beamer's layout): the witness's outer two rings |
+| Stage A | `rotations.csv` | `# comment` lines + `id, spin[0..255]` (60 border spins, 196 zeros; 1 on the reserved inner pieces under `--double_decker`) |
+| Stage A | `--decker_out`, default `<out stem>_decker.csv` | per border: a `# <name> reserve SIDE=ids ...` line, then `<name>, 0, pos[256], rot[256]` (514, the beamer's layout): one layout of the outer two rings |
 | beamer | `beam_completions_<border>_<row>.csv` / `..._random_<row>.csv` | `config_id, sol_idx, pos[256], rot[256]` (514) |
 | beamer | `sweep_checkpoint.txt` | resume state, one line |
 | roundhouse | the output CSV named as the third positional argument; every board goes to it | canonical 514-field layout, ids `<input-id>_<line><tag><n>`, tag `s`/`d`/`j`/`f` for solved, deepest, hold-join, break-filled |

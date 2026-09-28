@@ -1049,9 +1049,11 @@ step_annealer_decker() {
     local A=src/A_border/E555_edge_annealer.py
     rm -rf "$OUT/decker" && mkdir -p "$OUT/decker"
 
-    # Exact counting: windows of real laid-out strips, every ordering tried.
+    # Exact counting: pieces of real strips, each with a reserve of its own
+    # pieces plus spares that fit its edges, counted by the annealer's
+    # memoized walk and by a plain exhaustive search.
     python3 - <<'EOF' || exit 1
-import itertools, random, sys
+import random, sys
 from dataclasses import replace
 sys.path.insert(0, "src/A_border")
 import E555_edge_annealer as A
@@ -1059,43 +1061,64 @@ import E555_edge_annealer as A
 pieces = A.read_pieces("data/seed_Edge5.txt")
 pbi = {p.id: p for p in pieces}
 corners, edges = A.classify_boundary_pieces(pieces)
-rows = A.read_rotations("data/borders_annealed_fix12.csv")
-checked = 0
-for sides in ((0, 1, 2, 3), (0,)):
-    cfg = replace(A.AnnealingConfig(), decker_sides=sides)
-    ctx = A.DeckerContext(pbi, corners, edges, sides)
-    for k in (1, 4):
-        st = A.dd_seed(ctx, *A.border_from_spins(pbi, rows[k][0]), random.Random(k), cfg)
-        assert st is not None and st.hard == 0.0, f"row {k}: no feasible seed"
-        for s in A.Side:
-            arcs, _ = A.dd_side_arcs(ctx, st, s)
-            k0, k1 = A.DD_ENDS[s]
-            order = A.euler_trail(arcs, A.dd_endpoint(ctx, st, s, k0),
-                                  A.dd_endpoint(ctx, st, s, k1), random.Random(3))
-            by = {lab: (u, v) for u, v, lab in arcs}
-            for w in (5, 6):
-                for i in range(0, len(order) - w + 1, 3):
-                    win = [by[lab] for lab in order[i:i + w]]
-                    start, end = win[0][0], win[-1][1]
-                    brute = 0
-                    for perm in itertools.permutations(win):
-                        node = start
-                        for u, v in perm:
-                            if u != node:
-                                break
-                            node = v
-                        else:
-                            brute += node == end
-                    got = A.count_euler_trails(win, start, end)
-                    assert brute == got, f"{A.SIDE_NAMES[s]} window {i}+{w}: {got} != {brute}"
-                    checked += 1
-print(f"ok: {checked} strip windows count exactly what brute force counts")
+rows = A.read_rotations("data/annealer_MaxSides.csv")
+cfg = replace(A.AnnealingConfig(), decker_sides=(0, 1, 2, 3))
+ctx = A.decker_context(pbi, corners, edges, cfg)
+
+def exhaustive(s, mids, start, end, reserve):
+    src, dst, total = A.DD_SRC[s], A.DD_DST[s], 0
+    def walk(left, used, node):
+        nonlocal total
+        if not left:
+            total += node == end
+            return
+        for e in left:
+            E = ctx.edge_rot[e][s]
+            if E[src] != node >> 5:
+                continue
+            for p in reserve:
+                if p in used:
+                    continue
+                for r in range(4):
+                    P = ctx.rot[p][r]
+                    if P[s] == E[A.DD_INWARD[s]] and P[src] == node & 31:
+                        walk([x for x in left if x != e], used | {p},
+                             A.decker_node(E[dst], P[dst]))
+    walk(list(mids), frozenset(), start)
+    return total
+
+rng = random.Random(4)
+checked = several = 0
+for k in (1, 3, 12):
+    st = A.dd_seed(ctx, *A.border_from_spins(pbi, rows[k][0]), random.Random(k), cfg)
+    assert st is not None and st.hard == 0.0, f"row {k}: no feasible seed"
+    for s in ctx.dd_sides:
+        lay = A.dd_counter(ctx, st, s).sample(random.Random(2))
+        src, dst = A.DD_SRC[s], A.DD_DST[s]
+        for w in (4, 5):
+            for i in range(0, len(lay) - w + 1, 2):
+                win = lay[i:i + w]
+                (e0, p0, f0), (e1, p1, f1) = win[0], win[-1]
+                start = A.decker_node(ctx.edge_rot[e0][s][src], ctx.rot[p0][(f0 - s) % 4][src])
+                end = A.decker_node(ctx.edge_rot[e1][s][dst], ctx.rot[p1][(f1 - s) % 4][dst])
+                mids, own = [e for e, _, _ in win], [p for _, p, _ in win]
+                fit = sorted({p for e in mids for (iw, _), lst in ctx.strip_index[s].items()
+                              if iw == ctx.inward[e] for p, _, _ in lst} - set(own))
+                res = own + rng.sample(fit, min(len(fit), 20))
+                got = A.ReserveCounter(ctx, s, mids, start, end, res).count()
+                want = exhaustive(s, mids, start, end, res)
+                assert got == want, f"row {k} {A.SIDE_NAMES[s]} window {i}+{w}: {got} != {want}"
+                checked += 1
+                several += got > 1
+assert several >= 10, f"only {several} windows with more than one layout: a weak test"
+print(f"ok: {checked} strip pieces counted exactly as exhaustive search counts "
+      f"({several} with several layouts)")
 EOF
 
     # Cold, all four sides: the classic warm-up, then the double decker. Rows
     # 0 and 1 are complete, so the finalizer takes it at --finalize_from 1.
     for t in 1 2; do
-        python3 -u "$A" data/seed_Edge5.txt --double_decker --restarts 2 --steps 10000 \
+        python3 -u "$A" data/seed_Edge5.txt --double_decker --restarts 2 --steps 6000 \
             --rng_seed 11 --threads "$t" --out "$OUT/decker/cold$t.csv" \
             > "$OUT/decker/cold$t.log" 2>&1 \
             || { cat "$OUT/decker/cold$t.log"; fail "the cold --double_decker run failed"; }
@@ -1148,6 +1171,24 @@ for line in open(sys.argv[1]):
     inner = sorted(c for p, c in enumerate(pos) if c != 999 and p >= 60)
     assert inner == [14 * 16 + c for c in range(1, 15)], f"inner cells {inner}"
 print("ok: --double_decker TOP places exactly row 14's 14 inner pieces")
+EOF
+
+    # --decker_keep_border searches the blocks and the reserve only: the spins
+    # that come back are the input row's, to the last one.
+    python3 -u "$A" data/seed_Edge5.txt --input data/borders_annealed_fix12.csv --row 4 \
+        --double_decker TOP --decker_keep_border --restarts 2 --steps 3000 --rng_seed 42 \
+        --out "$OUT/decker/keep.csv" > "$OUT/decker/keep.log" 2>&1 \
+        || { cat "$OUT/decker/keep.log"; fail "the --decker_keep_border refine failed"; }
+    python3 tests/check_decker.py "$OUT/decker/keep.csv" "$OUT/decker/keep_decker.csv" TOP 0 \
+        || fail "the keep-border outputs do not check out"
+    python3 - "$OUT/decker/keep.csv" <<'EOF' || exit 1
+import sys
+sys.path.insert(0, "src/A_border")
+import E555_edge_annealer as A
+want = A.read_rotations("data/borders_annealed_fix12.csv")[4][0][:60]
+rows = A.read_rotations(sys.argv[1])
+assert rows and all(spins[:60] == want for spins, _, _ in rows), "the border moved"
+print(f"ok: --decker_keep_border hands back the input's border in all {len(rows)} rows")
 EOF
 
     # The whole file, TOP and LEFT, no --out: both files land beside the
