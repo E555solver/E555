@@ -3,7 +3,8 @@
 usage (from the repository root, as tests/run_tests.sh runs it):
     python3 tests/check_decker.py ROTATIONS BOARDS SIDES [FINALIZE_FROM]
 
-SIDES is the comma list the run was given (TOP for the bare flag). For every rotations row and the witness board beside it, it checks:
+SIDES is the comma list the run was given (TOP,RIGHT,BOTTOM,LEFT for the bare
+flag or ALL). For every rotations row and the witness board beside it, it checks:
 
   - the comment's TOP=.. counts are the classic counts of the row's own spins,
     so --input's cross-check and E555_sort_rotations.py keep reading it right;
@@ -13,8 +14,8 @@ SIDES is the comma list the run was given (TOP for the bare flag). For every rot
   - every placed piece fits its cell and faces the frame the way the
     finalizer's fin_load_partial demands, every placed neighbour pair matches,
     and rows 0..FINALIZE_FROM are complete -- so the finalizer will load it;
-  - the side codes (spin 1 = TOP, 2 = BOTTOM) mark exactly the reserves plus
-    the corner blocks' inner pieces, each with its own side's code (a block
+  - the side codes (spin 1 = TOP, 2 = BOTTOM, 3 = LEFT or RIGHT) mark exactly
+    the reserves plus the corner blocks' inner pieces, each with its own side's code (a block
     piece: its row's, 14 -> 1, 1 -> 2), and the board's second-ring pieces all
     come from the reserves;
   - Decker= is, for each two-tall side, the number of layouts of its strip
@@ -33,7 +34,8 @@ import E555_edge_annealer as A
 
 rot_path, board_path, sides_arg = sys.argv[1:4]
 F = int(sys.argv[4]) if len(sys.argv) > 4 else None
-DD = {A.Side[n] for n in sides_arg.split(",")} if sides_arg else set()
+DD = (set(A.Side) if sides_arg == "ALL" else
+      {A.Side[n] for n in sides_arg.split(",")} if sides_arg else set())
 pieces = A.read_pieces("data/seed_Edge5.txt")
 pbi = {p.id: p for p in pieces}
 cap = A.build_inner_capacity(pieces)
@@ -146,13 +148,13 @@ for k, ((spins, comment, lineno), line, res_line) in enumerate(zip(rows, boards,
     want_code = {}
     for s, rs in reserve.items():
         for p in rs:
-            want_code[p] = 1 if s == T else 2
+            want_code[p] = {T: 1, B: 2, L: 3, R: 3}[s]
     for cell, b in blocked.items():
         if b:
             qr, qc = Q_CELL[cell]
             want_code[where[qr * 16 + qc]] = 1 if qr == 14 else 2
     got_code = {i + 1: spins[i] for i in range(60, 256) if spins[i]}
-    assert all(spins[i] in (0, 1, 2) for i in range(60, 256)), f"row {k}: inner spin outside 0..2"
+    assert all(spins[i] in (0, 1, 2, 3) for i in range(60, 256)), f"row {k}: inner spin outside 0..3"
     assert got_code == want_code, \
         f"row {k}: side codes {sorted(got_code.items())[:6]}.. != {sorted(want_code.items())[:6]}.."
     for s in DD:

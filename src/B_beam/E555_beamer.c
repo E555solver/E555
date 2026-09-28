@@ -1239,7 +1239,7 @@ static double g_corner_u = 1.0;          /* u_row for the row being expanded */
 
 /* --lambda_reserve F: keep the double-decker TOP reserve for last. Stage A
    --double_decker marks the pieces it reserves for row 14 in the rotations row
-   (spin 1 = TOP, 2 = BOTTOM); every TOP piece a board has placed costs F
+   (spin 1 = TOP, 2 = BOTTOM, 3 = LEFT or RIGHT); every TOP piece a board has placed costs F
    score-SDs, in the same u_row unit as --lambda_corners, so the two terms add
    and either can run alone. Nothing is held: a board may still spend a reserve
    piece when nothing else fits, and the dives treat the reserve as free. The
@@ -1260,10 +1260,10 @@ static inline int top_free(const uint64_t used[4]) {
 
 /* The TOP reserve of one border row: the inner pieces with spin 1, read only
    when the Stage A comment's `Decker=a/b/c/d` (TOP/RIGHT/BOTTOM/LEFT, `-` for
-   a classic side) shows TOP two tall. The side codes date from TOP/BOTTOM-only
-   double deckers; an older row that marked every two-tall side with 1 is
-   ambiguous when another side is two tall -- RIGHT or LEFT at all, or BOTTOM
-   with no piece coded 2 -- and gets no mask, with a note. */
+   a classic side) shows TOP two tall. Another two-tall side marks its pieces
+   2 (BOTTOM) or 3 (LEFT/RIGHT); an older row marked every side with 1, so a
+   row with another two-tall side but no piece coded 2 or 3 cannot be split,
+   and gets no mask, with a note. */
 static void reserve_row(uint32_t row, const char *comment, const uint8_t spins[NUM_PIECES]) {
     memset(g_top_mask, 0, sizeof g_top_mask);
     g_top_n = 0;
@@ -1279,9 +1279,9 @@ static void reserve_row(uint32_t row, const char *comment, const uint8_t spins[N
         if (*d == '/') d++;
     }
     if (n != 4 || !two[0]) return;
-    bool coded2 = false;
-    for (int i = 0; i < EXPECTED_INNER; i++) coded2 |= spins[g_inner_ids[i]] == 2;
-    if (two[1] || two[3] || (two[2] && !coded2)) {
+    bool coded = false;
+    for (int i = 0; i < EXPECTED_INNER; i++) coded |= spins[g_inner_ids[i]] >= 2;
+    if ((two[1] || two[2] || two[3]) && !coded) {
         printf("[reserve] border row %u: marks from an older --double_decker with another "
                "two-tall side -- the TOP reserve cannot be told apart, so it is not tracked\n", row);
         return;

@@ -68,12 +68,10 @@ WARM START -- refining a border you already have
 DOUBLE DECKER -- two-tall border segments (--double_decker [SIDES])
 
     A classic side is scored by the orderings of its 14 edge pieces. With
-    --double_decker, the named sides (TOP, BOTTOM or TOP,BOTTOM; bare = TOP --
-    the beam fails near the top, so a TOP reserve is the one a later stage
-    uses; LEFT/RIGHT are not offered) are scored
-    by their TWO rows instead: every order of the edges times every way to put
+    --double_decker, the named sides (a comma list of TOP, RIGHT, BOTTOM,
+    LEFT, or ALL; bare = ALL) are scored by their TWO rows instead: every order of the edges times every way to put
     an inner piece under each so the inner row chains too, drawn from a
-    RESERVE of --decker_reserve (24) inner pieces the search picks for that
+    RESERVE of --decker_reserve (16) inner pieces the search picks for that
     side, each used at most once. The count is exact, and it is the side's
     Decker= figure. The search finds the border and the reserves together, so
     what comes out is a border whose requested sides can be completed two rows
@@ -109,7 +107,8 @@ DOUBLE DECKER -- two-tall border segments (--double_decker [SIDES])
         stay the CLASSIC counts of the spins, so every reader of the file
         reads it as before, and Score= is the double-decker objective;
       - a side code instead of spin 0 on every reserved piece and every
-        block's inner piece: 1 = TOP (row 14), 2 = BOTTOM (row 1). The
+        block's inner piece: 1 = TOP (row 14), 2 = BOTTOM (row 1), 3 = LEFT or
+        RIGHT (columns 1 and 14); a block piece takes its row's code. The
         beamer's --lambda_reserve reads the TOP marks to spend those pieces
         last; every other reader skips inner spins;
       - one board per row in --decker_out (default <out stem>_decker.csv), in
@@ -196,7 +195,7 @@ USAGE
     python3 -u E555_edge_annealer.py seed_Edge5.txt \
       --input rotations.csv --restarts 2 --steps 500000 --threads 8
 
-    # make the top two rows rich, with a reserve of 24 inner pieces and a
+    # make the top two rows rich, with a reserve of 16 inner pieces and a
     # witness board per border (rotations_refined.csv + ..._decker.csv);
     # add --decker_keep_border to keep the borders exactly as they are
     python3 -u E555_edge_annealer.py seed_Edge5.txt \
@@ -342,7 +341,7 @@ class AnnealingConfig:
     # one broken match inside a corner block, and an explicit schedule for the
     # double-decker phase of a cold restart (None = probed in the worker).
     decker_sides:         Tuple[int, ...] = ()
-    decker_reserve:       int = 24
+    decker_reserve:       int = 16
     decker_keep_border:   bool = False
     decker_warmup:        float = 0.3
     block_penalty_weight: float = 10.0
@@ -1363,7 +1362,9 @@ def append_rotations(row_id: str, rec: BestRecord, out_path: str,
     the same posture E555_sort_rotations.py takes with its Turn= note."""
     full = list(rec.rot_vec) + [0] * (N_SPINS - len(rec.rot_vec))
     # A double decker marks its reserved inner pieces with the side they are
-    # for: spin 1 = TOP (row 14), 2 = BOTTOM (row 1). Only the beamer's
+    # for: spin 1 = TOP (row 14), 2 = BOTTOM (row 1), 3 = LEFT or RIGHT
+    # (columns 1 and 14; a spin has no fourth code to tell them apart, and
+    # nothing downstream needs it). Only the beamer's
     # --lambda_reserve reads the marks; every other reader skips inner spins.
     # `extra` is the Decker=/Board= note.
     for pid, code in rec.flags:
@@ -2319,7 +2320,7 @@ def dd_best_record(ctx: DeckerContext, st: DeckerState, step: int,
             for s in ctx.dd_sides}
     # Side codes: a reserve takes its side's, a corner block's inner piece the
     # code of the row it sits in (TL/TR on row 14, BL/BR on row 1).
-    code = {Side.TOP: 1, Side.BOTTOM: 2}
+    code = {Side.TOP: 1, Side.BOTTOM: 2, Side.LEFT: 3, Side.RIGHT: 3}
     flags = {p: code[s] for s, r in st.reserve.items() for p in r}
     for k, (_, _, q, _) in st.block.items():
         flags[q] = 1 if k in (Corner.TL, Corner.TR) else 2
@@ -3072,13 +3073,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "their targets are (omit for the linear objective)")
 
     g = p.add_argument_group("double decker -- two-tall border segments")
-    g.add_argument("--double_decker", nargs="?", const="TOP",
+    g.add_argument("--double_decker", nargs="?", const="ALL",
                    default=None, metavar="SIDES",
-                   help="score these sides (TOP, BOTTOM or TOP,BOTTOM; bare = TOP) "
-                        "by their TWO rows: the exact number of layouts of the edge "
-                        "row and the inner row under it, drawn from a reserve of "
-                        "inner pieces the search picks per side. Marks the reserves "
-                        "in the rotations row by side (spin 1 = TOP, 2 = BOTTOM), "
+                   help="score these sides (comma list of TOP, RIGHT, BOTTOM, LEFT, "
+                        "or ALL; bare = ALL) by their TWO rows: the exact number of "
+                        "layouts of the edge row and the inner row under it, drawn "
+                        "from a reserve of inner pieces the search picks per side. "
+                        "Marks the reserves in the rotations row by side (spin 1 = "
+                        "TOP, 2 = BOTTOM, 3 = LEFT or RIGHT), "
                         "writes a witness board of the outer two rings per border, "
                         "and notes Decker=/DeckerPool=/Board= in the comment")
     g.add_argument("--decker_reserve", type=int, default=argparse.SUPPRESS, metavar="K",
@@ -3103,22 +3105,17 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 def parse_decker_sides(text: str) -> Tuple[int, ...]:
-    """TOP and BOTTOM only. The beam fails near the top, so a TOP reserve is the
-    one a later stage can use (the beamer's --lambda_reserve, the finalizer's
-    locked row 14); a BOTTOM one serves the finalizer's witness boards at
-    --finalize_from 1. LEFT/RIGHT strips run through rows the beam fills
-    itself, and with all four sides two tall the reserves competed for the
-    same pieces (96 of 191) and every count came out lower."""
-    by_name = {"TOP": int(Side.TOP), "BOTTOM": int(Side.BOTTOM)}
+    """A comma list of TOP, RIGHT, BOTTOM, LEFT, or ALL for the four."""
+    by_name = {v: int(k) for k, v in SIDE_NAMES.items()}
     sides = set()
     for tok in text.split(","):
         name = tok.strip().upper()
-        if name in ("LEFT", "RIGHT"):
-            raise SystemExit(f"[ERROR] --double_decker: {name} is not offered -- only TOP "
-                             f"and BOTTOM reserves are of use to a later stage")
+        if name == "ALL":
+            sides.update(by_name.values())
+            continue
         if name not in by_name:
             raise SystemExit(f"[ERROR] --double_decker: unknown side '{tok.strip()}' "
-                             f"(use TOP, BOTTOM)")
+                             f"(use TOP, RIGHT, BOTTOM, LEFT or ALL)")
         sides.add(by_name[name])
     return tuple(sorted(sides))
 

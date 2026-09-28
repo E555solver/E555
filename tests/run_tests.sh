@@ -1121,28 +1121,24 @@ print(f"ok: {checked} strip pieces counted exactly as exhaustive search counts "
       f"({several} with several layouts)")
 EOF
 
-    # Cold, TOP and BOTTOM: the classic warm-up, then the double decker. Rows
-    # 0 and 1 are complete, so the finalizer takes it at --finalize_from 1.
+    # Cold, the bare flag (ALL four sides): the classic warm-up, then the double
+    # decker. Rows 0 and 1 are complete, so the finalizer takes it at
+    # --finalize_from 1.
     for t in 1 2; do
-        python3 -u "$A" data/seed_Edge5.txt --double_decker TOP,BOTTOM --restarts 2 --steps 6000 \
+        python3 -u "$A" data/seed_Edge5.txt --double_decker --restarts 2 --steps 6000 \
             --rng_seed 11 --threads "$t" --out "$OUT/decker/cold$t.csv" \
             > "$OUT/decker/cold$t.log" 2>&1 \
             || { cat "$OUT/decker/cold$t.log"; fail "the cold --double_decker run failed"; }
     done
     python3 tests/check_decker.py "$OUT/decker/cold1.csv" "$OUT/decker/cold1_decker.csv" \
-        TOP,BOTTOM 1 || fail "the cold double-decker outputs do not check out"
+        ALL 1 || fail "the cold double-decker outputs do not check out"
     python3 - "$OUT/decker/cold1.csv" <<'EOF' || exit 1
 import sys
 rows = [l.split(",")[1:] for l in open(sys.argv[1]) if l.strip() and l[0] not in "#%"]
 codes = {x.strip() for r in rows for x in r[60:]}
-assert codes == {"0", "1", "2"}, f"inner spins {sorted(codes)}: want side codes 1 and 2"
-print("ok: TOP,BOTTOM marks both sides' reserves, with codes 1 and 2")
+assert codes == {"0", "1", "2", "3"}, f"inner spins {sorted(codes)}: want side codes 1, 2 and 3"
+print("ok: the bare flag marks all four sides' reserves, with codes 1, 2 and 3")
 EOF
-    if python3 "$A" data/seed_Edge5.txt --double_decker TOP,LEFT --restarts 1 --steps 10 \
-            --out "$OUT/decker/lr.csv" > "$OUT/decker/lr.log" 2>&1; then
-        fail "--double_decker accepted LEFT"
-    fi
-    grep -q "LEFT is not offered" "$OUT/decker/lr.log" || fail "--double_decker LEFT: no reason given"
     for f in cold cold_decker; do
         cmp -s <(grep -v '^# run' "$OUT/decker/${f/cold/cold1}.csv") \
                <(grep -v '^# run' "$OUT/decker/${f/cold/cold2}.csv") \
@@ -1213,14 +1209,14 @@ assert rows and all(spins[:60] == want for spins, _, _ in rows), "the border mov
 print(f"ok: --decker_keep_border hands back the input's border in all {len(rows)} rows")
 EOF
 
-    # The whole file, BOTTOM alone, no --out: both files land beside the
+    # The whole file, TOP and LEFT, no --out: both files land beside the
     # input, one row and one board per input row, in input order.
     cp data/borders_annealed_fix12.csv "$OUT/decker/in.csv"
-    python3 -u "$A" data/seed_Edge5.txt --input "$OUT/decker/in.csv" --double_decker BOTTOM \
+    python3 -u "$A" data/seed_Edge5.txt --input "$OUT/decker/in.csv" --double_decker TOP,LEFT \
         --restarts 1 --steps 800 --rng_seed 42 --threads 3 > "$OUT/decker/rows.log" 2>&1 \
         || { cat "$OUT/decker/rows.log"; fail "the whole-file --double_decker run failed"; }
     python3 tests/check_decker.py "$OUT/decker/in_refined.csv" "$OUT/decker/in_refined_decker.csv" \
-        BOTTOM 0 || fail "the whole-file double-decker outputs do not check out"
+        TOP,LEFT 0 || fail "the whole-file double-decker outputs do not check out"
     [ "$(grep -o 'From=[^ ]*' "$OUT/decker/in_refined.csv" | sed 's/.*:row//' | tr '\n' ' ')" \
       = "0 1 2 3 4 5 6 7 8 9 10 11 " ] || fail "whole-file double-decker rows out of input order"
     echo "ok: 12 rows and 12 boards, in input order"

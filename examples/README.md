@@ -170,16 +170,18 @@ python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
 ```
 
 Each row's comment then carries `Decker=` (how many two-row layouts its reserve
-of 24 pieces allows, exactly), `DeckerPool=` (the bound with every piece free)
+of 16 pieces allows, exactly), `DeckerPool=` (the bound with every piece free)
 and `Board=`, the name of its witness board in `rotations_refined_decker.csv`
 -- the border plus row 14, in the beamer's board format, ready for the viewer
 or the finalizer. The reserved pieces carry their side's code in the rotations
-row (1 = TOP, 2 = BOTTOM), and the beamer's `--lambda_reserve F` makes every
+row (1 = TOP, 2 = BOTTOM, 3 = LEFT or RIGHT), and the beamer's
+`--lambda_reserve F` makes every
 TOP reserve piece a board places cost F, so the beam keeps them for last
 (PROJECT_E555.md, *Keeping the reserve for last*).
 `--decker_reserve K` changes the reserve size, `--decker_keep_border` keeps
-the border exactly as it was, and `--double_decker TOP,BOTTOM` scores the
-bottom as well; TOP is the default and the one the beamer uses.
+the border exactly as it was. The bare flag scores ALL four sides; name sides
+(`--double_decker TOP` or `TOP,BOTTOM`) to give the named ones the whole pool --
+all four reserves compete for the same pieces and each side's count drops.
 
 **`STEPS` has a floor of 250000.** Below it the annealer is not merely weaker --
 it often fails to place a legal border at all. Measured on the real seed: 8
