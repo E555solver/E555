@@ -173,12 +173,13 @@ Each row's comment then carries `Decker=` (how many two-row layouts its reserve
 of 24 pieces allows, exactly), `DeckerPool=` (the bound with every piece free)
 and `Board=`, the name of its witness board in `rotations_refined_decker.csv`
 -- the border plus row 14, in the beamer's board format, ready for the viewer
-or the finalizer. The reserved pieces carry spin 1 in the rotations row, and
-the beamer's `--reserve_decker` holds them out of the beam for row 14 -- at the
-default reserve size that costs the beam one to two rows of reach (measured in
-PROJECT_E555.md, *Holding the double-decker reserve*).
+or the finalizer. The reserved pieces carry their side's code in the rotations
+row (1 = TOP, 2 = BOTTOM), and the beamer's `--lambda_reserve F` makes every
+TOP reserve piece a board places cost F, so the beam keeps them for last
+(PROJECT_E555.md, *Keeping the reserve for last*).
 `--decker_reserve K` changes the reserve size, `--decker_keep_border` keeps
-the border exactly as it was, and the bare flag scores all four sides.
+the border exactly as it was, and `--double_decker TOP,BOTTOM` scores the
+bottom as well; TOP is the default and the one the beamer uses.
 
 **`STEPS` has a floor of 250000.** Below it the annealer is not merely weaker --
 it often fails to place a legal border at all. Measured on the real seed: 8

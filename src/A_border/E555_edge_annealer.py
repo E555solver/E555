@@ -68,7 +68,9 @@ WARM START -- refining a border you already have
 DOUBLE DECKER -- two-tall border segments (--double_decker [SIDES])
 
     A classic side is scored by the orderings of its 14 edge pieces. With
-    --double_decker, the named sides (comma list; bare = all four) are scored
+    --double_decker, the named sides (TOP, BOTTOM or TOP,BOTTOM; bare = TOP --
+    the beam fails near the top, so a TOP reserve is the one a later stage
+    uses; LEFT/RIGHT are not offered) are scored
     by their TWO rows instead: every order of the edges times every way to put
     an inner piece under each so the inner row chains too, drawn from a
     RESERVE of --decker_reserve (24) inner pieces the search picks for that
@@ -106,9 +108,10 @@ DOUBLE DECKER -- two-tall border segments (--double_decker [SIDES])
         (the whole-pool bound) and `Board=dd<seed>_r<N>`; TOP=.. and the rest
         stay the CLASSIC counts of the spins, so every reader of the file
         reads it as before, and Score= is the double-decker objective;
-      - spin 1 instead of 0 on every reserved piece and every block's inner
-        piece -- nothing reads an inner spin out of a rotations row today, so
-        this only marks them, for a later reservation;
+      - a side code instead of spin 0 on every reserved piece and every
+        block's inner piece: 1 = TOP (row 14), 2 = BOTTOM (row 1). The
+        beamer's --lambda_reserve reads the TOP marks to spend those pieces
+        last; every other reader skips inner spins;
       - one board per row in --decker_out (default <out stem>_decker.csv), in
         the beamer's own line format under the Board= name, preceded by a `#`
         line listing each side's reserve: the border ring plus the two-tall
@@ -473,7 +476,7 @@ class BestRecord:
     # layout as 0-based (pos, rot) vectors, flags the reserved inner pieces.
     dd_counts:    Optional[Dict[Side, int]] = None
     board:        Optional[Tuple[List[int], List[int]]] = None
-    flags:        Tuple[int, ...] = ()
+    flags:        Tuple[Tuple[int, int], ...] = ()   # (piece id, side code)
     dd_pool:      Optional[Dict[Side, int]] = None           # whole-pool bounds
     reserve:      Optional[Dict[Side, Tuple[int, ...]]] = None
 
@@ -1359,11 +1362,12 @@ def append_rotations(row_id: str, rec: BestRecord, out_path: str,
     still says where it came from once it outlives the shell that made it --
     the same posture E555_sort_rotations.py takes with its Turn= note."""
     full = list(rec.rot_vec) + [0] * (N_SPINS - len(rec.rot_vec))
-    # A double decker marks the inner pieces its witness placed with spin 1.
-    # Nothing reads an inner piece's spin out of a rotations row, so the mark
-    # rides through every existing reader; `extra` is its Decker=/Board= note.
-    for pid in rec.flags:
-        full[pid - 1] = 1
+    # A double decker marks its reserved inner pieces with the side they are
+    # for: spin 1 = TOP (row 14), 2 = BOTTOM (row 1). Only the beamer's
+    # --lambda_reserve reads the marks; every other reader skips inner spins.
+    # `extra` is the Decker=/Board= note.
+    for pid, code in rec.flags:
+        full[pid - 1] = code
     with open(out_path, "a") as f:
         f.write(f"#  {best_counts_str(rec).replace(',', ' ')}  "
                 f"{extra}Score={rec.score:.4f}{provenance}\n")
@@ -2313,7 +2317,13 @@ def dd_best_record(ctx: DeckerContext, st: DeckerState, step: int,
                           dd_endpoint(ctx, st, s, DD_ENDS[s][0]),
                           dd_endpoint(ctx, st, s, DD_ENDS[s][1]), qs)
             for s in ctx.dd_sides}
-    flags = sorted(qs | {p for r in st.reserve.values() for p in r})
+    # Side codes: a reserve takes its side's, a corner block's inner piece the
+    # code of the row it sits in (TL/TR on row 14, BL/BR on row 1).
+    code = {Side.TOP: 1, Side.BOTTOM: 2}
+    flags = {p: code[s] for s, r in st.reserve.items() for p in r}
+    for k, (_, _, q, _) in st.block.items():
+        flags[q] = 1 if k in (Corner.TL, Corner.TR) else 2
+    flags = sorted(flags.items())
     return BestRecord(score=st.score, euler_counts=rs.euler_counts(),
                       rot_vec=rotation_vector(ctx.pieces_by_id, rs), step=step,
                       dd_counts=dd_counts(st), board=(pos, rot), flags=tuple(flags),
@@ -3062,14 +3072,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "their targets are (omit for the linear objective)")
 
     g = p.add_argument_group("double decker -- two-tall border segments")
-    g.add_argument("--double_decker", nargs="?", const="TOP,RIGHT,BOTTOM,LEFT",
+    g.add_argument("--double_decker", nargs="?", const="TOP",
                    default=None, metavar="SIDES",
-                   help="score these sides (comma list; bare = all four) by their "
-                        "TWO rows: the exact number of layouts of the edge row and "
-                        "the inner row under it, drawn from a reserve of inner "
-                        "pieces the search picks per side. Flags the reserves with "
-                        "spin 1, writes a witness board of the outer two rings per "
-                        "border, and notes Decker=/DeckerPool=/Board= in the comment")
+                   help="score these sides (TOP, BOTTOM or TOP,BOTTOM; bare = TOP) "
+                        "by their TWO rows: the exact number of layouts of the edge "
+                        "row and the inner row under it, drawn from a reserve of "
+                        "inner pieces the search picks per side. Marks the reserves "
+                        "in the rotations row by side (spin 1 = TOP, 2 = BOTTOM), "
+                        "writes a witness board of the outer two rings per border, "
+                        "and notes Decker=/DeckerPool=/Board= in the comment")
     g.add_argument("--decker_reserve", type=int, default=argparse.SUPPRESS, metavar="K",
                    help="inner pieces reserved per two-tall side, 12..32 (default "
                         f"{AnnealingConfig.decker_reserve}); the strip has 12 cells, "
@@ -3092,14 +3103,23 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 def parse_decker_sides(text: str) -> Tuple[int, ...]:
-    by_name = {v: k for k, v in SIDE_NAMES.items()}
+    """TOP and BOTTOM only. The beam fails near the top, so a TOP reserve is the
+    one a later stage can use (the beamer's --lambda_reserve, the finalizer's
+    locked row 14); a BOTTOM one serves the finalizer's witness boards at
+    --finalize_from 1. LEFT/RIGHT strips run through rows the beam fills
+    itself, and with all four sides two tall the reserves competed for the
+    same pieces (96 of 191) and every count came out lower."""
+    by_name = {"TOP": int(Side.TOP), "BOTTOM": int(Side.BOTTOM)}
     sides = set()
     for tok in text.split(","):
         name = tok.strip().upper()
+        if name in ("LEFT", "RIGHT"):
+            raise SystemExit(f"[ERROR] --double_decker: {name} is not offered -- only TOP "
+                             f"and BOTTOM reserves are of use to a later stage")
         if name not in by_name:
             raise SystemExit(f"[ERROR] --double_decker: unknown side '{tok.strip()}' "
-                             f"(use TOP, RIGHT, BOTTOM, LEFT)")
-        sides.add(int(by_name[name]))
+                             f"(use TOP, BOTTOM)")
+        sides.add(by_name[name])
     return tuple(sorted(sides))
 
 def default_decker_path(out_path: str) -> str:

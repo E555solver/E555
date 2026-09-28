@@ -289,8 +289,8 @@ A classic side is scored by the orderings of its 14 edge pieces, and nothing in
 that says whether the row *inside* them can be filled. That is where boards
 fail: the shipped `best_463.csv` boards have 5–9 broken edges inside the outer
 two rings, and `board_example_462.csv` has 9. With `--double_decker` the named
-sides (a comma list; the bare flag means all four) are scored by their **two
-rows**: every order of the edges, times every way to put an inner piece under
+sides (TOP, BOTTOM or `TOP,BOTTOM`; the bare flag means TOP) are scored by their
+**two rows**: every order of the edges, times every way to put an inner piece under
 each so the inner row chains as well, drawn from a **reserve** of
 `--decker_reserve` inner pieces (24 by default, 12–32) that the search picks
 for that side, each used at most once. The count is exact, and it is the side's
@@ -343,7 +343,12 @@ border's potential.
   more border moves and 5.02 / 1.95 with more still; targeted draws scored
   4.97 / 2.11 at 85%, 4.69 / 1.93 at 60%, 4.62 / 1.57 never. With all four
   sides two tall the reserves compete for the same pieces (96 of 191), which
-  is why their counts stay lower. The schedule is probed as for classic
+  is why their counts stay lower -- one reason the option now offers TOP and
+  BOTTOM only (the measurement predates that). The other: the beam fails near
+  the top, so a TOP reserve is the one a later stage can use; a BOTTOM one
+  serves the finalizer's witness boards at `--finalize_from 1`, and LEFT/RIGHT
+  strips run through rows the beam fills itself. The geometry and counting
+  code stays general; only the command line narrowed. The schedule is probed as for classic
   refinement, over the double decker's own moves, with one addition: a probe
   whose feasible moves all score the same (a plateau -- a seed at 1 layout,
   say) gets T0 = 0.1, Tf = 0.005 (`DD_PLATEAU_T0/TF`). It used to fall to the
@@ -375,12 +380,13 @@ What each written border carries:
   `TOP=..` and the rest stay the classic counts of the spins, so `--input`'s
   cross-check and `E555_sort_rotations.py` read the row as before; no new
   token contains a side name. `Score=` is the double-decker objective.
-- **The rotations row** gives spin 1 instead of 0 to every reserved piece and
-  every block's inner piece. The beamer's `--reserve_decker` reads these marks
-  and holds the pieces out of the beam when TOP is the only two-tall side
-  (*Holding the double-decker reserve*); everything else that reads a rotations
-  row (`classify_deal_from_rotations`, `fin_rot_row_valid`, `fin_rot_match`)
-  skips inner spins.
+- **The rotations row** marks every reserved piece and every block's inner
+  piece with the side it is for, in place of spin 0: **1 = TOP** (row 14),
+  **2 = BOTTOM** (row 1); a block piece takes the code of the row it sits on.
+  The beamer's `--lambda_reserve` reads the TOP marks (*Keeping the reserve for
+  last*); everything else that reads a rotations row
+  (`classify_deal_from_rotations`, `fin_rot_row_valid`, `fin_rot_match`) skips
+  inner spins. Files written before the codes marked every side with 1.
 - **The witness board** goes to `--decker_out` (default `<out stem>_decker.csv`),
   one per row under the `Board=` name, in the beamer's own line format, after
   a `#` line naming each side's reserve: the whole border ring plus the
@@ -396,8 +402,8 @@ What each written border carries:
 Known limits: each corner block holds one fixed inner piece, so only the
 strips between them are flexible; K stops at 32 because the exact count grows
 with it; the finalizer locks a complete row 14, but returns the
-LEFT/RIGHT strips and the unplaced reserve pieces to the pool, and only the
-beamer's `--reserve_decker` holds a reserve back (TOP only);
+unplaced reserve pieces to the pool, and only the beamer's `--lambda_reserve`
+reads the reserve (TOP only);
 clue orientation is not modelled (row 14, columns 2 and 13, sit on the row-13
 clues in two of the four orientations).
 
@@ -1388,86 +1394,67 @@ The same engine runs on its own as `E555_diver` (Stage C), for boards that
 already exist: a beam file written without `--end_dive`, partials from other
 tools, or another pass with more dives or polish.
 
-### Holding the double-decker reserve (`--reserve_decker`)
+### Keeping the reserve for last (`--lambda_reserve`)
 
 Stage A's `--double_decker TOP` picks, per border, a reserve of inner pieces
 that can fill row 14 under that top border in many ways (`Decker=`), and marks
-them with spin 1 in the rotations row, together with the TL/TR block inner
-pieces at (14,1) and (14,14). Without this flag the beam spends them freely: on
-`dd_keep_r5.csv` (the 4 rows refined in *Two-tall sides*, 26 pieces marked)
-every board reaching row 11 had already placed 20-22 of the 26 in rows 1-11,
-one or two in row 1.
+them with side code 1 in the rotations row, together with the TL/TR block inner
+pieces at (14,1) and (14,14) (*Two-tall sides*). Left alone, the beam spends
+them like any other piece: on the row measured below, boards reaching row 10
+had placed all but 7.6 of the 26.
 
-`--reserve_decker` holds the marked pieces out of every board of that border
-row, the way the row-13 clue pair is held: they sit in the board's used mask
-from the root, so no chain placing one is accepted, and they stay in the
-colour totals, so the parity and demand accounting treats them as supply for
-the rows above the stop row -- which is where they go. The top-corner catalog
-(`--lambda_corners`) sees them as free, since two of them are its own block
-pieces. Nothing leaves the chain database, which is built once for every
-border row and cached. Emitted boards leave them unplaced, and `--end_dive`
-places them like any other free piece.
+`--lambda_reserve F` makes every TOP reserve piece a board has placed cost F,
+in units of the row's score SD -- the unit `--lambda_corners` uses, measured
+once on the score before either term, so the two add and either runs alone.
+Nothing is held: a reserve piece is still used where nothing else fits, which
+matters -- holding pieces outright (an earlier `--reserve_decker`, removed)
+stopped the beam before row 10 once 16 were held, and one of them, the only
+piece that fits (1,14) on its border, killed that border at row 1. The
+`--backtrack_row` search emits every board and never selects, so the penalty
+does not reach it; the dives treat every unplaced piece as free.
 
-Per border row, from the Stage A comment's `Decker=` (TOP/RIGHT/BOTTOM/LEFT):
+Per border row the marks are read only when the Stage A comment's `Decker=`
+shows TOP two tall. A row written before the side codes (every side marked 1)
+cannot be split when another side is two tall, and gets a `[reserve]` note and
+no penalty. The stop-row summary reports the TOP pieces still free on the
+emitted boards (`[sum] reserve at stop row`), also at F = 0.
 
-- **TOP the only two-tall side**: every inner piece with spin 1 is held, and a
-  `[reserve]` line gives the count and the slack.
-- **TOP classic, or no `Decker=`**: nothing is held; the row runs as usual.
-- **Another side two tall as well**: the row is skipped with a note. The spins
-  do not say which marked piece is whose, and a BOTTOM, LEFT or RIGHT reserve
-  belongs in cells the beam places itself.
-- **Too few pieces left**: rows 1..`--stop_row` take 14 inner pieces each out
-  of 196, less the held ones and, under `--clue_corners`, the row-13 pair. A row
-  that cannot fit is skipped; slack under 14 is warned about. With the default
-  reserve (24, so 26 held) `--stop_row 13` never fits and 12 fits with 2 to
-  spare.
-- **Row 1 must still be fillable**: the column filter that `--clue_corners`
-  uses (`row1_corner_compatible`) also runs against the held set, so a
-  (bottom, column) whose row 1 needs a held piece is dropped before any beam
-  runs. A bottom left with no column still counts against `--top_bottoms`
-  (its `[rank]` line says `run 0`), so a border row can spend its whole bottom
-  budget this way. Measured on `dd_keep_r5.csv`: rows 0-2 hold piece 80 (on
-  row 14 in every witness, the TL block's inner piece in two of them), and it
-  is the only piece that fits (1,14) over bottom colour 20 beside that
-  border's one row-1 right edge -- so every column of those bottoms is dead.
-  Before the filter 12 of 16 configurations spent their slot dying at row 1.
-  The same border refined with `--decker_reserve 12` held piece 80 in all 4
-  rows, and all 40 of its best-ranked bottoms were dead: a border whose
-  bottom-right cell is forced onto one piece cannot give that piece to the
-  top.
-- `--random_edges` has no rotations row and refuses the flag.
+**Measured** (real seed, cached database, width 20000, 4 threads, 4 bottoms x
+4 columns = 16 configurations, `--rng_seed 3`; the TOP reserve of
+`borders_annealed_fix12.csv` row 5 refined with `--decker_keep_border`, 4 x
+20000 steps, the restart with 1,888 layouts; "layouts alive" recounts, on 400
+sampled stop-row boards, the row-14 layouts the reserve pieces a board left
+free still allow, with `tests/check_decker.py`'s counter):
 
-**What it costs, measured** (real seed, cached database, width 20000, 4
-threads, border row 3 of `dd_keep_r5.csv`, 4 bottoms x 4 columns, `--stop_row
-10`, `--rng_seed 3`; held sets other than the reserve are random inner pieces,
-no clues):
-
-| held | configurations reaching row 10 | boards |
+| `--lambda_reserve` | stop 10: reached / boards / free of 26 | stop 11: reached / boards / free of 26 |
 |---|---|---|
-| none | 16 of 16 | 12,847 |
-| 8 random | 16 of 16 | 454 |
-| 16 random | 0 of 16 (all die at 10) | 0 |
-| 26 random | 0 of 16 (8 at 9, 8 at 10) | 0 |
-| 26, the TOP reserve | 0 of 16 (8 at 9, 8 at 10) | 0 |
+| 0 | 16 / 13,003 / 7.6 | 6 / 21 / 6.0 |
+| 0.25 | 16 / 14,005 / 9.9 | 7 / 16 / 7.6 |
+| 0.5 | 16 / 11,627 / 10.9 | 8 / 20 / 9.8 |
+| 1 | 16 / 9,793 / 11.7 | 6 / 16 / 10.9 |
+| 2 | 16 / 8,622 / 12.0 | 8 / 19 / 10.3 |
 
-The same one-row file was run with and without the flag, so the
-configurations are the same. Even 8 held pieces cost 96% of the boards,
-though every configuration still reached row 10. At `--stop_row 11` (4 rows x
-2 bottoms x 2 columns) the unreserved run reached row 11 in 5 of 16
-configurations and the reserved one in none. The beam's reach is set by how
-many pieces are still free: unreserved it dies at row 11 with 56 left, and
-the held runs died with 44-58 free, whichever pieces were held. At the default
-reserve size the flag is therefore **not** a way to reach row 11 or even row
-10 at width 20000; the measured room is under 16 held pieces, or a wider beam,
-or a lower stop row whose boards another stage finishes.
+With `--lambda_corners` on as well the figures are the same to within noise
+(stop 10, F = 2: 16 / 8,476 / 12.0). The penalty costs no reach -- 6-8 of 16
+configurations reach row 11 at every F -- and raises the free reserve by
+60-70%, at the price of fewer, more alike stop-row boards.
 
-Nothing yet turns the hold into a finished top. Emitted boards leave the held
-pieces unplaced and the dives put them wherever they fit; the finalizer
-returns every spin-1 piece to the pool (it reads no marks), and no tool lays
-the witness's rows 14-15 onto a beamer partial. That closing step -- stamp the
-witness's top two rows onto each stop-row board and let the finalizer's
-locked-top search (*Locked top rows*) fill the rows between -- is what the
-hold is for, and it is not built.
+What it does **not** do is keep row 14 buildable: in every setting, 0 of 400
+sampled boards could still lay out row 14 from the reserve they left free.
+Two reasons, both measured. This border's TL block piece is the only fit at
+(1,14) and sat there on all 400 boards; and the strip alone (block pieces
+counted free) survived on 2 of 400 at F = 2, because by row 10 the beam has
+to spend about half the reserve whatever F is. On the same border's restart
+without that piece (372 layouts), F = 0 / 2 / 4 left 7.3 / 12.4 / 12.5 free,
+with 0 / 2 / 1 of 400 strips alive: raising F past 2 buys nothing. The reserve
+is 26 of the 56 pieces left after row 10, and they are pieces that chain well
+under the top edge colours, which is what the rows below want too.
+
+So the term is a mild, safe bias rather than a reservation; its measured
+effect is on how many reserve pieces reach the top, not yet on scores. A
+board only keeps the reserve's layout where its top rows are locked, which
+the finalizer does (*Locked top rows*); no tool yet puts a witness's rows
+14-15 onto a beamer partial.
 
 ### Settings for reaching row 11 (measured)
 
@@ -1597,7 +1584,7 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--bail_columns N` | 0 | abandon a bottom after N consecutive columns that emitted nothing (0 = off) |
 | `--clue_center` | off | force the published centre clue (piece 138) onto its cell, at its orientation's spin |
 | `--clue_corners` | off | force the two reachable corner clues (row 2); the row-13 pair is reserved, never pinned |
-| `--reserve_decker` | off | hold each rotations row's double-decker TOP reserve (inner pieces with spin 1) out of the beam, for row 14 (see *Holding the double-decker reserve*) |
+| `--lambda_reserve F` | 0 | each double-decker TOP reserve piece (spin 1 in the rotations row) a board has placed costs F, in score-SD units; with or without `--lambda_corners` (see *Keeping the reserve for last*) |
 | `--time_limit S` | 600 | wall-time slice per configuration |
 | `--wall_time S` | 0 | total budget (0 = unlimited) |
 | `--max_emitted N` | 0 | stop after N boards reported -- completions **plus** `--incomplete_top` partials (0 = unlimited); under `--end_dive` it caps the finished boards written instead, and never stops the search |
@@ -3364,7 +3351,7 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
 
 | producer | file | layout |
 |---|---|---|
-| Stage A | `rotations.csv` | `# comment` lines + `id, spin[0..255]` (60 border spins, 196 zeros; 1 on the reserved inner pieces under `--double_decker`, which the beamer's `--reserve_decker` holds) |
+| Stage A | `rotations.csv` | `# comment` lines + `id, spin[0..255]` (60 border spins, 196 zeros; under `--double_decker` each reserved inner piece carries its side code, 1 = TOP, 2 = BOTTOM, which the beamer's `--lambda_reserve` reads) |
 | Stage A | `--decker_out`, default `<out stem>_decker.csv` | per border: a `# <name> reserve SIDE=ids ...` line, then `<name>, 0, pos[256], rot[256]` (514, the beamer's layout): one layout of the outer two rings |
 | beamer | `beam_completions_<border>_<row>.csv` / `..._random_<row>.csv` | `config_id, sol_idx, pos[256], rot[256]` (514) |
 | beamer | `sweep_checkpoint.txt` | resume state, one line |

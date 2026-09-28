@@ -47,7 +47,7 @@ Stage A  src/A_border/E555_edge_annealer.py   Euler-trail simulated annealing ->
                                                (optional: beamer --random_edges samples borders itself)
 Stage B  src/B_beam/E555_beamer.c             5-5-5 chain DB + wide beam + colour/Mahalanobis heuristic;
                                                --backtrack_row exhaustive tail, --end_dive/--end_polish finish;
-                                               --reserve_decker holds Stage A's TOP double-decker reserve
+                                               --lambda_reserve keeps Stage A's TOP double-decker reserve for last
                                                boards to 256 pieces (engine: src/C_tail/E555_dive.c)
          src/B_beam/E555_finalizer.c          restart the beam from a partial, locked below a row (reduced DB);
                                                locks clean top rows (--keep_ring: the ring); --backtrack_row, --end_dive

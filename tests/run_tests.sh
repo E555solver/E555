@@ -103,7 +103,7 @@ ALL_STEPS=(
     "band_with_frame|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
     "cpsat_chain|topper -> ender -> ender, each fed by the last"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
-    "beamer_backtrack_dive|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --reserve_decker holds its pieces"
+    "beamer_backtrack_dive|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --lambda_reserve keeps the reserve for last"
     "beamer_resume|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
     "scripts_parse|every shipped script parses, and passes only flags that exist"
     "example_finalizer|examples/02 re-grows the synthetic board"
@@ -1121,16 +1121,28 @@ print(f"ok: {checked} strip pieces counted exactly as exhaustive search counts "
       f"({several} with several layouts)")
 EOF
 
-    # Cold, all four sides: the classic warm-up, then the double decker. Rows
+    # Cold, TOP and BOTTOM: the classic warm-up, then the double decker. Rows
     # 0 and 1 are complete, so the finalizer takes it at --finalize_from 1.
     for t in 1 2; do
-        python3 -u "$A" data/seed_Edge5.txt --double_decker --restarts 2 --steps 6000 \
+        python3 -u "$A" data/seed_Edge5.txt --double_decker TOP,BOTTOM --restarts 2 --steps 6000 \
             --rng_seed 11 --threads "$t" --out "$OUT/decker/cold$t.csv" \
             > "$OUT/decker/cold$t.log" 2>&1 \
             || { cat "$OUT/decker/cold$t.log"; fail "the cold --double_decker run failed"; }
     done
     python3 tests/check_decker.py "$OUT/decker/cold1.csv" "$OUT/decker/cold1_decker.csv" \
-        TOP,RIGHT,BOTTOM,LEFT 1 || fail "the cold double-decker outputs do not check out"
+        TOP,BOTTOM 1 || fail "the cold double-decker outputs do not check out"
+    python3 - "$OUT/decker/cold1.csv" <<'EOF' || exit 1
+import sys
+rows = [l.split(",")[1:] for l in open(sys.argv[1]) if l.strip() and l[0] not in "#%"]
+codes = {x.strip() for r in rows for x in r[60:]}
+assert codes == {"0", "1", "2"}, f"inner spins {sorted(codes)}: want side codes 1 and 2"
+print("ok: TOP,BOTTOM marks both sides' reserves, with codes 1 and 2")
+EOF
+    if python3 "$A" data/seed_Edge5.txt --double_decker TOP,LEFT --restarts 1 --steps 10 \
+            --out "$OUT/decker/lr.csv" > "$OUT/decker/lr.log" 2>&1; then
+        fail "--double_decker accepted LEFT"
+    fi
+    grep -q "LEFT is not offered" "$OUT/decker/lr.log" || fail "--double_decker LEFT: no reason given"
     for f in cold cold_decker; do
         cmp -s <(grep -v '^# run' "$OUT/decker/${f/cold/cold1}.csv") \
                <(grep -v '^# run' "$OUT/decker/${f/cold/cold2}.csv") \
@@ -1201,14 +1213,14 @@ assert rows and all(spins[:60] == want for spins, _, _ in rows), "the border mov
 print(f"ok: --decker_keep_border hands back the input's border in all {len(rows)} rows")
 EOF
 
-    # The whole file, TOP and LEFT, no --out: both files land beside the
+    # The whole file, BOTTOM alone, no --out: both files land beside the
     # input, one row and one board per input row, in input order.
     cp data/borders_annealed_fix12.csv "$OUT/decker/in.csv"
-    python3 -u "$A" data/seed_Edge5.txt --input "$OUT/decker/in.csv" --double_decker TOP,LEFT \
+    python3 -u "$A" data/seed_Edge5.txt --input "$OUT/decker/in.csv" --double_decker BOTTOM \
         --restarts 1 --steps 800 --rng_seed 42 --threads 3 > "$OUT/decker/rows.log" 2>&1 \
         || { cat "$OUT/decker/rows.log"; fail "the whole-file --double_decker run failed"; }
     python3 tests/check_decker.py "$OUT/decker/in_refined.csv" "$OUT/decker/in_refined_decker.csv" \
-        TOP,LEFT 0 || fail "the whole-file double-decker outputs do not check out"
+        BOTTOM 0 || fail "the whole-file double-decker outputs do not check out"
     [ "$(grep -o 'From=[^ ]*' "$OUT/decker/in_refined.csv" | sed 's/.*:row//' | tr '\n' ' ')" \
       = "0 1 2 3 4 5 6 7 8 9 10 11 " ] || fail "whole-file double-decker rows out of input order"
     echo "ok: 12 rows and 12 boards, in input order"
@@ -2522,11 +2534,12 @@ step_beamer_backtrack_dive() {
         || { tail -5 "$OUT/btd_dive.log"; fail "end-dive run exited non-zero"; }
     grep -q "^\[sum\] backtrack from row 8" "$OUT/btd_plain.log" || fail "no backtrack summary"
 
-    # --reserve_decker: mark 8 inner pieces the way Stage A --double_decker
-    # does (spin 1, Decker= in the row's comment), then run the same search
-    # holding them (stop row 9: at width 2000 even 8 held pieces end this
-    # configuration at row 10). No stop-row board may place a held piece. A second row that
-    # names another two-tall side is skipped with a note.
+    # --lambda_reserve: mark 26 inner pieces as Stage A --double_decker TOP does
+    # (side code 1, Decker= in the comment), then run the same small beam with
+    # and without the penalty, --lambda_corners on both so the two terms share
+    # their unit. The penalised boards must leave more of the reserve free. A
+    # second row whose Decker= also names BOTTOM but carries no code 2 is in the
+    # older all-1 format and is not tracked.
     python3 - data/borders_annealed_fix12.csv "$OUT/btd_rsv.csv" <<'EOF' || exit 1
 import sys
 seed = [list(map(int, l.split())) for l in open("data/seed_Edge5.txt") if l.strip()]
@@ -2535,40 +2548,37 @@ clues = {138, 207, 254, 180, 248}                # piece ids are 0-based here
 rows = [l for l in open(sys.argv[1]) if l.strip() and l[0] not in "#%"]
 f = [x.strip() for x in rows[0].split(",")]
 spins = f[1:]
-held = [p for p in inner if p not in clues][3::23][:8]    # 26 held kills the beam by row 10
-for p in held:
+for p in [p for p in inner if p not in clues][3::7][:26]:
     spins[p] = "1"
 with open(sys.argv[2], "w") as o:
-    for dk in ("12/-/-/-", "12/5/-/-"):
+    for dk in ("12/-/-/-", "12/-/5/-"):
         o.write(f"#  TOP=1 RIGHT=1 BOTTOM=1 LEFT=1  Decker={dk}  Board=t\n")
         o.write(f[0] + ", " + ", ".join(spins) + "\n")
-open(sys.argv[2] + ".held", "w").write(",".join(map(str, held)))
 EOF
-    RSV=(bin/E555_beamer data/seed_Edge5.txt "$OUT/btd_rsv.csv"
-         --num_rows 2 --top_bottoms 1 --top_columns 1 --beam_width 2000
-         --backtrack_row 7 --stop_row 9 --lambda_corners --rng_seed 7 --threads 1
-         --reserve_decker)
-    if [ -n "$GATE_DB" ]; then RSV+=(--db_file "$GATE_DB"); fi
-    "${RSV[@]}" --out_dir "$OUT/btd_rsv" > "$OUT/btd_rsv.log" \
-        || { tail -5 "$OUT/btd_rsv.log"; fail "--reserve_decker run exited non-zero"; }
-    grep -q "^\[reserve\] border row 0: holding 8 TOP piece(s) for row 14" "$OUT/btd_rsv.log" \
-        || { grep reserve "$OUT/btd_rsv.log"; fail "--reserve_decker did not hold row 0's 8 pieces"; }
-    grep -q "^\[reserve\] border row 1: skipped -- sides other than TOP" "$OUT/btd_rsv.log" \
-        || fail "--reserve_decker did not skip a row with a second two-tall side"
-    python3 - "$OUT/btd_rsv/beam_completions_0_9.csv" "$OUT/btd_rsv.csv.held" <<'EOF' || exit 1
-import sys, os
-held = set(map(int, open(sys.argv[2]).read().split(",")))
-n = 0
-if os.path.exists(sys.argv[1]):
-    for l in open(sys.argv[1]):
-        if not l.strip() or l[0] in "#%":
-            continue
-        pos = list(map(int, l.split(",")[-512:-256]))
-        bad = [p for p in held if pos[p] != 999]
-        assert not bad, f"a stop-row board places held piece(s) {bad}"
-        n += 1
-assert n > 0, "the held run wrote no stop-row board"
-print(f"ok: --reserve_decker held 8 pieces on {n} stop-row board(s) and skipped the two-sided row")
+    for lam in 0 2; do
+        RSV=(bin/E555_beamer data/seed_Edge5.txt "$OUT/btd_rsv.csv"
+             --num_rows 2 --top_bottoms 1 --top_columns 1 --beam_width 2000
+             --stop_row 9 --lambda_corners --lambda_reserve "$lam" --rng_seed 7 --threads 2)
+        if [ -n "$GATE_DB" ]; then RSV+=(--db_file "$GATE_DB"); fi
+        "${RSV[@]}" --out_dir "$OUT/btd_rsv$lam" > "$OUT/btd_rsv$lam.log" \
+            || { tail -5 "$OUT/btd_rsv$lam.log"; fail "--lambda_reserve $lam run exited non-zero"; }
+    done
+    grep -q "^\[reserve\] border row 0: 26 TOP reserve piece(s), each placed one costs" "$OUT/btd_rsv2.log" \
+        || { grep reserve "$OUT/btd_rsv2.log"; fail "--lambda_reserve did not read row 0's 26 marks"; }
+    grep -q "^\[reserve\] border row 1: marks from an older --double_decker" "$OUT/btd_rsv2.log" \
+        || fail "an old-format two-sided row was not set aside"
+    python3 - "$OUT/btd_rsv0.log" "$OUT/btd_rsv2.log" <<'EOF' || exit 1
+import re, sys
+def free(path):
+    for l in open(path):
+        m = re.match(r"\[sum\] reserve at stop row: TOP pieces still free, mean ([0-9.]+) of 26", l)
+        if m:
+            return float(m.group(1))
+    raise SystemExit(f"no reserve summary in {path}")
+a, b = free(sys.argv[1]), free(sys.argv[2])
+assert b > a, f"--lambda_reserve 2 left {b} of 26 free, no more than {a} without it"
+print(f"ok: --lambda_reserve 2 with --lambda_corners keeps {b:.1f} of 26 reserve pieces free "
+      f"at the stop row, against {a:.1f} without it; an old-format row is set aside")
 EOF
     grep -q "^\[sum\] end dives:" "$OUT/btd_dive.log" || fail "no end-dive summary"
     # The diver replaying the plain run's boards is the same finish, so it must

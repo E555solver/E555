@@ -3,8 +3,7 @@
 usage (from the repository root, as tests/run_tests.sh runs it):
     python3 tests/check_decker.py ROTATIONS BOARDS SIDES [FINALIZE_FROM]
 
-SIDES is the comma list the run was given (TOP,RIGHT,BOTTOM,LEFT for the bare
-flag). For every rotations row and the witness board beside it, it checks:
+SIDES is the comma list the run was given (TOP for the bare flag). For every rotations row and the witness board beside it, it checks:
 
   - the comment's TOP=.. counts are the classic counts of the row's own spins,
     so --input's cross-check and E555_sort_rotations.py keep reading it right;
@@ -14,8 +13,10 @@ flag). For every rotations row and the witness board beside it, it checks:
   - every placed piece fits its cell and faces the frame the way the
     finalizer's fin_load_partial demands, every placed neighbour pair matches,
     and rows 0..FINALIZE_FROM are complete -- so the finalizer will load it;
-  - the spin-1 flags are exactly the reserves plus the corner blocks' inner
-    pieces, and the board's second-ring pieces all come from the reserves;
+  - the side codes (spin 1 = TOP, 2 = BOTTOM) mark exactly the reserves plus
+    the corner blocks' inner pieces, each with its own side's code (a block
+    piece: its row's, 14 -> 1, 1 -> 2), and the board's second-ring pieces all
+    come from the reserves;
   - Decker= is, for each two-tall side, the number of layouts of its strip
     from its reserve, recounted here by a search of its own; DeckerPool= is
     at least that.
@@ -140,12 +141,20 @@ for k, ((spins, comment, lineno), line, res_line) in enumerate(zip(rows, boards,
             for c in range(16):
                 assert r * 16 + c in grid, f"board {k}: cell {r},{c} empty at finalize_from {F}"
 
-    # 4. flags = reserves + corner q's; the second ring comes from the reserves
-    qs = {where[Q_CELL[cell][0] * 16 + Q_CELL[cell][1]] for cell, b in blocked.items() if b}
-    flagged = {i + 1 for i in range(60, 256) if spins[i] == 1}
-    assert all(spins[i] in (0, 1) for i in range(60, 256))
-    all_res = {p for rs in reserve.values() for p in rs}
-    assert flagged == all_res | qs, f"row {k}: flags {len(flagged)} != reserves+q {len(all_res | qs)}"
+    # 4. side codes = reserves + corner q's, each with its side's code; the
+    #    second ring comes from the reserves
+    want_code = {}
+    for s, rs in reserve.items():
+        for p in rs:
+            want_code[p] = 1 if s == T else 2
+    for cell, b in blocked.items():
+        if b:
+            qr, qc = Q_CELL[cell]
+            want_code[where[qr * 16 + qc]] = 1 if qr == 14 else 2
+    got_code = {i + 1: spins[i] for i in range(60, 256) if spins[i]}
+    assert all(spins[i] in (0, 1, 2) for i in range(60, 256)), f"row {k}: inner spin outside 0..2"
+    assert got_code == want_code, \
+        f"row {k}: side codes {sorted(got_code.items())[:6]}.. != {sorted(want_code.items())[:6]}.."
     for s in DD:
         di, dj = INWARD[s]
         for (r, c) in CELLS[s][1:13]:
