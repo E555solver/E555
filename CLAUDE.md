@@ -17,7 +17,7 @@ pip install ortools       # only needed for src/C_tail/E555_topper.py and E555_e
 
 - Flags are `-Wall -Wextra -O3 -fopenmp`. The test gate fails on **any** compiler warning.
 - Changing `ARCH`/`OPT`/`CC` forces a rebuild through `bin/.buildflags`. A binary built with `-march=native` dies with SIGILL on an older CPU.
-- beamer, finalizer and roundhouse all link `src/B_beam/E555_database.c`; the beamer and the diver also link `src/C_tail/E555_dive.c` (the end-dive engine, no argv of its own), and the diver links `E555_database.c` too. The backtracker is standalone.
+- beamer, finalizer and roundhouse all link `src/B_beam/E555_database.c`; the beamer, the finalizer and the diver also link `src/C_tail/E555_dive.c` (the end-dive engine, no argv of its own), and the diver links `E555_database.c` too. The backtracker is standalone.
 - `tests/datadriven/` is a self-contained beamer fork with its own Makefile (`cd tests/datadriven && make ARCH=generic`).
 
 ## Tests
@@ -48,7 +48,8 @@ Stage A  src/A_border/E555_edge_annealer.py   Euler-trail simulated annealing ->
 Stage B  src/B_beam/E555_beamer.c             5-5-5 chain DB + wide beam + colour/Mahalanobis heuristic;
                                                --backtrack_row exhaustive tail, --end_dive/--end_polish finish
                                                boards to 256 pieces (engine: src/C_tail/E555_dive.c)
-         src/B_beam/E555_finalizer.c          restart the beam from a partial, locked below a row (reduced DB)
+         src/B_beam/E555_finalizer.c          restart the beam from a partial, locked below a row (reduced DB);
+                                               keeps a clean ring and clean top rows; --backtrack_row, --end_dive
          src/B_beam/E555_roundhouse.c         rotate 90 deg, grow a W-wide strip; exhaustive, DP oracle
 Stage C  src/C_tail/E555_topper.py            CP-SAT break minimizer over bands / --holes masks
          src/C_tail/E555_backtracker.c        greedy dives + exhaustive DFS; --stop_row/--stop_column bands

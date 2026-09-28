@@ -230,7 +230,15 @@ stops filling. Measured on `board_partial_row12.csv` with 12 sampled columns:
 | 7, 8 | 0 of 12 | 0% |
 
 Under 1% occupancy is an exhaustive walk wearing a beam's clothes, which is why
-the tool's default is `5`.
+the tool's default is `5`. (That table predates the kept ring: a complete border
+whose edges all match now also keeps its right column and top border in place,
+and any clean rows under the top border, which narrows the search further;
+`--free_top` gives back the conditions it was measured under.)
+
+When the lock is high enough that the beam cannot widen anyway, search the rest
+exhaustively instead: `--backtrack_row` equal to `--finalize_from` runs no beam
+at all, and `--end_dive` finishes what the search reaches (both as in the
+beamer; PROJECT_E555.md, *E555_finalizer*).
 
 With an **incomplete** border the finalizer falls back to `--free_edges`, and
 `--top_columns 0` then enumerates *every* legal left column. That enumeration

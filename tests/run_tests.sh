@@ -85,6 +85,7 @@ ALL_STEPS=(
     "finalizer_synth|REGRESSION: rediscovers the synthetic solution from row 10"
     "finalizer_rotations|re-imposes a matching rotations row's side assignment"
     "finalizer_determinism|one seed re-run reproduces the search exactly"
+    "finalizer_top_lock|a clean border keeps its ring and top rows; --backtrack_row and --end_dive reach the solution"
     "roundhouse_synth|REGRESSION: rebuilds the solution at strip widths 3 and 5"
     "roundhouse_two_rounds|closes the board in two rounds, rotating between them"
     "roundhouse_cache|the transition cache agrees with decoding every record"
@@ -1156,7 +1157,11 @@ EOF
     wait "$pid" 2>/dev/null || true
     grep -q "\[sweep\] line 0: source 'dd11_r[0-9]*'  depth=1  lock rows 0..1  mode=fixed" "$log" \
         || { cat "$log"; fail "the finalizer did not load a witness board at --finalize_from 1"; }
-    echo "ok: the finalizer loads a witness board, locks rows 0..1 and fixes its sides"
+    # The witness is a complete, clean border with row 14 filled under it, so
+    # the finalizer keeps the ring in place and locks rows 14..15 from the top.
+    grep -q "\[sweep\] line 0: ring kept in place, top rows 14..15 locked" "$log" \
+        || { cat "$log"; fail "the finalizer did not keep the witness's ring and row 14"; }
+    echo "ok: the finalizer loads a witness board, locks rows 0..1 and 14..15, keeps its ring"
 
     # TOP only, refining one row: row 14 is the whole second ring, 14 flags.
     python3 -u "$A" data/seed_Edge5.txt --input data/borders_annealed_fix12.csv --row 4 \
@@ -1409,6 +1414,9 @@ EOF
 #     check would have passed with the RNG disconnected.
 #   * --finalize_from 5, so several rows clear the 64-sample Mahalanobis floor
 #     and the per-thread reduction behind it is actually exercised.
+#   * --free_top: the solution's complete border would otherwise keep its ring
+#     in place and lock rows 11..15, and that board then has one candidate per
+#     row -- no selection at all.
 #
 # Both arms fix --threads. Reproducibility across thread counts is deliberately
 # NOT asserted, because the finalizer does not offer it: the work partition
@@ -1419,7 +1427,7 @@ EOF
 step_finalizer_determinism() {
     for arm in a b; do
         bin/E555_finalizer data/synth_seed.txt data/synth_solution_480.csv \
-            --finalize_from 5 --stop_row 10 --beam_width 200 --frac_rand 0.30 \
+            --finalize_from 5 --stop_row 10 --beam_width 200 --frac_rand 0.30 --free_top \
             --finalize_repeats 2 --threads 4 --rng_seed 777 --verbose \
             --out_dir "$OUT/det_$arm" > "$OUT/det_$arm.log" \
             || { tail -5 "$OUT/det_$arm.log"; fail "the finalizer failed on arm $arm"; }
@@ -1445,6 +1453,99 @@ step_finalizer_determinism() {
     diff "$OUT/det_a.norm" "$OUT/det_b.norm" > "$OUT/det.diff" \
         || { head -10 "$OUT/det.diff"; fail "two runs on one seed searched differently"; }
     echo "ok: $n configurations reproduced exactly on a re-run"
+}
+
+# A line whose border is complete and clean keeps its ring in place and locks
+# its clean top rows (T = the lowest row above --stop_row with rows T..15
+# complete and matched). On the synthetic solution locked at row 6 and stopped
+# at 9 that is rows 10..15, so the search must meet row 10 exactly and the
+# emitted board is the whole solution -- which also proves the parity and
+# demand bookkeeping accepts the truth. Then the same through the exhaustive
+# search, with no beam (--backtrack_row = --finalize_from) and after one beam
+# row; a gap between the stop row and the locked top, filled by --end_dive; and
+# --free_top, which keeps only the sides. The backtracker's output must not
+# depend on the thread count, checked on a free-mode partial with some width.
+step_finalizer_top_lock() {
+    local d="$OUT/toplock"
+    mkdir -p "$d"
+    python3 - data/synth_solution_480.csv "$d" <<'EOF' || exit 1
+import sys
+f = [x.strip() for x in open(sys.argv[1]).read().strip().split("\n")[-1].split(",")]
+pos, rot = [int(x) for x in f[-512:-256]], f[-256:]
+def put(name, keep):
+    p = [c if keep(c) else 999 for c in pos]
+    open(f"{sys.argv[2]}/{name}.csv", "w").write(
+        f"{name}, 0, " + ", ".join(map(str, p)) + ", " + ", ".join(rot) + "\n")
+put("gap", lambda c: not (c // 16 in (10, 11) and c % 16 not in (0, 15)))   # rows 10-11 open
+put("low", lambda c: c // 16 <= 7)                                           # rows 0..7 only
+EOF
+    cat > "$d/match.py" <<'EOF'
+import sys
+def rows(p): return [[x.strip() for x in l.split(",")] for l in open(p) if l.strip() and not l.startswith("#")]
+t = rows(sys.argv[2])[0]; tp, tr = t[-512:-256], t[-256:]
+best = -1
+for r in rows(sys.argv[1]):
+    p, ro = r[-512:-256], r[-256:]
+    if all(a == "999" or (a == b and c == e) for a, c, b, e in zip(p, ro, tp, tr)):
+        best = max(best, sum(1 for x in p if x != "999"))
+want = int(sys.argv[3])
+assert best >= want, f"{sys.argv[1]}: best matching board places {best} pieces, want {want}"
+EOF
+    tl_run() {   # name, input, extra flags...
+        local n=$1 in=$2; shift 2
+        bin/E555_finalizer data/synth_seed.txt "$in" --beam_width 20000 --rng_seed 1 \
+            --out_dir "$d/$n" "$@" > "$d/$n.log" 2>&1 \
+            || { tail -5 "$d/$n.log"; fail "finalizer run $n failed"; }
+    }
+    tl_run auto data/synth_solution_480.csv --finalize_from 6 --stop_row 9 --threads 4
+    grep -q "ring kept in place, top rows 10..15 locked" "$d/auto.log" \
+        || { grep sweep "$d/auto.log"; fail "the clean top rows were not locked"; }
+    python3 "$d/match.py" "$d/auto/beam_completions_finalized_9.csv" data/synth_solution_480.csv 256 \
+        || fail "the top-locked search did not write the whole solution"
+
+    tl_run bt1 data/synth_solution_480.csv --finalize_from 6 --stop_row 9 --backtrack_row 6 --threads 1
+    tl_run bt4 data/synth_solution_480.csv --finalize_from 6 --stop_row 9 --backtrack_row 6 --threads 4 --verbose
+    grep -q "no beam: an exhaustive row-major search from the locked board" "$d/bt4.log" \
+        || fail "--backtrack_row = --finalize_from did not say it skips the beam"
+    if grep -q "^\[beam\] .* row=" "$d/bt4.log"; then
+        fail "a beam row ran under --backtrack_row = --finalize_from"
+    fi
+    python3 "$d/match.py" "$d/bt4/beam_completions_finalized_9.csv" data/synth_solution_480.csv 256 \
+        || fail "the exhaustive search from the lock missed the solution"
+    cmp -s "$d/bt1/beam_completions_finalized_9.csv" "$d/bt4/beam_completions_finalized_9.csv" \
+        || fail "the backtrack from the lock differs between 1 and 4 threads"
+    tl_run bt7 data/synth_solution_480.csv --finalize_from 6 --stop_row 9 --backtrack_row 7 --threads 4
+    python3 "$d/match.py" "$d/bt7/beam_completions_finalized_9.csv" data/synth_solution_480.csv 256 \
+        || fail "beam to row 7 then the exhaustive search missed the solution"
+
+    tl_run gap "$d/gap.csv" --finalize_from 6 --stop_row 9 --backtrack_row 6 \
+        --end_dive 2000 --end_polish 50 --emit_score 400 --threads 4
+    grep -q "top rows 12..15 locked (the rows between are left open)" "$d/gap.log" \
+        || { grep sweep "$d/gap.log"; fail "the gap partial did not lock rows 12..15"; }
+    python3 "$d/match.py" "$d/gap/beam_completions_finalized_9.csv" data/synth_solution_480.csv 256 \
+        || fail "--end_dive did not fill the open rows back to the solution"
+
+    tl_run free data/synth_solution_480.csv --finalize_from 8 --stop_row 12 --free_top --threads 4
+    if grep -q "ring kept" "$d/free.log"; then fail "--free_top still kept the ring"; fi
+    python3 - "$d/free/beam_completions_finalized_12.csv" <<'EOF' || exit 1
+import sys
+for l in open(sys.argv[1]):
+    pos = [int(x) for x in l.split(",")[-512:-256]]
+    top = [c for c in pos if c != 999 and c // 16 >= 13 and c % 16 not in (0, 15)]
+    assert not top, f"--free_top wrote cells above the stop row: {top}"
+EOF
+    python3 "$d/match.py" "$d/free/beam_completions_finalized_12.csv" data/synth_solution_480.csv 212 \
+        || fail "--free_top lost the solution (rows 0..12 plus the left column and TR)"
+
+    tl_run low1 "$d/low.csv" --finalize_from 7 --backtrack_row 7 --stop_row 10 --top_columns 20 --threads 1
+    tl_run low4 "$d/low.csv" --finalize_from 7 --backtrack_row 7 --stop_row 10 --top_columns 20 --threads 4
+    local nb; nb=$(wc -l < "$d/low4/beam_completions_finalized_10.csv")
+    [ "$nb" -ge 50 ] || fail "the free-mode backtrack wrote only $nb boards (want >= 50)"
+    cmp -s "$d/low1/beam_completions_finalized_10.csv" "$d/low4/beam_completions_finalized_10.csv" \
+        || fail "the free-mode backtrack differs between 1 and 4 threads"
+    echo "ok: ring and top rows kept; the solution found by beam, by backtrack from the lock and"
+    echo "    from row 7, and by dives across a gap; --free_top keeps sides only;"
+    echo "    $nb free-mode backtrack boards identical at 1 and 4 threads"
 }
 
 # The roundhouse rebuilds a board from a rotated frame, so a wrong rotation, a

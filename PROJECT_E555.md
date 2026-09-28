@@ -378,15 +378,17 @@ What each written border carries:
   two-tall sides' first inner ring -- one layout drawn uniformly from the
   counted ones -- and 999 elsewhere. The finalizer loads it in fixed-sides mode
   at `--finalize_from 0`, and at 1 when BOTTOM is two tall (rows 0 and 1 are
-  then complete); the gate runs the real loader on one.
+  then complete). It keeps the ring in place and, with TOP two tall, locks rows
+  14-15 as well (*Kept ring and top rows*); the gate runs the real loader on one.
 - **No turns.** `E555_sort_rotations.py` leaves such rows unturned and
   `E555_rotate.py --rotations` refuses the file: a turn would leave the board,
   the flags and the `Decker=` side order behind.
 
 Known limits: each corner block holds one fixed inner piece, so only the
 strips between them are flexible; K stops at 32 because the exact count grows
-with it; the finalizer returns everything above `--finalize_from` to the pool,
-so the reserves are information (and flags) until a reservation uses them;
+with it; the finalizer keeps the ring and a complete row 14, but returns the
+LEFT/RIGHT strips and the unplaced reserve pieces to the pool, so the reserves
+are information (and flags) until a reservation uses them;
 clue orientation is not modelled (row 14, columns 2 and 13, sit on the row-13
 clues in two of the four orientations).
 
@@ -1589,7 +1591,7 @@ bin/E555_finalizer seed.txt partials.csv [rotations.csv] --finalize_from 10 --st
 
 **Settings track the beamer's where the meaning is the same** -- `--beam_width
 250000`, `--beam_expand 4`, `--parent_cap 4`, `--lambda_J 1.0`,
-`--lambda_Mahalanobis 0.6`, `--pool_factor 8`, `--top_columns 12`,
+`--lambda_Mahalanobis 1.0`, `--pool_factor 8`, `--top_columns 12`,
 `--stop_row 11`, `--time_limit 600` -- so one number means one thing across
 Stage B, and
 `--bail_columns` exists here too (it abandons a partial line after N consecutive
@@ -1698,9 +1700,11 @@ searched row pins a colour there instead, because a clue's bottom face has to
 meet whatever sits under it. Rows below the lock are checked, not searched: a
 partial whose locked region already contradicts a clue is skipped with the
 reason, since no row above it could repair the board. The row-13 pair is
-reserved and attached to the emitted board only where its own cell and the
-cell below are empty, so a searched row 13 or a filled row 12 simply leaves it
-off (the beamer, unlike the finalizer, writes it over a filled row 12 too). Nothing about the clues caps `--stop_row`.
+reserved and attached to the emitted board where its own cell is empty, as in
+the beamer, so a searched or locked row 13 simply leaves it off. A clue inside
+locked top rows (below) is read off like one in the rows below the lock, and a
+locked top that contradicts it skips the line. Nothing about the clues caps
+`--stop_row`.
 
 **Side modes.** Without `--free_edges`, the partial's border placement is used
 as a fixed assignment (requires all 60 border pieces in the line; otherwise
@@ -1744,6 +1748,79 @@ comparison per locked border cell (a border piece's rotation on a border cell
 is already forced to face the frame, so same-spin *is* same-side), and rows are
 structurally validated at load, so a match can never fail mid-sweep.
 
+**Kept ring and top rows.** A line whose border is complete and whose ring is
+clean -- every edge between consecutive border pieces matched -- is treated as
+a board that already exists at the top, not only at the bottom:
+
+- **The ring stays in place.** Fixed mode always took the left column from the
+  partial; the right column and the top border were only *sets* (each row picked
+  its right edge again from the side's pool, and row 15 was a multiset of colours
+  row 14 had to offer). Now every searched row takes the input's own right-edge
+  piece for that row, and every emitted board carries the whole ring.
+- **Clean top rows are locked.** `T` is the lowest row above `--stop_row` such
+  that rows `T..15` are complete and every edge inside them matches (the ring
+  alone gives `T = 15`). Those rows are locked exactly like the rows below
+  `--finalize_from`: excluded from the reduced database, booked in the parity
+  counters (their inner pieces' faces consumed, row `T`'s bottoms owed), part of
+  the input-dedup hash, and written into every emitted board.
+- **The row under the lock** (`T-1`, when it is the stop row) must meet row `T`
+  exactly: each top it exposes is row `T`'s bottom in that column. The beam
+  checks it segment by segment as chains are decoded; the exhaustive search
+  (`--backtrack_row`, below) pins every cell's top colour and so prunes from the
+  first cell, which makes backtracking the natural way to close onto a locked
+  top. At `T = 15` this is the old row-14 rule made exact per column.
+- **A gap** (`--stop_row < T-1`) is simply left open: the locked pieces are
+  reserved, so the search never spends them, and `--end_dive` fills the gap.
+- **Corners.** With `T <= 14` the input has already built the top corners, so
+  `--lambda_corners` has nothing to measure and is off for that line (a
+  `[corner]` note says so). With `T = 15` the catalog is pruned to the blocks
+  whose side pieces and top-border witnesses are the ring's own, and corner
+  seeding has nothing to place (its witness cells are filled).
+- **`--free_top`** turns all of it off: sides only, nothing above the stop row
+  kept, which is how every complete border was treated before. A border with a
+  broken edge is treated that way too, with a note.
+
+The synthetic regression boards are complete solutions, so they now take this
+path; `finalizer_determinism` passes `--free_top` because a board with its ring
+and top rows kept has one candidate per row and nothing to select.
+
+**From a double-decker witness.** Stage A's `--double_decker` writes, for each
+border, a witness board: the ring plus the first inner ring of each two-tall
+side (see *Two-tall sides*). With TOP two tall its row 14 is complete, so the
+finalizer keeps rows 14-15 and the ring and grows the board from
+`--finalize_from 0` (1 when BOTTOM is two tall too). The LEFT/RIGHT strips
+(columns 1 and 14) are not kept: they sit in rows the search fills. Locking at
+row 0 or 1 rebuilds nearly the whole chain database in memory, per witness:
+minutes and ~8 GB, as for the beamer. A typical run beams a few rows and then
+backtracks:
+
+```bash
+bin/E555_finalizer data/seed_Edge5.txt rotations_refined_decker.csv \
+    --finalize_from 0 --beam_width 250000 --backtrack_row 6 --stop_row 11 \
+    --end_dive 20000 --end_polish 50000 --emit_score 0
+```
+
+**`--backtrack_row N`** (`--finalize_from <= N < --stop_row`) is the beamer's
+exhaustive search (*Backtracking to the stop row*): the beam stops at row `N`,
+expanded as a stop row, and every raw row-`N` candidate roots a cell-by-cell
+depth-first search to `--stop_row` that emits every board completing it. With
+`N = --finalize_from` no beam row runs at all: the locked board is the single
+root, and the search is split across threads by the same hand-off queue (every
+other thread starts out hungry, so the first rows are handed off at once). The
+file does not depend on the thread count. The search honours the line's clue
+pins, the kept ring, the locked top and, under `--lambda_corners`, the corner
+cut; `--incomplete_top` has no effect, and `--time_limit` bounds it per
+configuration.
+
+**`--end_dive [M]`, `--end_polish R`, `--emit_score S`, `--corner_seeds N`**
+finish every stop-row board with the beamer's dive engine
+(`src/C_tail/E555_dive.c`, *Finishing boards*), with the same defaults. Every
+placed cell stays -- the locked rows, the kept ring and top rows, the left
+column -- and edge pieces keep the side the border deals them (any side in
+free mode). Boards are written per configuration, best first, as
+`config_id, connected edges, pos, rot`, and `--max_emitted` caps the written
+boards instead of stopping the search.
+
 **Row 14.** `--stop_row` may go up to 14 (15 is rejected: the top border is
 deliberately outside the database, and placing it on a finished row 14 is
 trivial). Committing row 14 counts its tops as *satisfying* the top border,
@@ -1773,7 +1850,11 @@ from a locked partial at any `--finalize_from`.
 
 **Output** appends to `beam_completions_finalized_<stop_row>.csv` with config
 ids `p<line>r<repeat>l<column>`; several instances on the same machine may
-share one output file (each line is one atomic append).
+share one output file (each line is one atomic append). Besides rows
+`0..stop_row`, a board carries what its configuration fixed above them: the
+whole ring and the locked top rows when the ring is kept, else (known sides)
+the left column as far as it was chosen and the corner reserved for the top
+right, as the beamer writes them. Free mode writes neither.
 
 **Bounding a run.** Both tools accept `--wall_time` (time) and
 `--max_emitted` (output): the latter ends the run once N boards have been
@@ -3166,7 +3247,7 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
 | beamer | `beam_completions_<border>_<row>.csv` / `..._random_<row>.csv` | `config_id, sol_idx, pos[256], rot[256]` (514) |
 | beamer | `sweep_checkpoint.txt` | resume state, one line |
 | roundhouse | the output CSV named as the third positional argument; every board goes to it | canonical 514-field layout, ids `<input-id>_<line><tag><n>`, tag `s`/`d`/`j`/`f` for solved, deepest, hold-join, break-filled |
-| finalizer | `beam_completions_finalized_<row>.csv` | same 514-field layout, ids `p<line>r<repeat>l<column>` |
+| finalizer | `beam_completions_finalized_<row>.csv` | same 514-field layout, ids `p<line>r<repeat>l<column>`; slot 2 is the score under `--end_dive` |
 | Stage C (all) | output CSV | **canonical**: `config_id, score, pos[256], rot[256]` (514) |
 | backtracker | `<out>.checkpoint.csv`, `<out>.status.csv`, `<out>.best_*.csv` | canonical rows / diagnostic sidecars |
 | backtracker | `<out>.stop_row<N>.csv` / `<out>.stop_col<N>.csv` (`_rev` when reversed) | every completed stop band, canonical 514-field layout |
