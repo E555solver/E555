@@ -1172,7 +1172,9 @@ def resolve_schedule(config: AnnealingConfig, state: RunState,
                      inner_capacity: Counter, rng: random.Random,
                      t0_given: Optional[float],
                      tf_given: Optional[float],
-                     probe: Optional[MoveProbe] = None) -> Tuple[float, float, List[str], str]:
+                     probe: Optional[MoveProbe] = None,
+                     plateau: Optional[Tuple[float, float]] = None
+                     ) -> Tuple[float, float, List[str], str]:
     """(T0, Tf, lines for the header, "polish" or "search") for this run.
 
     Two schedules, ~50x apart, and which one is wanted does NOT follow from the
@@ -1205,7 +1207,13 @@ def resolve_schedule(config: AnnealingConfig, state: RunState,
     Decided ONCE, here in the parent, so the header, every restart and the
     --out marker all report the numbers the run actually used. A double
     decker hands in its own `probe` (dd_probe), which samples its own moves;
-    the rule that reads it is the same."""
+    the rule that reads it is the same.
+
+    `plateau` is the schedule for a probe whose feasible moves ALL score the
+    same: there is a neighbourhood, just no slope in it to measure. The double
+    decker passes one (DD_PLATEAU_T0/TF); without it such a probe reads as no
+    neighbourhood at all and gets the cold schedule, which is set by the
+    classic feasibility cliff and is a random walk in double-decker units."""
     if probe is None:
         probe = probe_move_scale(state, pieces_by_id, edge_ids, inner_capacity, config, rng)
     kind = "search"
@@ -1216,6 +1224,10 @@ def resolve_schedule(config: AnnealingConfig, state: RunState,
         why = (f"polishing: only {probe.improving}/{probe.feasible} feasible moves "
                f"improve this border, so it already sits near an optimum of these "
                f"weights; move scale sigma={probe.sigma:.4g}")
+    elif probe.sigma is None and plateau is not None and probe.feasible >= PROBE_MIN_SAMPLES:
+        t0, tf = plateau
+        why = (f"searching: all {probe.feasible} feasible moves of {probe.candidates} "
+               f"probes score the same, a plateau with no slope to calibrate to")
     else:
         t0, tf = config.cold_schedule()
         if probe.sigma is None:
@@ -2204,6 +2216,14 @@ def dd_propose(ctx: DeckerContext, st: DeckerState, rng: random.Random,
 # samples fewer; most land feasible, which still leaves hundreds of score
 # changes to measure the spread over.
 DD_PROBE_CANDIDATES = 600
+# The schedule for a flat probe (resolve_schedule's `plateau`). Measured on
+# data/borders_annealed_fix12.csv, --double_decker TOP --decker_keep_border,
+# 4 restarts x 20000 steps, exact TOP layouts per restart:
+#   row 4 (a plateau at 1 layout; the cold schedule T0=11.25 gave 1,1,2,1)
+#     T0=1 8,6,17,8   0.3 24..368   0.1 188,480,980,452   0.045 80..192   0.02 113..315
+#   row 5 (probed as polishing, T0=0.0455: 512,608,1888,372)
+#     T0=0.1 636,540,1712,2038
+DD_PLATEAU_T0, DD_PLATEAU_TF = 0.1, 0.005
 
 def dd_probe(ctx: DeckerContext, st: DeckerState, config: AnnealingConfig,
              rng: random.Random, cands: int = DD_PROBE_CANDIDATES) -> MoveProbe:
@@ -2402,7 +2422,8 @@ def anneal_decker_restart(restart: int, pieces_by_id: Dict[int, Piece],
                 config, None, pieces_by_id, edge_ids, inner_capacity, None,
                 config.decker_T0, config.decker_Tf,
                 probe=dd_probe(ctx, st, config,
-                               random.Random(f"decker-probe:{seed}:{restart}")))
+                               random.Random(f"decker-probe:{seed}:{restart}")),
+                plateau=(DD_PLATEAU_T0, DD_PLATEAU_TF))
             if config.verbose:
                 log.extend("  " + line for line in lines)
     else:
@@ -3103,7 +3124,8 @@ def decker_warm_plan(config: AnnealingConfig, pieces_by_id: Dict[int, Piece],
                          "with some edge of this border")
     t0, tf, lines, kind = resolve_schedule(
         config, None, pieces_by_id, edge_ids, inner_capacity, None, t0_given, tf_given,
-        probe=dd_probe(ctx, st, config, random.Random(restart_seed(config.random_seed, 0))))
+        probe=dd_probe(ctx, st, config, random.Random(restart_seed(config.random_seed, 0))),
+        plateau=(DD_PLATEAU_T0, DD_PLATEAU_TF))
     baseline = st.score if st.hard == 0.0 else None
     head = [f"[cfg] double decker: seeded on this border  {dd_state_str(st, config)}  "
             + (f"score={st.score:.4f}" if baseline is not None

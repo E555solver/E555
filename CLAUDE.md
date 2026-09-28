@@ -49,7 +49,7 @@ Stage B  src/B_beam/E555_beamer.c             5-5-5 chain DB + wide beam + colou
                                                --backtrack_row exhaustive tail, --end_dive/--end_polish finish
                                                boards to 256 pieces (engine: src/C_tail/E555_dive.c)
          src/B_beam/E555_finalizer.c          restart the beam from a partial, locked below a row (reduced DB);
-                                               keeps a clean ring and clean top rows; --backtrack_row, --end_dive
+                                               locks clean top rows (--keep_ring: the ring); --backtrack_row, --end_dive
          src/B_beam/E555_roundhouse.c         rotate 90 deg, grow a W-wide strip; exhaustive, DP oracle
 Stage C  src/C_tail/E555_topper.py            CP-SAT break minimizer over bands / --holes masks
          src/C_tail/E555_backtracker.c        greedy dives + exhaustive DFS; --stop_row/--stop_column bands

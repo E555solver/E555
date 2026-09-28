@@ -38,14 +38,14 @@
  *   (--top_columns columns per partial, each the best of RANDOM_SIDE_SAMPLES
  *   fan-out-ranked chains), so repeated runs explore ever-fresh completions.
  *
- * KEPT RING AND TOP ROWS
- *   A line whose border is complete and clean keeps the ring in place (each
- *   searched row takes the input's own right edge; the ring is written out) and
- *   locks its clean top rows T..15 -- the lowest T above --stop_row with those
- *   rows complete and matched -- exactly like the rows below the lock: excluded
- *   from the database, booked in the parity counters, written into every board.
- *   Row T-1 then meets row T's bottoms instead of demanding another row (see
- *   commit_row, seg_meets_top). --free_top restores sides-only fixed mode.
+ * LOCKED TOP ROWS
+ *   A line whose border is complete and clean locks its clean top rows T..15 --
+ *   the lowest T above --stop_row with those rows complete and matched --
+ *   exactly like the rows below the lock: excluded from the database, booked in
+ *   the parity counters, written into every board. Row T-1 then meets row T's
+ *   bottoms instead of demanding another row (see commit_row, seg_meets_top).
+ *   --keep_ring also holds the right column in place, --free_sides samples the
+ *   left column under the lock, and --free_top turns the lock off.
  *
  * BACKTRACK AND DIVES
  *   --backtrack_row N ends the beam at row N and searches every row-N candidate
@@ -157,7 +157,18 @@ static int      g_corner_seeds   = 4;     /* --corner_seeds N; 0 = off */
    T..15 are complete with every edge between them matched. g_top_T == PUZZLE_SIDE
    means no row is locked from above. --free_top turns all of it off. */
 static bool     g_free_top  = false;
-static bool     g_ring_kept = false;       /* this line */
+/* --free_sides: keep the locked top rows, but below them treat the ring as the
+   sides' piece sets only -- right edges from the side's pool, the left column
+   sampled -- as for a line whose sides come from a rotations row. For witness
+   boards, whose classic sides are one random trail order among thousands. */
+static bool     g_free_sides = false;
+/* --keep_ring: also hold the right column in place (each searched row takes
+   the input's own right edge). Opt-in: a ring the input never built as part of
+   a board -- a witness's classic sides, a --with_frame band -- is one random
+   trail order, and pinned it killed 4 of 8 witnesses at row 1. */
+static bool     g_keep_ring  = false;
+static bool     g_ring_kept = false;       /* this line: ring pinned in place */
+static bool     g_sides_from_ring = false; /* this line: --free_sides took effect */
 static int      g_top_T     = PUZZLE_SIDE; /* this line */
 
 /* Optional Stage A rotations CSV (3rd positional): every data row is a candidate
@@ -763,10 +774,16 @@ static void board_arrays(const RowChoice rows[EDGE_LEN + 1], int row, uint16_t c
             occ[r * PUZZLE_SIDE + c] = true;
         }
     }
-    if (g_ring_kept) {
-        for (int r = row + 1; r < PUZZLE_SIDE; r++)
+    if (g_top_T < PUZZLE_SIDE)                       /* the locked top rows */
+        for (int r = g_top_T; r < PUZZLE_SIDE; r++)
             for (int c = 0; c < PUZZLE_SIDE; c++) {
-                if (r < g_top_T && c != 0 && c != PUZZLE_SIDE - 1) continue;
+                const Oriented *o = &g_grid[r][c];
+                pos[o->piece_id] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[o->piece_id] = o->rotation;
+                occ[r * PUZZLE_SIDE + c] = true;
+            }
+    if (g_ring_kept) {
+        for (int r = row + 1; r < g_top_T; r++)
+            for (int c = 0; c < PUZZLE_SIDE; c += PUZZLE_SIDE - 1) {
                 const Oriented *o = &g_grid[r][c];
                 pos[o->piece_id] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[o->piece_id] = o->rotation;
                 occ[r * PUZZLE_SIDE + c] = true;
@@ -3221,7 +3238,7 @@ static int fin_load_partial(const char *path, uint32_t want, char id_out[64]) {
     /* The ring and the clean rows at the top (fin_top_T_of). The locked top
        joins the lock mask, so it leaves the database like the rows below. */
     g_top_T = fin_top_T_of(pos, rot);
-    g_ring_kept = g_top_T < PUZZLE_SIDE;
+    g_ring_kept = g_top_T < PUZZLE_SIDE && g_keep_ring && !g_free_sides;
     for (int r = g_top_T; r < PUZZLE_SIDE; r++)
         for (int c = 0; c < PUZZLE_SIDE; c++)
             used_set(g_lock_mask, g_grid[r][c].piece_id);
@@ -3619,7 +3636,9 @@ static bool fin_sample_left(RNG *rng, double tau, LeftOrder *lo) {
     for (int k = 0; k < s_corner_n; k++)
         if (!used_test(g_lock_mask, (uint16_t)s_corner_ids[k]))
             free_c[nfc++] = s_corner_ids[k];
-    if (nfc != 2) fatal("expected exactly 2 unlocked corners, found %d", nfc);
+    /* The sampler picks the top corners itself only when no side assignment
+       names them (a rotations row, or the ring under --free_sides, does). */
+    if (!g_sides_from_rot && nfc != 2) fatal("expected exactly 2 unlocked corners, found %d", nfc);
 
     Oriented best[PUZZLE_SIDE], bestTL, bestTR;
     memset(&bestTL, 0, sizeof bestTL); memset(&bestTR, 0, sizeof bestTR);
@@ -3655,13 +3674,18 @@ static bool fin_sample_left(RNG *rng, double tau, LeftOrder *lo) {
         used_set(used, (uint16_t)tr_id);
         int prev_top = g_grid[from - 1][0].top;
         bool ok = true;
-        for (int r = from; r <= EDGE_LEN; r++) {
+        /* Under a top lock the column above T-1 is the input's, and the last
+           sampled piece meets it; else it meets the TL corner. */
+        const int last = g_top_T < PUZZLE_SIDE ? g_top_T - 1 : EDGE_LEN;
+        const int need = g_top_T < PUZZLE_SIDE ? g_grid[g_top_T][0].bottom : TL.bottom;
+        for (int r = last + 1; r <= EDGE_LEN; r++) seq[r] = g_grid[r][0];
+        for (int r = from; r <= last; r++) {
             int cand[MAX_EDGE_TERMINALS], nc = 0;
             for (int k = 0; k < s_leftz_n; k++) {
                 const Oriented *o = &s_leftz[k];
                 if (used_test(used, o->piece_id)) continue;
                 if (o->bottom != prev_top) continue;
-                if (r == EDGE_LEN && o->top != TL.bottom) continue;
+                if (r == last && o->top != need) continue;
                 cand[nc++] = k;
             }
             if (nc == 0) { ok = false; break; }
@@ -3801,7 +3825,7 @@ static void run_left_config(BeamCtx *ctx, Scratch **scratch, double t_start,
 
     /* Corner seeding places a block and its top-border witnesses; with the ring
        kept those cells are the input's, so there is nothing to seed. */
-    if (g_end_dive) dv_seeding(g_corners_on && !g_ring_kept);
+    if (g_end_dive) dv_seeding(g_corners_on && g_top_T == PUZZLE_SIDE);
     BeamResult br = beam_search_config(ctx, scratch, cfg_hash, slice_end);
     /* Finish the configuration's queued stop-row boards and write the kept ones
        now, so a killed run loses at most the configuration in flight. Edge
@@ -3853,6 +3877,7 @@ static void fin_enum_rec(BeamCtx *ctx, Scratch **scratch, double t_start,
         const Oriented *o = &s_leftz[k];
         if (used_test(used, o->piece_id)) continue;
         if (o->bottom != prev_top) continue;
+        if (g_top_T < PUZZLE_SIDE && r == g_top_T - 1 && o->top != g_grid[g_top_T][0].bottom) continue;
         seq[r] = *o;
         used_set(used, o->piece_id);
         fin_enum_rec(ctx, scratch, t_start, line, lo, seq, r + 1, o->top, used, count);
@@ -3897,8 +3922,10 @@ static uint8_t fin_tc_ring_prune(void) {
             int n = 0;
             for (int i = 0; i < g_tc_blk_n[s][k]; i++) {
                 TcBlock b = g_tc_blk[s][k][i];
-                if (b.pid[0] != g_grid[PUZZLE_SIDE - 2][side].piece_id) continue;
-                if (b.n == 5 && b.pid[1] != g_grid[PUZZLE_SIDE - 3][side].piece_id) continue;
+                if (g_ring_kept) {
+                    if (b.pid[0] != g_grid[PUZZLE_SIDE - 2][side].piece_id) continue;
+                    if (b.n == 5 && b.pid[1] != g_grid[PUZZLE_SIDE - 3][side].piece_id) continue;
+                }
                 bool wit = b.nwit >= TC_MAX_WIT;        /* a truncated list may hold it */
                 for (int u = 0; u < b.nwit && !wit; u++)
                     wit = b.wit[u][0] == w1 && (b.wit[u][1] == TC_NO_PIECE || b.wit[u][1] == w2);
@@ -3999,14 +4026,13 @@ static void usage(const char *a0) {
 "that matches no row is searched exactly as before, with a note. Ignored when\n"
 "--free_edges is given, or when the partial's border is already complete.\n"
 "\n"
-"A line whose border is complete and clean keeps the whole RING in place: every\n"
-"searched row takes the input's own right edge, and the ring is written into every\n"
-"emitted board. It also keeps its clean TOP rows: the lowest row T above --stop_row\n"
+"A line whose border is complete and clean keeps its clean TOP rows (and, with\n"
+"--keep_ring, the whole ring in place): the lowest row T above --stop_row\n"
 "with rows T..15 complete and every edge inside them matched. Those rows are locked\n"
 "like the rows below --finalize_from and written out; row T-1, when searched, must\n"
 "meet row T's bottoms exactly, and rows between --stop_row and T are left open\n"
 "(--end_dive fills them). A Stage A --double_decker witness board with TOP two\n"
-"tall keeps rows 14-15 this way. --free_top turns all of it off.\n"
+"tall keeps rows 14-15 this way. --free_top turns it off.\n"
 "\n"
 "Input lines are deduplicated on the fly: a line whose search state at\n"
 "--finalize_from (frontier row, fixed sides, and the set of free pieces --\n"
@@ -4033,10 +4059,20 @@ static void usage(const char *a0) {
 "  --free_edges           free every edge piece above finalize_from into a shared\n"
 "                         pool; activated automatically when the partial leaves a\n"
 "                         border piece unplaced (fixed sides need all 60 placed)\n"
-"  --free_top             keep neither the ring nor the clean top rows of a complete\n"
-"                         border: its right column and top border are kept only as the\n"
-"                         sets of pieces on those sides, and nothing above the stop row\n"
-"                         is written (the behaviour before the ring was kept)\n"
+"  --free_top             do not lock the clean top rows of a complete border: its top\n"
+"                         border is kept only as the colours row 14 must offer, and\n"
+"                         nothing above the stop row is kept\n"
+"  --keep_ring            also hold the right column in place: each searched row takes\n"
+"                         the input's own right edge. For a ring the input built as\n"
+"                         part of a board; a witness's or a --with_frame band's sides\n"
+"                         are one random trail order, and pinned they often cannot be\n"
+"                         completed at all\n"
+"  --free_sides           keep the clean top rows locked, but below them treat the\n"
+"                         ring as the sides' piece sets only: right edges from the\n"
+"                         side's pool, the left column sampled (--top_columns) as for\n"
+"                         a rotations-matched line. Meant for double-decker witness\n"
+"                         boards, whose classic sides are one random trail order:\n"
+"                         kept in place that order killed 4 of 8 witnesses at row 1\n"
 "  --clue_center          hold the published centre clue (piece 138) on its cell and\n"
 "                         spin while the rows above the lock are rebuilt. Without it\n"
 "                         a --finalize_from below 7 frees that cell and the search\n"
@@ -4139,8 +4175,9 @@ static void usage(const char *a0) {
 "                         F in units of the row's score SD. Needs known sides: lines\n"
 "                         in free mode are skipped, as is a line, orientation or\n"
 "                         column whose lock already spends every block of a corner.\n"
-"                         With the ring kept only blocks on the ring's own side and\n"
-"                         top-border pieces count; a line whose top lock reaches row\n"
+"                         With the top border locked only blocks on its own witness\n"
+"                         pieces count (and, with --keep_ring, on the ring's own side\n"
+"                         pieces); a line whose top lock reaches row\n"
 "                         14 has its corners built already and runs without the term.\n"
 "                         Bare flag = 0.5; absent = 0 (off). --stop_row <= 12\n"
 "  --frac_rand F          fraction of the beam selected at random instead of by score,\n"
@@ -4174,7 +4211,7 @@ static void usage(const char *a0) {
 "                         with an alive top-corner block also dives up to N copies\n"
 "                         with a block and a free pair of top witnesses fixed on\n"
 "                         their cells (default 4, 0 = off; nothing to seed when the\n"
-"                         ring is kept)\n"
+"                         top border is locked)\n"
 "\n"
 "Feasibility certificates:\n"
 "  --no_free_demand       DISABLE the free-mode demand accounting. On by default: an\n"
@@ -4236,6 +4273,8 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (rot_path) printf(" %s", rot_path);
     if (g_opt_free_edges) printf(" --free_edges");
     if (g_free_top)       printf(" --free_top");
+    if (g_free_sides)     printf(" --free_sides");
+    if (g_keep_ring)      printf(" --keep_ring");
     if (g_incomplete_top) printf(" --incomplete_top");
     if (g_verbose)        printf(" --verbose");
     if (g_print_cmd)      printf(" --print_cmd");
@@ -4290,6 +4329,8 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--finalize_repeats") && i+1 < argc) g_finalize_repeats = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--free_edges"))                g_opt_free_edges = true;
         else if (!strcmp(argv[i], "--free_top"))                  g_free_top = true;
+        else if (!strcmp(argv[i], "--free_sides"))                g_free_sides = true;
+        else if (!strcmp(argv[i], "--keep_ring"))                 g_keep_ring = true;
         else if (!strcmp(argv[i], "--backtrack_row") && i+1 < argc) {
             int v = atoi(argv[++i]);
             if (v < 0) fatal("--backtrack_row must be >= 0");
@@ -4466,7 +4507,14 @@ int main(int argc, char *argv[]) {
     printf("[cfg] tau_columns=%.2f\n", g_tau_columns);
     printf("[cfg] top=%s\n", g_free_top
            ? "free (--free_top: sides only, nothing above the stop row kept)"
-           : "a complete clean border keeps its ring in place and locks its clean top rows");
+           : g_free_sides
+           ? "a complete clean border locks its clean top rows; below them its sides are "
+             "piece sets and the left column is sampled (--free_sides)"
+           : g_keep_ring
+           ? "a complete clean border keeps its ring in place and locks its clean top rows "
+             "(--keep_ring)"
+           : "a complete clean border locks its clean top rows; the left column is kept, "
+             "the right edges are a set");
     if (g_backtrack_row_set) {
         if (g_backtrack_row == g_finalize_from)
             printf("[cfg] backtrack_row=%u (no beam: an exhaustive row-major search from the "
@@ -4590,10 +4638,19 @@ int main(int argc, char *argv[]) {
            column) from the partial itself; otherwise a rotations row that matches
            the locked border fixes the sides while the column is still searched;
            failing both, every edge is free. */
-        g_sides_from_rot = false;
-        g_rot_matched    = -1;
+        g_sides_from_rot  = false;
+        g_sides_from_ring = false;
+        g_rot_matched     = -1;
         if (g_opt_free_edges) g_free_edges = true;
-        else if (fin_border_complete()) g_free_edges = false;
+        else if (fin_border_complete()) {
+            g_free_edges = false;
+            if (g_free_sides && g_top_T < PUZZLE_SIDE) {
+                /* The ring deals the sides, as a rotations row would; the key
+                   only has to differ from every other line's for the pools. */
+                g_sides_from_rot = g_sides_from_ring = true;
+                g_rot_matched = -3 - (int)line;
+            }
+        }
         else if (g_rot_n && fin_rot_match(line)) {
             g_free_edges     = false;
             g_sides_from_rot = true;
@@ -4602,24 +4659,28 @@ int main(int argc, char *argv[]) {
             printf("[note] line %u: unplaced border pieces -> --free_edges activated automatically\n", line);
         }
         char mode_str[32];
-        if (g_sides_from_rot) snprintf(mode_str, sizeof mode_str, "fixed(rot %d)", g_rot_matched);
+        if (g_sides_from_ring) snprintf(mode_str, sizeof mode_str, "sides(ring)");
+        else if (g_sides_from_rot) snprintf(mode_str, sizeof mode_str, "fixed(rot %d)", g_rot_matched);
         else                  snprintf(mode_str, sizeof mode_str, "%s", g_free_edges ? "free" : "fixed");
         printf("[sweep] line %u: source '%s'  depth=%d  lock rows 0..%u  mode=%s\n",
                line, src_id, g_partial_depth, g_finalize_from, mode_str);
-        if (g_ring_kept) {
+        if (g_top_T < PUZZLE_SIDE) {
+            const char *how = g_ring_kept ? "ring kept in place"
+                            : g_sides_from_ring ? "sides from the ring (--free_sides)"
+                            : "left column kept, right edges a set";
             if (g_top_T == PUZZLE_SIDE - 1)
-                printf("[sweep] line %u: ring kept in place, top border included", line);
+                printf("[sweep] line %u: %s, top border locked", line, how);
             else
-                printf("[sweep] line %u: ring kept in place, top rows %d..15 locked", line, g_top_T);
+                printf("[sweep] line %u: %s, top rows %d..15 locked", line, how, g_top_T);
             printf("%s\n", g_top_T > (int)g_stop_row + 1 ? " (the rows between are left open)" : "");
         }
         else if (!g_free_edges && !g_sides_from_rot && !g_free_top)
-            printf("[note] line %u: the border has a broken edge, so the ring is not kept in "
-                   "place (sides only, as with --free_top)\n", line);
+            printf("[note] line %u: the border has a broken edge, so no top row is locked "
+                   "(sides only, as with --free_top)\n", line);
         fflush(stdout);
         /* The corner term measures blocks still to be built. A lock reaching row
            14 has built them already, from the input. */
-        g_corners_on = g_corners_req && !(g_ring_kept && g_top_T <= EDGE_LEN);
+        g_corners_on = g_corners_req && g_top_T > EDGE_LEN;
         if (g_corners_req && !g_corners_on)
             printf("[corner] line %u: rows 14-15 are locked from the input, so the corner "
                    "blocks' pieces there are fixed -- --lambda_corners is off for this line\n", line);
@@ -4630,7 +4691,7 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        if (!g_free_edges && !g_sides_from_rot) {  /* sides from the partial itself */
+        if (!g_free_edges && (!g_sides_from_rot || g_sides_from_ring)) {  /* sides from the partial itself */
             for (int r = 0; r < PUZZLE_SIDE; r++)
                 for (int c = 0; c < PUZZLE_SIDE; c++)
                     if (r == 0 || r == PUZZLE_SIDE-1 || c == 0 || c == PUZZLE_SIDE-1)
@@ -4659,7 +4720,7 @@ int main(int argc, char *argv[]) {
                 char lab[48]; snprintf(lab, sizeof lab, "line %u", line);
                 uint8_t live = tc_build(g_fin_orient >= 0 ? (uint8_t)(1u << g_fin_orient) : 1u,
                                         clued, lab);
-                if (live && g_ring_kept) {
+                if (live && g_top_T < PUZZLE_SIDE) {
                     live = fin_tc_ring_prune();
                     const int s0 = g_fin_orient >= 0 && g_tc_clued ? g_fin_orient : 0;
                     printf("[corner] line %u: ring kept -> TL %d / TR %d block(s) on its own "

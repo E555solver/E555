@@ -344,7 +344,15 @@ border's potential.
   4.97 / 2.11 at 85%, 4.69 / 1.93 at 60%, 4.62 / 1.57 never. With all four
   sides two tall the reserves compete for the same pieces (96 of 191), which
   is why their counts stay lower. The schedule is probed as for classic
-  refinement.
+  refinement, over the double decker's own moves, with one addition: a probe
+  whose feasible moves all score the same (a plateau -- a seed at 1 layout,
+  say) gets T0 = 0.1, Tf = 0.005 (`DD_PLATEAU_T0/TF`). It used to fall to the
+  classic cold schedule, T0 = 11.25, which is sized for the border's
+  feasibility cliff and is a random walk here: on row 4 of
+  `borders_annealed_fix12.csv` (TOP, `--decker_keep_border`, 4 x 20000 steps)
+  that gave 1-2 layouts, against 188-980 at T0 = 0.1. T0 = 0.3 gave 24-368,
+  0.045 gave 80-192 and 0.02 gave 113-315; on row 5, which probes as
+  polishing (T0 = 0.0455: 372-1888), T0 = 0.1 gave 540-2038.
 - **The border.** A layout contains an order of the edge row, so a side with
   more edge orders scores more easily, and classic counts are no longer given
   away for nothing: over the 6-row bench with TOP two tall (2 seeds), 7 side
@@ -378,15 +386,15 @@ What each written border carries:
   two-tall sides' first inner ring -- one layout drawn uniformly from the
   counted ones -- and 999 elsewhere. The finalizer loads it in fixed-sides mode
   at `--finalize_from 0`, and at 1 when BOTTOM is two tall (rows 0 and 1 are
-  then complete). It keeps the ring in place and, with TOP two tall, locks rows
-  14-15 as well (*Kept ring and top rows*); the gate runs the real loader on one.
+  then complete). With TOP two tall it locks rows 14-15 as well (*Locked top
+  rows*); the gate runs the real loader on one.
 - **No turns.** `E555_sort_rotations.py` leaves such rows unturned and
   `E555_rotate.py --rotations` refuses the file: a turn would leave the board,
   the flags and the `Decker=` side order behind.
 
 Known limits: each corner block holds one fixed inner piece, so only the
 strips between them are flexible; K stops at 32 because the exact count grows
-with it; the finalizer keeps the ring and a complete row 14, but returns the
+with it; the finalizer locks a complete row 14, but returns the
 LEFT/RIGHT strips and the unplaced reserve pieces to the pool, so the reserves
 are information (and flags) until a reservation uses them;
 clue orientation is not modelled (row 14, columns 2 and 13, sit on the row-13
@@ -1748,27 +1756,25 @@ comparison per locked border cell (a border piece's rotation on a border cell
 is already forced to face the frame, so same-spin *is* same-side), and rows are
 structurally validated at load, so a match can never fail mid-sweep.
 
-**Kept ring and top rows.** A line whose border is complete and whose ring is
-clean -- every edge between consecutive border pieces matched -- is treated as
-a board that already exists at the top, not only at the bottom:
+**Locked top rows.** A line whose border is complete and whose ring is clean --
+every edge between consecutive border pieces matched -- is treated as a board
+that already exists at the top, not only at the bottom:
 
-- **The ring stays in place.** Fixed mode always took the left column from the
-  partial; the right column and the top border were only *sets* (each row picked
-  its right edge again from the side's pool, and row 15 was a multiset of colours
-  row 14 had to offer). Now every searched row takes the input's own right-edge
-  piece for that row, and every emitted board carries the whole ring.
 - **Clean top rows are locked.** `T` is the lowest row above `--stop_row` such
   that rows `T..15` are complete and every edge inside them matches (the ring
   alone gives `T = 15`). Those rows are locked exactly like the rows below
   `--finalize_from`: excluded from the reduced database, booked in the parity
   counters (their inner pieces' faces consumed, row `T`'s bottoms owed), part of
-  the input-dedup hash, and written into every emitted board.
+  the input-dedup hash, and written into every emitted board. Below them the
+  sides are handled as fixed mode always did: the left column is the input's,
+  the right edges are the side's set, each row picking its own.
 - **The row under the lock** (`T-1`, when it is the stop row) must meet row `T`
   exactly: each top it exposes is row `T`'s bottom in that column. The beam
   checks it segment by segment as chains are decoded; the exhaustive search
   (`--backtrack_row`, below) pins every cell's top colour and so prunes from the
   first cell, which makes backtracking the natural way to close onto a locked
-  top. At `T = 15` this is the old row-14 rule made exact per column.
+  top. At `T = 15` this is the old row-14 rule (a multiset of top-border
+  colours) made exact per column.
 - **A gap** (`--stop_row < T-1`) is simply left open: the locked pieces are
   reserved, so the search never spends them, and `--end_dive` fills the gap.
 - **Corners.** With `T <= 14` the corner blocks' pieces on rows 14-15 are the
@@ -1777,21 +1783,50 @@ a board that already exists at the top, not only at the bottom:
   but its row-14 inner pieces are locked, so every catalog block would read as
   dead and the term could only say zero. A row-13 clue whose top does not meet
   the locked row 14 makes that orientation non-viable, since the attached clue
-  would carry a break no search or dive could remove. With `T = 15` the catalog is pruned to the blocks
-  whose side pieces and top-border witnesses are the ring's own, and corner
+  would carry a break no search or dive could remove. With `T = 15` the catalog
+  is pruned to the blocks whose top-border witnesses are the locked row's own
+  (and, with `--keep_ring`, whose side pieces are the ring's), and corner
   seeding has nothing to place (its witness cells are filled).
-- **`--free_top`** turns all of it off: sides only, nothing above the stop row
-  kept, which is how every complete border was treated before. A border with a
+- **`--keep_ring`** also holds the right column in place: every searched row
+  takes the input's own right-edge piece, and the whole ring is written out.
+  Use it for a ring the input built as part of a board. A witness's classic
+  sides or a `--with_frame` band's frame are one random trail order, and pinned
+  that order is often impossible (measured below; the gate's framed band died
+  at row 6 with it).
+- **`--free_sides`** keeps the locked top rows and samples the left column below
+  them (`--top_columns`, or enumerated at 0) from the side's pieces, as for a
+  rotations-matched line, closing onto the locked column at row `T`.
+- **`--free_top`** turns the lock off: the top border is again only the colours
+  row 14 must offer, and nothing above the stop row is kept. A border with a
   broken edge is treated that way too, with a note.
 
-The synthetic regression boards are complete solutions, so they now take this
-path; `finalizer_determinism` passes `--free_top` because a board with its ring
-and top rows kept has one candidate per row and nothing to select.
+**Measured on witness boards** (`data/borders_annealed_fix12.csv` rows 4-5,
+`--double_decker TOP --decker_keep_border`, 4 witnesses each; real seed,
+`--finalize_from 0 --clue_center`, 4 threads). The rebuild at row 0 took 21 s
+plus 35 s of sorting, 4.4 GB:
+
+| mode | to row 6, W 10k (8 witnesses, pin 1) | to row 11, W 10k, backtrack from 6 (3 witnesses x 4 frames) |
+|---|---|---|
+| `--keep_ring` | 4 of 8 dead at row 1; the rest ~4-6k wide | 0 of 12; all die at row 9 |
+| default (top locked) | -- | 0 of 12; died at 10 (9) or 9 (3) |
+| `--free_sides`, 12 columns | -- | 0 of 144; died at 10 (95) or 9 (49) |
+| `--free_top` | all 8 alive, ~25k wide | 1 of 12, dived to 452 |
+
+A witness lays its classic sides out as one random trail order, and kept in
+place that order can be impossible: on one witness only piece 80 fits cell
+(1,14) beside row 1's right edge, and the reserve had spent it in row 14. And
+the locked row 14 costs reach even with the sides free, because it holds 14 of
+the inner pieces that chain best with the top edges. With `--pin_clue 1`,
+width 3000 and stop row 10, `--free_sides` reached row 10 in none of 12
+configurations; `--free_top` reached it in 2 of 3 and dived 22 boards to a best
+of 450. So at `--finalize_from 0` a witness is better used for its sides than
+for its row 14; the top lock pays where the rows below are already built, not
+from the bottom border up.
 
 **From a double-decker witness.** Stage A's `--double_decker` writes, for each
 border, a witness board: the ring plus the first inner ring of each two-tall
 side (see *Two-tall sides*). With TOP two tall its row 14 is complete, so the
-finalizer keeps rows 14-15 and the ring and grows the board from
+finalizer locks rows 14-15 and grows the board from
 `--finalize_from 0` (1 when BOTTOM is two tall too). The LEFT/RIGHT strips
 (columns 1 and 14) are not kept: they sit in rows the search fills. Locking at
 row 0 or 1 rebuilds nearly the whole chain database in memory, per witness:
@@ -1856,9 +1891,9 @@ from a locked partial at any `--finalize_from`.
 ids `p<line>r<repeat>l<column>`; several instances on the same machine may
 share one output file (each line is one atomic append). Besides rows
 `0..stop_row`, a board carries what its configuration fixed above them: the
-whole ring and the locked top rows when the ring is kept, else (known sides)
-the left column as far as it was chosen and the corner reserved for the top
-right, as the beamer writes them. Free mode writes neither.
+locked top rows, the whole ring under `--keep_ring`, and (known sides) the left
+column as far as it was chosen and the corner reserved for the top right, as
+the beamer writes them. Free mode writes only the locked rows.
 
 **Bounding a run.** Both tools accept `--wall_time` (time) and
 `--max_emitted` (output): the latter ends the run once N boards have been
