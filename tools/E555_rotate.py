@@ -352,6 +352,15 @@ def rotate_rotations(path, n, out_path, seed):
     build_top_border_demands and fin_rot_match all skip them -- so leaving them
     alone keeps the file's meaning identical and its diff to the frame."""
     greyed = [pid for pid, e in enumerate(seed) if 0 in e]
+    with open(path) as fh:
+        if n % 4 and any(l.lstrip().startswith(("#", "%")) and "Decker=" in l for l in fh):
+            # See E555_sort_rotations.orient: a --double_decker row's witness
+            # board, spin-1 flags and Decker= side order hold for this
+            # orientation only, and nothing here can turn them with it.
+            raise SystemExit(f"[ERROR] {path} holds --double_decker rows (Decker=): "
+                             "their witness boards and spin-1 flags would not turn "
+                             "with the border. Turn the classic rows, or re-run "
+                             "the annealer on the turned border.")
     rows = others = bad = 0
     label = "no rotation" if n == 0 else f"{n * 90} degrees clockwise"
     with open(path, newline="") as fh, open(out_path, "w", newline="") as out:

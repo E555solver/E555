@@ -260,6 +260,16 @@ def orient(borders, dst, want_max, flag, seed):
             warn(f"line {b['lineno']}: no trail counts, left unturned")
             kept.append(b)
             continue
+        if "Decker=" in (b["comment"] or ""):
+            # A double-decker row belongs to a witness board laid out for THIS
+            # orientation: its spin-1 flags mark inner pieces of the sides it
+            # named, and its Decker= counts are in side order. A turn would
+            # move the border under all three.
+            warn(f"line {b['lineno']}: a --double_decker row (Decker=) is left "
+                 "unturned; turning it would leave its witness board, flags and "
+                 "Decker= sides behind")
+            kept.append(b)
+            continue
         n = pick_turn(b["counts"], dst, want_max)
         before = RT.classify_border(seed, b["spins"])
         sizes = [len(before[s]) for s in SIDES]

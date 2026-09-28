@@ -160,6 +160,23 @@ python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
 Without `--out` the annealer always picks a file for you: `FILE_refined.csv`
 beside the `--input`, or `rotations.csv` for a run from scratch.
 
+To make the top two rows rich rather than only the top row, score the top by
+its two rows: the edges and the inner pieces under them, drawn from a reserve
+of inner pieces the annealer picks for the side.
+
+```bash
+python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
+    --input rotations.csv --double_decker TOP --restarts 2 --steps 20000
+```
+
+Each row's comment then carries `Decker=` (how many two-row layouts its reserve
+of 24 pieces allows, exactly), `DeckerPool=` (the bound with every piece free)
+and `Board=`, the name of its witness board in `rotations_refined_decker.csv`
+-- the border plus row 14, in the beamer's board format, ready for the viewer
+or the finalizer. The reserved pieces carry spin 1 in the rotations row.
+`--decker_reserve K` changes the reserve size, `--decker_keep_border` keeps
+the border exactly as it was, and the bare flag scores all four sides.
+
 **`STEPS` has a floor of 250000.** Below it the annealer is not merely weaker --
 it often fails to place a legal border at all. Measured on the real seed: 8
 restarts x 3000 steps found 2 feasible borders, and 2 x 2000 returned one border
