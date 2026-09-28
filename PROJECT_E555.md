@@ -1424,11 +1424,17 @@ Per border row, from the Stage A comment's `Decker=` (TOP/RIGHT/BOTTOM/LEFT):
 - **Row 1 must still be fillable**: the column filter that `--clue_corners`
   uses (`row1_corner_compatible`) also runs against the held set, so a
   (bottom, column) whose row 1 needs a held piece is dropped before any beam
-  runs, and a bottom with no such column is passed over. Measured on
-  `dd_keep_r5.csv`: rows 0-2 hold piece 80, the TR block's inner piece and the
-  only piece that fits (1,14) over bottom colour 20, so every column of their
-  bottoms is dead; before the filter 12 of 16 configurations spent their slot
-  dying at row 1.
+  runs. A bottom left with no column still counts against `--top_bottoms`
+  (its `[rank]` line says `run 0`), so a border row can spend its whole bottom
+  budget this way. Measured on `dd_keep_r5.csv`: rows 0-2 hold piece 80 (on
+  row 14 in every witness, the TL block's inner piece in two of them), and it
+  is the only piece that fits (1,14) over bottom colour 20 beside that
+  border's one row-1 right edge -- so every column of those bottoms is dead.
+  Before the filter 12 of 16 configurations spent their slot dying at row 1.
+  The same border refined with `--decker_reserve 12` held piece 80 in all 4
+  rows, and all 40 of its best-ranked bottoms were dead: a border whose
+  bottom-right cell is forced onto one piece cannot give that piece to the
+  top.
 - `--random_edges` has no rotations row and refuses the flag.
 
 **What it costs, measured** (real seed, cached database, width 20000, 4
@@ -1438,24 +1444,30 @@ no clues):
 
 | held | configurations reaching row 10 | boards |
 |---|---|---|
-| none | 16 of 16 | 12,784 (dived best 459) |
+| none | 16 of 16 | 12,847 |
 | 8 random | 16 of 16 | 454 |
 | 16 random | 0 of 16 (all die at 10) | 0 |
 | 26 random | 0 of 16 (8 at 9, 8 at 10) | 0 |
 | 26, the TOP reserve | 0 of 16 (8 at 9, 8 at 10) | 0 |
 
-At `--stop_row 11` the unreserved run reached row 11 in 5 of 16
+The same one-row file was run with and without the flag, so the
+configurations are the same. Even 8 held pieces cost 96% of the boards,
+though every configuration still reached row 10. At `--stop_row 11` (4 rows x
+2 bottoms x 2 columns) the unreserved run reached row 11 in 5 of 16
 configurations and the reserved one in none. The beam's reach is set by how
-many pieces are still free: it dies near row 11 with 56 left unreserved, and
-holding pieces moves that point down, whichever pieces they are. At the
-default reserve size the flag is therefore **not** a way to reach row 11; it
-is for a small reserve (`--decker_reserve 12` holds 14, between the 8 that
-cost little and the 16 that stopped every configuration), a wider beam, or a
-lower stop row whose boards another stage finishes. Nothing yet lays row 14
-out from the reserve on an emitted board -- the dives place the held pieces
-wherever they fit -- so the payoff needs a closing step: the finalizer, locked
-at the stop row with the witness's row 14 on top, is the natural one
-(*Locked top rows*).
+many pieces are still free: unreserved it dies at row 11 with 56 left, and
+the held runs died with 44-58 free, whichever pieces were held. At the default
+reserve size the flag is therefore **not** a way to reach row 11 or even row
+10 at width 20000; the measured room is under 16 held pieces, or a wider beam,
+or a lower stop row whose boards another stage finishes.
+
+Nothing yet turns the hold into a finished top. Emitted boards leave the held
+pieces unplaced and the dives put them wherever they fit; the finalizer
+returns every spin-1 piece to the pool (it reads no marks), and no tool lays
+the witness's rows 14-15 onto a beamer partial. That closing step -- stamp the
+witness's top two rows onto each stop-row board and let the finalizer's
+locked-top search (*Locked top rows*) fill the rows between -- is what the
+hold is for, and it is not built.
 
 ### Settings for reaching row 11 (measured)
 
