@@ -105,7 +105,8 @@ DOUBLE DECKER -- two-tall border segments (--double_decker [SIDES])
         count, TOP/RIGHT/BOTTOM/LEFT, `-` for a classic side), `DeckerPool=`
         (the whole-pool bound) and `Board=dd<seed>_r<N>`; TOP=.. and the rest
         stay the CLASSIC counts of the spins, so every reader of the file
-        reads it as before, and Score= is the double-decker objective;
+        reads it as before; Score= is the border's classic score, as in any
+        row, and Score_dd= the double-decker objective;
       - a side code instead of spin 0 on every reserved piece and every
         block's inner piece: 1 = TOP (row 14), 2 = BOTTOM (row 1), 3 = LEFT or
         RIGHT (columns 1 and 14); a block piece takes its row's code. The
@@ -478,6 +479,10 @@ class BestRecord:
     flags:        Tuple[Tuple[int, int], ...] = ()   # (piece id, side code)
     dd_pool:      Optional[Dict[Side, int]] = None           # whole-pool bounds
     reserve:      Optional[Dict[Side, Tuple[int, ...]]] = None
+    # --double_decker only: the border's own classic score under the weights in
+    # force -- `score` above is then the double-decker objective. The comment
+    # writes this one as Score= and the objective as Score_dd=.
+    classic_score: Optional[float] = None
 
 @dataclass
 class RestartResult:
@@ -1369,9 +1374,14 @@ def append_rotations(row_id: str, rec: BestRecord, out_path: str,
     # `extra` is the Decker=/Board= note.
     for pid, code in rec.flags:
         full[pid - 1] = code
+    # Score= is always the border's classic score, so every file ranks borders
+    # alike; a double decker adds its objective as Score_dd= (the token cannot
+    # match a reader's `\bScore[=,]`, the underscore being a word character).
+    scores = (f"Score={rec.score:.4f}" if rec.classic_score is None else
+              f"Score={rec.classic_score:.4f}  Score_dd={rec.score:.4f}")
     with open(out_path, "a") as f:
         f.write(f"#  {best_counts_str(rec).replace(',', ' ')}  "
-                f"{extra}Score={rec.score:.4f}{provenance}\n")
+                f"{extra}{scores}{provenance}\n")
         f.write(f"{row_id}, " + ",".join(map(str, full)) + "\n")
 
 def print_header(pieces: Sequence[Piece], corner_ids: List[int], edge_ids: List[int],
@@ -2328,7 +2338,8 @@ def dd_best_record(ctx: DeckerContext, st: DeckerState, step: int,
     return BestRecord(score=st.score, euler_counts=rs.euler_counts(),
                       rot_vec=rotation_vector(ctx.pieces_by_id, rs), step=step,
                       dd_counts=dd_counts(st), board=(pos, rot), flags=tuple(flags),
-                      dd_pool=pool, reserve={s: tuple(sorted(r)) for s, r in st.reserve.items()})
+                      dd_pool=pool, reserve={s: tuple(sorted(r)) for s, r in st.reserve.items()},
+                      classic_score=rs.score)
 
 def dd_state_str(st: DeckerState, config: AnnealingConfig) -> str:
     return "  ".join(f"{SIDE_NAMES[s]}{'*' if s in config.decker_sides else ''}"
@@ -2835,8 +2846,11 @@ def run_annealing(pieces: Sequence[Piece], config: AnnealingConfig,
               f"{what} {baseline:.4f}")
     if champion is not None:
         ec = champion.best.euler_counts
-        print(f"[sum] best: restart {champion.restart}  score={champion.best.score:.4f}  "
-              f"TOP={ec[Side.TOP]} RIGHT={ec[Side.RIGHT]} "
+        cs = champion.best.classic_score
+        print(f"[sum] best: restart {champion.restart}  "
+              + (f"score={champion.best.score:.4f}  " if cs is None else
+                 f"score_dd={champion.best.score:.4f}  score={cs:.4f}  ")
+              + f"TOP={ec[Side.TOP]} RIGHT={ec[Side.RIGHT]} "
               f"BOTTOM={ec[Side.BOTTOM]} LEFT={ec[Side.LEFT]}"
               + (f"  Decker={decker_token(champion.best, config)}  "
                  f"DeckerPool={decker_pool_token(champion.best, config)}  "

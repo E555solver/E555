@@ -80,18 +80,23 @@ SIDES = RT.SIDE_NAMES                   # ("top", "right", "bottom", "left")
 # spacing, which is what lets the `=` and the `,` form each stay themselves.
 SIDES_RE = re.compile(r"\b(TOP|RIGHT|BOTTOM|LEFT)(\s*[=,]\s*)(\d+)")
 SCORE_RE = re.compile(r"\bScore\s*[=,]\s*(-?[\d.]+(?:[eE][-+]?\d+)?)")
+# A --double_decker row also carries its own objective; SCORE_RE cannot match
+# it, the underscore being a word character.
+SCORE_DD_RE = re.compile(r"\bScore_dd\s*=\s*(-?[\d.]+(?:[eE][-+]?\d+)?)")
 
 # Sorting is always best-first, as in E555_rank.py: a '-' prefix asks for
 # worst-first instead. "Best" for a named side or the score is the larger
 # number -- they are magnitudes. The three derived keys exist for the opposite
 # question, finding a CONSTRAINED border rather than a big one, so they sort
 # constraint-first: tightest minimum, tightest maximum, most lopsided.
-SORTABLE = ("score", "top", "right", "bottom", "left",
+SORTABLE = ("score", "score_dd", "top", "right", "bottom", "left",
             "min_side", "max_side", "spread")
-HIGH_IS_BETTER = {"score", "top", "right", "bottom", "left", "spread"}
+HIGH_IS_BETTER = {"score", "score_dd", "top", "right", "bottom", "left", "spread"}
 
 DIRECTIONS = """sort keys, all best-first (--sort=-KEY inverts one):
-  score                the annealer's own objective, highest first
+  score                the border's score (Score=), highest first
+  score_dd             a --double_decker row's objective (Score_dd=), highest
+                       first; rows without one sort last
   top right bottom left  that side's Euler-trail count, highest first
   min_side             the row's tightest side, TIGHTEST first
   max_side             the row's loosest side, tightest first
@@ -120,7 +125,13 @@ def score_of(comment):
     return float(m.group(1)) if m else None
 
 
-def measures(score, counts):
+def score_dd_of(comment):
+    """A --double_decker row's Score_dd=, or None."""
+    m = SCORE_DD_RE.search(comment) if comment else None
+    return float(m.group(1)) if m else None
+
+
+def measures(score, counts, score_dd=None):
     """One record of every sortable measure; None for one the comment lacks.
 
     A row with counts but no score still sorts correctly by a side key, and the
@@ -132,6 +143,7 @@ def measures(score, counts):
     rec = {k: None for k in SORTABLE}
     rec["unknown"] = 0 if (score is not None and counts is not None) else 1
     rec["score"] = score
+    rec["score_dd"] = score_dd
     if counts is None:
         return rec
     vals = [counts[s] for s in SIDES]
@@ -182,7 +194,7 @@ def parse(path):
             borders.append({"comment": pending, "row": line, "lineno": lineno,
                             "spins": [int(f) for f in fields[1:]],
                             "counts": counts, "score": score,
-                            "m": measures(score, counts)})
+                            "m": measures(score, counts, score_dd_of(pending))})
             pending = None
     if pending is not None:
         preamble.append(pending)
@@ -288,7 +300,7 @@ def orient(borders, dst, want_max, flag, seed):
         counts = turn_counts(b["counts"], n)
         b = dict(b, row=row, spins=spins, counts=counts,
                  comment=turn_comment(b["comment"], counts, n, flag),
-                 m=measures(b["score"], counts))
+                 m=measures(b["score"], counts, b["m"]["score_dd"]))
         turns[n] = turns.get(n, 0) + 1
         kept.append(b)
     if turns:

@@ -420,7 +420,14 @@ What each written border carries:
   whole-pool bounds) and `Board=dd<seed>_r<N>`, next to the trail counts.
   `TOP=..` and the rest stay the classic counts of the spins, so `--input`'s
   cross-check and `E555_sort_rotations.py` read the row as before; no new
-  token contains a side name. `Score=` is the double-decker objective.
+  token contains a side name. `Score=` is the border's own classic score
+  under the weights in force, as in any rotations row, so every file ranks
+  borders alike; `Score_dd=` is the double-decker objective, the mean over
+  the four sides of each side's log count (the `Decker=` count on a two-tall
+  side, the classic one elsewhere). The two are on different scales -- a
+  double decker's counts are single or double digits where a border's are
+  thousands, so `Score_dd=` sits around 1-2 and `Score=` around 8-9. The run
+  summary prints both.
 - **The rotations row** marks every reserved piece and every block's inner
   piece with the side it is for, in place of spin 0: **1 = TOP** (row 14),
   **2 = BOTTOM** (row 1), **3 = LEFT or RIGHT** (columns 1 and 14; a spin has
@@ -3262,7 +3269,8 @@ come back infeasible on a clue-broken board and the ladder simply climbs.
   row of that file `-inf` and silently degenerated the sort to input order.
   `--sort` takes comma-separated keys, best board first, `--sort=-KEY` to invert
   one, as `E555_rank.py` does. `score` and the four side names are magnitudes and
-  sort largest first. The three derived keys answer the opposite question --
+  sort largest first; `score_dd` is a `--double_decker` row's `Score_dd=`, also
+  largest first, with rows that carry none sorted last. The three derived keys answer the opposite question --
   which border is *constrained*, not which is big -- and so sort
   constraint-first: `min_side` puts the tightest side first, `max_side` the
   tightest maximum, and `spread`, `ln(max side) - ln(min side)`, the most
