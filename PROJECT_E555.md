@@ -360,7 +360,7 @@ border's potential.
   0.045 gave 80-192 and 0.02 gave 113-315; on row 5, which probes as
   polishing (T0 = 0.0455: 372-1888), T0 = 0.1 gave 540-2038.
 - **Temperatures.** A cold run has two phases with two schedules. The
-  classic warm-up (`--decker_warmup`, 30% of the steps) finds a usable border
+  classic warm-up (`--decker_warmup`, 50% of the steps) finds a usable border
   and runs on the classic schedule, the header's `T0=11.25 Tf=9`, sized to
   cross the feasibility cliff. The double-decker phase that follows is probed
   per restart over its own moves and printed per restart (`restart N:
@@ -398,9 +398,18 @@ border's potential.
   count. When they must not move at all, `--decker_keep_border` forbids every
   move that changes a side's edge set, and the spins that come back are the
   input's (the gate checks this).
-- **Cold and warm.** A cold restart spends `--decker_warmup` (0.3) of its steps
+- **Cold and warm.** A cold restart spends `--decker_warmup` (0.5) of its steps
   in the classic walk to find a usable border, then seeds the blocks and the
-  reserves on it: one fillable inner row, grown greedily to K. A warm start
+  reserves on it: one fillable inner row, grown greedily to K. The warm-up
+  picks the corners for good -- no double-decker move swaps them -- so its
+  border is the one the double decker has to live with. Measured on the bare
+  flag at 250000 steps (2 seeds x 4 restarts): warm-up 0.1 / 0.3 / 0.5 gave a
+  mean double-decker score of 1.53 / 1.68 / 1.69, with 1 / 0 / 0 of 8 restarts
+  never usable, and a classic border score after the warm-up of 7.96 / 8.12 /
+  8.53. 0.3 and 0.5 tie on the double decker (restart SD ~0.26), and 0.5 hands
+  the beamer the better border, hence the default. At 60000 steps the
+  double-decker phase is itself short of steps and the order reverses slightly
+  (1.32 at 0.1, 1.12 at 0.7, within noise), so keep real runs at 250000+. A warm start
   seeds on the input row and cannot come back below that seed. Whole-file mode
   works the same way, row by row.
 

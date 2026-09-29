@@ -97,7 +97,7 @@ DOUBLE DECKER -- two-tall border segments (--double_decker [SIDES])
     already reserved), trade them between sides, change a block, or move edges
     between sides; --decker_keep_border forbids the last, so the spins that
     come back are the input's. A cold restart first runs the classic walk for
-    --decker_warmup (0.3) of its steps to find a usable border; a warm start
+    --decker_warmup (0.5) of its steps to find a usable border; a warm start
     builds on the input row and cannot come back below its seeded reserve.
 
     Each written border then carries:
@@ -343,7 +343,7 @@ class AnnealingConfig:
     decker_sides:         Tuple[int, ...] = ()
     decker_reserve:       int = 16
     decker_keep_border:   bool = False
-    decker_warmup:        float = 0.3
+    decker_warmup:        float = 0.5
     block_penalty_weight: float = 10.0
     decker_T0:            Optional[float] = None
     decker_Tf:            Optional[float] = None
