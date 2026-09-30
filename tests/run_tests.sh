@@ -98,6 +98,7 @@ ALL_STEPS=(
     "backtracker_breakcount|break classes agree with the per-candidate scan they replaced"
     "backtracker_clues|--clue_center/--clue_corners force the hints on, or drop the board"
     "diver|E555_diver finishes held boards: identical at 1 and 4 threads, scores recount, placed cells untouched"
+    "diver_reopen|E555_diver --reopen: never worse, one row per board, only the band changes; scrambled top rows come back 480/480; copies differ"
     "whirlpool_lap|one whirlpool lap: turn, re-cut rows 0..5, re-grow to row 11"
     "clue_orient|a band carrying no clue is searched at all four orientations"
     "band_with_frame|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
@@ -113,6 +114,7 @@ ALL_STEPS=(
     "example_cpsat|examples/04a, scout -> promote -> polish -> close"
     "example_backtracker|examples/05 dives on the example board"
     "example_diver|examples/10 finishes the row-12 partial into a complete board"
+    "example_diver_reopen|examples/11 re-dives the seven 463s: one row each, none worse"
     "pipeline_topper_sweep|pipeline/topper_sweep.sh through a two-pass plan"
     "example_beamer|examples/01 both ways, random and annealed borders"
     "pipeline_full|pipeline/run_pipeline.sh, all seven stages"
@@ -2252,6 +2254,99 @@ EOF
     echo "ok: identical at 1 and 4 threads; misfit, complete and malformed rows handled"
 }
 
+# --reopen, --copies, --rounds: a complete board comes back as one row, never
+# worse, changed only inside the band it was reopened on; a synthetic solution
+# with its top rows scrambled comes back 480/480 (the band has a perfect fill,
+# and the dive finds it); copies dive differently; output independent of
+# --threads.
+step_diver_reopen() {
+    python3 - "$OUT/dvr_synth.csv" <<'EOF' || fail "could not build the reopen fixtures"
+import csv, random, sys
+row = next(csv.reader(open("data/synth_solution_480.csv")))
+f = [x.strip() for x in row]
+pos, rot = [int(x) for x in f[-512:-256]], [int(x) for x in f[-256:]]
+at = {pos[p]: p for p in range(256)}
+w = csv.writer(open(sys.argv[1], "w", newline=""), lineterminator="\n")
+w.writerow(["synth_clean", 480] + pos + rot)
+rng = random.Random(3)
+inner = [r * 16 + c for r in range(12, 15) for c in range(1, 15)]
+ps = [at[c] for c in inner]
+rng.shuffle(ps)                                  # rows 12-14 inner pieces shuffled, re-spun
+for c, p in zip(inner, ps):
+    pos[p], rot[p] = c, rng.randrange(4)
+a, b = at[15 * 16 + 4], at[15 * 16 + 10]         # two top-border pieces exchanged
+pos[a], pos[b] = pos[b], pos[a]
+w.writerow(["synth_top", 0] + pos + rot)
+EOF
+    bin/E555_diver data/synth_seed.txt "$OUT/dvr_synth.csv" "$OUT/dvr_synth_out.csv" \
+        --reopen top:4 --copies 4 --end_dive 2000 --end_polish 200 --emit_score 0 \
+        --threads 4 --rng_seed 3 > "$OUT/dvr_synth.log" || fail "E555_diver --reopen failed"
+    grep -q "1 board(s) score 480/480: nothing is broken" "$OUT/dvr_synth.log" \
+        || grep -q "reopened" "$OUT/dvr_synth.log" || fail "no reopen summary"
+    n=$(grep -c . "$OUT/dvr_synth_out.csv")
+    [ "$n" = 2 ] || fail "two boards in, $n rows out (one per board expected)"
+    python3 tools/E555_rank.py "$OUT/dvr_synth_out.csv" --seed_file data/synth_seed.txt \
+        --csv > "$OUT/dvr_synth_rank.csv"
+    bad=$(awk -F, 'NR>1 && $4!=480' "$OUT/dvr_synth_rank.csv" | head -1)
+    [ -z "$bad" ] || { cat "$OUT/dvr_synth_rank.csv"; tail -4 "$OUT/dvr_synth.log";
+        fail "the scrambled top rows did not come back to 480/480"; }
+
+    # A real board, auto band, copies and rounds: one row, never worse, only
+    # the band changed, identical at 1 and 4 threads.
+    for t in 1 4; do
+        bin/E555_diver data/seed_Edge5.txt data/board_example_462.csv "$OUT/dvr_462_$t.csv" \
+            --reopen auto --rounds 2 --copies 3 --orders mrv,left,centre --prior 1 --nogo 1 \
+            --end_dive 400 --end_polish 40 --emit_score 0 --threads $t --rng_seed 9 \
+            --print_cmd --verbose > "$OUT/dvr_462_$t.log" \
+            || fail "E555_diver --reopen auto failed at $t thread(s)"
+    done
+    cmp -s "$OUT/dvr_462_1.csv" "$OUT/dvr_462_4.csv" || fail "1 and 4 threads wrote different boards"
+    grep -q "\[copies\]" "$OUT/dvr_462_1.log" || fail "no per-copy report under --verbose"
+    python3 - data/seed_Edge5.txt data/board_example_462.csv "$OUT/dvr_462_1.csv" <<'EOF' || exit 1
+import sys
+seed = [list(map(int, l.split())) for l in open(sys.argv[1]) if l.strip() and not l.startswith("#")]
+def rows(path):
+    return [[x.strip() for x in l.split(",")] for l in open(path) if l.strip() and l[0] not in "#%"]
+def cells(f):
+    pos, rot = list(map(int, f[-512:-256])), list(map(int, f[-256:]))
+    return {pos[p]: (p, rot[p]) for p in range(256)}
+def score(c):
+    side = lambda x, d: seed[c[x][0]][(d + c[x][1]) % 4]
+    return sum(side(x, 1) == side(x + 1, 3) for x in range(256) if x % 16 < 15) \
+         + sum(side(x, 0) == side(x + 16, 2) for x in range(240))
+src, out = rows(sys.argv[2]), rows(sys.argv[3])
+if len(out) != len(src):
+    sys.exit("!!! %d boards in, %d rows out" % (len(src), len(out)))
+a, b = cells(src[0]), cells(out[0])
+if sorted(b) != list(range(256)):
+    sys.exit("!!! the written board is not complete")
+if score(b) != int(out[0][1]) or score(b) < score(a):
+    sys.exit("!!! score field %s, recount %d, input %d" % (out[0][1], score(b), score(a)))
+moved = [x for x in range(256) if a[x] != b[x]]
+dist = lambda x, k: (15 - x // 16, x // 16, x % 16, 15 - x % 16)[k]
+if moved and not any(all(dist(x, k) < 5 for x in moved) for k in range(4)):
+    sys.exit("!!! cells changed outside any 5-deep band: %s" % moved)
+print("ok: %d -> %d, %d cells changed, all in one band" % (score(a), score(b), len(moved)))
+EOF
+
+    # Copies of a partial board dive differently (they once shared one stream).
+    bin/E555_diver data/seed_Edge5.txt data/board_partial_row12.csv "$OUT/dvr_cp.csv" \
+        --copies 4 --end_dive 200 --emit_score 0 --threads 4 --rng_seed 5 --verbose \
+        > "$OUT/dvr_cp.log" || fail "E555_diver --copies failed"
+    grep "\[copies\]" "$OUT/dvr_cp.log" > "$OUT/dvr_cp_lines.txt" || fail "no [copies] line"
+    python3 - "$OUT/dvr_cp_lines.txt" <<'EOF' || exit 1
+import re, sys
+for l in open(sys.argv[1]):
+    s = [int(x) for x in re.findall(r"-?\d+", l.split(":", 1)[1].split("->")[0])]
+    if len(s) == 4 and len(set(s)) > 1:
+        print("ok: four copies scored %s" % s)
+        sys.exit(0)
+sys.exit("!!! the four copies scored alike: %s" % open(sys.argv[1]).read().strip())
+EOF
+    echo "ok: reopened boards never worse and one row each; scrambled top rows restored to" \
+         "480/480; copies differ; identical at 1 and 4 threads"
+}
+
 # One whirlpool lap: turn the board, re-cut rows 0..5 exactly, re-grow to row 11.
 # The assertions are the lap's geometry, which is what a rotation-sense error
 # would silently break: a turned rows-0..10 board must have 11 complete COLUMNS
@@ -2542,6 +2637,8 @@ EOF
         || { tail -5 "$OUT/ender_462.log"; fail "the ender exited non-zero on the 462 board"; }
     grep -Eq "redives=[1-9]" "$OUT/ender_462.log" \
         || { tail -3 "$OUT/ender_462.log"; fail "no redive ran on the 462 board"; }
+    ! grep -q "redive: .* failed" "$OUT/ender_462.log" \
+        || { grep "redive:" "$OUT/ender_462.log"; fail "the redive's E555_diver call failed"; }
     score=$(python3 tools/E555_rank.py "$OUT/ender_462.csv" \
             --seed_file data/seed_Edge5.txt --csv | awk -F, 'NR==2{print $4}')
     [ "${score:-0}" -ge 462 ] || fail "the 462 board came back at $score"
@@ -2882,6 +2979,21 @@ step_example_diver() {
     [ "$nf" = "514" ] || fail "examples/10 wrote $nf fields, want 514"
     grep -q "placed=256" "$OUT/ex10.log" || fail "examples/10 did not finish the board"
     echo "ok: examples/10 finished the partial into a canonical 256-piece board"
+}
+
+step_example_diver_reopen() {
+    bash examples/11_diver_reopen.sh OUT="$OUT/ex11.csv" SECONDS_PER_BOARD=1 THREADS=4 \
+        > "$OUT/ex11.log" || { tail -5 "$OUT/ex11.log"; fail "examples/11 exited non-zero"; }
+    n=$(grep -c . "$OUT/ex11.csv")
+    [ "$n" = 7 ] || fail "examples/11 wrote $n rows for the 7 boards of data/best_463.csv"
+    nf=$(awk -F, '{print NF; exit}' "$OUT/ex11.csv")
+    [ "$nf" = "514" ] || fail "examples/11 wrote $nf fields, want 514"
+    python3 tools/E555_rank.py "$OUT/ex11.csv" --seed_file data/seed_Edge5.txt --csv \
+        > "$OUT/ex11_rank.csv"
+    worse=$(awk -F, 'NR>1 && $4<463' "$OUT/ex11_rank.csv" | head -1)
+    [ -z "$worse" ] || fail "examples/11 returned a board below 463: $worse"
+    grep -q " -> " "$OUT/ex11.log" || fail "examples/11 printed no before -> after table"
+    echo "ok: examples/11 re-dived the seven 463s, one row each, none worse"
 }
 
 # Two passes: one that unsets the outer rows, one that fills them back in. That

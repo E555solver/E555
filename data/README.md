@@ -11,7 +11,7 @@ CSVs), **borders** (Stage A output), and **holes** (movable-cell masks).
 | **boards** | |
 | `board_example_462.csv` | A real 462/480 board from a long Stage B + Stage C campaign -- the standard guinea pig for the tail tools and the viewer. |
 | `best_463.csv` | The **7 best full boards found so far**, all 463/480, as a gallery. `python3 tools/E555_rank.py data/best_463.csv` sorts them by compactness. |
-| `best_465.csv` | **465/480**: the first board of `best_463.csv` after the ender's *redive* -- rows 12-15 lifted and re-dived with `E555_diver` (`--end_dive 50000 --end_polish 50000`, 4 copies per call; two of four calls reached 465). 28 cells changed, all in rows 12-15; two new breaks on the row-11/12 seam paid for four fewer above it. |
+| `best_465.csv` | **465/480**: the first board of `best_463.csv` after the ender's *redive* -- rows 12-15 lifted and re-dived with `E555_diver` (`--end_dive 50000 --end_polish 50000`; two of four calls, under different seeds, reached 465). 28 cells changed, all in rows 12-15; two new breaks on the row-11/12 seam paid for four fewer above it. |
 | `board_partial_row12.csv` | A genuine **Stage B beam output** on `seed_Edge5` (id `r0c669`, from the low-B Mahalanobis campaign): rows 0-12 filled, rows 13-15 still open, the bottom 12 rows already clean. The realistic input for the Stage C tools, which expect a partial. Field 2 here is the beamer's solution **index**, not the edge score (see the convention below). |
 | `synth_solution_480.csv` | The known 480/480 solution of the synthetic set, as a canonical board row. Used by `tests/run_tests.sh` as the finalizer regression: the finalizer must rediscover it from a partial locked at row 10. |
 | **borders** (Stage A output, feed to the beamer as its rotations CSV) | |

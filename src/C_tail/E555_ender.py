@@ -702,6 +702,7 @@ def border_band(break_cells, extra, cap):
 
 
 DIVER_OVERRIDE = None                       # --diver PATH
+_REDIVE_WARNED = False                      # a failing diver is reported once
 
 def diver_path():
     """The E555_diver binary: --diver, else bin/ of this script's repository."""
@@ -711,10 +712,15 @@ def diver_path():
 
 
 def redive(seed_file, tiles, at, cells, *, copies, dives, polish, threads, rng_seed,
-           keep=(), wall=None):
-    """Re-dive `cells` with E555_diver: lift their pieces, dive the holes
-    `copies` times (each copy its own random streams) with --end_dive/--end_polish,
-    and return the best finished board's cell map, or None.
+           keep=(), wall=None, plateau=False, prior=0.0, nogo=0.0):
+    """Re-dive `cells` of the complete board `at` with E555_diver --reopen: the
+    cells (minus `keep`, the clues) go to the diver as a mask, which lifts
+    them and dives them in `copies` copies a round (each on random streams of
+    its own, --end_dive/--end_polish per copy), round after round from the
+    best board so far until `wall` seconds are spent (one round without a
+    wall).  The diver never returns a worse board; `plateau` lets its rounds
+    move to a different board of the same score.  Returns the finished
+    board's cell map, or None.
 
     This is the dive engine as a large-neighbourhood move.  On boards whose top
     rows were dived and polished, re-diving the SAME rows with fresh seeds
@@ -723,33 +729,50 @@ def redive(seed_file, tiles, at, cells, *, copies, dives, polish, threads, rng_s
     row was fixed when the dive chose the top's pieces, and freeing it gives
     the dive different pieces to work with.  CP-SAT on the same 64 cells found
     nothing in 120 s; a dive is the stronger recreate at this size, CP-SAT the
-    stronger exact search on a window.  `keep` cells stay placed (clues)."""
+    stronger exact search on a window."""
+    global _REDIVE_WARNED
     import os, subprocess, tempfile
     exe = diver_path()
     if exe is None:
         return None
+    lift = {c for c in cells if c not in keep and at[c] is not None}
+    if not lift or any(v is None for v in at):
+        return None
     pos, rot = posrot_of(at)
-    for c in cells:
-        if c in keep or at[c] is None:
-            continue
-        p = at[c][0]
-        pos[p], rot[p] = CSV_UNPLACED, 0
     with tempfile.TemporaryDirectory(prefix="ender_redive_") as tmp:
         src, dst = os.path.join(tmp, "in.csv"), os.path.join(tmp, "out.csv")
+        mask = os.path.join(tmp, "reopen.csv")
         with open(src, "w", newline="") as fh:
-            w = csv.writer(fh, lineterminator="\n")
-            for k in range(copies):
-                w.writerow([f"redive{k}", 0] + pos + rot)
-        cmd = [str(exe), seed_file, src, dst, "--end_dive", str(dives),
-               "--end_polish", str(polish), "--emit_score", "0",
+            csv.writer(fh, lineterminator="\n").writerow(["redive", 0] + pos + rot)
+        with open(mask, "w") as fh:            # the --holes format: row 0 first
+            for r in range(SIDE):
+                fh.write(",".join("1" if r * SIDE + c in lift else "0"
+                                  for c in range(SIDE)) + "\n")
+        # --copies, not K rows of one board: the diver keys a board's random
+        # streams on its content, so K identical rows would dive identically.
+        cmd = [str(exe), seed_file, src, dst, "--reopen", mask, "--copies", str(copies),
+               "--end_dive", str(dives), "--end_polish", str(polish), "--emit_score", "0",
                "--threads", str(threads), "--rng_seed", str(rng_seed)]
         if wall is not None and wall != float("inf"):
-            # each copy is a batch of its own, and the diver stops after the
-            # batch in flight, so this bounds the overrun to one copy
-            cmd += ["--wall_time", str(max(1, int(wall)))]
+            # rounds until the wall: the engine stops its dives and polish
+            # there, so the overrun is a fraction of a second
+            cmd += ["--rounds", "1000000", "--wall_time", str(max(1, int(wall)))]
+        if plateau:
+            cmd += ["--plateau"]
+        if prior > 0:
+            cmd += ["--prior", f"{prior:g}"]
+        if nogo > 0:
+            cmd += ["--nogo", f"{nogo:g}"]
         try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           check=True, timeout=3600)
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           check=True, timeout=None if wall is None else wall + 600)
+        except subprocess.CalledProcessError as e:
+            if not _REDIVE_WARNED:
+                tail = (e.stderr or b"").decode(errors="replace").strip().splitlines()[-1:]
+                print(f"[warn] redive: {exe} failed ({'; '.join(tail) or e.returncode}); "
+                      f"an old binary? rebuild it with `make diver`", flush=True)
+                _REDIVE_WARNED = True
+            return None
         except (subprocess.SubprocessError, OSError):
             return None
         best = None
@@ -780,11 +803,14 @@ class Step:
     h: int = 0                 # window height / band depth / corner block size;
                                # redive: extra clean rows beyond the damage
     w: int = 0                 # window width; redive: cap on the band depth
-    seconds: float = 10.0
+    seconds: float = 10.0      # redive: the diver's wall clock per call
     corral: bool = False
     sets: int = 0              # swap: independent sets per visit; redive: copies
     dives: int = 0             # redive: --end_dive per copy
     polish: int = 0            # redive: --end_polish per copy
+    plateau: bool = False      # redive: --plateau
+    prior: float = 0.0         # redive: --prior (pull toward the incumbent's clean placements)
+    nogo: float = 0.0          # redive: --nogo (push off its broken ones)
 
 
 @dataclass(frozen=True)
@@ -801,7 +827,7 @@ EFFORT_PROFILES = {
     "overnight": EffortProfile(
         board_seconds=180.0, workers=4,
         plan=(Step("swap", sets=24),
-              Step("redive", 0, 5, sets=8, dives=50000, polish=50000),
+              Step("redive", 0, 5, 45.0, sets=8, dives=3000, polish=1000, prior=1.0, nogo=1.0),
               Step("window", 3, 5, 4.0),
               Step("window", 4, 5, 8.0),
               Step("window", 4, 7, 15.0),
@@ -811,12 +837,12 @@ EFFORT_PROFILES = {
     "deep": EffortProfile(
         board_seconds=900.0, workers=8,
         plan=(Step("swap", sets=48),
-              Step("redive", 0, 5, sets=8, dives=50000, polish=50000),
+              Step("redive", 0, 5, 90.0, sets=8, dives=3000, polish=1000, prior=1.0, nogo=1.0),
               Step("window", 4, 4, 5.0),
               Step("window", 4, 6, 12.0),
               Step("window", 5, 6, 20.0),
               Step("corner", 5, 0, 45.0),
-              Step("redive", 0, 5, sets=8, dives=50000, polish=50000),
+              Step("redive", 0, 5, 90.0, sets=8, dives=3000, polish=1000, prior=1.0, nogo=1.0),
               Step("window", 5, 8, 40.0),
               Step("band", 4, 0, 120.0),
               Step("frame", 0, 0, 90.0),
@@ -825,12 +851,12 @@ EFFORT_PROFILES = {
     "superdeep": EffortProfile(
         board_seconds=7200.0, workers=12,
         plan=(Step("swap", sets=96),
-              Step("redive", 0, 5, sets=16, dives=50000, polish=100000),
+              Step("redive", 0, 5, 600.0, sets=16, dives=3000, polish=1000, prior=1.0, nogo=1.0),
               Step("window", 4, 4, 8.0),
               Step("window", 4, 6, 20.0),
               Step("window", 5, 6, 40.0),
               Step("corner", 6, 0, 120.0),
-              Step("redive", 1, 6, sets=8, dives=50000, polish=100000),
+              Step("redive", 1, 6, 300.0, sets=8, dives=3000, polish=1000, prior=1.0, nogo=1.0),
               Step("window", 5, 8, 90.0),
               Step("window", 6, 8, 180.0),
               Step("band", 5, 0, 600.0),
@@ -1159,7 +1185,10 @@ def solve_board(partial, tiles, policy, workers, base_seed, verbose, *,
                 new = redive(policy["seed_file"], tiles, at, band & allowed,
                              copies=step.sets, dives=step.dives, polish=step.polish,
                              threads=workers, rng_seed=rng.randrange(1, 1 << 30),
-                             keep=keep, wall=remaining())
+                             keep=keep, plateau=step.plateau,
+                             prior=step.prior, nogo=step.nogo,
+                             wall=min(max(MIN_CALL_SECONDS, step.seconds * scale),
+                                      remaining()))
                 stats["redives"] += 1
                 if new is not None and accept(new, label, False) == "strict":
                     progress = True
@@ -1400,7 +1429,10 @@ def main():
         if s.kind == "swap":
             return f"swap{s.sets}"
         if s.kind == "redive":
-            return f"redive+{s.h}(x{s.sets},{s.dives}/{s.polish})"
+            return (f"redive+{s.h}(x{s.sets},{s.dives}/{s.polish}"
+                    + (f",prior{s.prior:g}" if s.prior else "")
+                    + (f",nogo{s.nogo:g}" if s.nogo else "")
+                    + (",plateau" if s.plateau else "") + f")/{s.seconds:g}s")
         head = (f"window{s.h}x{s.w}" if s.kind == "window" else f"{s.kind}{s.h or ''}")
         return head + ("(corral)" if s.corral else "") + f"/{s.seconds:g}s"
 

@@ -71,7 +71,8 @@ data/seed_Edge5.txt
 │   E555_topper.py      break minimizer; herds breaks to the NEAREST    │
 │                       corner; --side opens any border band            │
 │   E555_backtracker    exact / bounded-mismatch DFS tail closer        │
-│   E555_diver          the beamer's end dives + polish on any board    │
+│   E555_diver          end dives + polish on any board; --reopen       │
+│                       re-dives complete boards, never worse           │
 │   E555_ender.py       exact regions + redive; never returns worse     │
 │   - laptop             - output → canonical board CSV, score /480     │
 └───────────────────────────────────────────────────────────────────────┘
@@ -2958,6 +2959,8 @@ containers, not for a real run.
 bin/E555_diver seed.txt boards.csv output.csv [--end_dive M] [--end_polish R]
                [--emit_score S] [--rotations FILE] [--corner_seeds N] [--clue_corners]
                [--threads N] [--rng_seed S] [--wall_time S] [--max_emitted N]
+               [--reopen SPEC] [--rounds N] [--copies K] [--orders LIST]
+               [--prior A] [--nogo B] [--order_weight W]
                [--print_cmd] [--verbose]
 ```
 
@@ -2972,7 +2975,8 @@ differs. It needs no chain database and starts in milliseconds.
 - **Input.** Any board CSV: the last 512 fields of a row are `pos[256]`,
   `rot[256]`, a leading field is the config id, `#` and `%` lines are comments.
   Every placed cell stays where it is; the open cells are dived. A complete
-  board has nothing to dive and is skipped, as is a row that is not a board
+  board has nothing to dive and is skipped unless `--reopen` names cells to
+  lift from it (below), as is a row that is not a board
   (a cell outside 0..255, two pieces on one cell) or one whose open cells
   cannot take its unused pieces (corners, edges and inner pieces must balance).
 - **Batches.** Consecutive rows with the same config id are dived together,
@@ -3013,13 +3017,87 @@ differs. It needs no chain database and starts in milliseconds.
 Its output is complete boards with broken edges, which is what the ender and
 the backtracker (with a holes mask) repair.
 
+#### Improving complete boards: `--reopen`, `--copies`, `--rounds`
+
+A complete board -- a dived and polished Stage B final, a 463 -- is re-dived
+by lifting cells from it and diving them again, with the complete board as
+the dives' **incumbent**: every copy's best starts as the incumbent, and a
+dive or a polish replaces it only by beating it, so the board written is
+never worse than the one read, and is the one read, unchanged, unless
+something beat it. Every input board gives one output row, under its own id.
+
+| option | default | meaning |
+|---|---|---|
+| `--reopen SPEC` | off | which cells to lift from each complete board. `auto`: of the four sides, the one whose outer band holds the most damaged cells (cells with a broken edge), deep enough to hold 90% of the damaged cells on that side's half of the board, at most 5 rows; `auto+E` adds E rows. `top:K`, `bottom:K`, `left:K`, `right:K`: that side's K outer rows or columns. Anything else is a 16x16 0/1 mask file in the `--holes` format (`#` comments, first data line row 0). A board with no broken edge under `auto` (480/480) is written as it is. Partial boards in the same file are dived as usual |
+| `--rounds N` | 1 | re-dive every reopened board N times, each round from the best board so far (the `auto` band chosen again from its damage), each round on streams of its own |
+| `--copies K` | 1 | dive every board K times, each copy on random streams of its own (copy 0's are the stock ones, so `--copies 1` is the plain diver), in one batch; the best copy is written, the earliest on a tie |
+| `--orders LIST` | `mrv` | copy k starts filling at `LIST[k mod n]`: `mrv` (the stock dive), `left`, `right`, `centre`, `ends`, `top`, `bottom`. The most constrained cell still goes first; the order only breaks ties among the most constrained cells (`--order_weight W`, default 6, against unit Gumbel noise), so copies that start in different places leave their breaks in different places |
+| `--prior A` | 0 | the dives of a reopened board start pulled toward the incumbent's placements on its clean cells (A, 0..2, the starting cross-entropy weight of piece p on cell x): stage 1 is guided by the prior, and stage 2 learns from it instead of from zero |
+| `--nogo B` | 0 | ... and pushed off its placements on cells with a broken edge (-B) |
+
+The stages are the engine's, per copy: M/10 plain dives, the learning rounds,
+the polish. With `--rounds`, `--wall_time` is the budget to give: rounds run
+until it is spent, and the round in flight stops at it and is still written.
+
+**What a dive finds when a perfect fill exists (the rotated benchmark).**
+Turn a finished board 180 degrees, so that its clean bottom rows are on top,
+and lift the top K rows: a perfect fill of them against the rows below is
+known to exist -- the original. Diving them back (50000 dives, 50000 polish
+rounds) on the fifteen boards below (eight dived 459-460s, the seven 463s),
+the dive put back a perfect fill every time at K = 3 and at K = 4, and still
+15 of 15 at K = 4 with 1000 dives and no polish. At K = 6 the outcome is
+bimodal: at 1000 dives 3 of 15 perfect, the other 12 some 30 edges short; at
+K = 8 all 15 lost (35-40 short). So when the lifted pieces *can* fill a
+four-row band perfectly against its foundation, a dive finds that fill. The
+13-17 breaks a dive leaves in the top rows of a Stage B board are there
+because the pieces left over cannot fill those rows perfectly against the
+foundation, not because the search is weak -- which is why re-diving the same
+rows gains nothing, while re-diving them together with the row they stand on,
+whose pieces the dive may then choose, does.
+
+**Measured.** Fifteen dived-and-polished boards (the eight 459-460 row-12
+finals above and the seven 463s of `data/best_463.csv`), `--reopen auto`
+(rows 12-15 on 14 of them), each board on its own with `--wall_time 15
+--rounds 100000` on 4 threads, two seeds:
+
+| setting | runs that gained | boards that gained | mean gain a run |
+|---|---|---|---|
+| `--copies 1 --end_dive 50000 --end_polish 50000` (the redive as the ender first ran it) | 5/30 | 3/15 | +0.23 |
+| `--copies 8 --end_dive 3000 --end_polish 1000` | 5/30 | 3/15 | +0.20 |
+| `--copies 4 --end_dive 12000 --end_polish 4000` | 7/30 | 4/15 | +0.30 |
+| `--copies 16 --end_dive 1000 --end_polish 300` | 5/30 | 3/15 | +0.23 |
+| 8 copies, `--orders mrv,left,right,centre,ends,top,bottom,mrv` | 5/30 | 3/15 | +0.23 |
+| 8 copies, `--prior 1 --nogo 1` | **8/30** | **5/15** | **+0.33** |
+| 8 copies, `--plateau` | 5/30 | 3/15 | +0.20 |
+| 8 copies, `--reopen auto+1` (rows 11-15) | 5/30 | 4/15 | +0.17 |
+
+The board that became `data/best_465.csv` reached 465 again in 12 of those
+16 runs. The lesson is in *which* boards gained: the same three to five, in
+every setting, within seconds -- and the other ten never, whatever the
+sampling. On those ten the redive reaches the best filling of rows 12-15 that
+their foundation allows; cheaper or more copies, fill orders and plateau
+moves only sample that same space. What did best was **correlated
+sampling**: dives that start pulled toward the incumbent's clean placements
+and pushed off its broken ones (`--prior 1 --nogo 1`) improved all three 459
+boards that any setting ever improved, where plain copies improved one. That
+is the setting `11_diver_reopen.sh` and the ender's redive use. The
+differences are within the noise of 30 runs each: the ranking is the
+direction, not a proof.
+
+Not measured: `--reopen` cycles through the corner quadrants
+(`--reopen auto --reopen box:8-15,0-7 --reopen box:8-15,8-15`) and the band
+with the frame's side arms (a mask: rows 12-15 plus columns 0 and 15 of rows
+8-11), the two moves that change the foundation itself -- the next thing to
+try on the boards the band redive leaves where they are.
+
 **Extending.** The diver is the front-end only: reading, batching, the frame
-choice and writing. A new dive policy, move or stage belongs in the engine's
-layers (`E555_dive.c`: problem, dive, learning, local search, batch,
-seeders, reporting), where the beamer gets it too. A new way of choosing what
-to dive -- a holes mask that reopens placed cells, reopened rows, another
-seeder -- belongs in the diver, as preparation of the board it hands to
-`dv_add()`.
+choice, what to reopen, and writing. A new dive policy, move or stage belongs
+in the engine's layers (`E555_dive.c`: problem, dive, learning, local search,
+batch, seeders, reporting), where the beamer gets it too; copies, incumbents
+and fill orders are engine features (`dv_queue()`, `E555_dive.h`), so the
+beamer and the finalizer can use them as well. A new way of choosing what to
+dive -- another reopen rule, another seeder -- belongs in the diver, as
+preparation of the board it hands to `dv_queue()`.
 
 ### E555_ender.py -- the closer: exact regions, cheapest first ( power tool)
 
@@ -3060,7 +3138,7 @@ changes.
 | family | region | notes |
 |---|---|---|
 | `swap` | a maximal set of pairwise non-adjacent cells, damaged cells first | with no two cells adjacent every cell's matches depend only on its own piece, so the best permutation is a **linear assignment** problem, solved exactly in milliseconds: every exchange cycle of any length, across the whole board |
-| `redive` | the outer rows holding 90 % of the damage, **including the clean row under a dived band's seam** | lifts those pieces and re-dives the holes with `bin/E555_diver` (`--end_dive`/`--end_polish`, several copies with their own random streams); the best finished board is kept if it is strictly better. Not a CP-SAT call: the dive engine is the stronger *recreate* at 64 cells, CP-SAT the stronger *exact* search on a window. `--no-redive` turns it off; without the binary it is skipped with a note |
+| `redive` | the outer rows holding 90 % of the damage, **including the clean row under a dived band's seam** | hands the board to `bin/E555_diver --reopen` with those cells as a mask: copies on random streams of their own, round after round from the best board so far, for the step's seconds (see *Improving complete boards* under `E555_diver`); the board that comes back is kept if it is strictly better. Not a CP-SAT call: the dive engine is the stronger *recreate* at 64 cells, CP-SAT the stronger *exact* search on a window. `--no-redive` turns it off; without the binary it is skipped with a note |
 | `window h x w` | every h x w (and w x h) rectangle touching a break | the workhorse on boards nothing has polished (topper, roundhouse, finalizer output); small ones prove optimal in a second or two and are cached |
 | `corner d` | a d x d corner block **plus the full frame arms on both sides** | the frame's five border colours let the arms re-thread round the corner |
 | `band k` | the k consecutive rows (or columns) holding most damage | e.g. the whole dived top |
@@ -3068,13 +3146,16 @@ changes.
 
 | profile | budget | threads | plan |
 |---|---|---|---|
-| `overnight` | 180 s | 4 | swap, redive x8, windows 3x5 4x5 4x7, band 3 |
-| `deep` | 900 s | 8 | swap, redive x8, windows 4x4 4x6 5x6, corner 5, redive x8, window 5x8, band 4, frame, corral 5x6 |
-| `superdeep` | 7200 s | 12 | swap, redive x16, windows 4x4 4x6 5x6, corner 6, redive x8 one row deeper, windows 5x8 6x8, band 5, frame, corral 5x8 |
+| `overnight` | 180 s | 4 | swap, redive 45 s, windows 3x5 4x5 4x7, band 3 |
+| `deep` | 900 s | 8 | swap, redive 90 s, windows 4x4 4x6 5x6, corner 5, redive 90 s, window 5x8, band 4, frame, corral 5x6 |
+| `superdeep` | 7200 s | 12 | swap, redive 600 s (16 copies), windows 4x4 4x6 5x6, corner 6, redive 300 s one row deeper, windows 5x8 6x8, band 5, frame, corral 5x8 |
 
-A redive copy runs `--end_dive 50000 --end_polish 50000` (100 000 polish rounds
-in `superdeep`). Call caps scale with a `--board_time_limit` that differs from
-the profile's own budget, but never below 2 s.
+A redive is one `E555_diver --reopen` call of 8 copies a round (16 in
+`superdeep`), `--end_dive 3000 --end_polish 1000 --prior 1 --nogo 1` each,
+rounds from the best board so far until the step's seconds are spent -- the
+best setting measured (`E555_diver`, *Improving complete boards*). Call caps
+and redive seconds scale with a `--board_time_limit` that differs from the
+profile's own budget, but never below 2 s.
 
 Several models run at once (`--jobs`): CP-SAT releases the GIL while it solves,
 so threads in one process give real parallelism (measured: two 4-second solves
@@ -3126,9 +3207,12 @@ Run as a whole, on the same 8 boards at `--profile overnight
 --board_time_limit 180 --threads 4`: the previous ender gained nothing on the 5
 boards it was run on (every portfolio exhausted); this one gained an edge on
 one board of 8, by redive. On the seven 463 boards of `data/best_463.csv`,
-four redive calls of four copies each lifted one board to **465**
+four redive calls under different seeds lifted one board to **465**
 (`data/best_465.csv`; two of the four calls reached it) and left the other six
-at 463.
+at 463. (These runs predate the diver's `--copies`: the ender then wrote its
+copies as identical rows, which the diver dives identically -- a board's
+random streams are keyed by its content -- so each call was one copy in
+effect, paid for several times over.)
 
 **On Stage B finals** (row-12 boards through `--end_dive`/`--end_polish`),
 give one process every thread and a deep budget, and keep the diver built:
@@ -3139,9 +3223,10 @@ python3 src/C_tail/E555_ender.py data/seed_Edge5.txt finals.csv closed.csv \
     --profile deep --threads 20
 ```
 
-A redive of 4 copies at 50 000/50 000 over 64 open cells took 11 s on 4
-threads, so the deep profile's 15 minutes a board buy many of them between the
-exact steps.
+A round of 8 copies at 3000/1000 over 64 open cells takes about 0.9 s on 4
+threads, so the deep profile's 15 minutes a board buy hundreds of copies
+between the exact steps. The same move without CP-SAT is
+`examples/11_diver_reopen.sh`.
 
 **What changed, and why** (the previous ender, measured on the same boards):
 
@@ -3610,8 +3695,8 @@ tools to the same-seed-same-threads contract.
 | `src/B_beam/E555_roundhouse.c` | Strip solver: board rotation, width-W chain DB, relaxed DP oracle, exhaustive/sampling strip search, 3-round spiral. |
 | `src/C_tail/E555_topper.py` | CP-SAT break minimizer, nearest-corner pull, `--side` bands + sliding window, or an explicit `--holes` mask. |
 | `src/C_tail/E555_backtracker.c` | Exact/bounded-mismatch DFS tail closer. |
-| `src/C_tail/E555_dive.c/.h` | End-dive engine shared by the beamer (`--end_dive`) and the diver: dives, cross-entropy learning, polish, corner seeding, job scheduler. |
-| `src/C_tail/E555_diver.c` | Front-end that runs the end-dive engine on any board file: input, batching by config id, frame choice, output. |
+| `src/C_tail/E555_dive.c/.h` | End-dive engine shared by the beamer (`--end_dive`) and the diver: dives, cross-entropy learning, polish, corner seeding, job scheduler; copies on their own streams, incumbents (never worse, plateau moves, prior and no-go weights) and fill orders (`dv_queue`). |
+| `src/C_tail/E555_diver.c` | Front-end that runs the end-dive engine on any board file: input, batching by config id, frame choice, output; `--reopen` cuts complete boards (auto band, side bands, boxes, masks, cycled per round) and chains `--rounds`. |
 | `src/C_tail/E555_ender.py` | CP-SAT closer: exact region re-solves (whole-board exchange cycles, windows, corners with frame arms, bands, the frame) plus the dive engine's redive of the damaged rows, cheapest first, driven by `--profile` and a true `--board_time_limit`. |
 | `tools/E555_viewer.py` | Board viewer/differ + bucas URL. |
 | `tools/E555_rank.py` | Ranks/sorts board CSVs by compactness, solidity, clean rows; `--rescore` rewrites them canonically; `--diverse K` picks independent roots. |

@@ -435,9 +435,11 @@ static int dv_lcv(DvBoard *b, DvFc *f, int x, const DvCand *cand, int lo, int hi
     return best;
 }
 
-/* One dive over cells[0..n): never backtracks, always completes. */
+/* One dive over cells[0..n): never backtracks, always completes. `tpos` (per
+   cell; NULL = none) is a fill order's key: among the most constrained cells,
+   the one with the largest tpos + noise (+ the policy's pull) goes first. */
 static void dv_dive(DvBoard *b, DvFc *f, const uint8_t *cells, int n, RNG *rng,
-                    const DvPolicy *pol) {
+                    const DvPolicy *pol, const float *tpos) {
     const bool g = dv_guided(pol);
     uint8_t rem[NUM_PIECES];
     memcpy(rem, cells, (size_t)n);
@@ -445,7 +447,7 @@ static void dv_dive(DvBoard *b, DvFc *f, const uint8_t *cells, int n, RNG *rng,
     for (int pos = 0; pos < n; pos++) {
         int sel = -1, best_ex = INT_MAX;
         uint32_t ties = 0;
-        if (!g) {
+        if (!g && !tpos) {
             for (int j = pos; j < n; j++) {
                 const int ex = f->dom[rem[j]];
                 if (ex == 0) continue;
@@ -461,7 +463,9 @@ static void dv_dive(DvBoard *b, DvFc *f, const uint8_t *cells, int n, RNG *rng,
             if (best_ex != INT_MAX)
                 for (int j = pos; j < n; j++) {
                     if (f->dom[rem[j]] != best_ex) continue;
-                    const double k = pol->beta * (double)dv_maxw(f, rem[j], pol) + gumbel_noise(rng);
+                    double k = gumbel_noise(rng);
+                    if (g) k += pol->beta * (double)dv_maxw(f, rem[j], pol);
+                    if (tpos) k += (double)tpos[rem[j]];
                     if (sel < 0 || k > bk) { bk = k; sel = j; }
                 }
         }
@@ -756,7 +760,15 @@ typedef struct {
     uint8_t  seeded;                 /* corner seed: 1 = TL, 2 = TR, 3 = both */
     int8_t   top_row;                /* highest row with every row below it full; -1 none */
     uint32_t origin;                 /* queue index of the unseeded board it came from */
+    uint32_t group, copy;            /* queue index of its board's first copy; which copy */
+    uint8_t  order;                  /* DvOrder of this copy */
+    bool     kept_copy;              /* after dv_run: the copy its board keeps */
+    int      inc_score;              /* score of the incumbent it was cut from; -1 = none */
+    int      own;                    /* its own best dive or polish; -1 = none yet */
+    bool     moved;                  /* best is no longer the incumbent (plateau) */
+    uint8_t  inc_pid[NUM_PIECES], inc_rot[NUM_PIECES];
     /* Run state of the batch in flight (NULL / 0 between batches). */
+    float        *w0;                /* prior weights from the incumbent, when set */
     DvTop        *top;               /* polish candidates, when polishing */
     struct DvS2  *s2;                /* stage-2 learning state, while live */
     struct DvPol *pol;               /* polish state, while polishing */
@@ -780,6 +792,19 @@ static DvKeep  *g_dv_keep = NULL;    /* kept boards not yet written */
 static size_t   g_dv_kn = 0, g_dv_kcap = 0;
 static char   **g_dv_cfg = NULL;     /* batch ids the kept boards name */
 static size_t   g_dv_ncfg = 0, g_dv_cfgcap = 0;
+/* The queued boards of the batch (one per dv_add/dv_queue call): the root of
+   the first copy, and after dv_run the root of the copy kept. */
+static uint32_t *g_dv_grp = NULL, *g_dv_grp_keep = NULL;
+static size_t    g_dv_grpn = 0, g_dv_grpcap = 0;
+static bool      g_dv_ran = false;   /* the next queued board starts a batch */
+static bool      g_dv_multi = false; /* the batch has a board queued in copies */
+static size_t    g_dv_last_n = 0;    /* roots of the last batch run */
+static char      g_dv_last_id[256];
+static bool      g_dv_keeping = true;
+
+const char *const dv_order_names[DV_NORDERS] = {
+    "mrv", "left", "right", "centre", "ends", "top", "bottom"
+};
 
 static struct {
     uint64_t roots, stage2, dives, kept, written, dup;
@@ -792,6 +817,8 @@ static struct {
     int      seed_best, plain_best;
     double   t, t_s1, t_s2, u_s1, u_s2, jt_s2, jt_pol;
     int      best;
+    uint64_t inc_boards, inc_better;  /* boards with an incumbent; beaten by a dive */
+    int64_t  inc_gain;
     uint64_t hist[DV_EDGES + 1];
 } g_dv_run = { .best = -1, .seed_best = -1, .plain_best = -1, .top_min = PUZZLE_SIDE, .top_max = -1 };
 
@@ -801,6 +828,7 @@ void dv_init(const DvParams *p) {
 }
 
 void dv_seeding(bool on) { g_p.seed_corners = on; }
+void dv_keeping(bool on) { g_dv_keeping = on; }
 
 uint64_t dv_written(void) { return g_dv_run.written; }
 uint64_t dv_boards(void)  { return g_dv_run.roots; }
@@ -813,13 +841,16 @@ static DvRoot *dv_push_root(void) {
     return &g_dv_q[g_dv_qn++];
 }
 
-static void dv_root_key(DvRoot *r) {
+/* The root's random streams: its board and the master seed, and a nonzero
+   salt for a copy (salt 0 = the stock streams). */
+static void dv_root_key(DvRoot *r, uint64_t salt) {
     uint64_t h = 14695981039346656037ULL;
     for (int x = 0; x < NUM_PIECES; x++) {
         h ^= r->base_pid[x]; h *= 1099511628211ULL;
         h ^= r->base_rot[x]; h *= 1099511628211ULL;
     }
     r->fp = splitmix64(h ^ g_p.master_seed);
+    if (salt) r->fp = splitmix64(r->fp ^ splitmix64(salt));
     r->seq = g_dv_seq++;
 }
 
@@ -903,7 +934,9 @@ static void dv_queue_copy(const DvRoot *src, const DvSeed *a, const DvSeed *b, u
                 r->base_pid[sd[k]->cell[j]] = sd[k]->pid[j];
                 r->base_rot[sd[k]->cell[j]] = sd[k]->rot[j];
             }
-    dv_root_key(r);
+    dv_root_key(r, 0);
+    r->group = (uint32_t)(g_dv_qn - 1);          /* a board of its own */
+    r->copy = 0;
     r->seeded = mask;
     g_dv_run.seed_roots++;
 }
@@ -969,25 +1002,66 @@ static void dv_seed_corners(size_t qi) {
     free(opt0);
 }
 
+void dv_queue(const uint16_t pid[NUM_PIECES], const uint8_t rot[NUM_PIECES],
+              const DvQueue *o) {
+    static const DvQueue stock = { 0 };
+    if (!o) o = &stock;
+    if (g_dv_ran) { g_dv_grpn = 0; g_dv_ran = false; g_dv_multi = false; }
+    if (o->copies > 1) g_dv_multi = true;
+    if (g_dv_grpn == g_dv_grpcap) {
+        g_dv_grpcap = g_dv_grpcap ? g_dv_grpcap * 2 : 256;
+        g_dv_grp = xrealloc(g_dv_grp, g_dv_grpcap * sizeof *g_dv_grp);
+        g_dv_grp_keep = xrealloc(g_dv_grp_keep, g_dv_grpcap * sizeof *g_dv_grp_keep);
+    }
+    const uint32_t first = (uint32_t)g_dv_qn;
+    g_dv_grp[g_dv_grpn] = g_dv_grp_keep[g_dv_grpn] = first;
+    g_dv_grpn++;
+    int inc_score = -1;
+    if (o->inc_pid) {
+        DvBoard inc;
+        for (int x = 0; x < NUM_PIECES; x++) {
+            if (o->inc_pid[x] >= NUM_PIECES) fatal("internal error: an incumbent with an open cell");
+            if (pid[x] != DV_EMPTY && (pid[x] != o->inc_pid[x] || (rot[x] & 3) != (o->inc_rot[x] & 3)))
+                fatal("internal error: a board that was not cut from its incumbent");
+            inc.c[x] = g_dv_or[o->inc_pid[x]][o->inc_rot[x] & 3];
+        }
+        inc_score = dv_score(&inc);
+    }
+    const uint32_t copies = o->copies ? o->copies : 1;
+    for (uint32_t k = 0; k < copies; k++) {
+        DvRoot *r = dv_push_root();
+        memset(r, 0, sizeof *r);
+        for (int x = 0; x < NUM_PIECES; x++) {
+            r->base_pid[x] = pid[x];
+            r->base_rot[x] = pid[x] == DV_EMPTY ? 0 : (uint8_t)(rot[x] & 3);
+        }
+        r->top_row = -1;
+        for (int row = 0; row < PUZZLE_SIDE; row++) {
+            bool full = true;
+            for (int c = 0; c < PUZZLE_SIDE && full; c++)
+                full = pid[row * PUZZLE_SIDE + c] != DV_EMPTY;
+            if (!full) break;
+            r->top_row = (int8_t)row;
+        }
+        dv_root_key(r, o->salt * 0x10000ULL + k);
+        r->best = -1;
+        r->origin = (uint32_t)(g_dv_qn - 1);
+        r->group = first;
+        r->copy = k;
+        r->order = (uint8_t)(o->norders > 0 ? o->orders[k % (uint32_t)o->norders] % DV_NORDERS
+                                            : DV_ORDER_MRV);
+        r->inc_score = inc_score;
+        if (inc_score >= 0)
+            for (int x = 0; x < NUM_PIECES; x++) {
+                r->inc_pid[x] = (uint8_t)o->inc_pid[x];
+                r->inc_rot[x] = (uint8_t)(o->inc_rot[x] & 3);
+            }
+        if (k == 0) dv_seed_corners(g_dv_qn - 1);   /* its seeded copies follow it */
+    }
+}
+
 void dv_add(const uint16_t pid[NUM_PIECES], const uint8_t rot[NUM_PIECES]) {
-    DvRoot *r = dv_push_root();
-    memset(r, 0, sizeof *r);
-    for (int x = 0; x < NUM_PIECES; x++) {
-        r->base_pid[x] = pid[x];
-        r->base_rot[x] = pid[x] == DV_EMPTY ? 0 : (uint8_t)(rot[x] & 3);
-    }
-    r->top_row = -1;
-    for (int row = 0; row < PUZZLE_SIDE; row++) {
-        bool full = true;
-        for (int c = 0; c < PUZZLE_SIDE && full; c++)
-            full = pid[row * PUZZLE_SIDE + c] != DV_EMPTY;
-        if (!full) break;
-        r->top_row = (int8_t)row;
-    }
-    dv_root_key(r);
-    r->best = -1;
-    r->origin = (uint32_t)(g_dv_qn - 1);
-    dv_seed_corners(g_dv_qn - 1);
+    dv_queue(pid, rot, NULL);
 }
 
 /* Can every dive of this board complete under the current frame? A stuck cell
@@ -1038,8 +1112,47 @@ typedef struct {
     uint8_t cells[NUM_PIECES], up[NUM_PIECES];
     int     ncell, nup;
     int16_t pslot[NUM_PIECES], xslot[NUM_PIECES];
+    float   tpos[NUM_PIECES];        /* the root's fill-order key, per cell */
+    bool    ordered;                 /* tpos is live: the root's order is not MRV */
     DvTop   top;                     /* the job's own polish candidates */
 } DvWork;
+
+/* A fill order's key per open cell: order_weight x a place in [0, 1] of the
+   open cells' bounding box, 1 where the order starts. centre and ends run
+   along the box's longer side. */
+static void dv_order_key(int order, const uint8_t *cells, int n, float *tpos) {
+    int r0 = PUZZLE_SIDE, r1 = -1, c0 = PUZZLE_SIDE, c1 = -1;
+    for (int j = 0; j < n; j++) {
+        const int r = cells[j] / PUZZLE_SIDE, c = cells[j] % PUZZLE_SIDE;
+        if (r < r0) r0 = r;
+        if (r > r1) r1 = r;
+        if (c < c0) c0 = c;
+        if (c > c1) c1 = c;
+    }
+    const float tw = g_p.order_weight > 0.0f ? g_p.order_weight : 6.0f;
+    const float h = (float)(r1 - r0), w = (float)(c1 - c0);
+    for (int j = 0; j < n; j++) {
+        const int x = cells[j];
+        const float r = (float)(x / PUZZLE_SIDE - r0), c = (float)(x % PUZZLE_SIDE - c0);
+        const float along = w >= h ? c : r, span = w >= h ? w : h;
+        float t = 0.5f;
+        switch (order) {
+            case DV_ORDER_LEFT:   if (w > 0) t = 1.0f - c / w; break;
+            case DV_ORDER_RIGHT:  if (w > 0) t = c / w; break;
+            case DV_ORDER_TOP:    if (h > 0) t = r / h; break;
+            case DV_ORDER_BOTTOM: if (h > 0) t = 1.0f - r / h; break;
+            case DV_ORDER_CENTRE:
+            case DV_ORDER_ENDS:
+                if (span > 0) {
+                    t = 1.0f - fabsf(2.0f * along / span - 1.0f);
+                    if (order == DV_ORDER_ENDS) t = 1.0f - t;
+                }
+                break;
+            default: break;
+        }
+        tpos[x] = tw * t;
+    }
+}
 
 static void dv_work_root(DvWork *k, const DvRoot *r) {
     for (int x = 0; x < NUM_PIECES; x++) {
@@ -1059,6 +1172,8 @@ static void dv_work_root(DvWork *k, const DvRoot *r) {
             k->up[k->nup++] = (uint8_t)p;
         }
     }
+    k->ordered = r->order != DV_ORDER_MRV && k->ncell > 0;
+    if (k->ordered) dv_order_key(r->order, k->cells, k->ncell, k->tpos);
 }
 
 /* -- Polish candidates --------------------------------------------------------- */
@@ -1239,7 +1354,9 @@ static void dv_merge(size_t ri, const DvLocal *l, const DvTop *t, bool stopped) 
     DvRoot *r = &g_dv_q[ri];
     omp_set_lock(&g_dv_lock[ri]);
     r->dives += l->dives;
+    if (l->best > r->own) r->own = l->best;
     if (l->best >= 0 && (r->best < 0 || dv_key_before(l->best, l->best_idx, r->best, r->best_idx))) {
+        r->moved = r->inc_score >= 0;
         r->best = l->best; r->best_idx = l->best_idx;
         memcpy(r->best_pid, l->brd, NUM_PIECES);
         memcpy(r->best_rot, l->brd + NUM_PIECES, NUM_PIECES);
@@ -1256,13 +1373,17 @@ static void dv_job_s1(DvWork *k, uint32_t ri, uint32_t a, uint32_t cnt) {
     const bool polish = r->top != NULL;
     dv_work_root(k, r);
     k->top.n = 0;
+    /* Plain dives, or with an incumbent's prior dives pulled by it. */
+    const DvPolicy prior = { r->w0, k->pslot, k->xslot, k->ncell, DV_S2_BETA };
+    const DvPolicy *pol = r->w0 ? &prior : NULL;
+    const float *tpos = k->ordered ? k->tpos : NULL;
     DvLocal l = { .best = -1 };
     bool stopped = false;
     for (uint32_t i = a; i < a + cnt; i++) {
         if (((i - a) & 15u) == 0 && dv_time_up()) { stopped = true; break; }
         RNG rng = rng_for(r->fp, 1u, i, 0u);
         k->b = k->base; k->f = k->proto;
-        dv_dive(&k->b, &k->f, k->cells, k->ncell, &rng, NULL);
+        dv_dive(&k->b, &k->f, k->cells, k->ncell, &rng, pol, tpos);
         dv_local_take(&l, k, &k->b, dv_score(&k->b), i, polish);
     }
     dv_merge(ri, &l, polish ? &k->top : NULL, stopped);
@@ -1349,7 +1470,8 @@ static void dv_s2_start(uint32_t ri) {
     const size_t nw = (size_t)s->nup * (size_t)s->ncell;
     s->w = xmalloc((nw ? nw : 1) * sizeof *s->w);
     s->E = xmalloc((nw ? nw : 1) * sizeof *s->E);
-    memset(s->w, 0, nw * sizeof *s->w);
+    if (r->w0) memcpy(s->w, r->w0, nw * sizeof *s->w);   /* the same layout: dv_work_root */
+    else       memset(s->w, 0, nw * sizeof *s->w);
     memset(s->E, 0, nw * sizeof *s->E);
     s->n2 = g_dv_n2;
     s->per = g_dv_n2 / (uint32_t)DV_ROUNDS;
@@ -1375,7 +1497,7 @@ static void dv_job_s2(DvWork *k, uint32_t ri, uint32_t a, uint32_t cnt) {
         if (((i - a) & 15u) == 0 && dv_time_up()) { stopped = true; break; }
         RNG rng = rng_for(r->fp, 3u + (uint32_t)s->rd, i, 0u);
         k->b = k->base; k->f = k->proto;
-        dv_dive(&k->b, &k->f, k->cells, k->ncell, &rng, &pol);
+        dv_dive(&k->b, &k->f, k->cells, k->ncell, &rng, &pol, k->ordered ? k->tpos : NULL);
         const int sc = dv_score(&k->b);
         s->rsc[i] = sc;
         uint8_t *pl = s->rec + (size_t)i * k->ncell;
@@ -1501,21 +1623,63 @@ static void dv_polish_end(uint32_t ri) {
     for (int j = 0; j < pl->nst; j++)
         if (pl->walk_s[j] > cur_s) { cur_s = pl->walk_s[j]; cur = j; from_walk = true; }
     omp_set_lock(&g_dv_lock[ri]);
-    if (cur >= 0 && cur_s > r->best) {
+    if (cur_s > r->own) r->own = cur_s;
+    /* On the plateau a polished board that ties the incumbent, still in place,
+       replaces it too. */
+    const bool tie = g_p.plateau && r->inc_score >= 0 && !r->moved && cur_s == r->best;
+    if (cur >= 0 && (cur_s > r->best || tie)) {
+        r->moved = r->inc_score >= 0;
         const DvBoard *b = from_walk ? &pl->walk[cur] : &pl->st[cur];
         for (int x = 0; x < NUM_PIECES; x++) {
             r->best_pid[x] = (uint8_t)b->c[x].piece_id;
             r->best_rot[x] = b->c[x].rotation;
         }
-        #pragma omp atomic
-        g_dv_pgain += (uint64_t)(cur_s - pl->before);
-        #pragma omp atomic
-        g_dv_proots++;
+        if (cur_s > pl->before) {
+            #pragma omp atomic
+            g_dv_pgain += (uint64_t)(cur_s - pl->before);
+            #pragma omp atomic
+            g_dv_proots++;
+        }
         r->best = cur_s;
     }
     omp_unset_lock(&g_dv_lock[ri]);
     free(pl);
     r->pol = NULL;
+}
+
+/* -- Incumbents ------------------------------------------------------------------ */
+
+/* The prior of a root cut from an incumbent: w(p, x) = +prior where the
+   incumbent holds piece p on open cell x with every edge of x matched, -nogo
+   where x has a broken edge, 0 elsewhere; in the layout dv_work_root gives the
+   root's stage-2 weights. */
+static float *dv_prior(const DvRoot *r) {
+    DvWork *k = xmalloc(sizeof *k);
+    dv_work_root(k, r);
+    const size_t nw = (size_t)k->nup * (size_t)k->ncell;
+    float *w = xmalloc((nw ? nw : 1) * sizeof *w);
+    memset(w, 0, nw * sizeof *w);
+    DvBoard inc;
+    for (int x = 0; x < NUM_PIECES; x++) inc.c[x] = g_dv_or[r->inc_pid[x]][r->inc_rot[x]];
+    const float up = g_p.prior < DV_CLIP ? g_p.prior : DV_CLIP;
+    const float down = g_p.nogo < DV_CLIP ? g_p.nogo : DV_CLIP;
+    for (int j = 0; j < k->ncell; j++) {
+        const int x = k->cells[j], ps = k->pslot[r->inc_pid[x]];
+        if (ps < 0) continue;
+        int nn = 0;
+        for (int d = 0; d < 4; d++) nn += dv_nb(x, d) >= 0;
+        w[(size_t)ps * (size_t)k->ncell + (size_t)j] = dv_local(&inc, x) == nn ? up : -down;
+    }
+    free(k);
+    return w;
+}
+
+int dv_result(size_t i, uint16_t pid[NUM_PIECES], uint8_t rot[NUM_PIECES]) {
+    if (i >= g_dv_grpn) return -1;
+    const DvRoot *r = &g_dv_q[g_dv_grp_keep[i]];
+    if (r->best < 0) return -1;
+    for (int x = 0; x < NUM_PIECES; x++) { pid[x] = r->best_pid[x]; rot[x] = r->best_rot[x]; }
+    return r->best;
 }
 
 /* -- The scheduler ------------------------------------------------------------- */
@@ -1566,6 +1730,47 @@ static double dv_cpu_seconds(void) {
          + (double)ru.ru_stime.tv_sec + 1e-6 * (double)ru.ru_stime.tv_usec;
 }
 
+/* Keep, for dv_flush, the kept copy of every board of the last batch whose
+   best is >= S; returns how many. */
+uint64_t dv_keep_last(void) {
+    const DvRoot *q = g_dv_q;
+    uint64_t kept = 0;
+    bool cfg_named = false;
+    uint32_t cfg = 0;
+    for (size_t i = 0; i < g_dv_last_n; i++) {
+        const DvRoot *r = &q[i];
+        if (!r->kept_copy || r->best < 0 || r->best < g_p.emit_score) continue;
+        if (!cfg_named) {
+            if (g_dv_ncfg == g_dv_cfgcap) {
+                g_dv_cfgcap = g_dv_cfgcap ? g_dv_cfgcap * 2 : 64;
+                g_dv_cfg = xrealloc(g_dv_cfg, g_dv_cfgcap * sizeof *g_dv_cfg);
+            }
+            g_dv_cfg[g_dv_ncfg] = xmalloc(strlen(g_dv_last_id) + 1);
+            strcpy(g_dv_cfg[g_dv_ncfg], g_dv_last_id);
+            cfg = (uint32_t)g_dv_ncfg++;
+            cfg_named = true;
+        }
+        if (g_dv_kn == g_dv_kcap) {
+            g_dv_kcap = g_dv_kcap ? g_dv_kcap * 2 : 256;
+            g_dv_keep = xrealloc(g_dv_keep, g_dv_kcap * sizeof *g_dv_keep);
+        }
+        DvKeep *kp = &g_dv_keep[g_dv_kn++];
+        memcpy(kp->pid, r->best_pid, NUM_PIECES);
+        memcpy(kp->rot, r->best_rot, NUM_PIECES);
+        uint64_t h = 14695981039346656037ULL;
+        for (int x = 0; x < NUM_PIECES; x++) {
+            h ^= kp->pid[x]; h *= 1099511628211ULL;
+            h ^= kp->rot[x]; h *= 1099511628211ULL;
+        }
+        kp->fp = h ? h : 1;
+        kp->seq = r->seq; kp->cfg = cfg; kp->score = r->best; kp->seeded = r->seeded;
+        kp->top_row = r->top_row;
+        kept++;
+    }
+    g_dv_run.kept += kept;
+    return kept;
+}
+
 void dv_run(const char *id) {
     const size_t n = g_dv_qn;
     g_dv_qn = 0;
@@ -1588,11 +1793,22 @@ void dv_run(const char *id) {
         for (size_t i = 0; i < n; i++) omp_init_lock(&g_dv_lock[i]);
         g_dv_lock_n = n;
     }
+    const bool priors = g_p.prior > 0.0f || g_p.nogo > 0.0f;
     for (size_t i = 0; i < n; i++) {
-        q[i].top = NULL; q[i].s2 = NULL; q[i].pol = NULL;
+        q[i].top = NULL; q[i].s2 = NULL; q[i].pol = NULL; q[i].w0 = NULL;
         q[i].pending = 0; q[i].stopped = false; q[i].best = -1; q[i].best_idx = 0;
-        q[i].dives = 0;
+        q[i].dives = 0; q[i].own = -1; q[i].moved = false;
         if (polish) { q[i].top = xmalloc(sizeof(DvTop)); q[i].top->n = 0; }
+        if (q[i].inc_score >= 0) {
+            /* The incumbent is the best so far; a dive must beat it (index 0
+               wins every tie), so the board kept is never worse. On the
+               plateau it loses every tie instead (the last index). */
+            q[i].best = q[i].inc_score;
+            q[i].best_idx = g_p.plateau ? UINT64_MAX : 0;
+            memcpy(q[i].best_pid, q[i].inc_pid, NUM_PIECES);
+            memcpy(q[i].best_rot, q[i].inc_rot, NUM_PIECES);
+            if (priors) q[i].w0 = dv_prior(&q[i]);
+        }
     }
     uint32_t n1 = (uint32_t)(g_p.dives * DV_S1_SHARE + 0.5);
     if (n1 < 1) n1 = 1;
@@ -1665,50 +1881,47 @@ void dv_run(const char *id) {
     free(sel);
     g_dv_wait = NULL; g_dv_wait_n = g_dv_wait_next = 0;
 
-    for (size_t i = 0; i < n; i++) { free(q[i].top); q[i].top = NULL; }
+    for (size_t i = 0; i < n; i++) {
+        free(q[i].top); q[i].top = NULL;
+        free(q[i].w0); q[i].w0 = NULL;
+    }
     g_dv_run.t_s1 += d_s1; g_dv_run.t_s2 += d_s2;
     g_dv_run.u_s1 += u_s1; g_dv_run.u_s2 += u_s2;
     g_dv_run.jt_s2 += g_dv_jt[DV_JOB_S2];
     g_dv_run.jt_pol += g_dv_jt[DV_JOB_P0] + g_dv_jt[DV_JOB_P1];
     g_dv_run.pol_gain += g_dv_pgain; g_dv_run.pol_roots += g_dv_proots;
 
-    /* Keep the boards at or above S. */
-    uint64_t dives = 0, kept = 0;
-    int best = -1;
-    uint32_t cfg = 0;
-    bool cfg_named = false;
+    /* The copy kept for each board: its best, the earliest on a tie. */
+    uint32_t *gbest = xmalloc(n * sizeof *gbest);
+    for (size_t i = 0; i < n; i++) gbest[i] = UINT32_MAX;
     for (size_t i = 0; i < n; i++) {
-        const DvRoot *r = &q[i];
-        dives += r->dives;
-        if (r->best > best) best = r->best;
-        if (r->best < 0 || r->best < g_p.emit_score) continue;
-        if (!cfg_named) {
-            if (g_dv_ncfg == g_dv_cfgcap) {
-                g_dv_cfgcap = g_dv_cfgcap ? g_dv_cfgcap * 2 : 64;
-                g_dv_cfg = xrealloc(g_dv_cfg, g_dv_cfgcap * sizeof *g_dv_cfg);
-            }
-            g_dv_cfg[g_dv_ncfg] = xmalloc(strlen(id) + 1);
-            strcpy(g_dv_cfg[g_dv_ncfg], id);
-            cfg = (uint32_t)g_dv_ncfg++;
-            cfg_named = true;
-        }
-        if (g_dv_kn == g_dv_kcap) {
-            g_dv_kcap = g_dv_kcap ? g_dv_kcap * 2 : 256;
-            g_dv_keep = xrealloc(g_dv_keep, g_dv_kcap * sizeof *g_dv_keep);
-        }
-        DvKeep *kp = &g_dv_keep[g_dv_kn++];
-        memcpy(kp->pid, r->best_pid, NUM_PIECES);
-        memcpy(kp->rot, r->best_rot, NUM_PIECES);
-        uint64_t h = 14695981039346656037ULL;
-        for (int x = 0; x < NUM_PIECES; x++) {
-            h ^= kp->pid[x]; h *= 1099511628211ULL;
-            h ^= kp->rot[x]; h *= 1099511628211ULL;
-        }
-        kp->fp = h ? h : 1;
-        kp->seq = r->seq; kp->cfg = cfg; kp->score = r->best; kp->seeded = r->seeded;
-        kp->top_row = r->top_row;
-        kept++;
+        const uint32_t g = q[i].group;
+        const DvRoot *b = gbest[g] == UINT32_MAX ? NULL : &q[gbest[g]];
+        if (!b || q[i].best > b->best || (q[i].best == b->best && q[i].moved && !b->moved))
+            gbest[g] = (uint32_t)i;
     }
+    for (size_t j = 0; j < g_dv_grpn; j++) g_dv_grp_keep[j] = gbest[g_dv_grp[j]];
+    for (size_t i = 0; i < n; i++) q[i].kept_copy = gbest[q[i].group] == i;
+    free(gbest);
+    for (size_t j = 0; j < g_dv_grpn; j++) {
+        const DvRoot *r = &q[g_dv_grp_keep[j]];
+        if (r->inc_score < 0) continue;
+        g_dv_run.inc_boards++;
+        if (r->best > r->inc_score) {
+            g_dv_run.inc_better++;
+            g_dv_run.inc_gain += r->best - r->inc_score;
+        }
+    }
+    uint64_t dives = 0;
+    int best = -1;
+    for (size_t i = 0; i < n; i++) {
+        dives += q[i].dives;
+        if (q[i].best > best) best = q[i].best;
+    }
+    g_dv_last_n = n;
+    snprintf(g_dv_last_id, sizeof g_dv_last_id, "%s", id);
+    g_dv_ran = true;
+    const uint64_t kept = g_dv_keeping ? dv_keep_last() : 0;
     /* Corner seeds: each unseeded board against the best of its seeded copies,
        which follow it in the queue. */
     uint64_t c_pairs = 0, c_wins = 0, c_seeded = 0;
@@ -1732,7 +1945,7 @@ void dv_run(const char *id) {
     }
     const double dt = omp_get_wtime() - t0;
     g_dv_run.roots += n; g_dv_run.stage2 += n_s2; g_dv_run.dives += dives;
-    g_dv_run.kept += kept; g_dv_run.t += dt;
+    g_dv_run.t += dt;
     if (best > g_dv_run.best) g_dv_run.best = best;
     if (g_verbose) {
         printf("[dive] %s boards=%zu stage1_best=%d median=%d stage2=%zu best=%d "
@@ -1744,6 +1957,16 @@ void dv_run(const char *id) {
             printf(" seeded=%" PRIu64 " (seeded beats plain on %" PRIu64 " of %" PRIu64 " boards)",
                    c_seeded, c_wins, c_pairs);
         printf("\n");
+        /* Boards dived in copies: every copy's own best (its dives and polish,
+           the incumbent aside), then the board kept. */
+        for (size_t j = 0; g_dv_multi && j < g_dv_grpn; j++) {
+            const uint32_t g = g_dv_grp[j];
+            printf("[copies] %s board %zu:", id, j);
+            if (q[g].inc_score >= 0) printf(" incumbent %d; copies", q[g].inc_score);
+            for (size_t i = g; i < n; i++)
+                if (q[i].group == g) printf(" %d", q[i].own);
+            printf(" -> kept %d\n", q[g_dv_grp_keep[j]].best);
+        }
         fflush(stdout);
     }
 }
@@ -1895,6 +2118,10 @@ void dv_print_summary(double wall_total) {
                    (double)g_dv_run.seed_diff / (double)g_dv_run.seed_pairs);
         printf("\n");
     }
+    if (g_dv_run.inc_boards)
+        printf("[sum] incumbents: %" PRIu64 " board(s) re-dived, %" PRIu64 " beaten by a dive "
+               "(%+" PRId64 " edges in all), the rest kept as they were\n",
+               g_dv_run.inc_boards, g_dv_run.inc_better, g_dv_run.inc_gain);
     printf("[sum] end dive scores written:");
     int shown = 0;
     for (int sc = DV_EDGES; sc >= 0 && shown < 16; sc--)

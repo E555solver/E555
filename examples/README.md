@@ -79,6 +79,7 @@ value. Copy that line and you have the run, without this script in the middle.
 | `04c_CP-SAT_ender_elite.sh` | ender | pick diverse elites and give each repeated `deep` or ten-hour `superdeep` passes | `pip install ortools`, hours |
 | `05_backtracker_dives.sh` | backtracker | greedy dives to triage, exhaustive DFS to prove | minutes to overnight |
 | `10_diver_quickstart.sh` | diver | finish partial boards with the beamer's end dives and polish, from any board file | seconds to minutes |
+| `11_diver_reopen.sh` | diver | improve complete, already polished boards: reopen the damaged rows and re-dive them in copies and rounds, never returning a worse board | a minute per board, or more |
 | `06_roundhouse_both_ways.sh` | roundhouse | chain two roundhouse passes per board, once each way round, so the two spirals cover all four sides | seconds to minutes |
 | `08_distiller_quickstart.sh` | distiller (+ backtracker) | triage a corpus: rank thousands of >=450 boards by how much repair headroom is left, then write the Stage C commands to attack the best of them | seconds to minutes |
 | `07_barebones_chain.sh` | all four | the whole chain in six calls, no arguments and no indirection: what the tools are actually invoked with | 8 GB RAM, ~15 min |
@@ -362,7 +363,10 @@ safe. On a many-core machine give one process all the threads: it solves
 optimal there -- so what the ender gains on them comes from its *redive* step:
 it lifts the damaged rows *and the clean row they were built on* and re-dives
 them with `bin/E555_diver`. Build the diver (`make diver`) before running the
-ender on such boards; without it the step is skipped with a note.
+ender on such boards; without it the step is skipped with a note. The same
+move runs without CP-SAT or OR-Tools as `11_diver_reopen.sh`: the diver's
+`--reopen` alone, a wall clock per board, every board back as one row, never
+worse.
 
 The topper still writes what the ender reads, so a roundhouse output whose
 damage is already on the border can go straight to `04b`/`04c` and skip the

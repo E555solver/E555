@@ -30,6 +30,24 @@
  *
  * Every dive's random stream is keyed by its board and its index, so the result
  * does not depend on the thread count.
+ *
+ * COPIES, INCUMBENTS, ORDERS (dv_queue)
+ *   copies     a board queued K times, each copy on random streams of its own,
+ *              is dived K times as K boards of the batch; only its best copy is
+ *              kept (the earliest on a tie)
+ *   incumbent  the complete board a queued board was cut from: every copy's
+ *              best starts as the incumbent, so the board kept is never worse
+ *              than it, and is the incumbent itself unless a dive beats it
+ *              (DvParams.plateau: or ties it with a different board, which is
+ *              then kept -- a walk along the plateau when batches are chained).
+ *              With DvParams.prior / .nogo the dives start pulled toward the
+ *              incumbent's placements on its clean cells and pushed off them on
+ *              its broken cells: stage 1 is guided by those weights, and stage 2
+ *              learns from them instead of from zero
+ *   orders     copy k fills its open cells starting where orders[k % n] says:
+ *              still the most constrained cell first, the order only breaking
+ *              ties among the most constrained, so copies that start at
+ *              different places leave their breaks in different places
  */
 #ifndef E555_DIVE_H
 #define E555_DIVE_H
@@ -55,7 +73,30 @@ typedef struct {
     double   deadline;         /* absolute omp_get_wtime(); 0 = none */
     int      threads;
     volatile sig_atomic_t *stop;   /* raised by a signal handler; may be NULL */
+    float    prior;            /* starting weight on an incumbent's clean placements; 0 = off */
+    float    nogo;             /* ... and minus this on its broken ones; 0 = off */
+    float    order_weight;     /* how strongly a copy's order breaks MRV ties; 0 = 6 */
+    bool     plateau;          /* a board with an incumbent keeps a different board that ties
+                                  it, when a dive or the polish finds one */
 } DvParams;
+
+/* Where a copy starts filling (DvQueue.orders): MRV is the stock dive, the
+   others break MRV's ties toward one place of the open cells. */
+typedef enum {
+    DV_ORDER_MRV, DV_ORDER_LEFT, DV_ORDER_RIGHT, DV_ORDER_CENTRE, DV_ORDER_ENDS,
+    DV_ORDER_TOP, DV_ORDER_BOTTOM, DV_NORDERS
+} DvOrder;
+extern const char *const dv_order_names[DV_NORDERS];   /* "mrv", "left", ... */
+
+/* How dv_queue() queues one board; all zero = dv_add(). */
+typedef struct {
+    const uint16_t *inc_pid;   /* the complete board it was cut from, per cell; NULL = none */
+    const uint8_t  *inc_rot;
+    uint32_t        copies;    /* dive it this many times, each copy on streams of its own; 0 = 1 */
+    const uint8_t  *orders;    /* copy k fills in order orders[k % norders] (DvOrder) */
+    int             norders;   /* 0 = every copy MRV */
+    uint64_t        salt;      /* keys the copies' streams too; 0 with one copy = dv_add's */
+} DvQueue;
 
 /* Once, after the seed is loaded. */
 void     dv_init(const DvParams *p);
@@ -73,6 +114,11 @@ void     dv_seeding(bool on);
    last call). The board's top row -- the highest row with every row below it
    full -- is where seeding reads the exposed tops. */
 void     dv_add(const uint16_t pid[NUM_PIECES], const uint8_t rot[NUM_PIECES]);
+/* dv_add() with copies, an incumbent and fill orders (see COPIES above). The
+   incumbent must hold every placed cell of the board as the board does. With
+   seeding on, the seeded copies are made from the first copy only. */
+void     dv_queue(const uint16_t pid[NUM_PIECES], const uint8_t rot[NUM_PIECES],
+                  const DvQueue *o);
 /* Under the current dv_frame, can a board's dives always complete? False when
    a piece is placed twice or a class of open cells lacks candidates (a board
    whose edges do not sit on the sides the frame deals them). */
@@ -84,6 +130,15 @@ void     dv_run(const char *id);
 void     dv_flush(FILE *fp);
 uint64_t dv_written(void);
 uint64_t dv_boards(void);
+/* After dv_run: the best board of queued board i of that batch (i counts
+   dv_add/dv_queue calls, not copies) -- its best copy, or its incumbent -- and
+   its score, whether or not it reached S; -1 when it has none. */
+int      dv_result(size_t i, uint16_t pid[NUM_PIECES], uint8_t rot[NUM_PIECES]);
+/* Keep each batch's boards for dv_flush (on, the default), or not (off): a
+   front-end chaining batches reads them with dv_result, and keeps the last
+   batch's with dv_keep_last (returns how many were >= S). */
+void     dv_keeping(bool on);
+uint64_t dv_keep_last(void);
 void     dv_print_summary(double wall_total);
 
 #endif /* E555_DIVE_H */

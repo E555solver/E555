@@ -30,16 +30,29 @@
  * Every dive's random stream is keyed by its board and --rng_seed, so output
  * does not depend on --threads or on where a batch starts.
  *
- * EXTENDING. This file is only the front-end: input, batching, frame choice
- * and output. New dive policies, moves and stages belong in E555_dive.c's
- * layers; new ways of choosing what to dive (holes masks, reopened rows,
- * alternative seeders) belong here, as preparation of the board handed to
- * dv_add().
+ * REOPEN. A complete board is skipped, unless --reopen names cells to lift
+ * from it: the band of rows (or columns) holding its damage (auto), a fixed
+ * band, or a mask. The lifted board is dived with the complete one as its
+ * incumbent, so the board written is the incumbent itself unless a dive beats
+ * it -- never worse. --rounds N re-dives each board's best N times, the auto
+ * band re-chosen every round (--reopen given n times: round r reopens the
+ * (r mod n)-th spec). --copies K dives every board K times on streams
+ * of its own and keeps the best copy; --orders gives the copies different
+ * places to start filling from; --prior / --nogo start the dives of a reopened
+ * board pulled toward the incumbent's clean placements and away from its
+ * broken ones (E555_dive.h, "COPIES, INCUMBENTS, ORDERS").
+ *
+ * EXTENDING. This file is only the front-end: input, batching, frame choice,
+ * what to reopen, and output. New dive policies, moves and stages belong in
+ * E555_dive.c's layers; new ways of choosing what to dive (holes masks,
+ * reopened rows, alternative seeders) belong here, as preparation of the board
+ * handed to dv_queue().
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <math.h>
 #include <omp.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -52,6 +65,21 @@
 #define DR_S_DEFAULT      450      /* --emit_score */
 #define DR_SEED_DEFAULT   1        /* --rng_seed */
 #define DR_MAX_FIELDS     1024
+#define DR_MAX_COPIES     1024     /* --copies */
+#define DR_AUTO_COVER     0.9      /* --reopen auto: share of its side's damage the band holds */
+#define DR_AUTO_CAP       5        /* ... and at most this deep before the extra rows */
+#define DR_MAX_SPECS      16       /* --reopen A --reopen B ...: round r reopens spec r mod n */
+
+/* One --reopen spec: the auto band, a side's band, or a set of cells. */
+typedef struct {
+    bool auto_band;
+    int  side;                     /* 0 top, 1 bottom, 2 left, 3 right; -1 = auto or cells */
+    int  depth;                    /* side:K's K, or auto+E's E */
+    bool cell[NUM_PIECES];         /* box: or a mask file */
+} DrSpec;
+static DrSpec      g_spec[DR_MAX_SPECS];
+static const char *g_spec_arg[DR_MAX_SPECS];
+static int         g_nspec = 0;
 
 /* -- Options ---------------------------------------------------------------- */
 static const char *g_rot_path     = NULL;    /* --rotations FILE */
@@ -62,6 +90,15 @@ static int         g_seeds        = 0;       /* --corner_seeds N; 0 = off */
 static uint64_t    g_rng          = DR_SEED_DEFAULT;
 static double      g_wall         = 0.0;     /* --wall_time S; 0 = none */
 static uint64_t    g_max_written  = 0;       /* --max_emitted N; 0 = none */
+static uint32_t    g_copies       = 1;       /* --copies K */
+static uint8_t     g_orders[64];             /* --orders LIST */
+static int         g_norders      = 0;
+static float       g_order_weight = 0.0f;    /* --order_weight W; 0 = the engine's */
+static const char *g_reopen       = NULL;    /* --reopen SPEC, the first one given */
+static int         g_rounds       = 1;       /* --rounds N */
+static bool        g_plateau      = false;   /* --plateau */
+static float       g_prior        = 0.0f;    /* --prior A */
+static float       g_nogo         = 0.0f;    /* --nogo B */
 
 static volatile sig_atomic_t g_stop = 0;
 static void handle_stop(int sig) { (void)sig; g_stop = 1; }
@@ -71,6 +108,12 @@ typedef struct {
     uint16_t pid[NUM_PIECES];      /* per cell; DV_EMPTY = open */
     uint8_t  rot[NUM_PIECES];
     uint64_t line;
+    bool     cut;                  /* reopened: inc holds the complete board */
+    bool     done;                 /* reopened and written: out of the rounds */
+    int      orig;                 /* the score it was read with (reopened) */
+    uint64_t orig_fp;              /* ... and its fingerprint */
+    uint16_t inc_pid[NUM_PIECES];
+    uint8_t  inc_rot[NUM_PIECES];
 } DrBoard;
 
 static struct {
@@ -81,6 +124,8 @@ static struct {
 
 static struct {
     uint64_t rows, batches, complete, malformed, misfit, unframed, dived;
+    uint64_t reopened, lifted, solved, better, moved;
+    int64_t  gain;
 } g_st;
 
 /* Split a data line into trimmed comma-separated fields, in place. */
@@ -134,6 +179,185 @@ static long dr_id_row(const char *id) {
     char *e;
     const long v = strtol(id + 1, &e, 10);
     return (*e == 'b' && v >= 0) ? v : -1;
+}
+
+/* -- Reopen: the cells lifted from a complete board ------------------------- */
+
+/* Side d (0 top, 1 right, 2 bottom, 3 left) of piece p at CCW spin s. */
+static inline int dr_side(int p, int s, int d) {
+    const int e[4] = { g_seed_top[p], g_seed_right[p], g_seed_bottom[p], g_seed_left[p] };
+    return e[(d + s) & 3];
+}
+
+/* Broken edges of a complete board; brk[x] marks the cells they touch. */
+static int dr_breaks(const uint16_t *pid, const uint8_t *rot, bool brk[NUM_PIECES]) {
+    int n = 0;
+    memset(brk, 0, NUM_PIECES * sizeof *brk);
+    for (int x = 0; x < NUM_PIECES; x++) {
+        const int r = x / PUZZLE_SIDE, c = x % PUZZLE_SIDE;
+        if (c < PUZZLE_SIDE - 1 &&
+            dr_side(pid[x], rot[x], 1) != dr_side(pid[x + 1], rot[x + 1], 3)) {
+            n++; brk[x] = brk[x + 1] = true;
+        }
+        if (r < PUZZLE_SIDE - 1 &&
+            dr_side(pid[x], rot[x], 0) != dr_side(pid[x + PUZZLE_SIDE], rot[x + PUZZLE_SIDE], 2)) {
+            n++; brk[x] = brk[x + PUZZLE_SIDE] = true;
+        }
+    }
+    return n;
+}
+
+/* Distance of cell x from side k (0 top, 1 bottom, 2 left, 3 right). */
+static inline int dr_dist(int x, int k) {
+    const int r = x / PUZZLE_SIDE, c = x % PUZZLE_SIDE;
+    return k == 0 ? PUZZLE_SIDE - 1 - r : k == 1 ? r : k == 2 ? c : PUZZLE_SIDE - 1 - c;
+}
+
+static int dr_cmp_int(const void *a, const void *b) {
+    const int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+/* The cells --reopen lifts from a complete board; returns how many, 0 when
+   auto finds no damage. auto: of the four sides, the one whose outer band
+   holds the most damaged cells (cells with a broken edge), that band deep
+   enough to hold DR_AUTO_COVER of the damaged cells on its side's half of the
+   board, at most DR_AUTO_CAP, plus auto+E's extra rows. Measured on dived and
+   polished boards (damage in rows 12-15): re-diving rows 12-15 gained where
+   rows 13-15 did not, and rows 11-15 gained less -- one stray deep break must
+   not deepen the band (PROJECT_E555.md, E555_ender.py). */
+static int dr_lift(const uint16_t *pid, const uint8_t *rot, const DrSpec *sp,
+                   bool lift[NUM_PIECES]) {
+    memset(lift, 0, NUM_PIECES * sizeof *lift);
+    int side = sp->side, depth = sp->depth, n = 0;
+    if (!sp->auto_band && side < 0) {                            /* box or mask */
+        for (int x = 0; x < NUM_PIECES; x++) { lift[x] = sp->cell[x]; n += lift[x]; }
+        return n;
+    }
+    if (sp->auto_band) {
+        bool brk[NUM_PIECES];
+        if (!dr_breaks(pid, rot, brk)) return 0;
+        int best_hits = -1;
+        side = -1;
+        for (int k = 0; k < 4; k++) {
+            int near[NUM_PIECES], nn = 0;
+            for (int x = 0; x < NUM_PIECES; x++)
+                if (brk[x] && dr_dist(x, k) < PUZZLE_SIDE / 2) near[nn++] = dr_dist(x, k);
+            if (!nn) continue;
+            qsort(near, (size_t)nn, sizeof *near, dr_cmp_int);
+            int need = (int)ceil((double)nn * DR_AUTO_COVER);
+            if (need < 1) need = 1;
+            int d = near[need - 1] + 1;
+            if (d > DR_AUTO_CAP) d = DR_AUTO_CAP;
+            d += sp->depth;
+            int hits = 0;
+            for (int x = 0; x < NUM_PIECES; x++) hits += brk[x] && dr_dist(x, k) < d;
+            if (hits > best_hits) { best_hits = hits; side = k; depth = d; }
+        }
+        if (side < 0) return 0;
+    }
+    for (int x = 0; x < NUM_PIECES; x++)
+        if (dr_dist(x, side) < depth) { lift[x] = true; n++; }
+    return n;
+}
+
+/* Lift the cells of `lift` from b's incumbent into b's board. */
+static void dr_apply(DrBoard *b, const bool lift[NUM_PIECES]) {
+    for (int x = 0; x < NUM_PIECES; x++) {
+        b->pid[x] = lift[x] ? DV_EMPTY : b->inc_pid[x];
+        b->rot[x] = lift[x] ? 0 : b->inc_rot[x];
+    }
+}
+
+/* Write a complete board as a canonical row, outside the engine: a reopened
+   board with nothing left to reopen (it scores 480). */
+static void dr_write_complete(FILE *fp, const char *id, const uint16_t *pid, const uint8_t *rot) {
+    bool brk[NUM_PIECES];
+    const int score = 480 - dr_breaks(pid, rot, brk);
+    uint32_t pos[NUM_PIECES], rr[NUM_PIECES];
+    for (int x = 0; x < NUM_PIECES; x++) { pos[pid[x]] = (uint32_t)x; rr[pid[x]] = rot[x]; }
+    fprintf(fp, "%s, %d", id, score);
+    for (int p = 0; p < NUM_PIECES; p++) fprintf(fp, ", %u", pos[p]);
+    for (int p = 0; p < NUM_PIECES; p++) fprintf(fp, ", %u", rr[p]);
+    fprintf(fp, "\n");
+    fflush(fp);
+}
+
+static uint64_t dr_fp(const uint16_t *pid, const uint8_t *rot) {
+    uint64_t h = 14695981039346656037ULL;
+    for (int x = 0; x < NUM_PIECES; x++) {
+        h ^= pid[x]; h *= 1099511628211ULL;
+        h ^= rot[x]; h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* Parse one --reopen spec: auto, auto+E, top:K, bottom:K, left:K, right:K,
+   box:R0-R1,C0-C1 (rows R0..R1 of columns C0..C1), or a 16x16 0/1 mask file
+   (the --holes format: '#' comments, first data line row 0). */
+static void dr_parse_spec(const char *spec, DrSpec *sp) {
+    static const char *const sides[4] = { "top:", "bottom:", "left:", "right:" };
+    memset(sp, 0, sizeof *sp);
+    sp->side = -1;
+    if (!strcmp(spec, "auto") || !strncmp(spec, "auto+", 5)) {
+        sp->auto_band = true;
+        sp->depth = spec[4] ? atoi(spec + 5) : 0;
+        if (sp->depth < 0 || sp->depth > PUZZLE_SIDE / 2)
+            fatal("--reopen auto+E: E must be in 0..%d", PUZZLE_SIDE / 2);
+        return;
+    }
+    for (int k = 0; k < 4; k++) {
+        const size_t n = strlen(sides[k]);
+        if (strncmp(spec, sides[k], n)) continue;
+        sp->side = k;
+        sp->depth = atoi(spec + n);
+        if (sp->depth < 1 || sp->depth > PUZZLE_SIDE)
+            fatal("--reopen %s: K must be in 1..%d", spec, PUZZLE_SIDE);
+        return;
+    }
+    if (!strncmp(spec, "box:", 4)) {
+        int r0, r1, c0, c1;
+        if (sscanf(spec + 4, "%d-%d,%d-%d", &r0, &r1, &c0, &c1) != 4 || r0 < 0 || r1 < r0 ||
+            r1 >= PUZZLE_SIDE || c0 < 0 || c1 < c0 || c1 >= PUZZLE_SIDE)
+            fatal("--reopen %s: want box:R0-R1,C0-C1 with 0 <= R0 <= R1 <= 15 and "
+                  "0 <= C0 <= C1 <= 15", spec);
+        for (int r = r0; r <= r1; r++)
+            for (int c = c0; c <= c1; c++) sp->cell[r * PUZZLE_SIDE + c] = true;
+        return;
+    }
+    FILE *fp = fopen(spec, "r");
+    if (!fp) fatal("--reopen %s: not auto, auto+E, top:K, bottom:K, left:K, right:K, "
+                   "or a readable mask file (%s)", spec, strerror(errno));
+    char *line = NULL;
+    size_t cap = 0;
+    int row = 0, n = 0;
+    while (row < PUZZLE_SIDE && getline(&line, &cap, fp) > 0) {
+        const char *q = line;
+        while (*q == ' ' || *q == '\t') q++;
+        if (*q == '#' || *q == '%' || *q == '\n' || *q == '\r' || !*q) continue;
+        int c = 0;
+        for (; *q && c < PUZZLE_SIDE; q++) {
+            if (*q != '0' && *q != '1') continue;
+            sp->cell[row * PUZZLE_SIDE + c] = *q == '1';
+            n += *q == '1';
+            c++;
+        }
+        if (c != PUZZLE_SIDE) fatal("--reopen %s: data line %d has %d cells, not %d",
+                                    spec, row + 1, c, PUZZLE_SIDE);
+        row++;
+    }
+    free(line);
+    fclose(fp);
+    if (row != PUZZLE_SIDE) fatal("--reopen %s: %d data lines, not %d", spec, row, PUZZLE_SIDE);
+    if (!n) fatal("--reopen %s: the mask opens no cell", spec);
+}
+
+/* --reopen, given n times: round r of a board reopens the (r mod n)-th spec. */
+static void dr_parse_reopen(const char *arg) {
+    if (g_nspec == DR_MAX_SPECS) fatal("--reopen: at most %d specs", DR_MAX_SPECS);
+    if (!g_nspec) g_reopen = arg;
+    g_spec_arg[g_nspec] = arg;
+    dr_parse_spec(arg, &g_spec[g_nspec++]);
 }
 
 /* -- Rotations rows and the corner catalog, cached per row ----------------- */
@@ -198,25 +422,110 @@ static void dr_corner_config(const DrBoard *b) {
 }
 
 /* -- Batches ---------------------------------------------------------------- */
-static FILE *g_out;
+static FILE  *g_out;
+static double g_deadline = 0.0;
 
-/* Dive boards idx[0..n) of the batch under one frame, and write the result. */
+static bool dr_time_up(void) {
+    return g_stop || (g_deadline > 0.0 && omp_get_wtime() >= g_deadline);
+}
+
+/* Queue boards idx[0..n) of the batch, a reopened one with its incumbent;
+   `salt` gives a round's copies streams of their own. */
+static void dr_queue(const size_t *idx, size_t n, bool seed, uint64_t salt) {
+    for (size_t i = 0; i < n; i++) {
+        const DrBoard *b = &g_batch.b[idx[i]];
+        if (seed) dr_corner_config(b);
+        DvQueue o = { .copies = g_copies, .orders = g_orders, .norders = g_norders, .salt = salt };
+        if (b->cut) { o.inc_pid = b->inc_pid; o.inc_rot = b->inc_rot; }
+        dv_queue(b->pid, b->rot, &o);
+    }
+}
+
+/* Dive boards idx[0..n) of the batch under one frame, and write the result:
+   first the boards dived as they came, then the reopened ones, round after
+   round, each round re-cutting every board from its best so far. */
 static void dr_run(const size_t *idx, size_t n, bool by_side, bool seed) {
     if (!n) return;
     dv_frame(by_side);
     dv_seeding(seed);
+    size_t *plain = xmalloc(2 * n * sizeof *plain), *cut = plain + n, np = 0, nc = 0;
     for (size_t i = 0; i < n; i++) {
-        const DrBoard *b = &g_batch.b[idx[i]];
-        if (seed) dr_corner_config(b);
-        dv_add(b->pid, b->rot);
+        if (g_batch.b[idx[i]].cut) cut[nc++] = idx[i];
+        else                       plain[np++] = idx[i];
     }
     if (g_verbose) {
-        printf("[batch] %s: %zu board(s), %s edges%s\n", g_batch.id, n,
+        printf("[batch] %s: %zu board(s), %s edges%s", g_batch.id, n,
                by_side ? "dealt" : "free", seed ? ", corner seeding" : "");
+        if (nc) printf(", %zu reopened x %d round(s)", nc, g_rounds);
+        if (g_copies > 1) printf(", %u copies each", g_copies);
+        printf("\n");
         fflush(stdout);
     }
-    dv_run(g_batch.id);
-    dv_flush(g_out);
+    if (np) {
+        dr_queue(plain, np, seed, 0);
+        dv_run(g_batch.id);
+        dv_flush(g_out);
+    }
+    if (nc && !g_stop) {
+        dv_keeping(false);
+        size_t live = nc;
+        for (int round = 0; round < g_rounds && live; round++) {
+            if (round > 0) {
+                /* The next round dives each board's best so far, the auto band
+                   chosen afresh; a board with nothing left to reopen is done. */
+                size_t k = 0;
+                for (size_t i = 0; i < live; i++) {
+                    DrBoard *b = &g_batch.b[cut[i]];
+                    bool lift[NUM_PIECES];
+                    if (!dr_lift(b->inc_pid, b->inc_rot, &g_spec[round % g_nspec], lift)) {
+                        dr_write_complete(g_out, g_batch.id, b->inc_pid, b->inc_rot);
+                        g_st.solved++;
+                        b->done = true;
+                        continue;
+                    }
+                    bool prev[NUM_PIECES];
+                    for (int x = 0; x < NUM_PIECES; x++) prev[x] = b->pid[x] == DV_EMPTY;
+                    dr_apply(b, lift);
+                    if (!dv_fits(b->pid)) dr_apply(b, prev);   /* the last cut always fits */
+                    cut[k++] = cut[i];
+                }
+                live = k;
+                if (!live) break;
+            }
+            dr_queue(cut, live, seed, (uint64_t)round);
+            dv_run(g_batch.id);
+            for (size_t i = 0; i < live; i++) {
+                DrBoard *b = &g_batch.b[cut[i]];
+                if (dv_result(i, b->inc_pid, b->inc_rot) < 0)
+                    fatal("internal error: a reopened board lost its incumbent");
+            }
+            if (g_verbose && g_rounds > 1) {
+                int best = -1;
+                for (size_t i = 0; i < live; i++) {
+                    bool brk[NUM_PIECES];
+                    const DrBoard *b = &g_batch.b[cut[i]];
+                    const int sc = 480 - dr_breaks(b->inc_pid, b->inc_rot, brk);
+                    if (sc > best) best = sc;
+                }
+                printf("[round] %s: round %d of %d, %zu board(s), best %d\n",
+                       g_batch.id, round + 1, g_rounds, live, best);
+                fflush(stdout);
+            }
+            if (dr_time_up()) break;
+        }
+        if (live) dv_keep_last();          /* the last round holds every live board's best */
+        dv_keeping(true);
+        dv_flush(g_out);
+        for (size_t i = 0; i < n; i++) {
+            const DrBoard *b = &g_batch.b[idx[i]];
+            if (!b->cut) continue;
+            bool brk[NUM_PIECES];
+            const int sc = 480 - dr_breaks(b->inc_pid, b->inc_rot, brk);
+            if (sc > b->orig) { g_st.better++; g_st.gain += sc - b->orig; }
+            else if (dr_fp(b->inc_pid, b->inc_rot) != b->orig_fp) g_st.moved++;
+        }
+    }
+    free(plain);
     g_st.dived += n;
 }
 
@@ -302,6 +611,24 @@ static void usage(const char *prog) {
         "  --rng_seed S        keys every dive (default %d)\n"
         "  --wall_time S       stop after S seconds; the current batch is still written\n"
         "  --max_emitted N     stop after writing N boards\n"
+        "\nImproving complete boards (a dived and polished board, say):\n"
+        "  --reopen SPEC       lift cells from every complete board and dive them again; the\n"
+        "                      board written is the old one unless a dive beats it. SPEC:\n"
+        "                      auto (the rows or columns of the side holding the damage,\n"
+        "                      deep enough for 90%% of it, at most 5), auto+E (E rows more),\n"
+        "                      top:K, bottom:K, left:K, right:K, box:R0-R1,C0-C1, or a\n"
+        "                      16x16 0/1 mask file. Given n times, round r reopens the\n"
+        "                      (r mod n)-th\n"
+        "  --rounds N          re-dive each board's best N times (default 1)\n"
+        "  --plateau           a round may also move a board to a different one of the\n"
+        "                      same score (never to a worse one)\n"
+        "  --copies K          dive every board K times, each copy on streams of its own;\n"
+        "                      the best copy is written (default 1)\n"
+        "  --orders LIST       copy k starts filling at LIST[k mod n]: mrv (the stock dive),\n"
+        "                      left, right, centre, ends, top, bottom (default mrv)\n"
+        "  --prior A           dives of a reopened board start pulled toward its clean\n"
+        "                      placements (weight A, 0..2; default 0 = off)\n"
+        "  --nogo B            ... and pushed off its placements on broken cells (0..2)\n"
         "  --print_cmd         echo the full command line\n"
         "  --verbose           one line per batch\n\n",
         DR_M_DEFAULT, DR_S_DEFAULT, DR_SEED_DEFAULT);
@@ -316,6 +643,17 @@ static void print_cmd(const char *a0, const char *seed, const char *in, const ch
     printf(" --threads %d --rng_seed %" PRIu64, g_nthreads, g_rng);
     if (g_wall > 0.0)                 printf(" --wall_time %g", g_wall);
     if (g_max_written)                printf(" --max_emitted %" PRIu64, g_max_written);
+    for (int k = 0; k < g_nspec; k++) printf(" --reopen %s", g_spec_arg[k]);
+    if (g_reopen)                     printf(" --rounds %d", g_rounds);
+    if (g_plateau)                    printf(" --plateau");
+    if (g_copies > 1)                 printf(" --copies %u", g_copies);
+    if (g_norders) {
+        printf(" --orders ");
+        for (int k = 0; k < g_norders; k++) printf("%s%s", k ? "," : "", dv_order_names[g_orders[k]]);
+    }
+    if (g_order_weight > 0.0f)        printf(" --order_weight %g", g_order_weight);
+    if (g_prior > 0.0f)               printf(" --prior %g", g_prior);
+    if (g_nogo > 0.0f)                printf(" --nogo %g", g_nogo);
     if (g_print_cmd)                  printf(" --print_cmd");
     if (g_verbose)                    printf(" --verbose");
     printf("\n");
@@ -349,6 +687,44 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--wall_time")   && i + 1 < argc) g_wall = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_emitted") && i + 1 < argc) g_max_written = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--copies")      && i + 1 < argc) {
+            const long v = atol(argv[++i]);
+            if (v < 1 || v > DR_MAX_COPIES) fatal("--copies must be in 1..%d", DR_MAX_COPIES);
+            g_copies = (uint32_t)v;
+        }
+        else if (!strcmp(argv[i], "--orders")      && i + 1 < argc) {
+            char buf[512];
+            snprintf(buf, sizeof buf, "%s", argv[++i]);
+            g_norders = 0;
+            for (char *t = strtok(buf, ","); t; t = strtok(NULL, ",")) {
+                int k = 0;
+                while (k < DV_NORDERS && strcmp(t, dv_order_names[k])) k++;
+                if (k == DV_NORDERS) fatal("--orders: unknown order '%s' (mrv, left, right, "
+                                           "centre, ends, top, bottom)", t);
+                if (g_norders == (int)sizeof g_orders) fatal("--orders: at most %d entries",
+                                                             (int)sizeof g_orders);
+                g_orders[g_norders++] = (uint8_t)k;
+            }
+            if (!g_norders) fatal("--orders needs at least one order");
+        }
+        else if (!strcmp(argv[i], "--order_weight") && i + 1 < argc) {
+            g_order_weight = (float)atof(argv[++i]);
+            if (g_order_weight <= 0.0f) fatal("--order_weight must be > 0");
+        }
+        else if (!strcmp(argv[i], "--reopen")      && i + 1 < argc) dr_parse_reopen(argv[++i]);
+        else if (!strcmp(argv[i], "--plateau"))    g_plateau = true;
+        else if (!strcmp(argv[i], "--rounds")      && i + 1 < argc) {
+            g_rounds = atoi(argv[++i]);
+            if (g_rounds < 1) fatal("--rounds must be >= 1");
+        }
+        else if (!strcmp(argv[i], "--prior")       && i + 1 < argc) {
+            g_prior = (float)atof(argv[++i]);
+            if (g_prior < 0.0f || g_prior > 2.0f) fatal("--prior must be in 0..2");
+        }
+        else if (!strcmp(argv[i], "--nogo")        && i + 1 < argc) {
+            g_nogo = (float)atof(argv[++i]);
+            if (g_nogo < 0.0f || g_nogo > 2.0f) fatal("--nogo must be in 0..2");
+        }
         else if (!strcmp(argv[i], "--print_cmd"))  g_print_cmd = true;
         else if (!strcmp(argv[i], "--verbose"))    g_verbose = true;
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); usage(argv[0]); return 1; }
@@ -359,10 +735,22 @@ int main(int argc, char **argv) {
                                       "are built from the sides a rotations row deals");
     if ((g_clue_mask & CLUE_CORNERS) && !g_seeds)
         printf("[warn] --clue_corners only shapes --corner_seeds; ignored\n");
+    if (!g_reopen && (g_prior > 0.0f || g_nogo > 0.0f || g_rounds > 1 || g_plateau))
+        printf("[warn] --prior, --nogo, --rounds and --plateau act on reopened boards only "
+               "(--reopen)\n");
     if (g_print_cmd) print_cmd(argv[0], seed_path, in_path, out_path);
     printf("[cfg] dives=%u polish=%d emit_score=%d frame=%s corner_seeds=%d%s threads=%d rng_seed=%" PRIu64 "\n",
            g_dives, g_polish, g_emit, g_rot_path ? g_rot_path : "(free edges)", g_seeds,
            (g_clue_mask & CLUE_CORNERS) ? " (clue 2x3)" : "", g_nthreads, g_rng);
+    if (g_reopen || g_copies > 1 || g_norders) {
+        printf("[cfg] reopen=");
+        if (!g_nspec) printf("off");
+        for (int k = 0; k < g_nspec; k++) printf("%s%s", k ? " then " : "", g_spec_arg[k]);
+        printf(" rounds=%d copies=%u orders=", g_rounds, g_copies);
+        if (!g_norders) printf("mrv");
+        for (int k = 0; k < g_norders; k++) printf("%s%s", k ? "," : "", dv_order_names[g_orders[k]]);
+        printf(" prior=%g nogo=%g%s\n", g_prior, g_nogo, g_plateau ? " plateau" : "");
+    }
     fflush(stdout);
 
     const double t0 = omp_get_wtime();
@@ -374,11 +762,14 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, handle_stop); signal(SIGTERM, handle_stop);
     const double deadline = g_wall > 0.0 ? t0 + g_wall : 0.0;
+    g_deadline = deadline;
     DvParams dp = {
         .dives = g_dives, .emit_score = g_emit, .polish = g_polish,
         .corner_seeds = g_seeds, .seed_corners = g_seeds > 0,
         .master_seed = g_rng, .max_written = g_max_written,
         .deadline = deadline, .threads = g_nthreads, .stop = &g_stop,
+        .prior = g_prior, .nogo = g_nogo, .order_weight = g_order_weight,
+        .plateau = g_plateau,
     };
     dv_init(&dp);
 
@@ -400,10 +791,30 @@ int main(int argc, char **argv) {
         }
         g_st.rows++;
         b.line = lno;
+        b.cut = b.done = false;
         bool open = false;
         for (int x = 0; x < NUM_PIECES && !open; x++) open = b.pid[x] == DV_EMPTY;
-        if (!open) { g_st.complete++; continue; }
-        dr_take(n > 2 * NUM_PIECES ? f[0] : "board", &b);
+        const char *id = n > 2 * NUM_PIECES ? f[0] : "board";
+        if (!open) {
+            if (!g_reopen) { g_st.complete++; continue; }
+            bool lift[NUM_PIECES], brk[NUM_PIECES];
+            const int nl = dr_lift(b.pid, b.rot, &g_spec[0], lift);
+            if (!nl) {                          /* auto, and nothing is broken */
+                if (strcmp(id, g_batch.id) != 0) dr_batch();
+                dr_write_complete(g_out, id, b.pid, b.rot);
+                g_st.solved++;
+                continue;
+            }
+            memcpy(b.inc_pid, b.pid, sizeof b.pid);
+            memcpy(b.inc_rot, b.rot, sizeof b.rot);
+            b.orig = 480 - dr_breaks(b.pid, b.rot, brk);
+            b.orig_fp = dr_fp(b.pid, b.rot);
+            dr_apply(&b, lift);
+            b.cut = true;
+            g_st.reopened++;
+            g_st.lifted += (uint64_t)nl;
+        }
+        dr_take(id, &b);
     }
     if (!dr_done(deadline)) dr_batch();
     fclose(in);
@@ -418,9 +829,24 @@ int main(int argc, char **argv) {
     const double wall = omp_get_wtime() - t0;
     printf("[sum] diver: %" PRIu64 " board row(s) read, %" PRIu64 " dived in %" PRIu64 " batch(es)",
            g_st.rows, g_st.dived, g_st.batches);
-    if (g_st.complete)  printf(", %" PRIu64 " already complete (nothing to dive)", g_st.complete);
+    if (g_st.complete)  printf(", %" PRIu64 " already complete (nothing to dive; see --reopen)",
+                               g_st.complete);
     if (g_st.malformed) printf(", %" PRIu64 " skipped as malformed", g_st.malformed);
     printf("\n");
+    if (g_reopen)
+        printf("[sum] reopen %s%s: %" PRIu64 " complete board(s) reopened (%.1f cells lifted on "
+               "average), %d round(s) x %u copies; %" PRIu64 " improved (%+" PRId64 " edges in "
+               "all), the rest written %s%s\n", g_reopen,
+               g_nspec > 1 ? " (and the other specs in turn)" : "", g_st.reopened,
+               g_st.reopened ? (double)g_st.lifted / (double)g_st.reopened : 0.0, g_rounds,
+               g_copies, g_st.better, g_st.gain,
+               g_plateau ? "at their old score" : "as they were",
+               g_st.solved ? "; SOLVED boards written as they are" : "");
+    if (g_plateau && g_reopen)
+        printf("[sum] plateau: %" PRIu64 " board(s) written at their old score as a different "
+               "board\n", g_st.moved);
+    if (g_st.solved)
+        printf("[sum] %" PRIu64 " board(s) score 480/480: nothing is broken\n", g_st.solved);
     if (g_rot_path)
         printf("[sum] frame: %" PRIu64 " board(s) under an id naming no rotations row, %" PRIu64
                " that do not fit their row: both dived with free edges\n", g_st.unframed, g_st.misfit);
