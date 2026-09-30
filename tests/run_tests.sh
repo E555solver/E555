@@ -102,6 +102,7 @@ ALL_STEPS=(
     "clue_orient|a band carrying no clue is searched at all four orientations"
     "band_with_frame|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
     "cpsat_chain|topper -> ender -> ender, each fed by the last"
+    "ender_repair|REGRESSION: a scrambled synthetic solution comes back 480/480; a real board redives and comes back no worse"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
     "beamer_backtrack_dive|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --lambda_reserve keeps the reserve for last"
     "beamer_resume|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
@@ -2478,6 +2479,74 @@ step_cpsat_chain() {
         echo "note: only $rows rank emitted (no distinct board within slack)"
     fi
     echo "ok: three stages chained, all outputs canonical"
+}
+
+step_ender_repair() {
+    if ! python3 -c "import ortools" 2>/dev/null; then
+        echo "SKIPPED: OR-Tools not installed (pip install ortools)"
+        return 0
+    fi
+    # Scramble the known synthetic solution three ways the ender has to undo:
+    # two 2x3 blocks whose pieces are cycled and re-spun (adjacent damage),
+    # three long-range swaps of inner pieces, and two top-border pieces
+    # exchanged along the frame. Every break is repairable by construction --
+    # the solution is still there to be found -- so anything short of 480 is a
+    # regression in the engine, the exchange move or the frame handling.
+    python3 - "$OUT/ender_scrambled.csv" <<'EOF' || fail "could not scramble the synthetic solution"
+import csv, random, sys
+row = next(csv.reader(open("data/synth_solution_480.csv")))
+f = [x.strip() for x in row]
+pos = [int(x) for x in f[-512:-256]]
+rot = [int(x) for x in f[-256:]]
+at = {pos[p]: p for p in range(256)}
+rng = random.Random(8)
+def put(p, c, s):
+    pos[p], at[c], rot[p] = c, p, s
+for r0, c0 in ((12, 3), (11, 9)):              # two 2x3 blocks, cycled and re-spun
+    cells = [r * 16 + c for r in range(r0, r0 + 2) for c in range(c0, c0 + 3)]
+    ps = [at[c] for c in cells]
+    for c, p in zip(cells, ps[1:] + ps[:1]):
+        put(p, c, rng.randrange(4))
+inner = [c for c in range(256) if 0 < c // 16 < 15 and 0 < c % 16 < 15
+         and not (11 <= c // 16 <= 13 and 3 <= c % 16 <= 11)]
+for _ in range(3):                             # three long-range swaps
+    a, b = rng.sample(inner, 2)
+    pa, pb = at[a], at[b]
+    put(pa, b, rot[pa]); put(pb, a, rot[pb])
+a, b = 15 * 16 + 5, 15 * 16 + 9                # two top-border pieces exchanged
+pa, pb = at[a], at[b]
+put(pa, b, rot[pa]); put(pb, a, rot[pb])
+csv.writer(open(sys.argv[1], "w", newline=""), lineterminator="\n").writerow(
+    ["synth_scrambled", 0] + pos + rot)
+EOF
+    before=$(python3 tools/E555_rank.py "$OUT/ender_scrambled.csv" \
+             --seed_file data/synth_seed.txt --csv | awk -F, 'NR==2{print $4}')
+    [ "${before:-480}" -lt 480 ] || fail "the scramble left the board intact"
+    python3 src/C_tail/E555_ender.py data/synth_seed.txt "$OUT/ender_scrambled.csv" \
+        "$OUT/ender_repaired.csv" --profile overnight --board_time_limit 120 \
+        --threads 4 --rng_seed 5 > "$OUT/ender_repair.log" \
+        || { tail -5 "$OUT/ender_repair.log"; fail "the ender exited non-zero"; }
+    nf=$(awk -F, '{print NF; exit}' "$OUT/ender_repaired.csv")
+    [ "$nf" = "514" ] || fail "the repaired board has $nf fields (want 514)"
+    after=$(python3 tools/E555_rank.py "$OUT/ender_repaired.csv" \
+            --seed_file data/synth_seed.txt --csv | awk -F, 'NR==2{print $4}')
+    [ "$after" = 480 ] || { tail -3 "$OUT/ender_repair.log";
+        fail "the scrambled solution came back at $after/480, not 480"; }
+
+    # The redive step hands a board to bin/E555_diver and reads the result
+    # back; the synthetic repair above never reaches it (the exchange move
+    # finishes first), so run a real board long enough for one redive.
+    python3 src/C_tail/E555_ender.py data/seed_Edge5.txt data/board_example_462.csv \
+        "$OUT/ender_462.csv" --profile overnight --board_time_limit 30 \
+        --threads 4 --rng_seed 5 > "$OUT/ender_462.log" \
+        || { tail -5 "$OUT/ender_462.log"; fail "the ender exited non-zero on the 462 board"; }
+    grep -Eq "redives=[1-9]" "$OUT/ender_462.log" \
+        || { tail -3 "$OUT/ender_462.log"; fail "no redive ran on the 462 board"; }
+    score=$(python3 tools/E555_rank.py "$OUT/ender_462.csv" \
+            --seed_file data/seed_Edge5.txt --csv | awk -F, 'NR==2{print $4}')
+    [ "${score:-0}" -ge 462 ] || fail "the 462 board came back at $score"
+    echo "ok: a scrambled synthetic solution ($before/480) restored to 480/480;" \
+         "the 462 board redived and kept at $score"
 }
 
 step_beamer_micro() {

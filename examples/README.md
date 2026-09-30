@@ -334,12 +334,12 @@ expect roughly one break per two cells it has to fill.
 ## 04 -- Stage C, and why it is now three scripts
 
 The topper and the ender only make sense together: the topper deliberately
-**piles** breaks onto a border band, and the ender is what un-piles them. What
-changed is that the ender no longer has modes you pick between -- it runs an
-adaptive portfolio, small break-centred pools first and broad neighbourhoods
-after -- so the old three-pass chain collapsed into one ender call, and the
-three scripts now differ by *how much effort* they spend rather than by which
-neighbourhood they open.
+**piles** breaks onto a border band, and the ender is what un-piles them. The
+ender has no modes you pick between -- it runs a plan of exact neighbourhoods,
+cheapest first (whole-board exchange cycles, windows round the damage, corners
+with their frame arms, the damaged band, the whole frame) -- so the old
+three-pass chain is one ender call, and the three scripts differ by *how much
+effort* they spend rather than by which neighbourhood they open.
 
 - **`04a_CP-SAT_top_and_end.sh`** is the funnel and the one to read first:
   topper scout (wide, cheap) -> promote a diverse subset -> topper polish ->
@@ -351,10 +351,18 @@ neighbourhood they open.
 
 **The two ender knobs that matter.** `ENDER_PROFILE` is the effort level --
 `overnight`, `deep`, `superdeep` -- and `ENDER_BOARD_TIME` (`--board_time_limit`)
-is the **true total budget for one board**, every focused pool, broad phase and
-restart included. Do not set `--attempt_time` unless you are deliberately
-capping one CP-SAT call. The ender never returns a board worse than its input,
-so running any of these is always safe.
+is the **true total budget for one board**, every call included. Do not set
+`--attempt_time` unless you are deliberately capping one CP-SAT call. The ender
+never returns a board worse than its input, so running any of these is always
+safe. On a many-core machine give one process all the threads: it solves
+`--jobs` regions at once (one per 4 threads by default).
+
+**Boards that were dived and polished** (`--end_dive`/`--end_polish`, or
+`E555_diver`) have nothing left for small exact windows -- they are measured
+optimal there -- so what the ender gains on them comes from its *redive* step:
+it lifts the damaged rows *and the clean row they were built on* and re-dives
+them with `bin/E555_diver`. Build the diver (`make diver`) before running the
+ender on such boards; without it the step is skipped with a note.
 
 The topper still writes what the ender reads, so a roundhouse output whose
 damage is already on the border can go straight to `04b`/`04c` and skip the

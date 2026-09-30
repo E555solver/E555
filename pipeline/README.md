@@ -305,14 +305,13 @@ Measured: one 420 s beam emitted **425 boards**, and stage 3 was still on board
 very differently: `TOP1` is ~25 s a board, `TOP2` ~250 s. Widen stage 3 freely;
 widen stage 6 only if you have the hours.
 
-**The ender climbs a ladder, and that is the budget trap.** Both ring and patch
-mode run one solve per rung — `[r1 m4]`, `[r1 m8]`, … — each at the full
-`--time_limit`, and the rungs number `reach × (max_changes / 4)`: **8 solves a
-board** at stage 7, **18** at stage 8. A stage costs boards × rungs × time.
-Before this was measured the defaults read as half an hour and were really four
-hours an iteration, with a deep pass of `10 × 30 × 900 s × 2 modes` — **six days**.
-In practice a rung stalls well before its ceiling, so real cost is about a third
-of worst case.
+**The ender's budget is per board, and it is a true wall clock.** An ender
+stage costs (boards in) × `--board_time_limit` at worst -- every call it makes
+for a board is inside that budget. It ends a board sooner only when the board
+is solved, or -- with `--no-redive`, since a redive is random and never runs
+out -- when every region of its plan is proven optimal. (An older ender ran
+one full-length solve per rung of a ladder, `reach × (max_changes / 4)` of them,
+which is how a deep pass once priced out at six days; that is gone.)
 
 **Budgets.** `--wall_time` covers the beamer's whole run, database build
 included, so `BEAM` under about four minutes with no `DB` is spent entirely on
