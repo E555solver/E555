@@ -96,13 +96,17 @@ python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
 bin/E555_beamer data/seed_Edge5.txt rotations.csv --start_row R --num_rows N \
     --clue_center --beam_width 10000 --backtrack_row 6 --stop_row 11 \
     --top_bottoms 6 --top_columns 12 --tau_bottoms 0.1 --tau_columns 0.1 \
-    --end_dive 10000 --end_polish 20000 --emit_score 452 \
-    --prefix run1 --db_file chain.db --out_dir beam_R
+    --extend_nodes 0 --end_dive 10000 --end_polish 20000 --emit_score 452 \
+    --prefix run1 --db_file chain_center.db --out_dir beam_R
 
 # Stage C: keep the best 25, then close them
 python3 tools/E555_distiller.py beam_R/*.csv --top 25 --out best.csv
 python3 src/C_tail/E555_ender.py data/seed_Edge5.txt best.csv closed.csv --profile deep
 ```
+
+`--extend_nodes 0` because every stop-row board is dived (§5.10); to stop lower
+and keep only boards that grow further, use `--stop_row 9 --backtrack_min_col 3`
+instead. The database cache depends on the clue flags, hence its own file.
 
 `examples/` holds one small script per tool (start with
 `examples/01_beamer_quickstart.sh`); `pipeline/` holds long unattended runs
@@ -706,8 +710,8 @@ known.
 **Breadth** (288 configurations, border rows 4-7, width 10000,
 `--backtrack_row 6`): neither the bottom nor the column rank predicted yield
 (bottoms 0-5 reached row 11 in 21-29 of 48 configurations each, with no trend),
-while the border row did (19/72 on row 4, 67/72 on row 5). `--tau 0.1` on both
-ranks cost nothing (168/288 against 159/288 at 0); `--tau 2` is near-uniform and
+while the border row did (19/72 on row 4, 67/72 on row 5). `--tau_bottoms/--tau_columns 0.1` on both
+ranks cost nothing (168/288 against 159/288 at 0); tau 2 is near-uniform and
 lost 10%. Spend the budget on border rows first.
 
 **Recommended pass** (the command of §3.1): width 10000, `--backtrack_row 6`,
@@ -1054,9 +1058,9 @@ Dropping the no-reuse rule turns a strip into a layered graph (nodes
 `(level, signature)`, arcs database records). One backward sweep gives which
 signatures can still finish the strip and in how many ways (0.4 s per strip at
 W = 5). A branch whose signature is dead is cut by one bitset test, so a live
-branch can only fail by piece reuse; an empty live set at level 1 proves the
-band cannot be filled by any pieces (`REFUTED ... colour alone rules this band
-out`). `--verbose` prints the live count per level.
+branch can only fail by piece reuse; an empty live set proves the band cannot
+be filled by any pieces, reported as `[round] ... status=COLOR_DEAD level=L`.
+`--verbose` prints the live count per level.
 
 - **Earlier sides** of a multi-round run must finish (the next round needs their
   wall), so they use this endpoint oracle.
@@ -1108,7 +1112,8 @@ inherited, never placed.
 The search is exhaustive and deterministic. A complete board is a solution; an
 exhausted search is a proof that this core admits no break-free refill of these
 bands, unless a budget (`--max_nodes`, `--time_limit`, `--wall_time`,
-`--max_emitted`) stopped it, which the summary marks TRUNCATED.
+`--max_emitted`) stopped it: each input's `[board]` line reports `status=DONE`,
+`BUDGET` or `TARGET` (`--target_ties` reached).
 
 Per input board it writes the deepest board reached (most pieces placed);
 `--ties N` keeps up to N at that depth that differ at least `--tie_depth` levels
@@ -1219,7 +1224,8 @@ python3 tools/E555_distiller.py partials*.csv.gz --top 25 --out distilled.csv
 ```
 
 Reads plain or gzip CSVs of partial or complete boards and keeps N = `--top`
-(default 25). With P unique partials:
+(default 25); `--out` (default `distilled.csv`) and `--seed_file` are its only
+other options. With P unique partials:
 
 | stage | method | kept |
 |---|---|---|
@@ -1293,7 +1299,7 @@ the damage lifted too.
 | `--copies K` | 1 | dive each board K times on separate streams; keep the best |
 | `--prior A`, `--nogo B` | 0, 0 | starting weights: +A on the incumbent's clean placements, -B on its broken cells (0..2) |
 | `--plateau` | off | a round may move to a different board of equal score |
-| `--orders LIST` | `mrv` | copy k breaks cell-choice ties toward `left`, `right`, `centre`, `ends`, `top`, `bottom` |
+| `--orders LIST`, `--order_weight W` | `mrv`, 6 | copy k breaks cell-choice ties toward `left`, `right`, `centre`, `ends`, `top`, `bottom`, with strength W |
 | `--threads N`, `--rng_seed S` | all, 1 | output independent of threads |
 | `--wall_time S`, `--max_emitted N` | -- | stop after the batch in flight |
 | `--print_cmd`, `--verbose` | off | |
@@ -1353,8 +1359,18 @@ clean row under them gained +1 on 2 of 8 boards and turned a 463 into
 | `--start_row`, `--num_rows`, `--shard_count`, `--shard_index`, `--resume` | 0, 0, 1, 0, off | input window and sharding |
 | `--rng_seed S`, `--verbose` | 0 = random, off | |
 
-`--show_advanced --help` lists the low-level controls (`--holes`,
-`--max_new_breaks`, `--max_changes`, ...).
+Advanced controls (`--show_advanced --help`):
+
+| option | default | meaning |
+|---|---|---|
+| `--attempt_time S` | -- | cap every CP-SAT call |
+| `--holes FILE` | -- | only these cells may move; the whole mask is also solved as one region |
+| `--max_new_breaks N`, `--max_changes N` | no cap | junctions matched in the input a move may break; cells one move may change |
+| `--preserve_clean` / `--no-preserve_clean`, `--preserve_side {auto,any,all,B,T,L,R}`, `--max_clean_loss N` | on, auto, -- | protect the board's clean foundation rows/columns |
+| `--duplicate_policy {reuse,rerun}` | -- | exact duplicate inputs |
+| `--max_passes N` | 0 = budget only | passes over the plan per board |
+| `--diver PATH` | `bin/E555_diver` | the redive binary |
+| `--symmetry_level`, `--linearization_level`, `--log_search` | solver defaults | OR-Tools controls |
 
 ### 9.4 `E555_topper.py` -- CP-SAT break minimizer over border bands
 
@@ -1379,6 +1395,23 @@ load.
   clues can be enforced here).
 - Budgets: `--time_limit` (300 s per board, split over ranks), `--stall_time`
   (120 s), `--threads` (8).
+
+| option | default | meaning |
+|---|---|---|
+| `--side`, `--band_depth N` | T, 4 | bands to open |
+| `--locked_rows N` | 0 | outer rows/cols of each band unset and kept empty |
+| `--holes FILE` | -- | explicit mask instead of bands |
+| `--top N`, `--beam_diff N`, `--beam_slack N` | 1, 4, 1 | distinct ranks per board |
+| `--beam_diff_mode {piece,placement}` | piece | whether a rotation-only change counts as a difference |
+| `--rank1_fraction F` | 0.60 | share of the board's time reserved for rank 1 when `--top > 1` |
+| `--relax_breaks` | off | let the break count trade against a longer corner pull |
+| `--clue_center`, `--clue_corners`, `--clue_orient` | off, off, auto | clues |
+| `--time_limit S`, `--stall_time S` | 300, 120 | per board (split over ranks); per rank without improvement |
+| `--threads N`, `--rng_seed S` | 8, 0 = OS entropy | |
+| `--symmetry_level`, `--linearization_level` | 2, 1 | OR-Tools levels |
+| `--repair_hint` / `--no-repair_hint`, `--hint_conflicts N` | off, 1000 | repair the hint before search |
+| `--start_row`, `--num_rows` | 0, 0 = all | input window |
+| `--tag_id`, `--log_search`, `--verbose` | off | append `_<score>` to ids; solver logs; telemetry |
 
 `pipeline/topper_sweep.sh PRESET=...` chains passes `SIDE DEPTH LOCKED`:
 
@@ -1454,7 +1487,7 @@ node rate).
 | `--break_mode`, `--breaks K` | stuck, 0 | engine; break ceiling |
 | `--restarts N`, `--no_lcv` | 50000, off | dives; value ordering off |
 | `--order`, `--reverse`, `--jump` | mrv, off, off | cell order |
-| `--hall MODE`, `--hall_stride N`, `--hall_min N` | adaptive, 8, 32 | Hall bound schedule |
+| `--hall MODE`, `--hall_stride N`, `--hall_min N` | adaptive, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record |
 | `--max_emitted N` | 1 | completions per record (0 = all) |
@@ -1475,7 +1508,9 @@ Output: one best-board row per input record in `output.csv`, plus
 
 - **`tools/E555_viewer.py`** -- ASCII board (`#` marks broken junctions),
   placement and match statistics, frame check, an e2.bucas.name URL; `--diff A B`
-  compares two rows. It is also the shared Python module (clue table, board
+  compares two rows; `--row N`, `--all` (one URL per row), `--name`, `--no_board`,
+  `--no_url`, `--seed_file` (default `./seed_Edge5.txt`, then `data/`). It is also
+  the shared Python module (clue table, board
   parsing) that the rank tool and the CP-SAT tools import.
 - **`tools/E555_rank.py`** -- ranks board CSVs by measures the score cannot see:
   `breaks`, `score`, `solid`, `placed`, `border`, `break_rows`, `break_cols`
@@ -1485,12 +1520,17 @@ Output: one best-board row per input record in `output.csv`, plus
   inverts). `--out F` writes the rows re-ordered verbatim; `--rescore` rewrites
   them canonically with the score recomputed. `--diverse K` picks K boards
   farthest-first on cell agreement; `--max_agree P` drops near-duplicates;
-  `--group_box`/`--unique` group before ranking. `--count`, `--field NAME` and
-  `--split KEY N A.csv B.csv` serve scripts. `--top N` streams with bounded
+  `--diversity_box` and `--diversity_metric {cells,fraction}` set where and how
+  agreement is measured. `--group_box R0:R1,C0:C1` / `--unique` group boards by a
+  rectangle's (or the whole board's) contents and keep `--per_group` per group
+  before ranking; `--border_only` keeps boards with a clean complete border.
+  Output: a table (`--no_id`, `--quiet`) or CSV (`--csv`); `--count`,
+  `--field NAME` and `--split KEY N A.csv B.csv` serve scripts; `--seed_file`.
+  `--top N` streams with bounded
   memory; `--max_mem` (8 GB) refuses larger inputs up front.
 - **`tools/E555_rotate.py`** -- turns every board by N quarter-turns clockwise
   (`--all` writes all four), losslessly and re-scored; `--holes` turns a mask
-  with it; `--rotations` turns a Stage A rotations file (a border piece's spin
+  with it (`--holes_out`; `--out` names the board file; `--seed_file`); `--rotations` turns a Stage A rotations file (a border piece's spin
   fixes its side). `--sink M` moves every piece M rows down, not losslessly: the
   bottom M rows leave the board, row 0 and rows `15-M..15` open (`16(M+2)` cells),
   giving a Stage C partial with a fresh top; `--clue_center` keeps only boards
@@ -1498,9 +1538,11 @@ Output: one best-board row per input record in `output.csv`, plus
 - **`tools/E555_sort_rotations.py`** -- orders a rotations file (the beamer reads
   borders in file order) by `score`, `score_dd`, a side's count, or the
   constraint-first keys `min_side`, `max_side`, `spread` (= ln max - ln min).
-  `--max_top`...`--min_left` turn each row so its largest or smallest count lands
+  `--max_top/--max_right/--max_bottom/--max_left` and
+  `--min_top/--min_right/--min_bottom/--min_left` turn each row so its largest or smallest count lands
   on the named side, appending a `Turn=` note; `Score=` is not rewritten.
-  Writes to stdout unless `-o`.
+  `--top N` keeps the best N. Writes to stdout unless `-o`; `--seed_file` is
+  read only for a turn.
 - **`tools/E555_extract_consensus.py`** -- for a pool of clued partials: brings
   each board to orientation 0, builds the piece-by-cell frequency table of the
   pool, and scores each board by the mean over its cells of
@@ -1514,6 +1556,17 @@ Output: one best-board row per input record in `output.csv`, plus
   side has `--min_trails` trails, within `--border_time`. It also writes
   `<stem>_frame.csv`, the 60 border pieces laid out as the maximum-consensus Euler
   trail per side (exact subset DP), a finalizer input in fixed-sides mode.
+  Other options: `--metric {lift,logp,rank,top1}` (sort key; all four are
+  printed), `--alpha` (smoothing, 0.5), `--loo {auto,on,off}`, `--min_support N`
+  (2), `--common_frac F` (1.0), `--box R0:R1,C0:C1` (score a rectangle, canonical
+  coordinates), `--band_rows D` (5) and `--min_band_support N` (25) for the bag
+  scores, `--consensus_out/--consensus_in FILE` (score one corpus against
+  another's table), `--top`, `--out` (rows re-ordered verbatim), `--csv`,
+  `--no_id`, `--quiet`, `--count`, `--max_mem`, `--progress_every`,
+  `--seed_file`; for the border search `--border_pin N` (the `--pin_clue` frame
+  to emit in), `--border_rows N` (borders per corner class), `--w_consensus`
+  (1.0), `--w_trails` (0.5), `--border_steps` (100000), `--border_restarts`,
+  `--border_T0/--border_Tf`, `--border_seed`.
 - **`tools/E555_clean_csv.py`** -- drops boards that repeat an earlier board
   with one frontier piece swapped.
 
