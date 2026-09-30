@@ -816,11 +816,11 @@ static struct {
     int      top_min, top_max;       /* top full rows of the written boards */
     int      seed_best, plain_best;
     double   t, t_s1, t_s2, u_s1, u_s2, jt_s2, jt_pol;
-    int      best;
+    int      best, last_best;         /* the run's best; the last dv_run batch's */
     uint64_t inc_boards, inc_better;  /* boards with an incumbent; beaten by a dive */
     int64_t  inc_gain;
     uint64_t hist[DV_EDGES + 1];
-} g_dv_run = { .best = -1, .seed_best = -1, .plain_best = -1, .top_min = PUZZLE_SIDE, .top_max = -1 };
+} g_dv_run = { .best = -1, .last_best = -1, .seed_best = -1, .plain_best = -1, .top_min = PUZZLE_SIDE, .top_max = -1 };
 
 void dv_init(const DvParams *p) {
     g_p = *p;
@@ -831,6 +831,7 @@ void dv_seeding(bool on) { g_p.seed_corners = on; }
 void dv_keeping(bool on) { g_dv_keeping = on; }
 
 uint64_t dv_written(void) { return g_dv_run.written; }
+int      dv_last_best(void) { return g_dv_run.last_best; }
 uint64_t dv_boards(void)  { return g_dv_run.roots; }
 
 static DvRoot *dv_push_root(void) {
@@ -1774,6 +1775,7 @@ uint64_t dv_keep_last(void) {
 void dv_run(const char *id) {
     const size_t n = g_dv_qn;
     g_dv_qn = 0;
+    g_dv_run.last_best = -1;
     if (!n) return;
     const double t0 = omp_get_wtime();
     const int nt = g_p.threads > 0 ? g_p.threads : omp_get_max_threads();
@@ -1947,6 +1949,7 @@ void dv_run(const char *id) {
     g_dv_run.roots += n; g_dv_run.stage2 += n_s2; g_dv_run.dives += dives;
     g_dv_run.t += dt;
     if (best > g_dv_run.best) g_dv_run.best = best;
+    g_dv_run.last_best = best;
     if (g_verbose) {
         printf("[dive] %s boards=%zu stage1_best=%d median=%d stage2=%zu best=%d "
                "kept>=%d:%" PRIu64 " dives=%" PRIu64 " t=%.2fs (stage 1 %.2fs, "

@@ -2790,6 +2790,63 @@ assert n >= len(plain), "fewer dived boards than stop-row boards"
 print("ok: %d stop-row boards legal with the frame; %d dived boards complete, "
       "scores recount, cores untouched" % (len(plain), n))
 EOF
+
+    # The column-major extension (on by default under --backtrack_row): the
+    # same run with --extend_nodes 0 must write the same stop-row boards, the
+    # extension only adding cells above the stop row, in column-major order
+    # from column 1 (checked by the legality pass above: no break anywhere).
+    # 4 threads write the same file as 1; --backtrack_min_col 1 writes the
+    # subset whose extension fills column 1; --prefix names the boards.
+    grep -q "^\[sum\] extension (--extend_nodes 100000)" "$OUT/btd_plain.log" \
+        || fail "no extension summary"
+    "${CMD[@]}" --extend_nodes 0 --out_dir "$OUT/btd_noext" > "$OUT/btd_noext.log" \
+        || { tail -5 "$OUT/btd_noext.log"; fail "--extend_nodes 0 run exited non-zero"; }
+    "${CMD[@]}" --threads 4 --out_dir "$OUT/btd_t4" --prefix gate1 > "$OUT/btd_t4.log" \
+        || { tail -5 "$OUT/btd_t4.log"; fail "--prefix run exited non-zero"; }
+    "${CMD[@]}" --backtrack_min_col 1 --out_dir "$OUT/btd_min1" --prefix > "$OUT/btd_min1.log" \
+        || { tail -5 "$OUT/btd_min1.log"; fail "--backtrack_min_col 1 run exited non-zero"; }
+    local code
+    code=$(sed -n 's/^\[cfg\] run prefix: \([A-Z0-9]\{6\}\) .*/\1/p' "$OUT/btd_min1.log")
+    [ -n "$code" ] || fail "a bare --prefix printed no 6-character run code"
+    for bad in "a b" "a,b"; do
+        if "${CMD[@]}" --prefix "$bad" --out_dir "$OUT/btd_bad" > "$OUT/btd_bad.log" 2>&1; then
+            fail "--prefix '$bad' was accepted"
+        fi
+    done
+    python3 - "$OUT/btd_plain/beam_completions_0_10.csv" "$OUT/btd_noext/beam_completions_0_10.csv" \
+              "$OUT/btd_t4/beam_completions_0_10.csv" "$OUT/btd_min1/beam_completions_0_10.csv" \
+              "$code" <<'EOF' || exit 1
+import sys
+STOP, H = 10, 4
+def rows(p):
+    for l in open(p):
+        if l.strip() and l[0] not in "#%":
+            v = [x.strip() for x in l.split(",")]
+            yield v[0], list(map(int, v[-512:-256])), v[-256:]
+def split(pos, rot):
+    core = tuple(sorted((c, p, rot[p]) for p, c in enumerate(pos) if c != 999 and (c < 16 * (STOP + 1) or c % 16 in (0, 15) or c >= 240)))
+    ext = sorted(c for c in pos if c != 999 and STOP < c // 16 < 15 and 0 < c % 16 < 15)
+    return core, ext
+order = [r * 16 + c for c in range(1, 15) for r in range(STOP + 1, 15)]
+ext_rows = list(rows(sys.argv[1]))
+cores, n_ext = [], 0
+for name, pos, rot in ext_rows:
+    core, ext = split(pos, rot)
+    assert ext == sorted(order[:len(ext)]), f"{name}: extension cells are not a column-major prefix: {ext}"
+    cores.append(core); n_ext += len(ext)
+plain = [split(p, r)[0] for _, p, r in rows(sys.argv[2])]
+assert all(not split(p, r)[1] for _, p, r in rows(sys.argv[2])), "--extend_nodes 0 placed cells above the stop row"
+assert cores == plain, "the extension changed the stop-row boards or their order"
+t4 = list(rows(sys.argv[3]))
+assert [(p, r) for _, p, r in t4] == [(p, r) for _, p, r in ext_rows], "4 threads wrote other boards than 1"
+assert all(n.startswith("gate1_") for n, _, _ in t4), "--prefix gate1 did not name the boards"
+m1 = list(rows(sys.argv[4]))
+assert all(n.startswith(sys.argv[5] + "_") for n, _, _ in m1), "the bare --prefix code does not name the boards"
+full1 = [(p, r) for _, p, r in ext_rows if len(split(p, r)[1]) >= H]
+assert [(p, r) for _, p, r in m1] == full1, "--backtrack_min_col 1 did not write exactly the boards filling column 1"
+print(f"ok: extension on {len(ext_rows)} boards ({n_ext} cells, column-major, stop-row boards unchanged); "
+      f"same at 4 threads; --backtrack_min_col 1 keeps {len(m1)}; --prefix names the rows")
+EOF
 }
 
 # =============================================================================

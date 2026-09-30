@@ -129,6 +129,8 @@ void     dv_run(const char *id);
    forget them. Called after every batch, so a killed run loses at most one. */
 void     dv_flush(FILE *fp);
 uint64_t dv_written(void);
+/* The best score of the last dv_run batch, -1 when it dived nothing. */
+int      dv_last_best(void);
 uint64_t dv_boards(void);
 /* After dv_run: the best board of queued board i of that batch (i counts
    dv_add/dv_queue calls, not copies) -- its best copy, or its incumbent -- and

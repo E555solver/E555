@@ -46,7 +46,9 @@
  *   --stop_row: parity at every row and clue pins, and under --lambda_corners
  *   at least one top corner still closable (a TL or TR block alive) at every
  *   row. Every completing board is emitted, exact duplicates aside and without the
- *   EMIT_MAX cap. See backtrack_emit.
+ *   EMIT_MAX cap -- first extended column by column above the stop row, from
+ *   its deepest zero-break prefix (--extend_nodes, --backtrack_min_col). See
+ *   backtrack_emit and extend_board.
  *
  * END DIVES (--end_dive M --emit_score S)
  *   Instead of being written, each stop-row board is completed to 256 pieces
@@ -78,6 +80,7 @@
 #define _FILE_OFFSET_BITS 64
 
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
@@ -90,6 +93,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -118,7 +122,22 @@ static uint32_t g_stop_row        = 11;
 /* --backtrack_row N (0 = off): the beam stops at row N, and every row-N
    candidate is searched exhaustively, cell by cell, up to --stop_row. */
 static uint32_t g_backtrack_row   = 0;
+/* --extend_nodes N: every board the backtracker completes at --stop_row is
+   extended by an exhaustive column-major search over rows stop+1..14, cols
+   1..14, of at most N nodes, and written from its deepest zero-break prefix
+   (0 = off). --backtrack_min_col K writes only boards whose extension fills
+   at least K whole columns. See extend_board. */
+static uint32_t g_extend_nodes    = 100000;
+static uint32_t g_bt_min_col      = 0;
+/* --prefix: written in front of the configuration id in every board name. */
+static char     g_prefix[40]      = "";
+/* Boards found at the stop row and written, this configuration's and the
+   run's (cfg_count_written). */
+static uint64_t g_cfg_found = 0, g_cfg_written = 0, g_found_total = 0, g_written_total = 0;
+static char     g_board_id_str[140] = "c0";
+
 static bool     g_backtrack_row_set = false;
+static bool     g_extend_set = false, g_min_col_set = false;
 /* The row the beam treats as its last: expanded like a stop row (every
    conflict-free completion, raw ranking) and never pruned. */
 static inline uint32_t gen_stop_row(void) { return g_backtrack_row ? g_backtrack_row : g_stop_row; }
@@ -181,6 +200,28 @@ static const LeftOrder   *g_cur_left   = NULL;
 /* Wide enough that snprintf cannot truncate the longest id the sweep can build
    ("r<row>b<bottom>l<column>"), which -Wformat-truncation checks. */
 static char     g_config_id_str[96] = "c0";
+
+/* A run code for a bare --prefix: 6 characters of [A-Z0-9] from the kernel's
+   random source (clock and pid if that fails), never from the master RNG, so
+   runs under --rng_seed stay reproducible. */
+static void run_code(char out[7]) {
+    static const char al[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    uint8_t b[6];
+    if (getrandom(b, sizeof b, 0) != (ssize_t)sizeof b) {
+        uint64_t x = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ULL ^ (uint64_t)getpid() << 17
+                   ^ (uint64_t)clock();
+        for (int k = 0; k < 6; k++) { x ^= x >> 29; x *= 0xBF58476D1CE4E5B9ULL; b[k] = (uint8_t)(x >> 56); }
+    }
+    for (int k = 0; k < 6; k++) out[k] = al[b[k] % 36];
+    out[6] = '\0';
+}
+
+/* The name a written board carries in its first cell: the configuration id,
+   behind the --prefix when one is set. */
+static void set_board_id(void) {
+    if (g_prefix[0]) snprintf(g_board_id_str, sizeof g_board_id_str, "%s_%s", g_prefix, g_config_id_str);
+    else             snprintf(g_board_id_str, sizeof g_board_id_str, "%s", g_config_id_str);
+}
 
 /* Emit dedup table (open addressing, power-of-2; emission is serial). */
 static uint64_t  *g_emit_htable = NULL;
@@ -636,6 +677,11 @@ static inline bool cell_is_placed(int r, int c, int row, uint16_t colmask) {
     return (r < row) || ((colmask >> c) & 1u) != 0;
 }
 
+/* A stop-row board's extension above its top row (extend_board): n catalog
+   orientations, the k-th on cell[k]. */
+#define EXT_MAX (EDGE_LEN * EDGE_LEN)
+typedef struct { uint16_t n; uint8_t cell[EXT_MAX]; uint16_t ci[EXT_MAX]; } Ext;
+
 /* Flatten rows[0..row] into per-piece position/rotation vectors and write them
    as the 512 comma-separated fields that follow a line's prefix. colmask says
    which columns of the TOP row carry a piece (ROWMASK_FULL for a completed stop
@@ -645,7 +691,8 @@ static inline bool cell_is_placed(int r, int c, int row, uint16_t colmask) {
    board_arrays fills the per-piece vectors; format_board_tail writes them and
    returns the byte count. */
 static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colmask,
-                         int orient, uint32_t pos[NUM_PIECES], uint32_t rot_arr[NUM_PIECES]) {
+                         int orient, const Ext *ext,
+                         uint32_t pos[NUM_PIECES], uint32_t rot_arr[NUM_PIECES]) {
     for (int i = 0; i < NUM_PIECES; i++) { pos[i] = 999; rot_arr[i] = 0; }
     for (int r = 0; r <= row; r++) {
         uint16_t m = (r == row) ? colmask : ROWMASK_FULL;
@@ -655,6 +702,11 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
             pos[pid] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[pid] = rot;
         }
     }
+    if (ext)
+        for (int k = 0; k < ext->n; k++) {
+            const Oriented *o = &g_cat[ext->ci[k]];
+            pos[o->piece_id] = ext->cell[k]; rot_arr[o->piece_id] = o->rotation;
+        }
     /* --clue_corners: also place the two row-13 clue pieces the beam never
        reaches, so every emitted board carries all the clues its orientation
        holds -- the viewer shows the corners pinned, and Stage C (and the end
@@ -668,6 +720,7 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
         for (int k = 3; k < CLUE_N; k++) {
             const ClueCell *cc = &g_clue[orient][k];
             if (cell_is_placed(cc->row, cc->col, row, colmask)) continue;
+            if (pos[cc->piece] != 999) continue;          /* the extension placed it */
             pos[cc->piece]     = (uint32_t)(cc->row * PUZZLE_SIDE + cc->col);
             rot_arr[cc->piece] = cc->spin;
         }
@@ -701,9 +754,9 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
 }
 
 static int format_board_tail(const RowChoice rows[EDGE_LEN], int row,
-                             uint16_t colmask, int orient, char *out) {
+                             uint16_t colmask, int orient, const Ext *ext, char *out) {
     uint32_t pos[NUM_PIECES], rot_arr[NUM_PIECES];
-    board_arrays(rows, row, colmask, orient, pos, rot_arr);
+    board_arrays(rows, row, colmask, orient, ext, pos, rot_arr);
     char *p = out;
     for (int i = 0; i < NUM_PIECES; i++) { *p++ = ','; *p++ = ' '; p = u32a(p, pos[i]); }
     for (int i = 0; i < NUM_PIECES; i++) { *p++ = ','; *p++ = ' '; p = u32a(p, rot_arr[i]); }
@@ -736,7 +789,7 @@ static void emit_incomplete(const BeamCtx *ctx, const BeamEntry *parent,
     partial_keys(parent->used, kind, orient, seq, n, keys);
 
     char line[EMIT_LINE_MAX];
-    int len = format_board_tail(rows, row, colmask, orient, line);
+    int len = format_board_tail(rows, row, colmask, orient, NULL, line);
 
     #pragma omp critical(e555_incomplete)
     {
@@ -745,7 +798,7 @@ static void emit_incomplete(const BeamCtx *ctx, const BeamEntry *parent,
             g_part_count[kind]++;
             g_partial_count++;
             uint64_t sol_idx = g_partial_total++;
-            fprintf(*fp, "%s, %" PRIu64, g_config_id_str, sol_idx);
+            fprintf(*fp, "%s, %" PRIu64, g_board_id_str, sol_idx);
             fwrite(line, 1, (size_t)len, *fp);
         }
     }
@@ -2488,10 +2541,11 @@ static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
 #define DIVE_SLOT_BYTES (NUM_PIECES * (sizeof(uint16_t) + 1))
 _Static_assert(DIVE_SLOT_BYTES <= EMIT_LINE_MAX, "dive slot fits an emission slot");
 
-static int prepare_board(const RowChoice rows[EDGE_LEN], int row, int orient, char *slot) {
-    if (!g_end_dive) return format_board_tail(rows, row, ROWMASK_FULL, orient, slot);
+static int prepare_board(const RowChoice rows[EDGE_LEN], int row, int orient,
+                         const Ext *ext, char *slot) {
+    if (!g_end_dive) return format_board_tail(rows, row, ROWMASK_FULL, orient, ext, slot);
     uint32_t pos[NUM_PIECES], rot[NUM_PIECES];
-    board_arrays(rows, row, ROWMASK_FULL, orient, pos, rot);
+    board_arrays(rows, row, ROWMASK_FULL, orient, ext, pos, rot);
     uint16_t pid[NUM_PIECES];
     uint8_t *cr = (uint8_t *)slot + NUM_PIECES * sizeof(uint16_t);
     for (int x = 0; x < NUM_PIECES; x++) { pid[x] = DV_EMPTY; cr[x] = 0; }
@@ -2508,7 +2562,7 @@ static void emit_board_line(const char *slot, size_t len) {
         dv_add(pid, (const uint8_t *)slot + sizeof pid);
         return;
     }
-    fprintf(g_completions_fp, "%s, %" PRIu64, g_config_id_str, g_solution_idx++);
+    fprintf(g_completions_fp, "%s, %" PRIu64, g_board_id_str, g_solution_idx++);
     fwrite(slot, 1, len, g_completions_fp);
 }
 
@@ -2552,7 +2606,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
             g_emit_lens[k] = prepare_board(rows, row,
                                            (pe->flags & FLAG_ORIENT_SET)
                                                ? (int)(pe->flags & FLAG_ORIENT_MASK) : -1,
-                                           g_emit_lines + (size_t)k * EMIT_LINE_MAX);
+                                           NULL, g_emit_lines + (size_t)k * EMIT_LINE_MAX);
             if (g_corners_on)
                 g_emit_corner[k] = corner_emit_code(&beam[pe->parent], &pe->mv, row,
                     (pe->flags & FLAG_ORIENT_SET) ? (int)(pe->flags & FLAG_ORIENT_MASK) : -1);
@@ -2619,6 +2673,134 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
    placeholder, so the boards come out in exactly the serial search's order and
    the counts are the serial search's counts. */
 
+/* -- Extending a stop-row board (--extend_nodes) ----------------------------- *
+
+   Every board the backtracker completes at the stop row S goes on, before it is
+   written or dived, with an exhaustive zero-break search over the inner cells
+   above it -- rows S+1..14, cols 1..14 -- in COLUMN-major order: column 1 bottom
+   up, then column 2, and so on. The board is written from the deepest prefix
+   the search reaches (the first found at that depth, so the output does not
+   depend on the thread count), still one line per stop-row board. Growing by
+   columns leaves the unfilled cells, and so the dives' breaks, in the top-right
+   corner; the right column and the top border above S are left to the dives.
+
+   Every cell is checked on its own: an unused piece matching the left and
+   bottom colours (g_lb_bucket); on row 14, a top colour still carried by an
+   unplaced piece of the top-border pool (the rotations row's top border, or
+   every unused edge under --free_edges), so no cell forces a break at the top
+   border; next to a clue cell, the colour the clue will show. A clue cell in
+   the region takes its piece at its spin when the board's orientation is
+   known, and ends the extension when it is not. At most --extend_nodes
+   placements per board. */
+typedef struct {
+    uint64_t used[4];
+    int      avail[NUM_COLORS_TOTAL];     /* top-border pool, by inner colour */
+    int16_t  fix[NUM_PIECES];             /* per cell: clue catalog index, -1 free, -2 stop */
+    uint8_t  topc[NUM_PIECES], rgtc[NUM_PIECES];   /* colours a placed region cell shows */
+    uint8_t  cell[EXT_MAX];               /* the region, in visit order */
+    uint16_t cur[EXT_MAX];
+    const uint8_t *rtop;
+    int      nreg, best, stop;
+    uint64_t nodes, cap;
+    Ext     *out;
+} ExtCtx;
+
+static void ext_dfs(ExtCtx *e, int d);
+
+static inline void ext_place(ExtCtx *e, int d, int cell, uint16_t ci) {
+    e->cur[d] = ci;
+    e->topc[cell] = g_cat[ci].top;
+    e->rgtc[cell] = g_cat[ci].right;
+    ext_dfs(e, d + 1);
+}
+
+static void ext_dfs(ExtCtx *e, int d) {
+    if (d > e->best) { e->best = d; memcpy(e->out->ci, e->cur, (size_t)d * sizeof e->cur[0]); }
+    if (d == e->nreg || e->nodes >= e->cap) return;
+    const int cell = e->cell[d], r = cell / PUZZLE_SIDE, c = cell % PUZZLE_SIDE;
+    const int L = (c == 1) ? g_cur_left->right[r] : e->rgtc[cell - 1];
+    const int B = (r == e->stop + 1) ? e->rtop[c] : e->topc[cell - PUZZLE_SIDE];
+    if (!color_is_inner(L) || !color_is_inner(B)) return;
+    const int f = e->fix[cell];
+    if (f == -2) return;
+    const int up = (r < EDGE_LEN) ? e->fix[cell + PUZZLE_SIDE] : -1;
+    const int rt = (c < EDGE_LEN) ? e->fix[cell + 1] : -1;
+    const int need_t = up >= 0 ? g_cat[up].bottom : -1;
+    const int need_r = rt >= 0 ? g_cat[rt].left : -1;
+    if (f >= 0) {                     /* the clue: reserved in used, placed as is */
+        const Oriented *o = &g_cat[f];
+        if (o->left != L || o->bottom != B) return;
+        if ((need_t >= 0 && o->top != need_t) || (need_r >= 0 && o->right != need_r)) return;
+        e->nodes++;
+        ext_place(e, d, cell, (uint16_t)f);
+        return;
+    }
+    const bool top_row = (r == EDGE_LEN);
+    const int nb = g_lb_count[L][B];
+    for (int k = 0; k < nb; k++) {
+        const int ci = g_lb_bucket[L][B][k];
+        const Oriented *o = &g_cat[ci];
+        if (need_t >= 0 && o->top != need_t) continue;
+        if (need_r >= 0 && o->right != need_r) continue;
+        if (top_row && e->avail[o->top] <= 0) continue;
+        if (used_test(e->used, o->piece_id)) continue;
+        if (e->nodes >= e->cap) return;
+        e->nodes++;
+        used_set(e->used, o->piece_id);
+        if (top_row) e->avail[o->top]--;
+        ext_place(e, d, cell, (uint16_t)ci);
+        if (top_row) e->avail[o->top]++;
+        used_clear(e->used, o->piece_id);
+        if (e->best == e->nreg) return;
+    }
+}
+
+/* Extend the stop-row board (used, rtop, orientation) above row `stop` into
+   out; returns whether the node cap cut the search short. */
+static bool extend_board(const uint64_t used[4], const uint8_t rtop[PUZZLE_SIDE],
+                         int stop, int orient, Ext *out) {
+    out->n = 0;
+    if (g_extend_nodes == 0 || stop >= EDGE_LEN) return false;
+    ExtCtx e;
+    memcpy(e.used, used, sizeof e.used);
+    e.rtop = rtop; e.stop = stop; e.out = out;
+    e.best = 0; e.nodes = 0; e.cap = g_extend_nodes;
+    e.nreg = 0;
+    for (int c = 1; c <= EDGE_LEN; c++)
+        for (int r = stop + 1; r <= EDGE_LEN; r++) e.cell[e.nreg++] = (uint8_t)(r * PUZZLE_SIDE + c);
+    for (int i = 0; i < NUM_PIECES; i++) e.fix[i] = -1;
+    if (g_clue_mask)
+        for (int k = 0; k < CLUE_N; k++) {
+            if (!clue_on(k)) continue;
+            for (int o = 0; o < 4; o++) {
+                if (!(g_clue_orients & (1u << o))) continue;
+                if (orient >= 0 && o != orient) continue;
+                const ClueCell *cc = &g_clue[o][k];
+                if (cc->row <= stop || cc->row > EDGE_LEN) continue;
+                e.fix[cc->row * PUZZLE_SIDE + cc->col] =
+                    orient >= 0 ? (int16_t)g_clue_ci[o][k] : (int16_t)-2;
+            }
+        }
+    memset(e.avail, 0, sizeof e.avail);
+    if (g_free_edges) {
+        for (int t = 0; t < g_edge_term_count; t++)
+            if (!used_test(used, g_edge_term[t].piece_id) && color_is_inner(g_edge_term[t].left))
+                e.avail[g_edge_term[t].left]++;
+    } else {
+        for (int c = COLOR_MIN; c <= COLOR_MAX; c++) e.avail[c] = g_top_border_inner_count[c];
+    }
+    ext_dfs(&e, 0);
+    out->n = (uint16_t)e.best;
+    for (int k = 0; k < e.best; k++) out->cell[k] = e.cell[k];
+    return e.best < e.nreg && e.nodes >= e.cap;
+}
+
+/* Whole columns an extension fills, counted from column 1. */
+static inline int ext_columns(const Ext *x, int stop) {
+    const int h = EDGE_LEN - stop;
+    return h > 0 ? x->n / h : 0;
+}
+
 /* One search job's output: formatted boards and, between them, the outputs of
    the subtrees the job handed to the queue (kid[i] goes before board kid_at[i]). */
 typedef struct BtNode {
@@ -2627,6 +2809,7 @@ typedef struct BtNode {
     uint64_t *fp;                         /* exact-board fingerprint */
     uint8_t  *cc;                         /* corner code (--lambda_corners) */
     uint8_t  *rs;                         /* TOP reserve pieces left free */
+    uint8_t  *ex;                         /* extension cells (--extend_nodes) */
     uint32_t  n, ncap;
     struct BtNode **kid;
     uint32_t *kid_at;
@@ -2641,6 +2824,7 @@ typedef struct {
     uint16_t  pin_val[EDGE_LEN + 1][PUZZLE_SIDE];
     uint8_t   flags[EDGE_LEN + 1];        /* orientation tag row r commits with */
     uint64_t  nodes, fill[EDGE_LEN + 1], cut_parity, cut_corner;
+    uint64_t  ext_nodes_cap, cut_mincol;  /* extensions the node cap cut; under --backtrack_min_col */
     /* --lambda_corners: alive live-block indices per level, slot and corner. */
     uint16_t  cn[EDGE_LEN + 1][4][2];
     uint16_t  cl[EDGE_LEN + 1][4][2][TC_MAX_BLOCKS];
@@ -2654,6 +2838,13 @@ typedef struct {
 
 static struct {
     uint64_t roots, roots_emitting, nodes, cut_parity, cut_corner, emitted;
+    /* --extend_nodes, over the boards written: extension cells and whole
+       columns (sum, max), extensions the node cap cut, boards dropped by
+       --backtrack_min_col, and per configuration the deepest extension. */
+    uint64_t ext_cells, ext_cols, ext_cap, cut_mincol, dup;
+    int      ext_max, ext_cols_max, cfg_ext_max;
+    uint64_t cfg_found, cfg_dup, cfg_mincol;   /* this configuration's stop-row boards,
+                                           exact repeats, under --backtrack_min_col */
     uint64_t fill[EDGE_LEN + 1];
     double   t;
 } g_bt_run;
@@ -2692,7 +2883,7 @@ static struct {
     uint32_t  cursor;                     /* next root to write */
     omp_lock_t commit;
     bool      abort;
-    uint64_t  emitted, roots_emitting;
+    uint64_t  emitted, roots_emitting, dup;
 } g_bt;
 
 /* Is some thread out of work? Read without locks: a stale answer only moves a
@@ -2723,7 +2914,7 @@ static inline BtNode *bt_out(BtCtx *x) {
 static void bt_node_free(BtNode *o) {
     if (!o) return;
     for (uint32_t i = 0; i < o->nkid; i++) bt_node_free(o->kid[i]);
-    free(o->buf); free(o->off); free(o->fp); free(o->cc); free(o->rs); free(o->kid); free(o->kid_at);
+    free(o->buf); free(o->off); free(o->fp); free(o->cc); free(o->rs); free(o->ex); free(o->kid); free(o->kid_at);
     free(o);
 }
 
@@ -2785,7 +2976,7 @@ static void bt_spawn(BtCtx *x, int row) {
     bt_job_push(&j);
 }
 
-static void bt_out_push(BtNode *o, const BtCtx *x, int stop) {
+static void bt_out_push(BtNode *o, BtCtx *x, int stop) {
     if (o->len + EMIT_LINE_MAX > o->cap) {
         o->cap = o->cap ? o->cap * 2 : (size_t)64 * EMIT_LINE_MAX;
         while (o->len + EMIT_LINE_MAX > o->cap) o->cap *= 2;
@@ -2797,15 +2988,20 @@ static void bt_out_push(BtNode *o, const BtCtx *x, int stop) {
         o->fp  = xrealloc(o->fp,  (size_t)o->ncap * sizeof *o->fp);
         o->cc  = xrealloc(o->cc,  (size_t)o->ncap * sizeof *o->cc);
         o->rs  = xrealloc(o->rs,  (size_t)o->ncap * sizeof *o->rs);
+        o->ex  = xrealloc(o->ex,  (size_t)o->ncap * sizeof *o->ex);
     }
     const BeamEntry *t = &x->lvl[stop];
     const int orient = ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) : -1;
+    Ext ext;
+    if (extend_board(t->used, t->rtop, stop, orient, &ext)) x->ext_nodes_cap++;
+    if (g_bt_min_col && ext_columns(&ext, stop) < (int)g_bt_min_col) { x->cut_mincol++; return; }
     o->off[o->n] = o->len;
     o->fp[o->n]  = board_fingerprint(x->rows, stop);
     o->cc[o->n]  = g_corners_on
                  ? tc_board_code(orient, t->used, t->rtop, stop == PUZZLE_SIDE - 4) : 0;
     o->rs[o->n]  = (uint8_t)(g_top_n ? top_free(t->used) : 0);
-    o->len += (size_t)prepare_board(x->rows, stop, orient, o->buf + o->len);
+    o->ex[o->n]  = (uint8_t)ext.n;
+    o->len += (size_t)prepare_board(x->rows, stop, orient, &ext, o->buf + o->len);
     o->n++;
 }
 
@@ -2983,10 +3179,17 @@ static void bt_emit_node(const BtNode *o, uint64_t *boards) {
         while (k < o->nkid && o->kid_at[k] == i) bt_emit_node(o->kid[k++], boards);
         if (i == o->n) break;
         (*boards)++;
-        if (!htable_insert(o->fp[i])) continue;
+        if (!htable_insert(o->fp[i])) { g_bt.dup++; continue; }
         const size_t end = (i + 1 < o->n) ? o->off[i + 1] : o->len;
         emit_board_line(o->buf + o->off[i], end - o->off[i]);
         g_stats.emitted_total++; g_bt.emitted++;
+        if (g_extend_nodes) {
+            const int n = o->ex[i], h = EDGE_LEN - (int)g_stop_row, cols = h > 0 ? n / h : 0;
+            g_bt_run.ext_cells += (uint64_t)n; g_bt_run.ext_cols += (uint64_t)cols;
+            if (n > g_bt_run.ext_max) g_bt_run.ext_max = n;
+            if (cols > g_bt_run.ext_cols_max) g_bt_run.ext_cols_max = cols;
+            if (n > g_bt_run.cfg_ext_max) g_bt_run.cfg_ext_max = n;
+        }
         if (g_corners_on) tc_tally(o->cc[i]);
         rsv_tally(o->rs[i]);
     }
@@ -3126,12 +3329,13 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     g_bt.qhead = g_bt.qn = 0;
     g_bt.next = g_bt.cursor = 0;
     g_bt.abort = false;
-    g_bt.emitted = g_bt.roots_emitting = 0;
+    g_bt.emitted = g_bt.roots_emitting = g_bt.dup = 0;
     const int split_max = N + BT_SPLIT_ROWS < (int)g_stop_row - 1
                         ? N + BT_SPLIT_ROWS : (int)g_stop_row - 1;
     for (int t = 0; t < nt; t++) {
         BtCtx *x = g_bt_ctx[t];
         x->nodes = x->cut_parity = x->cut_corner = 0;
+        x->ext_nodes_cap = x->cut_mincol = 0;
         memset(x->fill, 0, sizeof x->fill);
         x->abort = false;
         x->split_max = split_max;
@@ -3194,11 +3398,12 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
         }
     }
 
-    uint64_t fill[EDGE_LEN + 1] = {0}, nodes = 0, cut_p = 0, cut_c = 0;
+    uint64_t fill[EDGE_LEN + 1] = {0}, nodes = 0, cut_p = 0, cut_c = 0, ecap = 0, cut_m = 0;
     bool aborted = g_bt.abort;
     for (int t = 0; t < nt; t++) {
         BtCtx *x = g_bt_ctx[t];
         nodes += x->nodes; cut_p += x->cut_parity; cut_c += x->cut_corner;
+        ecap += x->ext_nodes_cap; cut_m += x->cut_mincol;
         for (int r = 0; r <= EDGE_LEN; r++) fill[r] += x->fill[r];
         if (x->abort) aborted = true;
     }
@@ -3213,6 +3418,10 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     g_bt_run.roots += roots; g_bt_run.roots_emitting += roots_emitting;
     g_bt_run.nodes += nodes; g_bt_run.cut_parity += cut_p; g_bt_run.cut_corner += cut_c;
     g_bt_run.emitted += emitted; g_bt_run.t += dt;
+    g_bt_run.ext_cap += ecap; g_bt_run.cut_mincol += cut_m;
+    g_bt_run.dup += g_bt.dup;
+    g_bt_run.cfg_found = fill[g_stop_row];
+    g_bt_run.cfg_dup = g_bt.dup; g_bt_run.cfg_mincol = cut_m;
     for (int r = 0; r <= EDGE_LEN; r++) g_bt_run.fill[r] += fill[r];
 
     if (fill[g_stop_row]) {
@@ -3234,6 +3443,8 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
         printf("[dfs] %s roots=%" PRIu64 " emitting=%" PRIu64 " nodes=%" PRIu64
                " cut_parity=%" PRIu64, g_config_id_str, roots, roots_emitting, nodes, cut_p);
         if (g_corners_on) printf(" cut_corner=%" PRIu64, cut_c);
+        if (g_extend_nodes) printf(" ext_max=%d", g_bt_run.cfg_ext_max);
+        if (g_bt_min_col)   printf(" cut_mincol=%" PRIu64, cut_m);
         printf(" reached");
         for (int r = N + 1; r <= (int)g_stop_row; r++) printf(" r%d:%" PRIu64, r, fill[r]);
         printf(" emitted=%" PRIu64 "%s t=%.2fs\n", emitted,
@@ -3465,17 +3676,28 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         printf("\n");
     }
     if (g_backtrack_row && g_bt_run.roots) {
-        printf("[sum] backtrack from row %u: roots=%" PRIu64 " emitting=%" PRIu64
+        printf("[sum] backtrack from row %u: roots=%" PRIu64 " roots_with_boards=%" PRIu64
                " nodes=%" PRIu64 " (%.1f Mnodes/s) cut_parity=%" PRIu64,
                g_backtrack_row, g_bt_run.roots, g_bt_run.roots_emitting, g_bt_run.nodes,
                g_bt_run.t > 0 ? (double)g_bt_run.nodes / g_bt_run.t / 1e6 : 0.0,
                g_bt_run.cut_parity);
         if (g_corners_on) printf(" cut_corner=%" PRIu64, g_bt_run.cut_corner);
-        printf(" emitted=%" PRIu64 " time=%.1fs\n", g_bt_run.emitted, g_bt_run.t);
+        printf(" found=%" PRIu64 " time=%.1fs\n", g_bt_run.fill[g_stop_row], g_bt_run.t);
         printf("[sum] backtrack boards completing each row:");
         for (int r = (int)g_backtrack_row + 1; r <= (int)g_stop_row; r++)
             printf("  r%d:%" PRIu64, r, g_bt_run.fill[r]);
         printf("\n");
+        if (g_extend_nodes) {
+            const uint64_t b = g_bt_run.emitted;
+            const int h = EDGE_LEN - (int)g_stop_row;
+            printf("[sum] extension (--extend_nodes %u), over %" PRIu64 " board(s) kept: "
+                   "cells mean %.1f, max %d of %d; whole columns mean %.2f, max %d of %d; "
+                   "node cap hit %" PRIu64 "\n",
+                   g_extend_nodes, b, b ? (double)g_bt_run.ext_cells / (double)b : 0.0,
+                   g_bt_run.ext_max, h * EDGE_LEN,
+                   b ? (double)g_bt_run.ext_cols / (double)b : 0.0, g_bt_run.ext_cols_max, EDGE_LEN,
+                   g_bt_run.ext_cap);
+        }
     }
     if (g_end_dive) dv_print_summary(wall_total);
     if (g_rsv_boards)
@@ -3530,11 +3752,13 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
                 printf("[clue] row %2d: parents=%llu sumA=%llu sumB=%llu sumC=%llu\n", r,
                        (unsigned long long)g_dbg_calls[r], (unsigned long long)g_dbg_nA[r],
                        (unsigned long long)g_dbg_nB[r], (unsigned long long)g_dbg_nC[r]);
-    if (g_end_dive)
-        printf("[sum] stop-row boards dived: %" PRIu64 " (written >= %d: %" PRIu64 ")\n",
-               dv_boards(), g_emit_score, dv_written());
-    else
-        printf("[sum] emitted unique boards: %" PRIu64 "\n", g_stats.emitted_total);
+    printf("[sum] boards: found %" PRIu64 " at row %u", g_found_total, g_stop_row);
+    if (g_backtrack_row && g_bt_run.dup) printf(", %" PRIu64 " exact repeats dropped", g_bt_run.dup);
+    if (g_bt_min_col) printf(", %" PRIu64 " under --backtrack_min_col %u", g_bt_run.cut_mincol, g_bt_min_col);
+    printf(", written %" PRIu64, g_written_total);
+    if (g_end_dive) printf(" (dived %" PRIu64 ", kept >= %d)", dv_boards(), g_emit_score);
+    printf("\n");
+    if (g_prefix[0]) printf("[sum] run prefix: %s -> %s\n", g_prefix, g_out_dir);
     if (g_incomplete_top) {
         printf("[sum] incomplete-top partials: %zu  (", g_partial_total);
         for (int k = 0; k < PART_N; k++)
@@ -3552,7 +3776,7 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
    keep the side their rotations row deals them, unless edges are free. */
 static void dive_config(void) {
     dv_frame(!g_free_edges && !g_random_edges);
-    dv_run(g_config_id_str);
+    dv_run(g_board_id_str);
     dv_flush(g_completions_fp);
 }
 
@@ -3695,6 +3919,11 @@ static void usage(const char *a0) {
 "\n"
 "Input / output:\n"
 "  --out_dir DIR          output directory: completions + checkpoint (default beam_out)\n"
+"  --prefix [NAME]        write every board as NAME_<config> in its first CSV cell,\n"
+"                         to tell runs apart. NAME: letters, digits, '_' '.' '-'\n"
+"                         (no quotes needed). Bare: a random 6-character code for\n"
+"                         the run, printed in [cfg] and the summary; pass that code\n"
+"                         again with --resume to keep the names\n"
 "  --start_row N          first data row of rotation.csv to use (default 0)\n"
 "  --num_rows N           number of consecutive border rows to sweep\n"
 "                         (default 0 = every remaining row of rotation.csv)\n"
@@ -3741,7 +3970,18 @@ static void usage(const char *a0) {
 "                         completing the stop row is emitted (exact duplicates\n"
 "                         dropped); pair with --max_emitted. --incomplete_top is\n"
 "                         ignored with a warning (default 0 = off)\n"
-"  --beam_expand E        late-search width multiplier (default 4; 1 = no expansion)\n"
+"  --extend_nodes N       with --backtrack_row: every stop-row board goes on,\n"
+"                         cell by cell in COLUMN-major order (column 1 bottom up,\n"
+"                         then column 2, ...) over rows stop+1..14, cols 1..14, with\n"
+"                         no breaks, and is written (or dived) from the deepest\n"
+"                         prefix found -- still one line per stop-row board, its\n"
+"                         open cells in the top-right corner. Row-14 cells must\n"
+"                         show a colour the unplaced top border still carries.\n"
+"                         N caps the search per board (default 100000; 0 = off)\n"
+"  --backtrack_min_col K  with --backtrack_row: write only boards whose extension\n"
+"                         fills columns 1..K of rows stop+1..14 whole; lets a lower\n"
+"                         --stop_row run without flooding the output (default 0)\n"
+"  --beam_expand E      late-search width multiplier (default 4; 1 = no expansion)\n"
 "  --beam_expand_row R    row with the full ExK width; half of the extra width is\n"
 "                         granted one row earlier (default 7)\n"
 "\n"
@@ -3955,7 +4195,9 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     else                 printf(" --start_row %u --num_rows %u", g_start_row, g_num_rows);
     if (g_db_file) printf(" --db_file %s", g_db_file);
     printf(" --beam_width %u --stop_row %u", g_beam_width, g_stop_row);
-    if (g_backtrack_row) printf(" --backtrack_row %u", g_backtrack_row);
+    if (g_backtrack_row) printf(" --backtrack_row %u --extend_nodes %u", g_backtrack_row, g_extend_nodes);
+    if (g_bt_min_col)    printf(" --backtrack_min_col %u", g_bt_min_col);
+    if (g_prefix[0])     printf(" --prefix %s", g_prefix);
     if (g_end_dive) printf(" --end_dive %u --emit_score %d", g_end_dive, g_emit_score);
     if (g_end_dive && g_end_polish >= 0) printf(" --end_polish %d", g_end_polish);
     if (g_end_dive && g_corners_on && g_corner_seeds != 4) printf(" --corner_seeds %d", g_corner_seeds);
@@ -4023,6 +4265,16 @@ static const char *sweep_reason(const BeamResult *br) {
     return buf;
 }
 
+/* This configuration's boards: found at the stop row (the backtracker's
+   completions, or the beam's unique stop-row boards) and written to the CSV
+   (under --end_dive, the dived boards kept at >= --emit_score), with the run
+   totals of both. Set after the configuration's dives by cfg_count_written. */
+static void cfg_count_written(uint64_t dv_written_before) {
+    g_cfg_found   = g_backtrack_row ? g_bt_run.cfg_found : (uint64_t)g_emit_count;
+    g_cfg_written = g_end_dive ? dv_written() - dv_written_before : (uint64_t)g_emit_count;
+    g_found_total += g_cfg_found; g_written_total += g_cfg_written;
+}
+
 static void sweep_flush(void) {
     if (!g_verbose) {
         g_sw_group[0] = g_sw_key[0] = '\0';
@@ -4050,21 +4302,26 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
              filled ? "filled" : "died", br->row, br->width, sweep_reason(br));
 
     if (!g_verbose) {
-        /* Compact log: a line for completions and two-segment partials; B-only
-           partials are counted in the periodic progress line and the summary. */
+        /* Compact log: a line for configurations that found boards or
+           two-segment partials, or ended for an unusual reason; the rest are
+           counted in the periodic progress line and the summary. Every count is
+           this configuration's; run totals are in [progress] and the summary. */
         const size_t strong_partials = g_part_count[PART_AB]
                                      + g_part_count[PART_AC]
                                      + g_part_count[PART_BC];
-        const bool productive = g_emit_count != 0 || strong_partials != 0;
+        const bool productive = g_cfg_found != 0 || strong_partials != 0;
         const bool exceptional = strcmp(br->reason, "extinct") != 0
                               && strcmp(br->reason, "stop_row") != 0;
         if (productive || exceptional) {
-            printf("[sweep] %sl%ld %s", group, li, key);
-            if (g_emit_count) printf(" emitted=%zu", g_emit_count);
-            if (g_incomplete_top && g_partial_count)
-                printf(" partials=%zu part_total=%zu", g_partial_count, g_partial_total);
-            if (g_emit_count && g_end_dive) printf(" written=%" PRIu64, dv_written());
-            else if (g_emit_count) printf(" sol_total=%" PRIu64, g_solution_idx);
+            printf("[sweep] %sl%ld found=%" PRIu64, group, li, g_cfg_found);
+            if (g_backtrack_row && g_bt_run.cfg_dup) printf(" repeats=%" PRIu64, g_bt_run.cfg_dup);
+            if (g_bt_min_col) printf(" below_min_col=%" PRIu64, g_bt_run.cfg_mincol);
+            printf(" written=%" PRIu64, g_cfg_written);
+            if (g_backtrack_row && g_extend_nodes && g_cfg_found)
+                printf(" ext_max=%d", g_bt_run.cfg_ext_max);
+            if (g_end_dive && dv_last_best() >= 0) printf(" best=%d", dv_last_best());
+            if (g_incomplete_top && g_partial_count) printf(" partials=%zu", g_partial_count);
+            if (exceptional) printf(" stopped=%s at row %u", sweep_reason(br), br->row);
             printf(" wall=%.1fs\n", wall);
             fflush(stdout);
             return;
@@ -4073,10 +4330,10 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
         double now = omp_get_wtime();
         if (g_progress_last == 0.0) g_progress_last = now;
         if (now - g_progress_last >= SWEEP_QUIET_SEC) {
-            printf("[progress] %sl%ld configs=%" PRIu64
-                   " stop=%" PRIu64 " boards=%" PRIu64,
+            printf("[progress] %sl%ld configs=%" PRIu64 " reached_stop=%" PRIu64
+                   " found=%" PRIu64 " written=%" PRIu64,
                    group, li, g_stats.configs, g_stats.reached_stop,
-                   g_stats.emitted_total);
+                   g_found_total, g_written_total);
             if (g_incomplete_top) printf(" partials=%zu", g_partial_total);
             printf(" deaths");
             for (int r = 1; r <= (int)g_stop_row; r++)
@@ -4169,6 +4426,33 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--backtrack_row") && i+1 < argc) {
             int v = atoi(argv[++i]);
             g_backtrack_row = v > 0 ? (uint32_t)v : 0; g_backtrack_row_set = true;
+        }
+        else if (!strcmp(argv[i], "--extend_nodes") && i+1 < argc) {
+            char *end; long long v = strtoll(argv[++i], &end, 10);
+            if (*end || v < 0 || v > 1000000000LL)
+                fatal("--extend_nodes expects an integer in 0..1000000000, got '%s'", argv[i]);
+            g_extend_nodes = (uint32_t)v; g_extend_set = true;
+        }
+        else if (!strcmp(argv[i], "--backtrack_min_col") && i+1 < argc) {
+            char *end; long v = strtol(argv[++i], &end, 10);
+            if (*end || v < 0 || v > EDGE_LEN)
+                fatal("--backtrack_min_col expects an integer in 0..%d, got '%s'", EDGE_LEN, argv[i]);
+            g_bt_min_col = (uint32_t)v; g_min_col_set = true;
+        }
+        else if (!strcmp(argv[i], "--prefix")) {
+            /* The name is optional: bare, the run draws a 6-character code. */
+            if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0) {
+                const char *v = argv[++i];
+                size_t n = strlen(v);
+                if (n == 0 || n > 32) fatal("--prefix must be 1..32 characters, got '%s'", v);
+                for (size_t k = 0; k < n; k++)
+                    if (!isalnum((unsigned char)v[k]) && v[k] != '_' && v[k] != '.' && v[k] != '-')
+                        fatal("--prefix may hold only letters, digits, '_', '.' and '-' "
+                              "(no spaces or commas: it starts a CSV cell), got '%s'", v);
+                snprintf(g_prefix, sizeof g_prefix, "%s", v);
+            } else {
+                run_code(g_prefix);
+            }
         }
         else if (!strcmp(argv[i], "--end_dive")) {
             /* The value is optional, as for --lambda_corners: a bare --end_dive
@@ -4285,12 +4569,18 @@ int main(int argc, char *argv[]) {
         if (g_backtrack_row == 0 || g_backtrack_row >= g_stop_row)
             fatal("--backtrack_row must be in 1..%u (below --stop_row %u)",
                   g_stop_row - 1, g_stop_row);
+        if (g_bt_min_col && !g_extend_nodes)
+            fatal("--backtrack_min_col %u needs the extension: --extend_nodes 0 turns it off",
+                  g_bt_min_col);
         if (g_incomplete_top) {
             fprintf(stderr, "[warn] --incomplete_top has no effect with --backtrack_row: "
                             "the backtracker emits only complete stop-row boards\n");
             g_incomplete_top = false;
         }
     }
+    if ((g_extend_set || g_min_col_set) && !g_backtrack_row_set)
+        fatal("--extend_nodes and --backtrack_min_col extend the backtracker's stop-row "
+              "boards: add --backtrack_row N");
     if (g_emit_score < 0 || g_emit_score > 480) fatal("--emit_score must be in 0..480");
     if (g_end_polish >= 0 && !g_end_dive)
         fprintf(stderr, "[warn] --end_polish has no effect without --end_dive\n");
@@ -4381,6 +4671,16 @@ int main(int argc, char *argv[]) {
         printf("[cfg] backtrack_row=%u (beam through row %u, then an exhaustive "
                "row-major search of every row-%u candidate to row %u)\n",
                g_backtrack_row, g_backtrack_row, g_backtrack_row, g_stop_row);
+    if (g_backtrack_row && g_extend_nodes)
+        printf("[cfg] extend_nodes=%u (each row-%u board continues column by column, rows %u..14, "
+               "up to %u nodes; written from its deepest zero-break prefix)\n",
+               g_extend_nodes, g_stop_row, g_stop_row + 1, g_extend_nodes);
+    if (g_bt_min_col)
+        printf("[cfg] backtrack_min_col=%u (only boards whose extension fills columns 1..%u "
+               "of rows %u..14 are written)\n", g_bt_min_col, g_bt_min_col, g_stop_row + 1);
+    if (g_prefix[0])
+        printf("[cfg] run prefix: %s (boards are named %s_<config>) -> %s\n",
+               g_prefix, g_prefix, g_out_dir);
     if (g_end_dive) {
         printf("[cfg] end_dive=%u (stage 1 %u dives per stop-row board, stage 2 %u more for "
                "boards >= S-4, or the top 10%% if that is under 20%%) emit_score=%d\n",
@@ -4577,19 +4877,22 @@ int main(int argc, char *argv[]) {
                 g_cur_bottom = &bot;
                 g_cur_left   = &lft;
                 snprintf(g_config_id_str, sizeof g_config_id_str, "rndb%zul%zu", bi, li);
+                set_board_id();
                 uint64_t cfg_hash = splitmix64(g_master_seed
                                     ^ (fnv1a_str(g_config_id_str) * 0x9E3779B97F4A7C15ULL));
 
                 g_emit_count = 0; memset(g_emit_htable, 0, g_emit_htable_sz*sizeof(uint64_t));
+                g_bt_run.cfg_found = g_bt_run.cfg_dup = g_bt_run.cfg_mincol = 0;
+                g_bt_run.cfg_ext_max = 0;
                 if (g_incomplete_top) partial_config_reset();
                 double tc0 = omp_get_wtime();
                 double slice_end = tc0 + g_config_time_sec;
                 if (g_max_wall_sec > 0.0) { double ge = t_start + g_max_wall_sec; if (ge < slice_end) slice_end = ge; }
 
                 BeamResult br = beam_search_config(&ctx, scratch, cfg_hash, slice_end);
+                const uint64_t w0 = dv_written();
                 if (g_end_dive) dive_config();
-                /* emitted/partials are this config's unique boards; sol_total and
-                   part_total are the run totals written so far. */
+                cfg_count_written(w0);
                 { char grp[64]; snprintf(grp, sizeof grp, "rndb%zu", bi);
                   sweep_report(grp, (long)li, &br, omp_get_wtime()-tc0); }
                 if (g_completions_fp) fflush(g_completions_fp);
@@ -4720,19 +5023,22 @@ int main(int argc, char *argv[]) {
                 g_cur_bottom = &g_bottoms[bi];
                 g_cur_left   = &g_lefts[li];
                 snprintf(g_config_id_str, sizeof g_config_id_str, "%sl%zu", blab, li);
+                set_board_id();
                 uint64_t cfg_hash = splitmix64(g_master_seed
                                     ^ (fnv1a_str(g_config_id_str) * 0x9E3779B97F4A7C15ULL));
 
                 g_emit_count = 0; memset(g_emit_htable, 0, g_emit_htable_sz*sizeof(uint64_t));
+                g_bt_run.cfg_found = g_bt_run.cfg_dup = g_bt_run.cfg_mincol = 0;
+                g_bt_run.cfg_ext_max = 0;
                 if (g_incomplete_top) partial_config_reset();
                 double tc0 = omp_get_wtime();
                 double slice_end = tc0 + g_config_time_sec;
                 if (g_max_wall_sec > 0.0) { double ge = t_start + g_max_wall_sec; if (ge < slice_end) slice_end = ge; }
 
                 BeamResult br = beam_search_config(&ctx, scratch, cfg_hash, slice_end);
+                const uint64_t w0 = dv_written();
                 if (g_end_dive) dive_config();
-                /* emitted/partials are this config's unique boards; sol_total and
-                   part_total are the run totals written so far. */
+                cfg_count_written(w0);
                 sweep_report(blab, (long)li, &br, omp_get_wtime()-tc0);
                 if (g_completions_fp) fflush(g_completions_fp);
                 partial_outputs_flush();

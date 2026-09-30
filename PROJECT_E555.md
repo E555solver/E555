@@ -768,11 +768,29 @@ witness), with it the 2x3 around the clue -- and leaves the top rows open.
 
 ### Reading the sweep log
 
-Without `--verbose` the log is compact: a `[sweep]` line only for a
-configuration that wrote something (completions or two-segment partials) or
-stopped for a reason other than its stop row or an extinction, and every 30 s a
-`[progress]` line with the configurations run, how many reached the stop row,
-the boards written and the extinctions by row. Each border row opens with the
+Without `--verbose` the log is compact. It uses two words throughout: **found**
+counts the boards that completed the stop row, and **written** the rows appended
+to the completions CSV -- under `--end_dive` the dived boards kept at
+`>= --emit_score`, otherwise the found boards less exact repeats and those under
+`--backtrack_min_col`. A `[sweep]` line appears only for a configuration that
+found something (or two-segment partials) or stopped for a reason other than
+its stop row or an extinction, and every count on it is that configuration's:
+
+```
+[sweep] r0b0l1 found=1827 repeats=276 written=1551 ext_max=9 wall=3.1s
+[sweep] r0b1l0 found=40 written=40 ext_max=12 best=455 wall=41.0s
+[sweep] r0b1l3 found=0 written=0 stopped=time at row 9 wall=600.0s
+```
+
+`repeats=` (the backtracker only) counts boards reached a second time, which
+clue frames cause; `below_min_col=` appears with `--backtrack_min_col`;
+`ext_max=` is the deepest extension (cells above the stop row, see
+*Extending the stop-row boards*); `best=` the best dived score under
+`--end_dive`. Every 30 s a `[progress]` line gives the run totals
+(`configs= reached_stop= found= written=` and the extinctions by row), and the
+summary ends with `[sum] boards: found F at row S, ..., written W`. The beam's
+width and the row reached stay in the `--verbose` lines. With `--prefix` the
+banner and the summary name the run code. Each border row opens with the
 rotations row exactly as the file has it, after its Stage A comment line, so the
 log alone can rebuild the rotations file. `--verbose` prints every configuration,
 the per-bottom `[rank]` and `[bail]` lines and, per configuration, the per-row
@@ -786,8 +804,9 @@ Under `--verbose`, one `[sweep]` line per configuration, in one of three shapes:
 [sweep] r0b0l1-l19 x19 died=1 width=1 reason=extinct(clue_row) wall=0.1s
 ```
 
-Under `--end_dive`, `emitted=` counts the configuration's stop-row boards sent
-to the dives and `written=` the finished boards written so far in the run.
+In these verbose lines `emitted=` is the configuration's unique stop-row boards
+and `sol_total=` / `written=` (under `--end_dive`) are run totals so far -- the
+compact line above is the one with per-configuration found/written.
 
 `filled=` and `died=` are separate fields because one number cannot be both.
 `filled=R` is the last row COMPLETED, and the width beside it is the beam that
@@ -1312,7 +1331,8 @@ closable: no alive TL block and no alive TR block in the board's clue frame
 that corner is left to Stage C, or to the end dives. Clue pins the search passes
 through are enforced as in the beam. **Every** board that completes the stop
 row is emitted, best root first and, within a root, in the order found; only
-exact duplicates are dropped, and there is no per-configuration cap -- pair it
+exact duplicates are dropped, and there is no per-configuration cap. Each is
+first extended above the stop row (see *Extending the stop-row boards*). Pair it
 with `--max_emitted`, which is checked after each root, so the count overshoots
 by at most one root's boards. `--incomplete_top` is ignored with a warning.
 
@@ -1342,6 +1362,73 @@ two-socket machine pin threads with `OMP_PROC_BIND=close OMP_PLACES=cores`.
 nodes, parity cuts, corner cuts, boards completing each row); the run summary
 always carries the totals and the node rate. `--time_limit` and Ctrl-C stop the
 search mid-root, and the boards found so far are still written.
+
+### Extending the stop-row boards (`--extend_nodes`, `--backtrack_min_col`)
+
+Under `--backtrack_row`, a board that completes the stop row S does not stop
+there. Before it is written or dived, it is continued by a second exhaustive
+zero-break search over the inner cells above it: rows S+1..14, cols 1..14. This
+search runs in **column-major** order: column 1 from the bottom up, then column
+2, and so on.
+
+The board is written from the **deepest prefix** that search reaches. Ties go to
+the first one found at that depth, so the file does not depend on the thread
+count. It is still one line per stop-row board, and the stop-row part is
+unchanged.
+
+Growing by columns leaves the unfilled cells in the **top-right corner**, and so
+the dives' breaks end up there. The right column and the top border above S
+stay open for the dives.
+
+Every cell is tested on its own:
+
+- **Fit.** An unused piece matching the left and bottom colours
+  (`g_lb_bucket`). The left colour comes from the fixed left column for col 1,
+  and from the cell to the left otherwise.
+- **Row 14.** The top colour must still be carried by an unplaced piece of the
+  top-border pool: the rotations row's top border, or every unused edge under
+  `--free_edges`. A counter per colour goes down as row-14 cells use it, so no
+  cell forces a break at the top border.
+- **Clues.** A clue cell in the region takes its piece at its spin when the
+  board's frame is known. Its neighbours must show the colours it will
+  meet. When the frame is not known, the extension ends at the clue cell.
+  In practice these are the row-13 corner clues under `--clue_corners`, and the
+  centre clue when `--stop_row` < 8.
+
+Colour parity is not tested: it cannot fire (see *Color-parity pruning*), and
+the dives accept breaks anyway.
+
+`--extend_nodes N` caps the placements per board (default 100000; 0 turns the
+extension off and gives the old output exactly). The summary shows how often
+the cap was hit, alongside the depths:
+
+```
+[sum] extension (--extend_nodes 100000), over 1606503 board(s) kept: cells mean 2.4, max 32 of 70; whole columns mean 0.22, max 6 of 14; node cap hit 0
+```
+
+**`--backtrack_min_col K`** writes (or dives) only boards whose extension fills
+columns 1..K of rows S+1..14 whole. The extension keeps its deepest prefix, so
+this is exact up to the node cap: a board passes if and only if some zero-break
+continuation fills K columns. It is the knob for running at a lower `--stop_row`
+without flooding the output. The boards it drops are counted in the log
+(`below_min_col=`) and in the summary.
+
+**Measured** (fix12 border row 0, 2 bottoms × 2 columns, width 20k,
+`--backtrack_row 7 --stop_row 9`, 4 threads): 1.61 M row-9 boards took 16.6 s
+of search, with the extension included and never capped. The extensions
+averaged 2.4 cells, reached at most 32 of the 70, and filled at most 6 whole
+columns. A separate prototype, run on the same kind of boards, compared growing
+the region above row 9 by columns with growing it by whole rows:
+
+| zero-break cells above row 9 | boards (of 1.23 M) |
+|---|---|
+| rows 10–11 whole, right edges included (30 cells) | 3 |
+| columns 1–6, top border left to the dives (30 cells) | 140 |
+| columns 1–6, with the row-14 supply test (what the beamer does) | 1 |
+
+So growing by columns reaches about 50× more boards at the same size. The
+row-14 supply test is what keeps those cells from forcing breaks at the top
+border, and the top border is where most of them fail.
 
 ### Finishing boards: end dives and polish (`--end_dive`, `--end_polish`)
 
@@ -1606,6 +1693,7 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | option | default | meaning |
 |---|---|---|
 | `--out_dir DIR` | `beam_out` | output directory (completions CSV + checkpoint) |
+| `--prefix [NAME]` | -- | write every board as `NAME_<config>` in its first CSV cell (letters, digits, `_ . -`; no quotes needed). Bare: a random 6-character run code, printed in `[cfg]` and the summary; give it again with `--resume` |
 | `--start_row N` | 0 | first rotations-CSV data row to use (fixed mode only) |
 | `--num_rows N` | 0 | consecutive border rows to sweep (fixed mode only; 0 = every remaining row) |
 | `--samples N` | 1 | random bottoms to try (random mode only; 0 = uncapped, governed by `--wall_time`/`--max_emitted`) |
@@ -1617,6 +1705,8 @@ bin/E555_beamer seed.txt [rotations.csv] [options]
 | `--beam_width K` | 250000 | boards kept per row |
 | `--stop_row R` | 11 | last row filled (1-13); the beam fills 11 and dies at 12, so 11 emits |
 | `--backtrack_row N` | off | the beam stops at row N, and every row-N candidate is searched exhaustively to `--stop_row` (see *Backtracking to the stop row*) |
+| `--extend_nodes N` | 100000 | with `--backtrack_row`: each stop-row board is continued column by column over rows stop+1..14 and written from its deepest zero-break prefix, at most N nodes (0 = off; see *Extending the stop-row boards*) |
+| `--backtrack_min_col K` | 0 | with `--backtrack_row`: write only boards whose extension fills columns 1..K whole |
 | `--end_dive [M]` | off | finish every stop-row board with M dives (bare = 10000) and write the best completion instead (see *Finishing boards*) |
 | `--end_polish R` | off | with `--end_dive`: polish the best dives, then R kick-and-polish rounds |
 | `--emit_score S` | 450 | with `--end_dive`: matched edges (of 480) a finished board needs to be written |

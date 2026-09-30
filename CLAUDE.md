@@ -46,7 +46,8 @@ bash tests/run_tests.sh roundhouse_cache                # by name
 Stage A  src/A_border/E555_edge_annealer.py   Euler-trail simulated annealing -> rotations.csv (border spins)
                                                (optional: beamer --random_edges samples borders itself)
 Stage B  src/B_beam/E555_beamer.c             5-5-5 chain DB + wide beam + colour/Mahalanobis heuristic;
-                                               --backtrack_row exhaustive tail, --end_dive/--end_polish finish;
+                                               --backtrack_row exhaustive tail, each board then extended
+                                               column by column (--extend_nodes); --end_dive/--end_polish finish;
                                                --lambda_reserve keeps Stage A's TOP double-decker reserve for last
                                                boards to 256 pieces (engine: src/C_tail/E555_dive.c)
          src/B_beam/E555_finalizer.c          restart the beam from a partial, locked below a row (reduced DB);
