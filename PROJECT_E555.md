@@ -1430,6 +1430,21 @@ So growing by columns reaches about 50× more boards at the same size. The
 row-14 supply test is what keeps those cells from forcing breaks at the top
 border, and the top border is where most of them fail.
 
+**It does not improve the dives by itself.** Measured on the same 3,265 row-10
+boards (fix12 row 0, `--backtrack_row 7 --stop_row 10`), each dived with
+`E555_diver --end_dive 2000 --end_polish 200`:
+
+| dived from | mean | best | ≥ 455 | ≥ 456 |
+|---|---|---|---|---|
+| the stop row | 452.36 | 458 | 217 | 58 |
+| its extension (mean 1.6 cells) | 452.28 | 458 | 215 | 37 |
+
+Fixing the extension's cells takes those placements away from the dives, and
+at this depth that costs a little at the top of the distribution. The
+extension's use is selection: `--backtrack_min_col` keeps, from a low stop row,
+only the boards that can grow a few whole columns without a break. Turn it off
+with `--extend_nodes 0` when every stop-row board is dived anyway.
+
 ### Finishing boards: end dives and polish (`--end_dive`, `--end_polish`)
 
 A stop-row board covers rows 0..stop_row, so its real quality is unknown until
