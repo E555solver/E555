@@ -99,6 +99,7 @@ ALL_STEPS=(
     "backtracker_clues|--clue_center/--clue_corners force the hints on, or drop the board"
     "diver|E555_diver finishes held boards: identical at 1 and 4 threads, scores recount, placed cells untouched"
     "diver_reopen|E555_diver --reopen: never worse, one row per board, only the band changes; scrambled top rows come back 480/480; copies differ"
+    "diver_prepare|E555_diver --holes/--pin_clue/--stop_row: lifted rows rebuilt with zero breaks, kept rows untouched, thread-independent; clue conflicts dropped; --prefix ids frame"
     "whirlpool_lap|one whirlpool lap: turn, re-cut rows 0..5, re-grow to row 11"
     "clue_orient|a band carrying no clue is searched at all four orientations"
     "band_with_frame|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
@@ -2313,6 +2314,102 @@ EOF
          "480/480; copies differ; identical at 1 and 4 threads"
 }
 
+# --holes, --pin_clue, --backtrack/--stop_row prepare a board before its dives:
+# a synthetic solution with its top rows lifted is rebuilt with zero breaks
+# (rows up to S, then the column extension), its kept rows untouched; the
+# same output at 1 and 4 threads; --start_row/--num_rows pick records; a clue
+# the board cannot carry drops the board; a beamer --prefix id still names
+# its rotations row.
+step_diver_prepare() {
+    python3 - "$OUT/dvp_in.csv" <<'EOF' || fail "could not build the prepare fixtures"
+import sys
+f = [x.strip() for x in open("data/synth_solution_480.csv").readline().split(",")]
+with open(sys.argv[1], "w") as o:
+    for k in range(3):
+        o.write(", ".join([f"synth{k}", "480"] + f[-512:]) + "\n")
+EOF
+    bin/E555_diver data/synth_seed.txt "$OUT/dvp_in.csv" "$OUT/dvp_s13.csv" --num_rows 1 \
+        --holes top:4 --stop_row 13 --end_dive 0 > "$OUT/dvp_s13.log" \
+        || fail "--holes top:4 --stop_row 13 failed"
+    python3 - data/synth_seed.txt "$OUT/dvp_in.csv" "$OUT/dvp_s13.csv" <<'EOF' || exit 1
+import sys
+seed = [list(map(int, l.split())) for l in open(sys.argv[1]) if l.strip()]
+def cells(line):
+    v = [x.strip() for x in line.split(",")]
+    pos, rot = list(map(int, v[-512:-256])), list(map(int, v[-256:]))
+    return v[0], int(v[1]), {pos[p]: (p, rot[p]) for p in range(256) if pos[p] != 999}
+_, _, src = cells(open(sys.argv[2]).readline())
+out = [cells(l) for l in open(sys.argv[3]) if l.strip()]
+assert len(out) == 1, f"one record in, {len(out)} rows out"
+name, score, c = out[0]
+side = lambda x, d: seed[c[x][0]][(d + c[x][1]) % 4]
+m = 0
+for x in c:
+    r, col = divmod(x, 16)
+    if col < 15 and x + 1 in c:
+        assert side(x, 1) == side(x + 1, 3), f"break at cell {x}"; m += 1
+    if r < 15 and x + 16 in c:
+        assert side(x, 0) == side(x + 16, 2), f"break at cell {x}"; m += 1
+assert m == score, f"score {score} is not the {m} matched edges"
+assert all(c[x] == src[x] for x in range(12 * 16)), "a kept row changed"
+want = set(range(14 * 16)) | {14 * 16 + k for k in range(15)}
+assert set(c) == want, f"rows 12-13 plus row 14 cols 0-14 expected, got {len(c)} cells"
+print(f"ok: top:4 lifted, rows 12-13 rebuilt and row 14 extended to column 14, zero breaks ({m} edges)")
+EOF
+    for t in 1 4; do
+        bin/E555_diver data/synth_seed.txt "$OUT/dvp_in.csv" "$OUT/dvp_t$t.csv" --holes top:5 \
+            --stop_row 11 --end_dive 300 --end_polish 10 --emit_score 0 --threads $t \
+            > "$OUT/dvp_t$t.log" || fail "a prepared dive run failed at $t thread(s)"
+    done
+    cmp -s "$OUT/dvp_t1.csv" "$OUT/dvp_t4.csv" || fail "prepared dives differ between 1 and 4 threads"
+    grep -q "^\[sum\] backtrack: 3 board(s)" "$OUT/dvp_t4.log" || fail "no backtrack summary"
+    grep -q "^\[sum\] extension (--extend_nodes 100000)" "$OUT/dvp_t4.log" || fail "no extension summary"
+    bin/E555_diver data/synth_seed.txt "$OUT/dvp_in.csv" "$OUT/dvp_rec.csv" --start_row 1 \
+        --num_rows 1 --holes top:2 --end_dive 0 > "$OUT/dvp_rec.log" || fail "--start_row run failed"
+    [ "$(cut -d, -f1 "$OUT/dvp_rec.csv")" = "synth1" ] || fail "--start_row 1 --num_rows 1 did not read record 1 alone"
+    echo "ok: identical at 1 and 4 threads; --start_row 1 --num_rows 1 reads one record"
+
+    # Clues: the example board holds another piece on (7,7), so --pin_clue 1
+    # drops it; with rows 7-15 lifted, --pin_clue 3 puts piece 138 on (8,8).
+    bin/E555_diver data/seed_Edge5.txt data/board_example_462.csv "$OUT/dvp_c1.csv" \
+        --holes top:6 --pin_clue 1 --end_dive 0 > "$OUT/dvp_c1.log" || fail "--pin_clue 1 run failed"
+    grep -q "1 board(s) dropped" "$OUT/dvp_c1.log" || fail "a clue conflict did not drop the board"
+    bin/E555_diver data/seed_Edge5.txt data/board_example_462.csv "$OUT/dvp_c3.csv" \
+        --holes top:9 --pin_clue 3 --stop_row 11 --end_dive 0 > "$OUT/dvp_c3.log" || fail "--pin_clue 3 run failed"
+    python3 - "$OUT/dvp_c3.csv" <<'EOF' || exit 1
+import sys
+v = [x.strip() for x in open(sys.argv[1]).readline().split(",")]
+pos, rot = v[-512:-256], v[-256:]
+assert pos[138] == str(8 * 16 + 8) and rot[138] == "2", f"piece 138 at {pos[138]} spin {rot[138]}"
+print("ok: --pin_clue 3 places piece 138 on (8,8) at spin 2; a conflicting board is dropped")
+EOF
+    if bin/E555_diver data/synth_seed.txt "$OUT/dvp_in.csv" "$OUT/dvp_bad.csv" --holes top:2 \
+        --reopen auto > "$OUT/dvp_bad.log" 2>&1; then
+        fail "--holes with --reopen was accepted"
+    fi
+
+    # A beamer --prefix id ("NAME_r0b...") names rotations row 0 like "r0b...".
+    python3 - "$OUT/dvp_rot.csv" "$OUT/dvp_frame.csv" <<'EOF' || exit 1
+import sys
+v = [x.strip() for x in open("data/best_463.csv").readline().split(",")]
+rot = v[-256:]
+open(sys.argv[1], "w").write("0, " + ", ".join(rot) + "\n")
+with open(sys.argv[2], "w") as o:
+    for name in ("r0b0l0", "gate_r0b0l0", "gate"):
+        o.write(", ".join([name, "0"] + v[-512:]) + "\n")
+EOF
+    bin/E555_diver data/seed_Edge5.txt "$OUT/dvp_frame.csv" "$OUT/dvp_frame_out.csv" \
+        --rotations "$OUT/dvp_rot.csv" --holes top:3 --end_dive 0 --verbose > "$OUT/dvp_frame.log" \
+        || fail "the framing run failed"
+    for id in r0b0l0 gate_r0b0l0; do
+        grep -q "^\[batch\] $id: 1 board(s), dealt edges" "$OUT/dvp_frame.log" \
+            || { cat "$OUT/dvp_frame.log"; fail "id $id did not frame under --rotations"; }
+    done
+    grep -q "^\[batch\] gate: 1 board(s), free edges" "$OUT/dvp_frame.log" \
+        || fail "an id naming no row framed"
+    echo "ok: --holes with --reopen refused; a --prefix id still names its rotations row"
+}
+
 # One whirlpool lap: turn the board, re-cut rows 0..5 exactly, re-grow to row 11.
 # The assertions are the lap's geometry, which is what a rotation-sense error
 # would silently break: a turned rows-0..10 board must have 11 complete COLUMNS
@@ -2846,6 +2943,23 @@ full1 = [(p, r) for _, p, r in ext_rows if len(split(p, r)[1]) >= H]
 assert [(p, r) for _, p, r in m1] == full1, "--backtrack_min_col 1 did not write exactly the boards filling column 1"
 print(f"ok: extension on {len(ext_rows)} boards ({n_ext} cells, column-major, stop-row boards unchanged); "
       f"same at 4 threads; --backtrack_min_col 1 keeps {len(m1)}; --prefix names the rows")
+EOF
+
+    # E555_diver --stop_row runs the same extension on the same candidate order:
+    # fed the --extend_nodes 0 boards, it must place exactly what the beamer's
+    # extension placed, board for board.
+    bin/E555_diver data/seed_Edge5.txt "$OUT/btd_noext/beam_completions_0_10.csv" \
+        "$OUT/btd_dvext.csv" --rotations data/borders_annealed_fix12.csv --stop_row 10 \
+        --end_dive 0 --threads 3 > "$OUT/btd_dvext.log" || fail "E555_diver --stop_row exited non-zero"
+    python3 - "$OUT/btd_plain/beam_completions_0_10.csv" "$OUT/btd_dvext.csv" <<'EOF' || exit 1
+import sys
+def rows(p):
+    return [[x.strip() for x in l.split(",")][-512:] for l in open(p) if l.strip() and l[0] not in "#%"]
+a, b = rows(sys.argv[1]), rows(sys.argv[2])
+assert len(a) == len(b), f"the diver wrote {len(b)} boards for the beamer's {len(a)}"
+bad = sum(x != y for x, y in zip(a, b))
+assert not bad, f"{bad} of {len(a)} boards differ from the beamer's extension"
+print(f"ok: E555_diver --stop_row 10 extends the {len(a)} stop-row boards exactly as the beamer does")
 EOF
 }
 

@@ -69,7 +69,8 @@ Stage B  E555_beamer             beam rows 1..N, exhaustive search to the stop r
          E555_finalizer          the same machinery restarted from a partial
          E555_roundhouse         turn the board, refill W-wide strips exhaustively
 Stage C  E555_distiller.py       screen a corpus with dives, keep the N best
-         E555_diver              end dives + polish on any board; --reopen re-dives
+         E555_diver              holes, clues, zero-break rebuild to a stop row, then
+                                 end dives + polish on any board; --reopen re-dives
          E555_ender.py           exact CP-SAT regions + redive; never returns worse
          E555_topper.py          CP-SAT break minimizer over border bands
          E555_backtracker        exact / bounded-mismatch DFS; band enumeration
@@ -1257,43 +1258,102 @@ before the final ranking. End to end on that corpus (`--top 5`, 4 threads,
 47 min): 30,565 unique partials, 2,000 finished (best 462), output five
 distinct 462s.
 
-### 9.2 `E555_diver` -- end dives and polish on any board file
+### 9.2 `E555_diver` -- rebuild the top and finish any board file
 
 ```bash
 bin/E555_diver seed.txt boards.csv output.csv [options]
 ```
 
-Runs the beamer's end-dive engine (5.11) on every board of a file; placed cells
-never move and no database is needed. Consecutive rows with the same config id
-form a batch (stage 2 is selected within a batch). Without `--rotations` any
-unused edge piece may take any open border cell; with `--rotations FILE`, a
-beamer id `r<N>b...` holds edge pieces to the sides row N deals them. Boards
-whose best reaches `--emit_score` are written, best first per batch.
+The diver finishes boards for score. It needs no chain database. Every board goes through the same fixed steps; the later ones are optional:
 
-**Improving complete boards** (`--reopen SPEC`): each complete board is cut and
-dived again with the complete board as its **incumbent**, so the board written is
-never worse than the input. SPEC: `auto` (the outer band of the side holding the
-most damaged cells, deep enough for 90% of them, at most 5), `auto+E` (E more
-rows), `top:K`/`bottom:K`/`left:K`/`right:K`, `box:R0-R1,C0-C1`, or a mask file;
-given n times, round r uses the (r mod n)-th. Measured on 15 dived-and-polished
-boards (459-463), `--reopen auto`, 15 s per board, 2 seeds: `--copies 8
---end_dive 3000 --end_polish 1000 --prior 1 --nogo 1` gained on 8 of 30 runs
-(5 of 15 boards), the best of eight settings tried; one copy of 50000/50000
-gained on 5 of 30. The same few boards gain under every setting.
+1. **Select.** `--start_row R --num_rows N` reads data rows R..R+N-1 (0-based, comments not counted). This is a record index, not a board row.
+2. **Holes.** `--holes SPEC` lifts cells. SPEC is one of:
+   - a 16x16 0/1 mask file, first data line = row 0 (`data/holes_*.csv`);
+   - `top:K`, `bottom:K`, `left:K` or `right:K` (the outer K rows or columns);
+   - `box:R0-R1,C0-C1`.
 
-A finished board turned 180 degrees with its top K rows lifted (a perfect
-refill exists) is refilled perfectly on 15 of 15 boards at K = 3-4, 3 of 15 at
-K = 6, 0 at K = 8: the breaks a dive leaves in the top rows of a Stage B board
-are forced by the pieces left against the rows below. A gain needs the row under
-the damage lifted too.
+   The lifted board is an ordinary partial; nothing remembers what stood there.
+3. **Clues.** `--pin_clue N` places the centre clue (piece 138) of clue frame N, using the beamer's numbering: 1 lower-left (7,7), 2 lower-right (7,8), 3 upper-right (8,8), 4 upper-left (8,7). `--clue_corners` also places that frame's four corner clues, including the two on row 13, since the diver fills every cell. A board fails if a clue cell holds another piece, or a clue piece stands elsewhere or at another spin. Such a board is dropped and counted.
+4. **Backtrack** (`--backtrack`, or `--stop_row S`, which implies it). This is the beamer's trajectory (5.9, 5.10) run from the board itself. See the rules below.
+5. **Dives.** The open cells are filled by the beamer's end-dive engine (5.11), with the same stages and tuning. Placed cells never move. Boards whose best reaches `--emit_score` are written as `config_id, score, pos[256], rot[256]`, best first per batch. `--end_dive 0` writes the prepared boards instead, scored by the matched edges between placed cells.
+
+**Backtrack rules.** A cell takes an unused piece whose sides match every placed neighbour, with frame colour 0 facing exactly the board's edge.
+- **Candidates.** Inner cells draw from the catalog bucket of their (left, bottom) colours, in the beamer's order. Border cells draw from the edge and corner orientations; in a framed batch (below) only the spin its rotations row deals is allowed.
+- **Top supply.** While the top-border cell above is open, a row-14 piece's top colour must be the inner colour of an unused top-border candidate not yet promised to another row-14 cell. A candidate placed anywhere else spends one.
+- **Without `--stop_row`.** The open cells of rows 0..14 are filled in row-major order, and the deepest zero-break prefix is kept (the first found at maximum depth).
+- **With `--stop_row S`.** Rows up to S are searched exhaustively in the same order. Every board that completes them is extended column by column (column 0 from the bottom up, then column 1, and so on) over the open cells of rows S+1..14, cols 0..14. Each extension gets `--extend_nodes` nodes and keeps its deepest prefix. The board whose extension goes deepest is kept, the first found on ties, and a completely filled region ends the search.
+  - A board that never completes row S keeps its deepest row prefix and is dived from there; the summary counts it as not reaching S.
+- **Output and budget.** Each input gives at most one board. The budget is 10^7 nodes per board, extensions included, which is about 0.3 s. The top border and the right column above S are left to the dives, as in the beamer.
+- **Parity with the beamer.** On a beamer stop-row board written with `--extend_nodes 0`, `--stop_row S` places exactly the cells the beamer's own extension places. The gate checks this board for board.
+
+The diver deliberately has no break-tolerant search, no alternative cell orders and no enumeration of many solutions per board. For those (a band's every solution, bounded mismatches, Hall pruning), use `E555_backtracker` (9.5).
+
+**Batches and frame.**
+- **Batches.** Consecutive rows with the same config id form a batch, because stage 2 of the dives is selected within a batch. A beamer file therefore replays configuration by configuration.
+- **Without `--rotations`.** Any unused edge piece may take any open border cell.
+- **With `--rotations FILE`.** A beamer id `r<N>b...`, or `NAME_r<N>b...` from a `--prefix` run, holds edge pieces to the sides that row N deals them, in the backtrack and in the dives. A board whose edges do not sit where row N deals them is prepared and dived with free edges, in a run of its own under the same id. An id naming no row (finalizer, random-border or hand-made boards) is dived with free edges.
+- **Determinism.** Boards are searched in parallel but each serially, and every dive's random stream is keyed by its board and `--rng_seed`. The output does not depend on `--threads`.
+
+**Re-processing old boards.** Lift the rows an older run built, rebuild them with the current trajectory, and finish:
+
+```bash
+bin/E555_diver data/seed_Edge5.txt old_boards.csv redone.csv \
+    --rotations rotations.csv --holes top:6 --stop_row 11 \
+    --end_dive 10000 --end_polish 20000 --emit_score 455 --threads 16
+```
+
+- `--holes top:6` lifts rows 10-15, and rows 10-11 are rebuilt with zero breaks.
+- Add `--pin_clue N` when the lifted rows include the centre clue's cell, and `--clue_corners` when they include row 13's clue cells. A clue below the lifted rows must already be on the board, or the board is dropped.
+- Use `--end_dive 0` first to see how many boards reach S, and how deep their extensions go.
+
+**Measured** on 40 row-12 partials from an older beam (`data/E565_lowB_baseline.csv`), 2000/200 dives per board:
+
+| run | distinct boards | mean | max |
+|---|---|---|---|
+| `--holes top:6 --stop_row 11` | 16 | 453.8 | 457 |
+| `--holes top:6`, no rebuild | 16 | 452.9 | 455 |
+| the partials dived unchanged, rows 0–12 kept | 40 | 456.6 | 459 |
+
+- Once rows 10–15 are lifted, only 16 of the 40 boards are distinct; the engine drops exact repeats. On those, the rebuild beats a plain dive of the same holed board, in less than half the time.
+- Lifting rows that a beam built well costs more than rebuilding gains: dived unchanged, the original partials score higher. Lift the rows you don't trust (the top of the partial and anything above), not the rows the beam built well.
+
+**Improving complete boards** (`--reopen SPEC`). Each complete board is cut and dived again with the complete board as its **incumbent**, so the board written is never worse than the input.
+- **SPEC** is one of:
+  - `auto`: the outer band of the side holding the most damaged cells, deep enough for 90% of them, at most 5 rows;
+  - `auto+E`: E more rows;
+  - `top:K`, `bottom:K`, `left:K` or `right:K`;
+  - `box:R0-R1,C0-C1`;
+  - a mask file.
+
+  Given n times, round r uses the (r mod n)-th spec.
+- `--reopen` does not combine with `--holes`, which makes every board a partial with no incumbent, nor with `--backtrack`/`--stop_row`.
+- **Measured** on 15 dived-and-polished boards (459-463), with `--reopen auto`, 15 s per board and 2 seeds:
+  - `--copies 8 --end_dive 3000 --end_polish 1000 --prior 1 --nogo 1` gained on 8 of 30 runs (5 of 15 boards), the best of eight settings tried;
+  - one copy of 50000/50000 gained on 5 of 30.
+
+  The same few boards gain under every setting.
+
+A finished board turned 180 degrees, with its top K rows lifted so that a perfect refill exists, is refilled perfectly on:
+- 15 of 15 boards at K = 3-4;
+- 3 of 15 at K = 6;
+- 0 at K = 8.
+
+The breaks a dive leaves in the top rows of a Stage B board are forced by the pieces left against the rows below. A gain needs the row under the damage lifted too.
 
 | option | default | meaning |
 |---|---|---|
-| `--end_dive M` | 10000 | dives per board |
+| `--start_row R`, `--num_rows N` | 0, 0 (all) | input records R..R+N-1 |
+| `--holes SPEC` | off | lift cells first: mask file, `top:K`/`bottom:K`/`left:K`/`right:K`, `box:R0-R1,C0-C1` |
+| `--pin_clue N` | off | place clue frame N's centre clue (1..4, as the beamer) |
+| `--clue_corners` | off | with `--pin_clue`: also its four corner clues; shapes `--corner_seeds` blocks |
+| `--backtrack` | off | zero-break row-major fill of rows 0..14, deepest prefix kept |
+| `--stop_row S` | off | rows up to S, then the column extension; the deepest extension kept (implies `--backtrack`) |
+| `--extend_nodes N` | 100000 | node budget of each extension (0 = the first board to reach S) |
+| `--end_dive M` | 10000 | dives per board; 0 = write the prepared boards |
 | `--end_polish R` | off | polish plus R kick rounds |
 | `--emit_score S` | 450 | write boards whose best is >= S |
 | `--rotations FILE` | free edges | hold edge pieces to their dealt sides |
-| `--corner_seeds N`, `--clue_corners` | 0, off | corner-seeded copies (needs `--rotations`) |
+| `--corner_seeds N` | 0 | corner-seeded copies (needs `--rotations`) |
 | `--reopen SPEC` | off | re-dive complete boards, never worse |
 | `--rounds N` | 1 | rounds from the best board so far (continue until `--wall_time` if set) |
 | `--copies K` | 1 | dive each board K times on separate streams; keep the best |
@@ -1304,8 +1364,14 @@ the damage lifted too.
 | `--wall_time S`, `--max_emitted N` | -- | stop after the batch in flight |
 | `--print_cmd`, `--verbose` | off | |
 
-`E555_diver.c` is the front end (input, batches, frame, reopen); policies and
-stages live in `E555_dive.c`, shared with the beamer and the finalizer.
+**Summary lines.**
+- `[sum] holes`: cells lifted per board.
+- `[sum] clues`: pieces placed, boards dropped.
+- `[sum] backtrack`: boards, the highest full row, how many reached S, and node-cap hits.
+- `[sum] extension`: extension cells and whole columns, mean and max.
+- Then the dive engine's lines (5.14).
+
+`E555_diver.c` is the front end: input, preparation, batches, frame and reopen. Policies and stages live in `E555_dive.c`, shared with the beamer and the finalizer.
 
 ### 9.3 `E555_ender.py` -- the closer
 
@@ -1614,7 +1680,7 @@ roundhouse must rediscover `data/synth_solution_480.csv` from
 | `src/B_beam/E555_finalizer.c` | beam from a partial: locking, reduced database, side modes, locked top rows |
 | `src/B_beam/E555_roundhouse.c` | strip search: width-W database, oracles, spiral geometry |
 | `src/C_tail/E555_dive.{c,h}` | end-dive engine: dives, cross-entropy rounds, polish, corner seeds, copies and incumbents, job queue |
-| `src/C_tail/E555_diver.c` | the dive engine on any board file; `--reopen` |
+| `src/C_tail/E555_diver.c` | the dive engine on any board file; `--holes`, `--pin_clue`, `--stop_row`, `--reopen` |
 | `src/C_tail/E555_ender.py` | exact region re-solves and redive |
 | `src/C_tail/E555_topper.py` | CP-SAT band minimizer |
 | `src/C_tail/E555_backtracker.c` | exact / mismatch DFS, stop bands |

@@ -4,6 +4,7 @@
 #   bash examples/10_diver_quickstart.sh
 #   bash examples/10_diver_quickstart.sh BOARDS=beam_out/beam_completions_0_10.csv ROTATIONS=rotations.csv
 #   bash examples/10_diver_quickstart.sh END_POLISH=-1 EMIT_SCORE=450
+#   bash examples/10_diver_quickstart.sh HOLES=top:6 STOP_ROW=11     # rebuild rows 10-11 first
 #
 # The diver runs the beamer's --end_dive on boards you already have: every
 # placed cell stays, the open cells are filled by greedy random dives that
@@ -14,6 +15,11 @@
 # ROTATIONS holds each beamer board's edge pieces to the sides its "r<N>b..."
 # row dealt them (and lets CORNER_SEEDS seed alive top-corner blocks). Without
 # it any edge piece may take any open border cell.
+#
+# HOLES lifts cells from every board first (a 0/1 mask file, top:K, box:...);
+# STOP_ROW then rebuilds the open rows up to it with zero breaks and extends
+# the board column by column above it, as the beamer's --backtrack_row does,
+# before the dives. PIN_CLUE places the centre clue when HOLES opens its cell.
 # What the stages do: PROJECT_E555.md, "Finishing boards"
 set -euo pipefail
 
@@ -28,6 +34,9 @@ END_DIVE=10000          # dives per board
 END_POLISH=2000         # kick-and-polish rounds; -1 = no polish
 EMIT_SCORE=0            # write boards whose best finish is >= this
 CORNER_SEEDS=0          # seeded copies per board (needs ROTATIONS); 0 = off
+HOLES=                  # cells to lift first: mask file, top:K, box:R0-R1,C0-C1; empty = none
+STOP_ROW=               # zero-break rebuild up to this row, then columns; empty = off
+PIN_CLUE=               # centre clue frame 1..4 (PROJECT_E555.md 9.2); empty = off
 THREADS=8
 RNG_SEED=1
 # -----------------------------------------------------------------------------
@@ -44,8 +53,12 @@ cd "$REPO"
 
 ROT_ARG=(); [ -n "$ROTATIONS" ] && ROT_ARG=(--rotations "$ROTATIONS" --corner_seeds "$CORNER_SEEDS")
 POLISH_ARG=(); [ "$END_POLISH" -ge 0 ] && POLISH_ARG=(--end_polish "$END_POLISH")
+PREP_ARG=()
+[ -n "$HOLES" ]    && PREP_ARG+=(--holes "$HOLES")
+[ -n "$STOP_ROW" ] && PREP_ARG+=(--stop_row "$STOP_ROW")
+[ -n "$PIN_CLUE" ] && PREP_ARG+=(--pin_clue "$PIN_CLUE")
 
-bin/E555_diver "$SEED" "$BOARDS" "$OUT" "${ROT_ARG[@]}" "${POLISH_ARG[@]}" \
+bin/E555_diver "$SEED" "$BOARDS" "$OUT" "${ROT_ARG[@]}" "${POLISH_ARG[@]}" "${PREP_ARG[@]}" \
     --end_dive "$END_DIVE" --emit_score "$EMIT_SCORE" \
     --threads "$THREADS" --rng_seed "$RNG_SEED" --print_cmd --verbose
 

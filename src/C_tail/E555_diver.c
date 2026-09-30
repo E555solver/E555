@@ -1,16 +1,47 @@
 /*
- * E555_diver.c -- finish precomputed boards with the beamer's end dives and
- * polish, without the beam or the chain database.
+ * E555_diver.c -- finish board files with the beamer's end dives and polish,
+ * without the beam or the chain database, after optionally rebuilding their
+ * top the way the beamer's --backtrack_row trajectory does.
  *
  *   E555_diver seed.txt boards.csv output.csv [options]
  *
- * Reads any board CSV (the last 512 fields of a row are pos[256] and rot[256];
- * a leading field is the config id; '#' and '%' lines are comments), keeps
- * every placed cell fixed, and fills the open cells exactly as
- * `E555_beamer --end_dive` does: the same engine (E555_dive.c), the same
- * stages, the same tuning. Boards whose best finish scores >= --emit_score are
- * written as canonical "config_id, score, pos[256], rot[256]" rows, best first
- * within each batch, and output.csv.outputs.txt lists the output.
+ * INPUT. Any board CSV: the last 512 fields of a row are pos[256] and rot[256]
+ * (999 = unplaced), a leading field is the config id, '#' and '%' lines are
+ * comments. --start_row R / --num_rows N read data rows R..R+N-1 only.
+ *
+ * PER BOARD, in this order:
+ *   holes      --holes SPEC lifts cells: a 16x16 0/1 mask file (first data line
+ *              = row 0), top:K, bottom:K, left:K, right:K or box:R0-R1,C0-C1.
+ *   clues      --pin_clue N places the centre clue of frame N (the beamer's
+ *              quadrant numbering), --clue_corners also its four corner clues;
+ *              a board whose clue cell or clue piece is taken otherwise is
+ *              dropped.
+ *   backtrack  --backtrack fills the open cells of rows 0..14 in row-major order
+ *              with zero breaks and keeps the deepest prefix. --stop_row S
+ *              searches rows up to S exhaustively; every board completing them
+ *              is extended column by column over the open cells of rows
+ *              S+1..14, cols 0..14 (--extend_nodes per board), and the board
+ *              whose extension goes deepest is kept, the first found on ties; a
+ *              full region ends the search. One board in, at most one out. The
+ *              budget is DR_BT_NODES nodes a board, extensions included; a board
+ *              that never reaches S keeps its deepest row prefix.
+ *   dives      open cells are filled exactly as `E555_beamer --end_dive` does:
+ *              the same engine (E555_dive.c), stages and tuning. Boards whose
+ *              best finish scores >= --emit_score are written as canonical
+ *              "config_id, score, pos[256], rot[256]" rows, best first within
+ *              each batch. --end_dive 0 writes the prepared boards instead
+ *              (score = matched edges between placed cells).
+ *
+ * THE SEARCH. A cell takes an unused piece whose sides match every placed
+ * neighbour and whose frame colour 0 faces exactly the board's edge. Inner
+ * cells draw from g_lb_bucket[left][bottom] in the beamer's order, so a
+ * beamer stop-row board is extended exactly as the beamer extends it; border
+ * cells draw from the edge and corner orientations, at their dealt spin when
+ * the batch is framed. Top supply: while (15,c) is open, a row-14 piece's top
+ * colour must be the inner colour of an unused top-border candidate not yet
+ * promised to another row-14 cell, and a candidate placed elsewhere spends one
+ * (framed: pieces dealt to the top; free: any edge piece). Boards are searched
+ * in parallel, each serially, so the output does not depend on --threads.
  *
  * BATCHES. Consecutive rows with the same config id form a batch -- what the
  * beamer dives together for one configuration -- because stage 2 is chosen
@@ -18,14 +49,15 @@
  * replays configuration by configuration. Output is written after every batch.
  *
  * FRAME. Without --rotations every edge piece may take any open border cell.
- * With --rotations FILE, a beamer config id "r<N>b..." names the rotations row
- * its border came from, and the edge pieces are held to the sides that row
- * deals them, as in the beamer. A board that cannot be completed that way (its
- * edges do not sit where row N deals them) is dived with free edges instead, in
- * a run of its own under the same id -- which is how a beamer --free_edges
- * file replays, its corner seeds drawn from the row's pooled top/right catalog
- * as in the beamer. An id that names no row -- finalizer, random-border or
- * hand-made boards -- is dived with free edges.
+ * With --rotations FILE, a beamer config id "r<N>b..." (or "NAME_r<N>b..."
+ * from a beamer --prefix run) names the rotations row its border came from, and
+ * the edge pieces are held to the sides that row deals them, as in the beamer,
+ * in the backtrack as in the dives. A board that cannot be completed that way
+ * (its edges do not sit where row N deals them) is prepared and dived with
+ * free edges instead, in a run of its own under the same id -- which is how a
+ * beamer --free_edges file replays, its corner seeds drawn from the row's
+ * pooled top/right catalog as in the beamer. An id that names no row --
+ * finalizer, random-border or hand-made boards -- is dived with free edges.
  *
  * Every dive's random stream is keyed by its board and --rng_seed, so output
  * does not depend on --threads or on where a batch starts.
@@ -40,13 +72,16 @@
  * of its own and keeps the best copy; --orders gives the copies different
  * places to start filling from; --prior / --nogo start the dives of a reopened
  * board pulled toward the incumbent's clean placements and away from its
- * broken ones (E555_dive.h, "COPIES, INCUMBENTS, ORDERS").
+ * broken ones (E555_dive.h, "COPIES, INCUMBENTS, ORDERS"). --holes and --reopen
+ * do not combine, nor do --reopen and --backtrack: --holes and the backtrack
+ * turn every board into a partial with no incumbent.
  *
- * EXTENDING. This file is only the front-end: input, batching, frame choice,
- * what to reopen, and output. New dive policies, moves and stages belong in
- * E555_dive.c's layers; new ways of choosing what to dive (holes masks,
- * reopened rows, alternative seeders) belong here, as preparation of the board
- * handed to dv_queue().
+ * SCOPE. The diver finishes boards for score; its search is the beamer's
+ * zero-break trajectory and nothing else. Break-tolerant, reordered or
+ * enumerating searches (all solutions of a band, bounded mismatch, Hall
+ * pruning) are E555_backtracker's. New dive policies, moves and stages belong
+ * in E555_dive.c's layers; new ways of preparing the board handed to
+ * dv_queue() belong here.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -99,6 +134,8 @@ static int         g_rounds       = 1;       /* --rounds N */
 static bool        g_plateau      = false;   /* --plateau */
 static float       g_prior        = 0.0f;    /* --prior A */
 static float       g_nogo         = 0.0f;    /* --nogo B */
+static uint64_t    g_rec_start    = 0;       /* --start_row R: first record read */
+static uint64_t    g_rec_count    = 0;       /* --num_rows N; 0 = the rest */
 
 static volatile sig_atomic_t g_stop = 0;
 static void handle_stop(int sig) { (void)sig; g_stop = 1; }
@@ -124,7 +161,7 @@ static struct {
 
 static struct {
     uint64_t rows, batches, complete, malformed, misfit, unframed, dived;
-    uint64_t reopened, lifted, solved, better, moved;
+    uint64_t reopened, lifted, solved, better, moved, raw;
     int64_t  gain;
 } g_st;
 
@@ -173,12 +210,19 @@ static bool dr_parse(char **f, int n, DrBoard *b, const char **why) {
 }
 
 /* The rotations row a beamer config id "r<N>b..." names, or -1. Anchored, so
-   finalizer ids (p3r0l5) and random-border ids (rndb0l1) name none. */
-static long dr_id_row(const char *id) {
+   finalizer ids (p3r0l5) and random-border ids (rndb0l1) name none; a beamer
+   --prefix run's id "NAME_r<N>b..." is read after its last '_'. */
+static long dr_id_row_at(const char *id) {
     if (id[0] != 'r' || id[1] < '0' || id[1] > '9') return -1;
     char *e;
     const long v = strtol(id + 1, &e, 10);
     return (*e == 'b' && v >= 0) ? v : -1;
+}
+
+static long dr_id_row(const char *id) {
+    const long v = dr_id_row_at(id);
+    const char *u = strrchr(id, '_');
+    return (v >= 0 || !u) ? v : dr_id_row_at(u + 1);
 }
 
 /* -- Reopen: the cells lifted from a complete board ------------------------- */
@@ -269,13 +313,22 @@ static void dr_apply(DrBoard *b, const bool lift[NUM_PIECES]) {
     }
 }
 
-/* Write a complete board as a canonical row, outside the engine: a reopened
-   board with nothing left to reopen (it scores 480). */
+/* Write a board as a canonical row, outside the engine: a reopened board with
+   nothing left to reopen, or a prepared board under --end_dive 0. The score is
+   its matched edges between placed cells (480 for a solved board). */
 static void dr_write_complete(FILE *fp, const char *id, const uint16_t *pid, const uint8_t *rot) {
-    bool brk[NUM_PIECES];
-    const int score = 480 - dr_breaks(pid, rot, brk);
+    int score = 0;
     uint32_t pos[NUM_PIECES], rr[NUM_PIECES];
-    for (int x = 0; x < NUM_PIECES; x++) { pos[pid[x]] = (uint32_t)x; rr[pid[x]] = rot[x]; }
+    for (int p = 0; p < NUM_PIECES; p++) { pos[p] = 999; rr[p] = 0; }
+    for (int x = 0; x < NUM_PIECES; x++) {
+        if (pid[x] == DV_EMPTY) continue;
+        pos[pid[x]] = (uint32_t)x; rr[pid[x]] = rot[x];
+        const int r = x / PUZZLE_SIDE, c = x % PUZZLE_SIDE;
+        if (c < PUZZLE_SIDE - 1 && pid[x + 1] != DV_EMPTY)
+            score += dr_side(pid[x], rot[x], 1) == dr_side(pid[x + 1], rot[x + 1], 3);
+        if (r < PUZZLE_SIDE - 1 && pid[x + PUZZLE_SIDE] != DV_EMPTY)
+            score += dr_side(pid[x], rot[x], 0) == dr_side(pid[x + PUZZLE_SIDE], rot[x + PUZZLE_SIDE], 2);
+    }
     fprintf(fp, "%s, %d", id, score);
     for (int p = 0; p < NUM_PIECES; p++) fprintf(fp, ", %u", pos[p]);
     for (int p = 0; p < NUM_PIECES; p++) fprintf(fp, ", %u", rr[p]);
@@ -358,6 +411,305 @@ static void dr_parse_reopen(const char *arg) {
     if (!g_nspec) g_reopen = arg;
     g_spec_arg[g_nspec] = arg;
     dr_parse_spec(arg, &g_spec[g_nspec++]);
+}
+
+/* -- Prepare: holes, clue pins, backtrack ----------------------------------- */
+static DrSpec      g_holes;
+static const char *g_holes_arg = NULL;       /* --holes SPEC */
+static int         g_pin       = 0;          /* --pin_clue N; 0 = off */
+static int         g_orient    = -1;         /* its clue frame (g_clue row) */
+static bool        g_backtrack = false;      /* --backtrack */
+static int         g_stop_row  = -1;         /* --stop_row S; -1 = off */
+static uint32_t    g_ext_nodes = 100000;     /* --extend_nodes N */
+static bool        g_ext_set   = false;
+
+#define DR_BT_NODES 10000000ULL              /* per board: rows and extensions together */
+
+static struct {
+    uint64_t holed, holes_lifted, pinned, clue_drop;
+    uint64_t bt, reached, shortb, capped, ext_cells, ext_cols;
+    int      ext_max, ext_cols_max, row_max;
+} g_pr;
+
+/* Lift the --holes cells from a board. */
+static void dr_holes(DrBoard *b) {
+    bool lift[NUM_PIECES];
+    dr_lift(b->pid, b->rot, &g_holes, lift);
+    int n = 0;
+    for (int x = 0; x < NUM_PIECES; x++)
+        if (lift[x] && b->pid[x] != DV_EMPTY) { b->pid[x] = DV_EMPTY; b->rot[x] = 0; n++; }
+    g_pr.holed++;
+    g_pr.holes_lifted += (uint64_t)n;
+}
+
+/* --pin_clue: put the frame's centre clue (and, with --clue_corners, its four
+   corner clues) on the board. False when a clue cell holds another piece or a
+   clue piece stands elsewhere or at another spin: the board cannot carry this
+   frame. */
+static bool dr_clue(DrBoard *b) {
+    const int last = (g_clue_mask & CLUE_CORNERS) ? CLUE_N : 1;
+    for (int k = 0; k < last; k++) {
+        const ClueCell *cc = &g_clue[g_orient][k];
+        const int x = cc->row * PUZZLE_SIDE + cc->col;
+        if (b->pid[x] == cc->piece) { if (b->rot[x] != cc->spin) return false; continue; }
+        if (b->pid[x] != DV_EMPTY) return false;
+        for (int y = 0; y < NUM_PIECES; y++) if (b->pid[y] == cc->piece) return false;
+    }
+    for (int k = 0; k < last; k++) {
+        const ClueCell *cc = &g_clue[g_orient][k];
+        const int x = cc->row * PUZZLE_SIDE + cc->col;
+        if (b->pid[x] == DV_EMPTY) { b->pid[x] = cc->piece; b->rot[x] = cc->spin; g_pr.pinned++; }
+    }
+    return true;
+}
+
+/* The zero-break search of --backtrack / --stop_row. A cell takes an unused
+   piece whose sides match every placed neighbour and whose frame colour (0)
+   faces exactly the board's edge: an inner cell draws from the catalog bucket
+   g_lb_bucket[left][bottom] (the beamer's order), a border cell from the edge
+   and corner orientations below, at their dealt spin under a rotations row.
+   Top supply: while (15,c) is open, the top colour of a row-14 piece must be
+   the inner colour of an unused top-border candidate not yet promised to
+   another row-14 cell (avail[]); a candidate placed elsewhere spends one. */
+typedef struct { uint16_t pid; uint8_t rot, t, r, b, l; } DrOr;
+static DrOr g_eo[4 * NUM_PIECES];            /* edge and corner orientations, by (l, b) */
+static int  g_eo_at[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL + 1];
+
+static void dr_bt_init(void) {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    build_catalog_indices();                 /* g_lb_bucket, without a database */
+    int n = 0;
+    for (int l = 0; l < NUM_COLORS_TOTAL; l++)
+        for (int b = 0; b < NUM_COLORS_TOTAL; b++) {
+            g_eo_at[l][b] = n;
+            for (int p = 0; p < NUM_PIECES; p++) {
+                const int e[4] = { g_seed_top[p], g_seed_right[p], g_seed_bottom[p], g_seed_left[p] };
+                if (e[0] && e[1] && e[2] && e[3]) continue;          /* inner */
+                for (int s = 0; s < 4; s++)
+                    if (dr_side(p, s, 3) == l && dr_side(p, s, 2) == b)
+                        g_eo[n++] = (DrOr){ (uint16_t)p, (uint8_t)s, (uint8_t)dr_side(p, s, 0),
+                                            (uint8_t)dr_side(p, s, 1), (uint8_t)b, (uint8_t)l };
+            }
+        }
+    for (int l = 0; l < NUM_COLORS_TOTAL; l++) g_eo_at[l][NUM_COLORS_TOTAL] =
+        l + 1 < NUM_COLORS_TOTAL ? g_eo_at[l + 1][0] : n;
+}
+
+#define DR_OPEN 0xFF
+typedef struct {
+    uint16_t pid[NUM_PIECES];
+    uint8_t  rot[NUM_PIECES];
+    uint8_t  side[NUM_PIECES][4];            /* placed colours; DR_OPEN = open */
+    uint64_t used[4];
+    int      avail[NUM_COLORS_TOTAL];
+    int8_t   topc[NUM_PIECES];               /* inner colour a top candidate owes; -1 = none */
+    bool     framed;
+    int      nrow, next;                     /* row-phase and extension cells */
+    uint8_t  rcell[NUM_PIECES], ecell[NUM_PIECES];
+    uint16_t rp[NUM_PIECES], ep[NUM_PIECES]; /* the current path: piece, rotation */
+    uint8_t  rr[NUM_PIECES], er[NUM_PIECES];
+    int      rbest, ebest, leaf_best;        /* deepest row prefix, extension, best leaf's */
+    uint16_t bp[NUM_PIECES];                 /* the board kept, per cell */
+    uint8_t  br[NUM_PIECES];
+    uint64_t nodes, enodes;
+    bool     capped, done;
+} DrBt;
+
+static inline void bt_put(DrBt *t, int x, uint16_t p, uint8_t s, int tc, int rc, int bc, int lc) {
+    t->pid[x] = p; t->rot[x] = s;
+    t->side[x][0] = (uint8_t)tc; t->side[x][1] = (uint8_t)rc;
+    t->side[x][2] = (uint8_t)bc; t->side[x][3] = (uint8_t)lc;
+    used_set(t->used, p);
+}
+static inline void bt_take(DrBt *t, int x) {
+    used_clear(t->used, t->pid[x]);
+    t->pid[x] = DV_EMPTY;
+    memset(t->side[x], DR_OPEN, 4);
+}
+
+/* Try every candidate of cell x; next(t, d+1) after each placement. Returns
+   false when the search must stop (budget, or a full result). */
+typedef bool (*DrNext)(DrBt *t, int d);
+static bool bt_cell(DrBt *t, int x, int d, uint64_t *nodes, uint64_t cap, DrNext next) {
+    const int r = x / PUZZLE_SIDE, c = x % PUZZLE_SIDE;
+    const int L = c ? t->side[x - 1][1] : 0, B = r ? t->side[x - PUZZLE_SIDE][0] : 0;
+    if (L == DR_OPEN || B == DR_OPEN) return true;
+    const int up = r < PUZZLE_SIDE - 1 ? t->side[x + PUZZLE_SIDE][2] : 0;
+    const int rt = c < PUZZLE_SIDE - 1 ? t->side[x + 1][3] : 0;
+    const bool supply = r == EDGE_LEN && up == DR_OPEN;
+    if (r && r < PUZZLE_SIDE - 1 && c && c < PUZZLE_SIDE - 1) {
+        if (!color_is_inner(L) || !color_is_inner(B)) return true;
+        const int nb = g_lb_count[L][B];
+        for (int k = 0; k < nb; k++) {
+            const Oriented *o = &g_cat[g_lb_bucket[L][B][k]];
+            if (up != DR_OPEN && o->top != up) continue;
+            if (rt != DR_OPEN && o->right != rt) continue;
+            if (supply && t->avail[o->top] <= 0) continue;
+            if (used_test(t->used, o->piece_id)) continue;
+            if (*nodes >= cap) return false;
+            (*nodes)++;
+            bt_put(t, x, o->piece_id, o->rotation, o->top, o->right, o->bottom, o->left);
+            if (supply) t->avail[o->top]--;
+            const bool go = next(t, d + 1);
+            if (supply) t->avail[o->top]++;
+            bt_take(t, x);
+            if (!go) return false;
+        }
+        return true;
+    }
+    for (int k = g_eo_at[L][B]; k < g_eo_at[L][B + 1]; k++) {
+        const DrOr *o = &g_eo[k];
+        if ((o->r == 0) != (c == PUZZLE_SIDE - 1) || (o->t == 0) != (r == PUZZLE_SIDE - 1)) continue;
+        if (up != DR_OPEN && o->t != up) continue;
+        if (rt != DR_OPEN && o->r != rt) continue;
+        if (t->framed && o->rot != g_spin[o->pid]) continue;
+        if (used_test(t->used, o->pid)) continue;
+        const int tc = t->topc[o->pid];
+        if (tc >= 0 && t->avail[tc] <= 0) continue;
+        if (*nodes >= cap) return false;
+        (*nodes)++;
+        bt_put(t, x, o->pid, o->rot, o->t, o->r, o->b, o->l);
+        if (tc >= 0) t->avail[tc]--;
+        const bool go = next(t, d + 1);
+        if (tc >= 0) t->avail[tc]++;
+        bt_take(t, x);
+        if (!go) return false;
+    }
+    return true;
+}
+
+/* Extension: column-major over the open cells of rows S+1..14, cols 0..14;
+   the deepest prefix, first found. */
+static bool bt_ext(DrBt *t, int d) {
+    if (d > t->ebest) {
+        t->ebest = d;
+        for (int k = 0; k < d; k++) {
+            t->ep[k] = t->pid[t->ecell[k]]; t->er[k] = t->rot[t->ecell[k]];
+        }
+    }
+    if (d == t->next) return false;
+    return bt_cell(t, t->ecell[d], d, &t->enodes, g_ext_nodes, bt_ext);
+}
+
+/* Keep the board as it stands plus its extension prefix. */
+static void bt_keep(DrBt *t) {
+    memcpy(t->bp, t->pid, sizeof t->bp);
+    memcpy(t->br, t->rot, sizeof t->br);
+    for (int k = 0; k < t->ebest; k++) { t->bp[t->ecell[k]] = t->ep[k]; t->br[t->ecell[k]] = t->er[k]; }
+}
+
+/* Row phase: row-major over the open cells of rows 0..S (0..14 without S). */
+static bool bt_row(DrBt *t, int d) {
+    if (d > t->rbest) {
+        t->rbest = d;
+        for (int k = 0; k < d; k++) { t->rp[k] = t->pid[t->rcell[k]]; t->rr[k] = t->rot[t->rcell[k]]; }
+    }
+    if (d < t->nrow)
+        return bt_cell(t, t->rcell[d], d, &t->nodes, DR_BT_NODES, bt_row);
+    if (g_stop_row < 0) return false;                  /* every open cell filled */
+    t->ebest = 0; t->enodes = 0;
+    if (g_ext_nodes) bt_ext(t, 0);
+    t->nodes += t->enodes;                             /* one budget for both phases */
+    if (t->ebest > t->leaf_best) { t->leaf_best = t->ebest; bt_keep(t); }
+    if (t->enodes >= g_ext_nodes && t->ebest < t->next) t->capped = true;
+    return t->leaf_best < t->next && g_ext_nodes > 0;  /* a full region, or the first leaf, ends it */
+}
+
+/* Prepare one board in place: the best leaf at S, else the deepest row prefix. */
+static void dr_backtrack(DrBoard *b, bool framed, DrBt *t) {
+    memset(t, 0, sizeof *t);
+    t->framed = framed;
+    for (int x = 0; x < NUM_PIECES; x++) {
+        t->pid[x] = b->pid[x]; t->rot[x] = b->rot[x];
+        if (b->pid[x] == DV_EMPTY) { memset(t->side[x], DR_OPEN, 4); continue; }
+        for (int s = 0; s < 4; s++) t->side[x][s] = (uint8_t)dr_side(b->pid[x], b->rot[x], s);
+        used_set(t->used, b->pid[x]);
+    }
+    /* Top-border candidates: dealt to the top under a rotations row, any
+       edge piece otherwise; each owes the top border its inner colour. */
+    for (int p = 0; p < NUM_PIECES; p++) {
+        t->topc[p] = -1;
+        const int e[4] = { g_seed_top[p], g_seed_right[p], g_seed_bottom[p], g_seed_left[p] };
+        const int z = !e[0] + !e[1] + !e[2] + !e[3];
+        if (z != 1 || used_test(t->used, (uint16_t)p)) continue;
+        if (framed && dr_side(p, g_spin[p], 0) != 0) continue;
+        for (int k = 0; k < 4; k++) if (!e[k]) t->topc[p] = (int8_t)e[(k + 2) & 3];
+        t->avail[t->topc[p]]++;
+    }
+    const int top = g_stop_row >= 0 ? g_stop_row : EDGE_LEN;
+    for (int x = 0; x < (top + 1) * PUZZLE_SIDE; x++)
+        if (b->pid[x] == DV_EMPTY) t->rcell[t->nrow++] = (uint8_t)x;
+    if (g_stop_row >= 0)
+        for (int c = 0; c < EDGE_LEN + 1; c++)
+            for (int r = g_stop_row + 1; r <= EDGE_LEN; r++)
+                if (b->pid[r * PUZZLE_SIDE + c] == DV_EMPTY) t->ecell[t->next++] = (uint8_t)(r * PUZZLE_SIDE + c);
+    t->leaf_best = -1;
+    bt_row(t, 0);
+    if (t->nodes >= DR_BT_NODES) t->capped = true;
+    if (t->leaf_best >= 0) {                           /* reached S: the best leaf */
+        memcpy(b->pid, t->bp, sizeof t->bp);
+        memcpy(b->rot, t->br, sizeof t->br);
+        return;
+    }
+    for (int k = 0; k < t->rbest; k++) {               /* the deepest row prefix */
+        b->pid[t->rcell[k]] = t->rp[k]; b->rot[t->rcell[k]] = t->rr[k];
+    }
+}
+
+/* Whole columns of the region above S a board fills, from column 1. */
+static int dr_ext_cols(const DrBoard *b) {
+    int n = 0;
+    for (int c = 1; c <= EDGE_LEN; c++) {
+        for (int r = g_stop_row + 1; r <= EDGE_LEN; r++)
+            if (b->pid[r * PUZZLE_SIDE + c] == DV_EMPTY) return n;
+        n++;
+    }
+    return n;
+}
+
+/* Backtrack boards idx[0..n) of the batch under one frame, in parallel; each
+   board's search is serial, so the result does not depend on --threads. */
+static void dr_prepare(const size_t *idx, size_t n, bool framed) {
+    if (!n || !g_backtrack) return;
+    dr_bt_init();
+    int *reach = xmalloc(3 * n * sizeof *reach), *cap = reach + n, *filled = cap + n;
+    #pragma omp parallel
+    {
+        DrBt *t = xmalloc(sizeof *t);
+        #pragma omp for schedule(dynamic, 1)
+        for (size_t i = 0; i < n; i++) {
+            DrBoard *b = &g_batch.b[idx[i]];
+            dr_backtrack(b, framed, t);
+            reach[i] = t->leaf_best >= 0;
+            cap[i]   = t->capped;
+            filled[i] = t->leaf_best >= 0 ? t->leaf_best : t->rbest;
+        }
+        free(t);
+    }
+    for (size_t i = 0; i < n; i++) {
+        const DrBoard *b = &g_batch.b[idx[i]];
+        g_pr.bt++;
+        g_pr.capped += cap[i];
+        int row = -1;                                 /* highest full row */
+        for (int r = 0; r < PUZZLE_SIDE; r++) {
+            int x = 0;
+            while (x < PUZZLE_SIDE && b->pid[r * PUZZLE_SIDE + x] != DV_EMPTY) x++;
+            if (x < PUZZLE_SIDE) break;
+            row = r;
+        }
+        if (row > g_pr.row_max) g_pr.row_max = row;
+        if (g_stop_row < 0) continue;
+        if (!reach[i]) { g_pr.shortb++; continue; }
+        g_pr.reached++;
+        g_pr.ext_cells += (uint64_t)filled[i];
+        if (filled[i] > g_pr.ext_max) g_pr.ext_max = filled[i];
+        const int cols = dr_ext_cols(b);
+        g_pr.ext_cols += (uint64_t)cols;
+        if (cols > g_pr.ext_cols_max) g_pr.ext_cols_max = cols;
+    }
+    free(reach);
 }
 
 /* -- Rotations rows and the corner catalog, cached per row ----------------- */
@@ -562,6 +914,28 @@ static void dr_batch(void) {
                    "edges\n", g_batch.id, k, row);
         nf = k;
     }
+    dr_prepare(dealt, nd, true);
+    dr_prepare(freed, nf, false);
+    if (!g_dives) {                          /* --end_dive 0: the prepared boards */
+        if (g_verbose) {
+            if (nd) printf("[batch] %s: %zu board(s), dealt edges, prepared only\n", g_batch.id, nd);
+            if (nf) printf("[batch] %s: %zu board(s), free edges, prepared only\n", g_batch.id, nf);
+            fflush(stdout);
+        }
+        bool *keep = xmalloc(g_batch.n * sizeof *keep);
+        memset(keep, 0, g_batch.n * sizeof *keep);
+        for (size_t i = 0; i < nd; i++) keep[dealt[i]] = true;
+        for (size_t i = 0; i < nf; i++) keep[freed[i]] = true;
+        for (size_t i = 0; i < g_batch.n; i++) {
+            if (!keep[i] || (g_max_written && g_st.raw >= g_max_written)) continue;
+            dr_write_complete(g_out, g_batch.id, g_batch.b[i].pid, g_batch.b[i].rot);
+            g_st.raw++;
+        }
+        g_st.dived += nd + nf;
+        free(keep); free(dealt);
+        g_batch.n = 0;
+        return;
+    }
     if (nd && g_seeds > 0 && g_row_pooled) dr_build_catalog(false);
     dr_run(dealt, nd, true, framed && g_row_seed);
     /* Free-edge boards of a named row -- a beamer --free_edges run -- seed from
@@ -584,7 +958,7 @@ static void dr_take(const char *id, const DrBoard *b) {
 
 static bool dr_done(double deadline) {
     return g_stop || (deadline > 0.0 && omp_get_wtime() >= deadline) ||
-           (g_max_written && dv_written() >= g_max_written);
+           (g_max_written && dv_written() + g_st.raw >= g_max_written);
 }
 
 /* -- Command line ----------------------------------------------------------- */
@@ -606,7 +980,8 @@ static void usage(const char *prog) {
         "                      the sides row N deals them (default: any edge on any border cell)\n"
         "  --corner_seeds N    also dive N copies of each board with an alive top-corner\n"
         "                      block placed (needs --rotations; default 0 = off)\n"
-        "  --clue_corners      corner blocks use the 2x3 clue template\n"
+        "  --clue_corners      corner blocks use the 2x3 clue template; with --pin_clue the\n"
+        "                      frame's four corner clues are also placed (see below)\n"
         "  --threads N         worker threads (default: all)\n"
         "  --rng_seed S        keys every dive (default %d)\n"
         "  --wall_time S       stop after S seconds; the current batch is still written\n"
@@ -629,9 +1004,29 @@ static void usage(const char *prog) {
         "  --prior A           dives of a reopened board start pulled toward its clean\n"
         "                      placements (weight A, 0..2; default 0 = off)\n"
         "  --nogo B            ... and pushed off its placements on broken cells (0..2)\n"
+        "\nPreparing boards before the dives (in this order):\n"
+        "  --start_row R       read input records R.. only (0-based data rows, not a board row)\n"
+        "  --num_rows N        ... and at most N of them (default 0 = the rest)\n"
+        "  --holes SPEC        lift these cells from every board: a 16x16 0/1 mask file (first\n"
+        "                      data line = row 0), top:K, bottom:K, left:K, right:K or\n"
+        "                      box:R0-R1,C0-C1. Not with --reopen\n"
+        "  --pin_clue N        place the centre clue of frame N (1 lower-left (7,7), 2 lower-\n"
+        "                      right (7,8), 3 upper-right (8,8), 4 upper-left (8,7)); with\n"
+        "                      --clue_corners also its four corner clues. A board whose clue\n"
+        "                      cell or clue piece is taken otherwise is dropped\n"
+        "  --backtrack         fill open cells of rows 0..14 row by row with zero breaks, as\n"
+        "                      deep as the search gets (%llu nodes a board), then dive\n"
+        "  --stop_row S        backtrack rows up to S (1..14); every board that completes them\n"
+        "                      is extended column by column over rows S+1..14, cols 0..14, and\n"
+        "                      the one whose extension goes deepest is dived. Implies\n"
+        "                      --backtrack\n"
+        "  --extend_nodes N    node budget of each extension (default 100000; 0 = keep the\n"
+        "                      first board to reach S)\n"
+        "  --end_dive 0        write the prepared boards (score = matched edges) without diving\n"
+        "\n"
         "  --print_cmd         echo the full command line\n"
         "  --verbose           one line per batch\n\n",
-        DR_M_DEFAULT, DR_S_DEFAULT, DR_SEED_DEFAULT);
+        DR_M_DEFAULT, DR_S_DEFAULT, DR_SEED_DEFAULT, (unsigned long long)DR_BT_NODES);
 }
 
 static void print_cmd(const char *a0, const char *seed, const char *in, const char *out) {
@@ -654,6 +1049,12 @@ static void print_cmd(const char *a0, const char *seed, const char *in, const ch
     if (g_order_weight > 0.0f)        printf(" --order_weight %g", g_order_weight);
     if (g_prior > 0.0f)               printf(" --prior %g", g_prior);
     if (g_nogo > 0.0f)                printf(" --nogo %g", g_nogo);
+    if (g_rec_start)                  printf(" --start_row %" PRIu64, g_rec_start);
+    if (g_rec_count)                  printf(" --num_rows %" PRIu64, g_rec_count);
+    if (g_holes_arg)                  printf(" --holes %s", g_holes_arg);
+    if (g_pin)                        printf(" --pin_clue %d", g_pin);
+    if (g_stop_row >= 0)              printf(" --stop_row %d --extend_nodes %u", g_stop_row, g_ext_nodes);
+    else if (g_backtrack)             printf(" --backtrack");
     if (g_print_cmd)                  printf(" --print_cmd");
     if (g_verbose)                    printf(" --verbose");
     printf("\n");
@@ -665,7 +1066,8 @@ int main(int argc, char **argv) {
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "--end_dive") && i + 1 < argc) {
             const long v = atol(argv[++i]);
-            if (v < 10 || v > 1000000000L) fatal("--end_dive must be in 10..1e9");
+            if ((v < 10 && v != 0) || v > 1000000000L)
+                fatal("--end_dive must be 0 (no dives) or in 10..1e9");
             g_dives = (uint32_t)v;
         }
         else if (!strcmp(argv[i], "--end_polish") && i + 1 < argc) {
@@ -725,6 +1127,46 @@ int main(int argc, char **argv) {
             g_nogo = (float)atof(argv[++i]);
             if (g_nogo < 0.0f || g_nogo > 2.0f) fatal("--nogo must be in 0..2");
         }
+        else if (!strcmp(argv[i], "--start_row")   && i + 1 < argc) {
+            unsigned long long v;
+            if (!parse_u64_token(argv[++i], &v))
+                fatal("--start_row expects a non-negative integer (0-based record index), got '%s'", argv[i]);
+            g_rec_start = (uint64_t)v;
+        }
+        else if (!strcmp(argv[i], "--num_rows")    && i + 1 < argc) {
+            unsigned long long v;
+            if (!parse_u64_token(argv[++i], &v))
+                fatal("--num_rows expects a non-negative integer (0 = every remaining record), got '%s'", argv[i]);
+            g_rec_count = (uint64_t)v;
+        }
+        else if (!strcmp(argv[i], "--holes")       && i + 1 < argc) {
+            g_holes_arg = argv[++i];
+            if (!strncmp(g_holes_arg, "auto", 4))
+                fatal("--holes takes a mask file, top:K, bottom:K, left:K, right:K or "
+                      "box:R0-R1,C0-C1 (auto belongs to --reopen)");
+            dr_parse_spec(g_holes_arg, &g_holes);
+        }
+        else if (!strcmp(argv[i], "--pin_clue")    && i + 1 < argc) {
+            g_pin = atoi(argv[++i]);
+            if (g_pin < 1 || g_pin > 4)
+                fatal("--pin_clue takes 1..4 (1 lower-left, 2 lower-right, 3 upper-right, 4 upper-left)");
+        }
+        else if (!strcmp(argv[i], "--backtrack"))  g_backtrack = true;
+        else if (!strcmp(argv[i], "--stop_row")    && i + 1 < argc) {
+            char *e; errno = 0;
+            const long v = strtol(argv[++i], &e, 10);
+            if (errno || e == argv[i] || *e || v < 1 || v > EDGE_LEN)
+                fatal("--stop_row expects a board row in 1..%d, got '%s'", EDGE_LEN, argv[i]);
+            g_stop_row = (int)v;
+            g_backtrack = true;
+        }
+        else if (!strcmp(argv[i], "--extend_nodes") && i + 1 < argc) {
+            unsigned long long v;
+            if (!parse_u64_token(argv[++i], &v) || v > 1000000000ULL)
+                fatal("--extend_nodes expects an integer in 0..1e9, got '%s'", argv[i]);
+            g_ext_nodes = (uint32_t)v;
+            g_ext_set = true;
+        }
         else if (!strcmp(argv[i], "--print_cmd"))  g_print_cmd = true;
         else if (!strcmp(argv[i], "--verbose"))    g_verbose = true;
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); usage(argv[0]); return 1; }
@@ -733,15 +1175,41 @@ int main(int argc, char **argv) {
     omp_set_num_threads(g_nthreads);
     if (g_seeds && !g_rot_path) fatal("--corner_seeds needs --rotations: the corner blocks "
                                       "are built from the sides a rotations row deals");
-    if ((g_clue_mask & CLUE_CORNERS) && !g_seeds)
-        printf("[warn] --clue_corners only shapes --corner_seeds; ignored\n");
+    if ((g_clue_mask & CLUE_CORNERS) && !g_seeds && !g_pin)
+        printf("[warn] --clue_corners pins clues only with --pin_clue, and shapes "
+               "--corner_seeds; ignored\n");
     if (!g_reopen && (g_prior > 0.0f || g_nogo > 0.0f || g_rounds > 1 || g_plateau))
         printf("[warn] --prior, --nogo, --rounds and --plateau act on reopened boards only "
                "(--reopen)\n");
+    if (g_holes_arg && g_reopen)
+        fatal("--holes and --reopen do not combine: --holes makes every board a partial to "
+              "finish, --reopen improves complete boards against themselves");
+    if (!g_dives && g_reopen) fatal("--end_dive 0 writes prepared boards; --reopen needs dives");
+    if (g_backtrack && g_reopen)
+        fatal("--backtrack/--stop_row rebuild partial boards; --reopen keeps a complete board's "
+              "cells as its incumbent -- use one or the other");
+    if (g_ext_set && g_stop_row < 0) fatal("--extend_nodes needs --stop_row");
+    if (g_pin) {
+        g_orient = clue_orient_for_pin(g_pin);
+        g_clue_mask |= CLUE_CENTER;
+        g_clue_orients = (uint8_t)(1u << g_orient);
+    }
     if (g_print_cmd) print_cmd(argv[0], seed_path, in_path, out_path);
     printf("[cfg] dives=%u polish=%d emit_score=%d frame=%s corner_seeds=%d%s threads=%d rng_seed=%" PRIu64 "\n",
            g_dives, g_polish, g_emit, g_rot_path ? g_rot_path : "(free edges)", g_seeds,
            (g_clue_mask & CLUE_CORNERS) ? " (clue 2x3)" : "", g_nthreads, g_rng);
+    if (g_holes_arg || g_pin || g_backtrack || g_rec_start || g_rec_count) {
+        printf("[cfg] records=%" PRIu64 "..", g_rec_start);
+        if (g_rec_count) printf("%" PRIu64, g_rec_start + g_rec_count - 1);
+        printf(" holes=%s clues=", g_holes_arg ? g_holes_arg : "none");
+        if (g_pin) printf("pin %d (%s)%s", g_pin, clue_pin_quadrant_name(g_pin),
+                          (g_clue_mask & CLUE_CORNERS) ? " + corners" : "");
+        else       printf("as read");
+        if (g_stop_row >= 0) printf(" backtrack=rows to %d, then columns (extend_nodes=%u)",
+                                    g_stop_row, g_ext_nodes);
+        else if (g_backtrack) printf(" backtrack=rows");
+        printf("\n");
+    }
     if (g_reopen || g_copies > 1 || g_norders) {
         printf("[cfg] reopen=");
         if (!g_nspec) printf("off");
@@ -775,13 +1243,16 @@ int main(int argc, char **argv) {
 
     char *line = NULL, **f = xmalloc(DR_MAX_FIELDS * sizeof *f);
     size_t lcap = 0;
-    uint64_t lno = 0;
+    uint64_t lno = 0, nrec = 0;
     DrBoard b;
     while (!dr_done(deadline) && getline(&line, &lcap, in) > 0) {
         lno++;
         const char *s = line;
         while (*s == ' ' || *s == '\t') s++;
         if (*s == '#' || *s == '%' || *s == '\n' || *s == '\r' || !*s) continue;
+        const uint64_t rec = nrec++;
+        if (rec < g_rec_start) continue;
+        if (g_rec_count && rec >= g_rec_start + g_rec_count) break;
         const int n = dr_split(line, f, DR_MAX_FIELDS);
         const char *why = "more fields than any board row";
         if (n > DR_MAX_FIELDS || !dr_parse(f, n, &b, &why)) {
@@ -792,6 +1263,8 @@ int main(int argc, char **argv) {
         g_st.rows++;
         b.line = lno;
         b.cut = b.done = false;
+        if (g_holes_arg) dr_holes(&b);
+        if (g_pin && !dr_clue(&b)) { g_pr.clue_drop++; continue; }
         bool open = false;
         for (int x = 0; x < NUM_PIECES && !open; x++) open = b.pid[x] == DV_EMPTY;
         const char *id = n > 2 * NUM_PIECES ? f[0] : "board";
@@ -847,12 +1320,34 @@ int main(int argc, char **argv) {
                "board\n", g_st.moved);
     if (g_st.solved)
         printf("[sum] %" PRIu64 " board(s) score 480/480: nothing is broken\n", g_st.solved);
+    if (g_holes_arg)
+        printf("[sum] holes %s: %" PRIu64 " board(s), %.1f cells lifted on average\n", g_holes_arg,
+               g_pr.holed, g_pr.holed ? (double)g_pr.holes_lifted / (double)g_pr.holed : 0.0);
+    if (g_pin)
+        printf("[sum] clues (--pin_clue %d%s): %" PRIu64 " piece(s) placed, %" PRIu64 " board(s) "
+               "dropped (a clue cell or piece taken otherwise)\n", g_pin,
+               (g_clue_mask & CLUE_CORNERS) ? " --clue_corners" : "", g_pr.pinned, g_pr.clue_drop);
+    if (g_backtrack) {
+        printf("[sum] backtrack: %" PRIu64 " board(s), highest full row reached %d",
+               g_pr.bt, g_pr.row_max);
+        if (g_stop_row >= 0)
+            printf("; %" PRIu64 " reached row %d, %" PRIu64 " did not (dived from their deepest "
+                   "row prefix)", g_pr.reached, g_stop_row, g_pr.shortb);
+        printf("; node cap hit on %" PRIu64 "\n", g_pr.capped);
+        if (g_stop_row >= 0 && g_pr.reached)
+            printf("[sum] extension (--extend_nodes %u), over the %" PRIu64 " board(s) at row %d: "
+                   "cells mean %.1f, max %d of rows %d..14; whole columns mean %.2f, max %d\n",
+                   g_ext_nodes, g_pr.reached, g_stop_row,
+                   (double)g_pr.ext_cells / (double)g_pr.reached, g_pr.ext_max, g_stop_row + 1,
+                   (double)g_pr.ext_cols / (double)g_pr.reached, g_pr.ext_cols_max);
+    }
     if (g_rot_path)
         printf("[sum] frame: %" PRIu64 " board(s) under an id naming no rotations row, %" PRIu64
                " that do not fit their row: both dived with free edges\n", g_st.unframed, g_st.misfit);
-    dv_print_summary(wall);
-    printf("[sum] %" PRIu64 " board(s) >= %d written to %s in %.1fs%s\n", dv_written(), g_emit,
-           out_path, wall, g_stop ? " (interrupted)" :
+    if (g_dives) dv_print_summary(wall);
+    if (g_dives) printf("[sum] %" PRIu64 " board(s) >= %d", dv_written(), g_emit);
+    else         printf("[sum] %" PRIu64 " prepared board(s), not dived,", g_st.raw);
+    printf(" written to %s in %.1fs%s\n", out_path, wall, g_stop ? " (interrupted)" :
            (deadline > 0.0 && omp_get_wtime() >= deadline) ? " (wall time reached)" : "");
     printf("  outputs_txt = %s\n", man);
     return 0;

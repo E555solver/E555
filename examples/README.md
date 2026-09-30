@@ -45,7 +45,7 @@ in seconds.
 | `07_barebones_chain.sh` | beamer, finalizer, roundhouse, backtracker | the whole chain in six literal calls | seed → ranked boards | 8 GB RAM, ~15 min |
 | `08_distiller_quickstart.sh` | distiller (+ diver) | distil a corpus to the N boards worth the CP-SAT tail | corpus → N boards + ender command | minutes to hours |
 | `09_backtracker_all_sides.sh` | backtracker | fill break-free as far as possible, from several directions | break-free partials → one board each | minutes |
-| `10_diver_quickstart.sh` | diver | finish partial boards with end dives and polish | partials → complete boards | seconds to minutes |
+| `10_diver_quickstart.sh` | diver | finish partial boards with end dives and polish; HOLES + STOP_ROW rebuild lifted rows first | partials → complete boards | seconds to minutes |
 | `11_diver_reopen.sh` | diver | improve complete boards by re-diving their damaged band, never worse | complete → complete | a minute a board, or more |
 
 ## Which script when
