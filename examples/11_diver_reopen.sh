@@ -6,18 +6,12 @@
 #   bash examples/11_diver_reopen.sh BOARDS=final_out/best.csv SECONDS_PER_BOARD=600 THREADS=20
 #   bash examples/11_diver_reopen.sh REOPEN=auto+1 PRIOR=0 NOGO=0
 #
-# For boards that are already complete and were dived and polished (a beamer
-# --end_dive/--end_polish final, a diver output, a 463): every small window of
-# them is already optimal, so what can still gain is a large re-dive. The
-# diver lifts the band of rows holding the damage (REOPEN=auto: the rows of the
-# side with most broken edges, deep enough for 90% of them, at most 5) and
-# dives it again in COPIES copies on streams of their own, round after round
-# from the best board so far, until SECONDS_PER_BOARD is spent, the dives
-# pulled toward the board's clean placements (PRIOR) and pushed off its broken
-# ones (NOGO) -- the best setting measured. The board written is the one read
-# unless a dive beat it (PLATEAU=1: or tied it with a different board).
-# Every board of BOARDS gives one row of OUT, under its own id.
-# What the options do: PROJECT_E555.md, "E555_diver", "Improving complete boards"
+# For complete boards that were dived and polished (their small windows are
+# already optimal): lift the damaged band (REOPEN=auto) and re-dive it in COPIES
+# copies, round after round from the best board so far, until SECONDS_PER_BOARD
+# is spent. PRIOR/NOGO pull the dives toward the board's clean placements and
+# off its broken ones (the best setting measured). Every board comes back as
+# one row of OUT, never worse. PROJECT_E555.md, "E555_diver", has the details.
 set -euo pipefail
 
 # ---- settings: edit here, or pass NAME=value on the command line ------------

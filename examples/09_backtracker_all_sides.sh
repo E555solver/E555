@@ -6,38 +6,19 @@
 #   bash examples/09_backtracker_all_sides.sh BOARDS=stage_c_out/3_patched.csv
 #   bash examples/09_backtracker_all_sides.sh OUT=run1.csv TIME_LIMIT=600 QUIET=0
 #
-# What it does:
-#   1. runs bin/E555_backtracker once per entry in DIRS, each on the same input
-#      board, at --breaks 0 so no mismatched piece is ever placed;
-#   2. keeps, per input board, whichever direction filled the most cells;
-#   3. runs the first direction once more over those winners;
-#   4. reports with tools/E555_rank.py.
+# Runs bin/E555_backtracker at --breaks 0 once per direction in DIRS (an
+# --order plus a --rotate; the result is turned back), keeps per input board the
+# direction that filled the most cells, reruns the first direction over those,
+# and ranks the result. OUT holds one break-free board per input board.
 #
-# OUT holds exactly one board per input board, break-free, in the orientation it
-# came in.
-#
-# A direction is an --order plus a --rotate. --rotate turns the board before the
-# search and turns the result back, which is the only way to make a static order
-# start on another side. --rotate 2 puts the top border at row 0, which suits the
-# usual Stage B board, filled from row 0 upward.
-#
-# Worth knowing:
-#   - An exact search cannot skip a cell: a direction stops at the first empty
-#     cell no piece fits. That is why several are tried.
-#   - An input board that already has a broken edge is passed through unchanged,
-#     because --breaks 0 refuses it. Feed this break-free partials.
-#   - TIME_LIMIT is per call, and an exhaustive search need not finish, so set it.
-#   - FOURSIDES=1 appends --order 4sides. It can step over a dead cell and so
-#     fills more, but it has no early exit and will spend the whole TIME_LIMIT on
-#     an open board. Off by default.
-#   - HOLES= or CLUES=1 adds one preparation call in front, unrotated, which is
-#     where the mask and the hint pieces are applied: the tool applies --holes
-#     after --rotate, so a mask written in the CSV frame suits only an unrotated
-#     call. A clue lands only in an empty cell, so a board whose clue cells are
-#     taken is dropped; give it room with HOLES=, or start from a board built by
-#     bin/E555_beamer --clue_center --clue_corners.
-#   - The record window (FIRST_LINE, N_LINES) applies to every call that reads
-#     BOARDS, which is all of them.
+# - An exact search stops at the first cell no piece fits; hence several
+#   directions. FOURSIDES=1 adds --order 4sides, which can step over such a cell
+#   but spends the whole TIME_LIMIT on an open board.
+# - Feed break-free partials: a board with a broken edge passes through as it is.
+# - TIME_LIMIT is per call; set it, since an exact search need not finish.
+# - HOLES= or CLUES=1 adds an unrotated preparation call that applies the mask
+#   and the clue pieces (a clue needs its cell empty, or the board is dropped).
+# - FIRST_LINE / N_LINES select the input records for every call.
 set -euo pipefail
 
 # ---- settings: edit here, or pass NAME=value on the command line ------------

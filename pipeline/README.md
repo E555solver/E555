@@ -309,9 +309,7 @@ widen stage 6 only if you have the hours.
 stage costs (boards in) × `--board_time_limit` at worst -- every call it makes
 for a board is inside that budget. It ends a board sooner only when the board
 is solved, or -- with `--no-redive`, since a redive is random and never runs
-out -- when every region of its plan is proven optimal. (An older ender ran
-one full-length solve per rung of a ladder, `reach × (max_changes / 4)` of them,
-which is how a deep pass once priced out at six days; that is gone.)
+out -- when every region of its plan is proven optimal.
 
 **Budgets.** `--wall_time` covers the beamer's whole run, database build
 included, so `BEAM` under about four minutes with no `DB` is spent entirely on

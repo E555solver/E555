@@ -56,7 +56,7 @@ Stage C  src/C_tail/E555_topper.py            CP-SAT break minimizer over bands 
          src/C_tail/E555_backtracker.c        greedy dives + exhaustive DFS; --stop_row/--stop_column bands
          src/C_tail/E555_diver.c              the beamer's --end_dive/--end_polish on any board file; no DB
          src/C_tail/E555_ender.py             CP-SAT closer, never returns a worse board
-tools/   viewer, rank (--rescore), rotate (--sink), distiller (--plan/--triage), extract_consensus, sort_rotations, clean_csv
+tools/   viewer, rank (--rescore), rotate (--sink), distiller (dive screen -> finish -> redive probe -> ender plan), extract_consensus, sort_rotations, clean_csv
 ```
 
 - **One CSV dialect connects everything.** A canonical board row is `config_id, score, pos[256], rot[256]` (514 fields). `pos[p]` is the cell of piece `p`, with 999 meaning unplaced. Readers take the **last 512 fields** as pos+rot and treat any leading fields as metadata, so Stage B rows (which carry a solution index in slot 2, or the score under `--end_dive`) and the legacy 515-field rows parse everywhere. Lines starting with `#` or `%` are comments. Any stage's output can feed any other stage, or itself. `tools/E555_rank.py --out F --rescore` rewrites rows canonically.

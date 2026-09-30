@@ -75,7 +75,7 @@ ALL_STEPS=(
     "rank|measures agree with the viewer, --out verbatim, --rescore canonical"
     "rotate|a quarter-turn preserves every measure, four turns are the identity"
     "sink|--sink drops N rows, frees the frame it broke, and keeps the core intact"
-    "distiller|per-board windows differ, masks cover every break, --plan runs"
+    "distiller|screen, finish, probe, select: boards recount, reruns and gzip input give the same bytes"
     "consensus|four turns of one board score identically, and --border_out runs"
     "annealer|Stage A short run: BEST lines, a beamer-format --out CSV, and spins that match their comment"
     "annealer_refine|Stage A warm start: every shipped row round-trips, and refining one cannot lose ground"
@@ -250,88 +250,54 @@ step_rank() {
 
 # A quarter-turn must move the board without changing it: same breaks, same
 # solid count, transposed span. Four turns must return the original bytes.
-# The distiller ranks by what a board could BECOME, so the regression that
-# matters is that its board-DEPENDENT layer actually varies: b* of a fixed
-# window shape is the same for every board, so a build where the window search
-# has broken still prints a plausible table, just a useless one.
+# The distiller: screen -> finish -> probe -> select, every diver call seeded.
+# A 12-board slice must give complete boards whose scores recount, and the same
+# bytes from a fresh run on gzip input and from a resumed run; complete input
+# boards must never come back worse; the plan must run the ender, without --holes.
 step_distiller() {
-    python3 tools/E555_distiller.py data/best_463.csv --seed_file data/seed_Edge5.txt \
-        --top 7 > "$OUT/distil.txt" 2>"$OUT/distil.err" || fail "distiller exited nonzero"
-    rows=$(grep -cE '^ *[0-9]+ ' "$OUT/distil.txt")
-    [ "$rows" = "7" ] || fail "expected 7 ranked rows, got $rows"
+    head -12 data/E565_lowB_baseline.csv > "$OUT/dst_slice.csv"
+    ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" dst_slice.csv --top 2 \
+        --out dst_a.csv > dst_a.log 2>&1 ) \
+        || { tail -5 "$OUT/dst_a.log"; fail "the distiller exited nonzero"; }
+    n=$(grep -c . "$OUT/dst_a.csv")
+    [ "$n" = 2 ] || fail "--top 2 wrote $n rows"
+    python3 - data/seed_Edge5.txt "$OUT/dst_a.csv" <<'EOF' || exit 1
+import sys
+seed = [list(map(int, l.split())) for l in open(sys.argv[1]) if l.strip() and not l.startswith("#")]
+for l in open(sys.argv[2]):
+    f = [x.strip() for x in l.split(",")]
+    pos, rot = list(map(int, f[-512:-256])), list(map(int, f[-256:]))
+    if sorted(pos) != list(range(256)):
+        sys.exit("!!! %s: not a complete board" % f[0])
+    at = {pos[p]: p for p in range(256)}
+    side = lambda x, d: seed[at[x]][(d + rot[at[x]]) % 4]
+    m = sum(side(x, 1) == side(x + 1, 3) for x in range(256) if x % 16 < 15) \
+      + sum(side(x, 0) == side(x + 16, 2) for x in range(240))
+    if m != int(f[1]):
+        sys.exit("!!! %s: score field %s, recount %d" % (f[0], f[1], m))
+EOF
+    gzip -c "$OUT/dst_slice.csv" > "$OUT/dst_slice.csv.gz"
+    ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" dst_slice.csv.gz --top 2 \
+        --out dst_b.csv > dst_b.log 2>&1 ) || fail "the distiller failed on gzip input"
+    cmp -s "$OUT/dst_a.csv" "$OUT/dst_b.csv" \
+        || fail "a fresh run on the gzip copy wrote different boards"
+    ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" dst_slice.csv --top 2 \
+        --out dst_a.csv > dst_r.log 2>&1 ) || fail "the resumed run exited nonzero"
+    grep -q "resuming" "$OUT/dst_r.log" || fail "the rerun did not reuse its work directory"
+    ! grep -q "E555_diver --" "$OUT/dst_r.log" || fail "the resumed run dived again"
+    cmp -s "$OUT/dst_a.csv" "$OUT/dst_b.csv" || fail "the resumed run changed the boards"
+    bash -n "$OUT/dst_a.plan.sh" || fail "the plan does not parse"
+    grep -q "E555_ender.py" "$OUT/dst_a.plan.sh" || fail "the plan does not run the ender"
+    ! grep -q -- "--holes" "$OUT/dst_a.plan.sh" || fail "the plan still passes --holes"
 
-    # All seven boards score 463, so a ranking that works has to come from the
-    # structure. Distinct window names across the corpus is the cheapest proof
-    # that the per-board window search ran at all.
-    wins=$(awk '$1 ~ /^[0-9]+$/ {print $7}' "$OUT/distil.txt" | sort -u | wc -l)
-    [ "$wins" -ge 2 ] || fail "every board picked the same window: window search is dead"
-    echo "ok: 7 boards ranked, $wins distinct windows"
-
-    # --explain names the board's own geometry; row 2's breaks reach row 10, so
-    # no top band covers them cheaply and the hull has to win.
-    python3 tools/E555_distiller.py data/best_463.csv --seed_file data/seed_Edge5.txt \
-        --explain 2 > "$OUT/distil_explain.txt" 2>&1
-    grep -q "chosen window  hull" "$OUT/distil_explain.txt" \
-        || fail "--explain 2 should pick hull, not a band"
-
-    # --plan writes into the working directory, so run it somewhere disposable.
     ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" "$REPO/data/best_463.csv" \
-        --seed_file "$REPO/data/seed_Edge5.txt" --top 3 --plan > plan.txt 2>&1 ) \
-        || fail "distiller --plan exited nonzero"
-    [ -f "$OUT/plan_best_463/run_plan.sh" ] || fail "--plan wrote no run_plan.sh"
-    bash -n "$OUT/plan_best_463/run_plan.sh" || fail "run_plan.sh does not parse"
-    masks=$(ls "$OUT"/plan_best_463/*.holes.csv | wc -l)
-    [ "$masks" = "3" ] || fail "expected 3 hole masks, got $masks"
-
-    # A mask that misses a break is worse than useless: Stage C would re-solve a
-    # region that cannot contain the fix.
-    python3 - "$REPO" "$OUT/plan_best_463" <<'PY' || fail "a hole mask does not cover its board's breaks"
-import csv, sys
-from pathlib import Path
-root, plan = Path(sys.argv[1]), Path(sys.argv[2])
-sys.path.insert(0, str(root / "tools"))
-import E555_viewer as V, E555_distiller as D
-seed = V.load_seed(root / "data" / "seed_Edge5.txt")
-rows = [r for r in csv.reader(open(root / "data" / "best_463.csv")) if V.parse_row(r)]
-for mask_file in sorted(plan.glob("*.holes.csv")):
-    idx = int(mask_file.name[1:5])
-    _, _, pos, rot = V.parse_row(rows[idx])
-    _, bad = D.board_colors(pos, rot, seed)
-    vals = []
-    for line in open(mask_file):
-        if not line.strip().startswith("#"):
-            vals.extend(line.replace(",", " ").split())
-    if len(vals) != 256:
-        sys.exit(f"{mask_file.name}: {len(vals)} values, want 256")
-    free = {i for i, v in enumerate(vals) if int(v) == 1}
-    if not bad <= free:
-        sys.exit(f"{mask_file.name}: misses {len(bad - free)} break cell(s)")
-PY
-    echo "ok: --explain picks hull, 3 masks cover every break, run_plan.sh parses"
-
-    # --triage ranks on closure alone. A complete board has no pool left, so its
-    # closure must be exactly 0 -- the cheapest proof the ledger is being read
-    # rather than invented.
-    python3 tools/E555_distiller.py data/best_463.csv --seed_file data/seed_Edge5.txt \
-        --triage --top 3 > "$OUT/triage.txt" 2>"$OUT/triage.err" \
-        || fail "--triage exited nonzero"
-    trows=$(grep -cE '^ *[0-9]+ ' "$OUT/triage.txt")
-    [ "$trows" = "3" ] || fail "--triage: expected 3 rows, got $trows"
-    nonzero=$(awk '$1 ~ /^[0-9]+$/ && $6 != "0.00"' "$OUT/triage.txt" | wc -l)
-    [ "$nonzero" = "0" ] || fail "--triage: a complete board scored closure != 0"
-
-    # The point of the measure: a corpus the ranker cannot separate at all --
-    # every board grown to the same stop row, so every shape measure is a
-    # constant -- must still come out ordered.
-    python3 tools/E555_distiller.py data/E565_lowB_baseline.csv \
-        --seed_file data/seed_Edge5.txt --triage --top 50 \
-        > "$OUT/triage_partial.txt" 2>&1 || fail "--triage on the partial corpus failed"
-    spread=$(awk '$1 ~ /^[0-9]+$/ {print $6}' "$OUT/triage_partial.txt" | sort -u | wc -l)
-    [ "$spread" -ge 10 ] || fail "closure took only $spread value(s) over 50 partials: it is not separating them"
-    shapes=$(python3 tools/E555_rank.py data/E565_lowB_baseline.csv --csv 2>/dev/null \
-        | awk -F, 'NR>1{$1="";$2="";print}' | sort -u | wc -l)
-    echo "ok: --triage keeps closure 0 on complete boards, and splits into $spread value(s)"
-    echo "    a corpus E555_rank.py reduces to $shapes distinct measure vector(s)"
+        --top 1 --out dst_c.csv > dst_c.log 2>&1 ) || fail "the distiller failed on complete boards"
+    python3 tools/E555_rank.py "$OUT/dst_c.csv" --seed_file data/seed_Edge5.txt --csv \
+        > "$OUT/dst_c_rank.csv"
+    worse=$(awk -F, 'NR>1 && $4<463' "$OUT/dst_c_rank.csv" | head -1)
+    [ -z "$worse" ] || fail "a complete 463 came back worse: $worse"
+    echo "ok: complete boards that recount; identical on gzip input and on resume;" \
+         "no 463 made worse; the plan runs the ender without --holes"
 }
 
 step_rotate() {

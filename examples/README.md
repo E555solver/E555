@@ -1,707 +1,312 @@
 # E555 examples
 
-One script per tool, smallest first, then one that runs the whole chain. Each
-runs with no arguments, is short enough to read in a minute, and keeps every
-setting in a plain block at the top. The reference material that used to fill
-their headers lives here instead, so the scripts stay editable and this file
-stays readable.
+One script per tool, numbered in the order you would meet them. Each runs with
+no arguments and keeps its settings in a plain block at the top. For long
+unattended runs (the full pipeline, the whirlpool, the board farm) see
+[`../pipeline/`](../pipeline/).
 
-**These are for learning the tools.** For long unattended runs -- the whole
-pipeline, the whirlpool and the board farm -- see [`../pipeline/`](../pipeline/).
-
-## Start here
+## Setup
 
 ```bash
-make                                     # builds the four binaries
-bash examples/01_beamer_quickstart.sh    # ~5 minutes, needs ~8 GB RAM
-cd ~/runs && bash ~/E555/examples/07_barebones_chain.sh   # all four stages
+make ARCH=generic        # all binaries; plain `make` tunes for the build machine
+pip install ortools      # only for the 04 scripts (topper, ender)
 ```
 
-## How every script works
+The beamer (01, 07) builds a 6.4 GB chain database in memory, so it needs about
+8 GB of RAM. Set `DB_FILE` to cache the database on disk; later runs then map it
+in seconds.
 
-`01` to `06` share one shape; `07` is deliberately the other extreme and is
-described [in its own section](#07----the-whole-chain-barebones). One is for
-changing settings, the other for reading commands.
+## How the scripts work
 
-**Settings are plain assignments.** Open the file, change the number, save. That
-is the intended way to use them: copy a script into a folder of your own and let
-the copy be the record of what you ran.
-
-```bash
-SEED=data/seed_Edge5.txt
-OUT_DIR=final_out
-FROM=7
-```
-
-**Overriding without editing is optional.** Any `NAME=value` argument is applied
-over the block, so no arguments at all means the file's own values:
-
-```bash
-bash examples/02_finalizer_regrow.sh
-bash examples/02_finalizer_regrow.sh OUT_DIR=run7 THREADS=16
-bash examples/02_finalizer_regrow.sh BOARDS=beam_out/beam_completions_random_10.csv
-```
-
-**`REPO` says where the checkout is.** It defaults to the script's own parent,
-so a fresh clone runs untouched. If you copy a script somewhere else, set `REPO`
-at the top -- the script says so, by name, instead of failing obscurely:
-
-```
-REPO=/home/you/experiments is not an E555 checkout -- set REPO at the top
-```
-
-Every path below `REPO` in the settings block is relative to it. `OUT_DIR` is
-too, unless you give an absolute path.
-
-**They tell you where the output went.** Each tool writes `outputs.txt` in its
-output directory listing the files it actually filled -- one path per line,
-empty when it emitted nothing. No script guesses a filename, and neither should
-you:
-
-```bash
-cat final_out/outputs.txt
-python3 tools/E555_rank.py $(head -1 final_out/outputs.txt) --seed_file data/seed_Edge5.txt --top 10
-```
-
-**They print the command they ran.** Every tool call passes `--print_cmd`, so
-the log carries a `[cmd]` line with every flag populated from its effective
-value. Copy that line and you have the run, without this script in the middle.
+- **Settings** are plain assignments at the top: edit them, or override any of
+  them on the command line, e.g. `bash examples/02_finalizer_regrow.sh FROM=6
+  THREADS=16`.
+- **Paths** in the settings block are relative to `REPO`, which defaults to the
+  checkout the script sits in. Set `REPO` when you run a copy of a script
+  elsewhere.
+- **Outputs.** Every tool writes `outputs.txt` next to its output, listing the
+  files it filled.
+- **The command.** Every call passes `--print_cmd`, so the log's `[cmd]` line is
+  the exact command, reusable without the script.
+- **07** is the exception: literal commands, and output in the current directory.
 
 ## The scripts
 
-| script | tool | what it teaches | needs |
-|---|---|---|---|
-| `01_beamer_quickstart.sh` | beamer (+ annealer) | Stage B from nothing: sample a border, grow the board row by row. `ANNEAL=1` runs Stage A first, so the borders are searched for rather than sampled | 8 GB RAM, ~5 min |
-| `02_finalizer_regrow.sh` | finalizer | free the top rows of a board and re-grow them from a reduced database | seconds to minutes |
-| `03_roundhouse_strip.sh` | roundhouse | rotate the board, refill a border strip; can prove a board dead in milliseconds | megabytes |
-| `04a_CP-SAT_top_and_end.sh` | topper + ender | the CP-SAT funnel: scout widely, promote a diverse set, polish it, then one adaptive ender close | `pip install ortools` |
-| `04b_CP-SAT_ender_overnight.sh` | ender | deduplicate and shard a large full-board corpus over several ender processes | `pip install ortools`, hours |
-| `04c_CP-SAT_ender_elite.sh` | ender | pick diverse elites and give each repeated `deep` or ten-hour `superdeep` passes | `pip install ortools`, hours |
-| `05_backtracker_dives.sh` | backtracker | greedy dives to triage, exhaustive DFS to prove | minutes to overnight |
-| `10_diver_quickstart.sh` | diver | finish partial boards with the beamer's end dives and polish, from any board file | seconds to minutes |
-| `11_diver_reopen.sh` | diver | improve complete, already polished boards: reopen the damaged rows and re-dive them in copies and rounds, never returning a worse board | a minute per board, or more |
-| `06_roundhouse_both_ways.sh` | roundhouse | chain two roundhouse passes per board, once each way round, so the two spirals cover all four sides | seconds to minutes |
-| `08_distiller_quickstart.sh` | distiller (+ backtracker) | triage a corpus: rank thousands of >=450 boards by how much repair headroom is left, then write the Stage C commands to attack the best of them | seconds to minutes |
-| `07_barebones_chain.sh` | all four | the whole chain in six calls, no arguments and no indirection: what the tools are actually invoked with | 8 GB RAM, ~15 min |
-
-## They all speak the same CSV
-
-Every tool reads and writes the same canonical board row
-(`config_id, score, pos[256], rot[256]`), so any output feeds any input --
-including a tool's own output. That is what makes iteration possible:
-
-```bash
-bash examples/01_beamer_quickstart.sh
-bash examples/02_finalizer_regrow.sh BOARDS=beam_out/beam_completions_random_10.csv
-bash examples/04a_CP-SAT_top_and_end.sh BOARDS=final_out/beam_completions_finalized_12.csv
-bash examples/05_backtracker_dives.sh BOARDS=stage_c_funnel/4_closed.csv
-```
-
-Between any two steps, look at what you have:
-
-```bash
-python3 tools/E555_rank.py   FILE --seed_file data/seed_Edge5.txt --top 10
-python3 tools/E555_rank.py   FILE --seed_file data/seed_Edge5.txt --top 10 --no_id
-python3 tools/E555_rank.py   FILE --count            # how many boards
-python3 tools/E555_rank.py   FILE --field score      # the best board's score
-python3 tools/E555_viewer.py FILE --seed_file data/seed_Edge5.txt
-```
-
-`--no_id` drops the board-id column, which is the widest one and the usual
-reason the table wraps. `rank.py` is the one to trust: it recomputes the score
-from the seed -- **field 2 of a Stage B row is a solution index, not a score** --
-and it reports *where* the breaks are. Eighteen breaks spread over seven rows is
-a mess; the same eighteen packed into rows 14-15 is nearly finished.
-
----
-
-## 01 -- the beamer, and the borders it grows from
-
-`ANNEAL=1` runs Stage A first. The annealer searches for borders whose sides
-have many ways to be continued, and the beamer grows from those instead of from
-sampled ones. Slower to start, much better material.
-
-The script anneals **four times** as many borders as the beamer will use and
-keeps the best quarter with `E555_sort_rotations.py --top`: Stage A is cheap and
-the beam is not, so it pays to be picky.
-
-That tool also decides *which way up* each border is handed over, which matters
-because the beam grows bottom-up: a row's BOTTOM count is how many starts it
-offers and its TOP count how many ways it can be closed. `--max_bottom` turns
-each row onto its richest side to get the most starts, `--min_bottom` onto its
-poorest to make the opening rows commit, and `--sort min_side` or `--sort spread`
-rank by how *constrained* a border is rather than how high the annealer scored
-it. Run it without `-o` to see what a file holds before committing beam time to
-it.
-
-Once a row in that pool has the shape you want, you do not have to re-roll the
-dice to get more like it. Hand it straight back to Stage A:
-
-```bash
-python3 tools/E555_sort_rotations.py rotations.csv --sort min_side | head -4
-python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
-    --input rotations.csv --row 3 --restarts 8 --steps 500000 --out refined.csv
-```
-
-`--row` counts data rows from 0, the same numbering the beamer's `--start_row`
-uses, so the row you picked is the row you get. Every restart starts from that
-same border and refines it, the weights you use now need not be the ones that
-produced the file, and the run cannot come back worse than what you handed it.
-Prefer more `--steps` to more `--restarts` here: the restarts share a starting
-point, so extra ones buy less than extra depth does.
-
-Leave `--row` out and the whole pool is refined, one row back per input row, in
-the same order, with each row's per-side trail gains printed as it finishes:
-
-```bash
-python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
-    --input rotations.csv --restarts 2 --steps 500000    # -> rotations_refined.csv
-```
-
-Without `--out` the annealer always picks a file for you: `FILE_refined.csv`
-beside the `--input`, or `rotations.csv` for a run from scratch.
-
-To make the top two rows rich rather than only the top row, score the top by
-its two rows: the edges and the inner pieces under them, drawn from a reserve
-of inner pieces the annealer picks for the side.
-
-```bash
-python3 src/A_border/E555_edge_annealer.py data/seed_Edge5.txt \
-    --input rotations.csv --double_decker TOP --restarts 2 --steps 20000
-```
-
-Each row's comment then carries `Decker=` (how many two-row layouts its reserve
-of 16 pieces allows, exactly), `DeckerPool=` (the bound with every piece free)
-and `Board=`, the name of its witness board in `rotations_refined_decker.csv`
--- the border plus row 14, in the beamer's board format, ready for the viewer
-or the finalizer. The reserved pieces carry their side's code in the rotations
-row (1 = TOP, 2 = BOTTOM, 3 = LEFT or RIGHT), and the beamer's
-`--lambda_reserve F` makes every
-TOP reserve piece a board places cost F, so the beam keeps them for last
-(PROJECT_E555.md, *Keeping the reserve for last*).
-`--decker_reserve K` changes the reserve size, `--decker_keep_border` keeps
-the border exactly as it was. The bare flag scores ALL four sides; name sides
-(`--double_decker TOP` or `TOP,BOTTOM`) to give the named ones the whole pool --
-all four reserves compete for the same pieces and each side's count drops.
-
-**`STEPS` has a floor of 250000.** Below it the annealer is not merely weaker --
-it often fails to place a legal border at all. Measured on the real seed: 8
-restarts x 3000 steps found 2 feasible borders, and 2 x 2000 returned one border
-on one run and none on the next, while *every* restart at 250000 steps succeeded
-(2/2, 4/4, 8/8). The scripts warn below the floor rather than refusing, because
-a deliberately tiny smoke run is a legitimate thing to ask for.
-
-The weights say what a good border is. Without `--target_scale` a weight is a
-maximize/minimize sign rather than a per-side target, which is what lets
-`--w_bottom 0` mean "ignore the bottom". The two settings are coupled: putting
-`--target_scale` back makes every weight a target that must be positive, and
-`--w_bottom 0` stops meaning anything.
-
-**Finishing what the beam reaches.** `BACKTRACK_ROW=8` stops the beam at row 8
-and searches every row-8 board exhaustively up to `STOP_ROW`. Past row 7 or so
-the beam keeps only a small share of the legal boards, and the exhaustive search
-from there is cheap because the tree dies out within a few rows. `END_DIVE=10000
-END_POLISH=20000` then completes every stop-row board to all 256 pieces with
-random dives, polishes the best, and writes the best completion per board with
-its matched-edge count (out of 480) in field 2 -- so for these files field 2 IS
-a score. Only boards reaching `--emit_score` (450) are written. To run the same
-finish again on boards you already have (more dives, a polish pass, another
-seed), use `10_diver_quickstart.sh`.
-
-**Reproducibility.** The beam is reproducible from `--rng_seed` together with
-`--threads`, not from the seed alone. The work partition follows the thread
-count, and a beam that keeps a bounded number of candidates keeps a different
-subset from a different partition. Record the thread count with the seed.
-
----
-
-## 02 -- the finalizer, and how far down to lock
-
-`FROM` is the one knob that matters. Rows `0..FROM` stay put; everything above
-goes back in the pool. Lower `FROM` = more rows re-searched = deeper resampling
-and much slower. Do not set it just below the input's top row: that asks the
-search to redo the exact row that already failed, with the same pieces.
-
-**The useful range depends on whether the board's border is complete**, and the
-two cases pull opposite ways.
-
-With a **complete** border -- an ordinary beamer partial -- the left column is
-fixed and `--top_columns` samples orderings, so lower is better until the beam
-stops filling. Measured on `board_partial_row12.csv` with 12 sampled columns:
-
-| `--finalize_from` | configurations reaching row 11 | beam occupancy |
-|---|---|---|
-| 4 | 8 of 12 | 100% of cap at rows 6-9 |
-| 5 | 6 of 12 | 31-48% |
-| 6 | 0 of 12 | under 1% |
-| 7, 8 | 0 of 12 | 0% |
-
-Under 1% occupancy is an exhaustive walk wearing a beam's clothes, which is why
-the tool's default is `5`. (That table predates the top lock: a complete border
-whose edges all match now also locks its top border in place, with any clean
-rows under it, which narrows the search further; `--free_top` gives back the
-conditions it was measured under.)
-
-When the lock is high enough that the beam cannot widen anyway, search the rest
-exhaustively instead: `--backtrack_row` equal to `--finalize_from` runs no beam
-at all, and `--end_dive` finishes what the search reaches (both as in the
-beamer; PROJECT_E555.md, *E555_finalizer*).
-
-With an **incomplete** border the finalizer falls back to `--free_edges`, and
-`--top_columns 0` then enumerates *every* legal left column. That enumeration
-grows explosively as rows are freed, so the same board wants a **higher** lock.
-Measured on the shipped `board_partial_row12.csv`, `MAX_WALL=600`:
-
-| `FROM` | columns enumerated | boards | wall |
-|---|---|---|---|
-| 7 | 3512 | 6 | 6.2 s |
-| 6 | 40098 | 6 | 50.2 s |
-| 5 | 8606 | 0 | budget exhausted |
-| 4 | 127 | 0 | budget exhausted |
-
-That is why the example ships `FROM=7` while the tool defaults to `5`. Raise
-`MAX_WALL` before lowering `FROM`.
-
----
-
-## 03 -- the roundhouse, and which band it tears up
-
-It rotates the board 90 degrees and grows a `WIDTH`-wide vertical **strip**
-instead of a row, so every level is one chain lookup and the frontier is only
-`WIDTH` colours wide. Two things follow: it needs just the edge half of the
-chain database (megabytes, seconds -- no 6.4 GB build, no `--db_file`), and the
-relaxed problem is small enough to solve exactly, so the tool knows which
-colourings can still finish the strip **before** trying any piece.
-
-The search is **exhaustive and deterministic**: no beam, no sampling, no random
-seed. Finishing without a complete board is therefore a proof that none exists
-for this cut -- unless a budget stopped it first, which the run says.
-
-### WIDTH is the dial that matters
-
-`WIDTH=0` picks the narrowest width whose kept region is complete and
-break-free -- on a board filled in whole rows that is 16 minus the filled rows.
-A higher `WIDTH` frees already-solved rows on purpose:
-
-| WIDTH | pieces kept at ROUNDS = 1 / 2 / 3 | needs rows filled |
-|---|---|---|
-| 3 | 208 / 169 / 130 | 0..12 |
-| 4 | 192 / 144 / 96 | 0..11 |
-| 5 | 176 / 121 / 66 | 0..10 |
-
-### ROUNDS
-
-Frees -- and refills -- that many `WIDTH`-wide bands: right, then top, then
-left. The cuts nest, so a lower `ROUNDS` is a cheaper experiment, not a
-truncated one. Work upward: 1, then 2, then 3.
-
-**Cost.** Every cut keeping 96 pieces or more exhausts in seconds. The one wide
-cut is `ROUNDS=3 WIDTH=5` (a 66-piece core): round 1 alone has hundreds of
-thousands of break-free refills, so that one ends on `MAX_WALL` and the summary
-marks it TRUNCATED rather than proved.
-
-### ROTATE
-
-Picks which side of the **original** board each round attacks. Only the *kept*
-region is validated, so aim the strip at where the breaks and holes are and they
-are simply freed. Negative turns the other way (`-1 == 3`):
-
-| ROTATE | round 1 | round 2 | round 3 | ROUNDS=1 leaves its hole at |
+| script | tool | what it does | in → out | needs |
 |---|---|---|---|---|
-| 0 | right | top | left | top-right |
-| 1 | top | left | bottom | top-left |
-| 2 | left | bottom | right | bottom-left |
-| 3 / -1 | bottom | right | top | bottom-right |
+| `01_beamer_quickstart.sh` | beamer (+ annealer) | grow boards row by row from sampled or annealed borders | seed → partial or complete boards | 8 GB RAM, ~5 min |
+| `02_finalizer_regrow.sh` | finalizer | lock rows 0..FROM, re-grow everything above | partials → partials | minutes |
+| `03_roundhouse_strip.sh` | roundhouse | turn the board and refill a strip, exhaustively | partial → deepest board | seconds to minutes |
+| `04a_CP-SAT_top_and_end.sh` | topper + ender | scout, promote diverse boards, polish, close | boards → closed boards | OR-Tools |
+| `04b_CP-SAT_ender_overnight.sh` | ender | de-duplicate a large corpus and shard it over processes | corpus → ranked boards | OR-Tools, hours |
+| `04c_CP-SAT_ender_elite.sh` | ender | repeated `deep` or `superdeep` passes on a few elite boards | boards → best boards | OR-Tools, hours |
+| `05_backtracker_dives.sh` | backtracker | greedy dives (triage) or exhaustive search (proof) | board (+ mask) → boards | minutes to overnight |
+| `06_roundhouse_both_ways.sh` | roundhouse | two spiral chains per board, one each way | partial → boards | minutes |
+| `07_barebones_chain.sh` | beamer, finalizer, roundhouse, backtracker | the whole chain in six literal calls | seed → ranked boards | 8 GB RAM, ~15 min |
+| `08_distiller_quickstart.sh` | distiller (+ diver) | distil a corpus to the N boards worth the CP-SAT tail | corpus → N boards + ender command | minutes to hours |
+| `09_backtracker_all_sides.sh` | backtracker | fill break-free as far as possible, from several directions | break-free partials → one board each | minutes |
+| `10_diver_quickstart.sh` | diver | finish partial boards with end dives and polish | partials → complete boards | seconds to minutes |
+| `11_diver_reopen.sh` | diver | improve complete boards by re-diving their damaged band, never worse | complete → complete | a minute a board, or more |
 
-`ROTATE=1` (the default) attacks a Stage B partial's unsolved top first, while
-the piece pool is rich. `ROTATE=-1` attacks it last but re-cuts the bottom band
-first -- the band the pipeline fixes by random sampling at row 0 and never
-revisits.
+## Which script when
 
-### What you get back
+| goal | scripts |
+|---|---|
+| a first run from nothing | 01, then 10 on its partials |
+| a large corpus of partials or finished boards | 08, then the ender command it writes (or 11) |
+| improve finished boards | 11 (no OR-Tools) or 04c (the ender) |
+| re-grow the top rows of partials | 02, 03, 06 |
+| triage many partials, or prove a board dead | 05, 09 |
+| see the whole chain as plain commands | 07 |
 
-**One board per input board**: the furthest the search got, measured in pieces
-placed. Tagged `s` when it is complete and break-free (the puzzle solved) and
-`d` otherwise. `TIES=N` widens that to N boards that reached the same depth.
+Every tool reads and writes the same board row (`config_id, score, pos[256],
+rot[256]`; [`../data/README.md`](../data/README.md)), so any output feeds any
+script. Between steps:
 
-`BREAKS=B` then greedily fills the rest of that deepest board, spending at most
-B mismatches, and emits the complete result tagged `f`. That is a dive, not a
-search: it does not backtrack and B is not proved minimal. It exists so Stage C
-gets a full board to attack break by break instead of a hole. On the real seed,
-expect roughly one break per two cells it has to fill.
+```bash
+python3 tools/E555_rank.py   FILE --seed_file data/seed_Edge5.txt --top 10   # ranked, rescored
+python3 tools/E555_viewer.py FILE --seed_file data/seed_Edge5.txt            # ASCII board + web URL
+```
 
----
-
-## 04 -- Stage C, and why it is now three scripts
-
-The topper and the ender only make sense together: the topper deliberately
-**piles** breaks onto a border band, and the ender is what un-piles them. The
-ender has no modes you pick between -- it runs a plan of exact neighbourhoods,
-cheapest first (whole-board exchange cycles, windows round the damage, corners
-with their frame arms, the damaged band, the whole frame) -- so the old
-three-pass chain is one ender call, and the three scripts differ by *how much
-effort* they spend rather than by which neighbourhood they open.
-
-- **`04a_CP-SAT_top_and_end.sh`** is the funnel and the one to read first:
-  topper scout (wide, cheap) -> promote a diverse subset -> topper polish ->
-  one adaptive ender close.
-- **`04b_CP-SAT_ender_overnight.sh`** takes a large full-board corpus,
-  exact-deduplicates it and shards it over several ender processes.
-- **`04c_CP-SAT_ender_elite.sh`** picks a few diverse elites and gives each
-  repeated `deep` or ten-hour `superdeep` passes with independent seeds.
-
-**The two ender knobs that matter.** `ENDER_PROFILE` is the effort level --
-`overnight`, `deep`, `superdeep` -- and `ENDER_BOARD_TIME` (`--board_time_limit`)
-is the **true total budget for one board**, every call included. Do not set
-`--attempt_time` unless you are deliberately capping one CP-SAT call. The ender
-never returns a board worse than its input, so running any of these is always
-safe. On a many-core machine give one process all the threads: it solves
-`--jobs` regions at once (one per 4 threads by default).
-
-**Boards that were dived and polished** (`--end_dive`/`--end_polish`, or
-`E555_diver`) have nothing left for small exact windows -- they are measured
-optimal there -- so what the ender gains on them comes from its *redive* step:
-it lifts the damaged rows *and the clean row they were built on* and re-dives
-them with `bin/E555_diver`. Build the diver (`make diver`) before running the
-ender on such boards; without it the step is skipped with a note. The same
-move runs without CP-SAT or OR-Tools as `11_diver_reopen.sh`: the diver's
-`--reopen` alone, a wall clock per board, every board back as one row, never
-worse.
-
-The topper still writes what the ender reads, so a roundhouse output whose
-damage is already on the border can go straight to `04b`/`04c` and skip the
-topper entirely.
-
-**The topper's two knobs.** `SIDE` is which band opens: `T B L R`, or the
-L-shaped pairs `TR TL TB`. Open **only** where the breaks are: a pass over a
-clean side wastes time and can spread a break into a clean row. `WORK_ROWS` is
-how deep the band is -- deeper is stronger and much slower.
-
-`HOLES` replaces the band with a 16x16 0/1 mask and the tool opens exactly those
-cells; `SIDE` and `WORK_ROWS` stop applying. That is the only way to reach a
-ragged region around a cluster of breaks, or the interior, which no band can
-express. The ender and the backtracker read the same masks, so one mask drives
-all three.
-
-**Always re-score the output.** The topper's live `[inc] breaks=N` telemetry
-counts only junctions touching the open band, so it is not the board score. The
-script prints a rank table at each end.
+`E555_rank.py` recomputes the score from the seed and shows where the breaks
+are. Field 2 of a Stage B row is a solution index, not a score, unless the run
+used `--end_dive`.
 
 ---
 
-## 05 -- the backtracker: triage or proof
+## 01 -- beamer
 
-The two modes are different engines, and the distinction matters more than any
-other setting.
+Grows boards bottom-up over the database of all legal 5-piece row chains, with
+a wide beam guided by the colour heuristic.
 
-**`MODE=stuck` (default) -- greedy dives, for triage.** Each dive takes an exact
-fit where one exists and a minimal break where none does, never backtracks, and
-therefore always reaches 256 pieces. ~10k complete boards per second when that
-figure was taken, and about 3.3x-3.7x that since the forward-checking rewrites
-(`PROJECT_E555.md`, Stage C). Cheap enough to run over a whole batch to see which
-partials deserve a long run. It
-**proves nothing**: it never establishes that a board cannot be completed with
-fewer breaks.
+| setting | default | meaning |
+|---|---|---|
+| `STOP_ROW` | 10 | last row filled |
+| `BEAM_WIDTH` | 50000 | boards kept per row (the tool's default is 250000) |
+| `ANNEAL` | 0 | 1: run Stage A first; anneal 4 x `BORDERS` borders and keep the best quarter |
+| `STEPS` | 500000 | annealing steps per restart; below 250000 the annealer often places no legal border |
+| `BACKTRACK_ROW` | 0 | N: stop the beam at row N and search every row-N board exhaustively up to `STOP_ROW` |
+| `END_DIVE`, `END_POLISH` | 0, -1 | finish every stop-row board with dives (and polish); field 2 is then the score |
+| `DB_FILE` | none | cache the chain database here |
+| `CLUES` | 0 | 1: hold the five published clue pieces |
 
-**`MODE=any` (or `lds`) -- exhaustive, for proof.** Iterative deepening over the
-break count. An exhausted level is a theorem: no completion exists with that few
-broken edges. Cost per level grows roughly exponentially -- run it overnight, on
-the few boards triage picked out.
+- **Reproducibility.** `RNG_SEED` and `THREADS` together fix the run, since the
+  beam's work partition follows the thread count.
+- **Borders.** `tools/E555_sort_rotations.py` orders and turns a Stage A file.
+  The annealer refines a chosen row with `--input FILE --row K`, and scores a
+  two-row top with `--double_decker TOP`. The beamer's `--lambda_reserve` then
+  keeps that row's reserve pieces for last.
 
-A **complete** board has no empty cell, so dives on it are a no-op. Give `HOLES`
-a mask to reopen a region (`data/holes_open_border_*.csv`), or feed a partial.
+## 02 -- finalizer
 
-**Expect the default run to score worse than its input.** Reopening the ring of
-a well-optimized board and diving greedily lands around 28 breaks on a board
-that came in with 18 -- documented behaviour, not a bug. Dives are for ranking a
-hundred rough partials cheaply, not for improving a good one. Use `MODE=any`
-when you want the board to actually get better, or proved.
+Keeps rows 0..`FROM` and re-grows everything above from a reduced database.
 
-`ORDER=mrv` (most-constrained cell first) is the right default for both modes.
+| setting | default | meaning |
+|---|---|---|
+| `FROM` | 7 | the lock row; lower = more rows re-searched, much slower |
+| `STOP_ROW` | 12 | last row to reach |
+| `REPEATS` | 3 | independent re-runs per board |
+| `COLUMNS` | 0 | left columns tried per board; 0 enumerates them all |
+| `MAX_WALL` | 600 | seconds for the run |
 
-The run writes up to five CSVs -- the best per record plus four sidecars named
-after `OUT`. They are all listed in `$OUT.outputs.txt`.
+Where to put `FROM`:
 
----
+- **A complete border** (the usual beamer partial): lower is better until the
+  beam stops filling. The tool's default is 5; `FROM` 4 reached row 11 on 8 of
+  12 sampled columns, `FROM` 6 on none.
+- **An incomplete border:** the left columns are enumerated, and their number
+  explodes as rows are freed. On `board_partial_row12.csv`, `FROM` 7 takes 6 s,
+  `FROM` 6 takes 50 s, and `FROM` 5 exhausts 600 s.
+- Raise `MAX_WALL` before lowering `FROM`. `--backtrack_row` equal to the lock
+  searches everything above it exhaustively, with no beam.
 
-## 06 -- does the spiral direction matter?
+## 03 -- roundhouse
 
-Each input board is run through two chains of two roundhouse passes: `--ccw`
-then `--cw`, and `--cw` then `--ccw`. Two passes each way cover all
-four sides. Both chains start from the same board, so the scores are comparable
-and the tally at the end answers the question. `HOLD=1` makes the second pass
-keep the half of its final side that the first left standing, and search the
-other half; the seam between the two is deliberately left unconstrained.
+Turns the board 90 degrees and grows a `WIDTH`-wide strip instead of a row. It
+uses only the edge half of the database (megabytes), and a dynamic program
+refutes hopeless starts before any piece is tried. Exhaustive and deterministic:
+a run that ends without a complete board proves none exists for that cut,
+unless it reports that a budget stopped it.
 
-Each board is tagged with the pass that made it (`..._a1`, `..._b2`), so
-provenance survives when the four passes are `cat`-ed into one file.
+| setting | default | meaning |
+|---|---|---|
+| `WIDTH` | 5 | strip width 2..5; 0 = the narrowest that keeps the solved region. Pieces kept at `ROUNDS` 1/2/3: width 3 208/169/130, width 4 192/144/96, width 5 176/121/66 |
+| `ROUNDS` | 1 | bands freed and refilled in turn (right, top, left for `ROTATE` 0); the cuts nest, so work upward |
+| `ROTATE` | 1 | which side round 1 attacks: 0 right, 1 top, 2 left, 3 or -1 bottom |
+| `TIES` | 1 | boards emitted at the deepest reach |
+| `BREAKS` | 0 | B > 0: also fill the deepest board greedily with at most B mismatches |
 
----
+Output is one board per input, tagged `s` (solved), `d` (deepest partial) or
+`f` (filled with breaks). A cut that keeps 96 pieces or more exhausts in
+seconds; `ROUNDS=3 WIDTH=5` (66 pieces kept) ends on `MAX_WALL`.
+
+## 04 -- Stage C with CP-SAT (04a, 04b, 04c)
+
+- **`04a`**, the funnel: the topper scouts the corpus widely, a diverse share is
+  promoted, the topper polishes it, and the ender closes it. The topper's
+  settings are `SIDE`, the band that opens (`T B L R` or `TR TL TB`); `WORK_ROWS`,
+  its depth; and `HOLES`, a 16x16 mask instead of a band. Open only where the
+  breaks are.
+- **`04b`**: exact de-duplication of a large corpus, then sharding over
+  several ender processes; `BOARD_TIME` seconds per board.
+- **`04c`**: a few diverse elites, each given repeated passes with fresh seeds.
+  `MODE=deep` (about 1 h a board) or `superdeep` (about 10 h); `ELITE_COUNT`,
+  `TOTAL_SECONDS`.
+
+The ender's two settings are `ENDER_PROFILE` (`overnight`, `deep`, `superdeep`)
+and the per-board wall clock (`ENDER_BOARD_TIME`, `--board_time_limit`). It
+never returns a worse board. On dived and polished boards its gains come from
+the redive step, which needs `bin/E555_diver` (`make diver`). Re-score what the
+topper writes: its live `[inc] breaks=N` counts only the open band.
+
+## 05 -- backtracker
+
+| setting | default | meaning |
+|---|---|---|
+| `MODE` | `stuck` | `stuck`: greedy dives that always complete, cheap triage that proves nothing. `any` / `lds`: iterative deepening over the break count, where an exhausted level proves no completion with that few breaks |
+| `HOLES` | `holes_open_border_TR.csv` | cells to reopen; a complete board needs one |
+| `ORDER` | `mrv` | cell order (most constrained first is the right default) |
+| `MAX_MISMATCH` | 30 | break budget |
+| `RESTARTS` | 100000 | dives per board (stuck) |
+| `TIME_LIMIT` | 300 | seconds per board |
+
+Stuck dives on a reopened, polished board land well below its score (about 28
+breaks against 18): they rank rough partials, and they don't improve good
+boards. The run writes up to five CSVs, listed in `$OUT.outputs.txt`.
+
+## 06 -- roundhouse both ways
+
+Runs each board through two chains of two roundhouse passes, `--ccw` then
+`--cw` and `--cw` then `--ccw`, which together cover all four sides. The final
+tally says which direction won. `HOLD=1` makes the second pass keep the half of
+its final side the first left standing. Boards are tagged by pass (`_a1`,
+`_b2`).
 
 ## 07 -- the whole chain, barebones
-
-The other six scripts each teach one tool and share a skeleton: a settings
-block, optional `NAME=value` overrides, `outputs.txt` reading, guard clauses.
-`07` is the opposite extreme -- six calls, no arguments, no arrays, and one
-guard in the whole file. Every flag is a literal in the line that uses it, so
-any single call can be copied out of the file and pasted into a terminal
-unchanged.
 
 ```bash
 cd ~/runs && bash ~/E555/examples/07_barebones_chain.sh
 ```
 
-**Output goes to the directory you run it from.** It is the one script that does
-not `cd` into the checkout: `REPO` prefixes `bin/`, `data/` and `tools/`, and
-every output path is a bare relative path. Run it from a scratch folder and the
-whole run stays there. `THREADS` and `PREFIX` are the only other variables.
+Six literal calls, which can be copied into a terminal as they are:
 
-**Flags absent from the file are the tool's tuned defaults**, not oversights.
-`--beam_width` is the one to notice: the beamer and the finalizer both default
-to 250000, and writing that number into an example would pin a stale value the
-day it is retuned. `--print_cmd` reports every effective value at startup, so
-leaving a flag out hides nothing.
+1. the beamer to row 12 (`--incomplete_top` keeps the boards that reach it with
+   11 of its 16 pieces);
+2. the finalizer from row 4 (`--incomplete_top`, `--clue_center`);
+3. the roundhouse (only when a complete row 12 exists; usually skipped);
+4. backtracker dives to 256 pieces;
+5. `E555_rank.py`, then the viewer.
 
-**`--num_rows 0` means "every line of the input", and it is also the default.**
-Stages 2 and 3 read whatever the stage before them produced, and that count is
-not known when the script is written. The finalizer and the roundhouse both
-take 0 as "from `--start_row` to the end of the file" and resolve it before the
-banner, so `[cfg]` and `--print_cmd` report the real number rather than the
-sentinel -- so does the beamer, in its fixed-border mode. The beamer's
-`--random_edges` mode reads no file at all, so it counts random bottoms with a
-separate flag, `--samples`, instead.
+- **Output** stays in the current directory, named by `PREFIX`. Only
+  `PREFIX_ranked.csv` survives; change `PREFIX` between runs, because the C
+  tools append.
+- **Run length** is set by the beamer's `--wall_time` (two thirds of the total)
+  and the backtracker's `--time_limit` per board.
+- **Measured** on 4 cores: 914 s, 41 complete boards, best 455/480.
+- **First edit to make:** add `--db_file chain.db` to the beamer.
 
-**`--max_emitted 25` counts both files.** The beamer's help is explicit that
-the budget covers "both completions and `--incomplete_top` partials", so 25 is
-25 boards of either kind. It is a stop condition, not a quota: the beam in
-flight is always emitted in full, an overshoot of up to one beam width.
+## 08 -- distiller
 
-**Row 12 is the wall, and `--incomplete_top` is the only way through it.** No
-configuration of any tool tested here has ever produced a *complete* row 12 --
-every beamer and finalizer run ends `reached stop_row: 0`. What comes out
-instead are boards that reach row 12 with 11 of its 16 pieces, banked while the
-row dies, written to a separate `_partial.csv`. The five missing cells are work
-the backtracker was doing anyway for rows 13..15.
+Distils a corpus of any size to the N boards worth the CP-SAT tail, finished
+and probed, and writes the ender command for them.
 
-**Why the beamer goes straight to row 12.** An earlier version grew to row 11
-and had the finalizer carry it to 12. Given 880 s each to produce row-12
-material:
-
-| | row-12 boards | best after backtracker |
+| setting | default | meaning |
 |---|---|---|
-| beamer to row 11, then finalizer to row 12 | 13 | 454/480 |
-| **beamer straight to row 12** | **29** | **457/480** |
+| `BOARDS` | `data/E565_lowB_baseline.csv` | partial or complete boards, `.csv` or `.csv.gz` |
+| `TOP` | 5 | boards to keep |
+| `OUT` | `distilled.csv` | also writes `OUT.plan.sh` (the ender command) and `OUT_work/` |
 
-Every one of the direct beamer's top five (457, 456, 456, 455, 455) beat the
-two-stage best, and it passed 13 boards after six configurations -- about 262 s
-including the database build, against 880 s.
+The stages:
 
-**What the finalizer is for.** It takes a second, independent run at the same
-boards, and it carries `--incomplete_top` for the same reason the beamer does.
-Without that flag it reports only a complete row 12, which nothing has ever
-produced, and it contributed exactly **zero** boards across two measured runs.
-With it, it contributed **20 of the tail's 41** in 201 s. Note that at
-`--finalize_from 4` it keeps only rows 0..4 of its input, so it does not build on
-the beamer's row-12 work -- it re-derives from the same bottoms. That
-independence is the point. `--finalize_from 11` would instead attack the five
-missing cells directly, and is untested.
+1. drop exact repeats;
+2. screen every partial with 300 seeded dives;
+3. finish the best half (at most 400 x `TOP`);
+4. probe the best 4 x `TOP` with the ender's redive;
+5. keep `TOP` boards with distinct foundations.
 
-**Stage 3, the roundhouse, is conditional and usually sits out.** Only a
-*complete* row 12 is worth spiralling, and nothing has yet produced one. The two
-completions files are literally zero bytes when their stage emitted nothing --
-the CSV header is written with the first board, not at open -- so `[ -s ]` on
-their concatenation is an exact test rather than a heuristic. Give stage 1 a much
-longer `--wall_time` and this stage starts working. `shopt -s nullglob` at the
-top of the script is what lets the final concatenation succeed when the
-roundhouse never created an output directory. `--clue_center` is *not* passed
-here, unlike the two stages above: the roundhouse never frees the centre cell,
-so the flag could only verify what is already true. `--strip_width 5` is passed
-even though 5 is the default, because it is the dial worth turning -- it sets
-how wide a band each round tears up, 2 to 5, and three rounds at width 5 keep
-only the 66-piece core.
+The run is reproducible, and a rerun resumes from `OUT_work/`. The run prints
+its time estimate after reading; the default corpus takes about 4 min on 4
+threads. Then:
 
-**Three limits bound stage 1, and the clock is the one that should win.**
-`--wall_time 600`, `--max_emitted 25` and `--samples 50` are all live;
-whichever comes first stops the run. Yield is 0.7 to 1.2 boards per
-configuration at about 30 s each, so at these numbers the clock fires: one
-measured run stopped at 600.2 s with 21 boards from 18 bottoms, under both other
-limits. An earlier version set `--samples 30` and the bottoms ran out
-first, at 22 boards, with the board limit never firing at all -- a bound you
-cannot predict is not much of a bound.
+```bash
+bash distilled.plan.sh
+```
 
-**Where the lock goes, measured.** Four finalizer settings, 150 s each on one set
-of 277 row-11 boards, back when the finalizer was the stage reaching row 12:
+## 09 -- backtracker from all sides
 
-| `--finalize_from` | input lines seen | row-12 partials |
+Fills each break-free partial as far as it goes without breaking an edge
+(`--breaks 0`), from each direction in `DIRS` (a cell order plus a board turn).
+It keeps the deepest result per board, so there is one board per input.
+
+- **Input.** Feed it break-free partials: a board that already has a broken
+  edge passes through unchanged.
+- **`TIME_LIMIT`** is per call; set it, since an exact search need not finish.
+- **`FOURSIDES=1`** adds `--order 4sides`, which can step over a dead cell.
+
+## 10 -- diver: finish partials
+
+| setting | default | meaning |
 |---|---|---|
-| 2 | 2 | 9 |
-| **4** | **19** | **15** |
-| 7 | 95 | 0 |
+| `END_DIVE` | 10000 | dives per board |
+| `END_POLISH` | 2000 | kick-and-polish steps; -1 = none |
+| `EMIT_SCORE` | 0 | write boards whose best finish is >= this |
+| `ROTATIONS` | none | Stage A file: hold beamer boards' edge pieces to their dealt sides |
+| `CORNER_SEEDS` | 0 | extra copies with a top-corner block placed (needs `ROTATIONS`) |
 
-A higher lock races through lines and returns nothing, because from row 7 the
-beam never widens enough to reach row 12 at all. A lower lock spends 75 s a line
-and sees 2 boards of 277.
+Placed cells never move. The output does not depend on `THREADS`.
 
-**`--breaks 20` is a filter, not a promise.** Closing the gap in row 12
-plus rows 13..15 costs about 24-30 broken edges, so nothing passes a ceiling of
-20. In stuck mode that changes nothing about the output: every dive completes,
-the best board per input record is written regardless, and the ranking reads
-those.
+## 11 -- diver: improve complete boards
 
-**Expect the yield to swing, and do not tune on one run.** Two runs of the
-finalizer differing only in `--rng_seed` returned 15 partials and 1. That spread
-swamps every parameter effect, so settings were chosen at a *matched* seed,
-where `--finalize_repeats` earns its place:
-
-| repeats | `--frac_rand` | configurations searched | partials |
-|---|---|---|---|
-| 1 | 0.30 | 70 | 1 |
-| 1 | 0.50 | 73 | 1 |
-| **3** | **0.30** | **174** | **3** |
-| 3 | 0.75 | 173 | 3 |
-
-Three passes spend the same wall budget on 174 configurations where one pass
-reaches 70, and partials scale with configurations searched. `--frac_rand` moves
-nothing, which fits the source's own note that its 0.30 default already assumes
-repeated passes over one board. The board ids carry the pass index --
-`p<line>r<repeat>l<column>` -- so the passes can be counted rather than assumed.
-
-**`--clue_center` on the finalizer is load-bearing**, not decoration. Below
-`--finalize_from 7` the centre cell is freed along with everything else above
-the lock, and without the flag the beam quietly refills it with another piece.
-`--free_edges` is the mirror image: it is never passed, because a beamer board
-leaves the top border unplaced and the finalizer turns it on by itself.
-
-Only `${PREFIX}_ranked.csv` survives; the beamer and finalizer directories and
-the backtracker's CSVs are deleted once the ranking is written. Change `PREFIX`
-between runs -- the C tools append to their CSVs rather than truncating them.
-
-**Two dials set the run length**, since everything else is a default:
-`--wall_time` on the beamer, which is two thirds of the total and decides
-how many boards the rest of the chain is handed, and `--time_limit` on the
-backtracker, which is spent once per board it receives. They are coupled --
-doubling the first roughly doubles the fourth stage too. One measured
-end-to-end run, four cores:
-
-| stage | wall | out |
+| setting | default | meaning |
 |---|---|---|
-| beamer | 600 s (88 s of it the database), 18 configurations | 21 row-12 partials, 0 complete |
-| finalizer | 201 s | 20 row-12 partials, 0 complete |
-| roundhouse | 0 s | skipped: no complete row 12 to spiral |
-| backtracker | ~100 s | 41 full boards |
-| rank + view | seconds | best **455/480**, 25 breaks in 5 rows, 218/256 solid |
-| **total** | **914 s** | `bb1_ranked.csv`, 41 rows |
+| `REOPEN` | `auto` | cells to re-dive: `auto` (the damaged band, at most 5 rows), `auto+E`, `top:K`, `box:R0-R1,C0-C1`, or a mask file |
+| `SECONDS_PER_BOARD` | 60 | wall clock per board; rounds run until it is spent |
+| `COPIES` | 8 | copies per round, each on its own random streams |
+| `END_DIVE`, `END_POLISH` | 3000, 1000 | per copy |
+| `PRIOR`, `NOGO` | 1, 1 | start the dives pulled toward the board's clean placements and off its broken ones |
+| `PLATEAU` | 0 | 1: a round may move to a different board of equal score |
 
-That run predates the forward-checking rewrites, so its backtracker row is now
-roughly 3.3x quicker; the other stages are unchanged.
-
-Four idle cores; proportionally less on more threads. Stage 1 is two thirds of
-it and is capped by its own clock, so `--wall_time` there is the dial that
-moves the total. Measure on an idle machine: one stray solver left running from
-an earlier experiment doubled every figure in an earlier version of this table.
-
-Four chain shapes have now been measured end to end -- beamer to row 10, to row
-11, to row 12 with a finalizer behind it, and this one. Every one scored between
-454 and 457, which is inside the run-to-run noise, so none has separated itself
-on board quality. What does differ is throughput: this shape produces 41 boards
-in 914 s where the previous produced 22 in 1257.
-
-The first edit worth making is a different one: add `--db_file chain.db` to the
-beamer and later runs mmap the 6.4 GB chain database in seconds instead of
-rebuilding it in memory every time.
+- **Guarantee.** Every board comes back as one row, never worse; the run ends
+  with a before → after table.
+- **Defaults.** They are the best setting measured (PROJECT_E555.md,
+  E555_diver). This is the ender's redive without OR-Tools.
 
 ---
 
-## Fixing the Eternity II clue pieces
+## Clue pieces
 
-Scripts 01 to 04 take **`CLUES=1`**, which passes `--clue_center --clue_corners`
-to every tool in that script. It is off by default and changes nothing when
-unset. Script 07 is the exception: it holds the centre clue unconditionally,
-because its `--finalize_from 4` frees that cell and the flag is what stops the
-beam refilling it with something else.
+Scripts 01-04 take `CLUES=1` (`--clue_center --clue_corners` on every tool).
+Set it on every stage or on none: a stage that frees a clue cell without the
+flag refills it with another piece. `E555_rank.py FILE --sort clues,score`
+counts the clues a board still has.
 
-```bash
-bash examples/01_beamer_quickstart.sh CLUES=1
-bash examples/02_finalizer_regrow.sh  CLUES=1 BOARDS=beam_out/beam_completions_random_10.csv
-```
+## Turning and sinking a board
 
-Set it on **every** stage or on none. A clue held by one stage and dropped by
-the next is no better than never holding it, which is exactly what used to
-happen: script 02 locks rows 0..7 and re-grows everything above, so without the
-flag it frees the centre clue's cell and quietly refills it. The `clues` column
-of `E555_rank.py` counts how many of the five a board still has:
+Every stage is direction-biased, so a quarter-turn hands the same breaks to a
+different attack. Turns are lossless and re-scored:
 
 ```bash
-python3 tools/E555_rank.py FILE --sort clues,score --no_id
+python3 tools/E555_rotate.py FILE 1 --seed_file data/seed_Edge5.txt           # -> FILE_rot1.csv
+python3 tools/E555_rotate.py FILE 2 --sink 3 --seed_file data/seed_Edge5.txt   # turn, drop 3 rows
 ```
 
-## When a stage stalls, turn the board
+`--sink N` moves every piece N rows down, so that the damaged rows (turned to
+the bottom) fall out and their pieces return to the pool. The result is a
+partial for Stage C.
 
-Every stage here is direction-biased -- the finalizer frees rows from the top,
-the roundhouse grows a strip against one border, the backtracker starts from a
-fixed corner -- so a quarter-turn gives the same breaks to a different one. The
-turn is lossless and re-scored to prove it:
+## Results that are not failures
 
-```bash
-python3 tools/E555_rotate.py FILE 1 --seed_file data/seed_Edge5.txt   # -> FILE_rot1.csv
-```
-
-## When turning is not enough, sink the core
-
-A turn moves the breaks around the board; it does not remove them. `--sink N`
-does: it moves every piece N rows down, so the bottom N rows fall out of the
-board and their pieces go back in the pool. Turn first and it eats whichever
-side you aim it at, so a board whose top three rows are the problem is
-
-```bash
-python3 tools/E555_rotate.py FILE 2 --sink 3 --seed_file data/seed_Edge5.txt
-```
-
-which opens row 0 and rows 12..15 -- 80 cells -- and frees exactly the 80 pieces
-those cells need, corner for corner. Two of those rows you did not ask for: the
-new row 0 receives an interior row, and inner pieces have no grey face for the
-frame; the old top frame row lands inside the board with its grey pointing the
-wrong way. Both come free, which is also how all four corners do.
-
-Choose N by the breaks left among the pieces that survived, which the run
-prints:
-
-```
-[rot] sunk 3 row(s): rows 0, 12, 13, 14, 15 now open -- 80 cell(s)
-[rot] breaks left in the surviving core: min 0, max 1, 6 of 7 clean
-```
-
-On the shipped 463s that number falls from 3..12 at `--sink 1` to 0..1 at
-`--sink 3`. A sunk board has holes in its frame, so it is a partial: it goes to
-Stage C, not back to the beamer.
-
-`--clue_center` keeps only the boards whose centre clue is in place afterwards.
-The clue fixes an orientation as well as a cell, and sinking moves the cell
-without touching the spin, so any non-zero sink breaks a clue that was already
-right -- the filter finds boards the sink puts right, which are rare.
-
-## Three things that look like failures and are not
-
-- **A configuration goes extinct and no board is emitted.** An empty candidate
-  pool is an exact proof that that border is dead below the current row. The
-  search is working: it abandons the configuration and plays another hand.
-- **The roundhouse emits nothing and reports `REFUTED`.** Its oracle refuted
-  every possible start before trying a single piece, and it ignores the piece
-  supply entirely -- so no arrangement of any pieces can fill that band. That is
-  a theorem about your board, delivered in milliseconds.
-- **A roundhouse board scores far below the one you fed in.** Its output is
-  break-free by construction; the score is 480 minus the junctions its *empty*
-  cells leave open. A 191-piece board scoring 350 has no mismatch at all.
+- **A configuration goes extinct.** An empty candidate pool proves that border
+  dead below the current row; the beamer moves on to another.
+- **The roundhouse reports `REFUTED`.** No arrangement of any pieces fills that
+  band; this is a proof, in milliseconds.
+- **A roundhouse board scores far below its input.** It is break-free by
+  construction; the missing points are the junctions its empty cells leave open.
 
 ## Slurm
-
-The scripts are plain bash and know nothing about schedulers. One wrapper runs
-any of them as a batch job:
 
 ```bash
 sbatch pipeline/slurm_wrapper.sh examples/02_finalizer_regrow.sh
 sbatch --cpus-per-task=32 --mem=64G pipeline/slurm_wrapper.sh \
        examples/01_beamer_quickstart.sh THREADS=32 ANNEAL=1
 ```
-
-Anything passed to `sbatch` overrides the wrapper's own defaults.
