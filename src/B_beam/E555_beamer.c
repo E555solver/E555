@@ -50,9 +50,9 @@
  *   its deepest zero-break prefix (--extend_nodes, --backtrack_min_col). See
  *   backtrack_emit and extend_board. A stop-row board whose top row nearly
  *   repeats the previous one's is dropped first (--no_top_dedup keeps it); under
- *   --backtrack_min_col K a partial row whose columns 1..W can no longer reach
- *   row 14 is cut on the spot (--min_col_check, strip_reach), which drops no
- *   written board.
+ *   --backtrack_min_col K a partial row whose column 1 can no longer be
+ *   stacked to row 14 is cut on the spot (col_reach), which drops no written
+ *   board.
  *
  * END DIVES (--end_dive M --emit_score S)
  *   Instead of being written, each stop-row board is completed to 256 pieces
@@ -133,23 +133,25 @@ static uint32_t g_backtrack_row   = 0;
    at least K whole columns. See extend_board. */
 static uint32_t g_extend_nodes    = 100000;
 static uint32_t g_bt_min_col      = 0;
-/* --free_top_clue (with --clue_corners): the extension may place the two row-13
-   clue pieces on any cell above the stop row, and treats their own cells as
-   ordinary ones. Rows up to the stop row still hold them in reserve. */
+/* --free_top_clue (with --clue_corners): the extension treats the two row-13
+   clue cells as ordinary ones and may place the top-LEFT clue (13,2) on any
+   cell above the stop row. The top-RIGHT clue (13,13) stays held through the
+   extension, so it never lands in the left columns, and is then left off the
+   board for the dives to place among the open top-right cells. Rows up to the
+   stop row hold both in reserve. */
 static bool     g_free_top_clue   = false;
+/* The row-13 clue entries of g_clue: top-left on (13,2), top-right on (13,13). */
+#define CLUE_TOP_LEFT  3
+#define CLUE_TOP_RIGHT 4
 /* The top-row near-duplicate filter (--no_top_dedup turns it off): a stop-row
    board whose top row repeats the previous one's columns 1..K and differs from
    it in at most one other cell is dropped before its extension. See
    bt_close_row. */
 static bool     g_top_dedup       = true;
-/* --min_col_check W: under --backtrack_min_col K, the backtracker cuts a
-   partial row as soon as columns 1..W (W <= K) can no longer be stacked to row
-   14, and a stop-row cell of columns 1..K whose top nothing can sit on. -1 =
-   the default width, 0 = off. See strip_reach. */
-static int      g_col_check       = -1;
-static bool     g_col_check_set   = false;
-#define STRIP_WMAX 6                      /* cols 1..6 never meet a pinned clue cell */
-#define STRIP_W_DEFAULT 1                 /* wider strips cut more, but cost more than they save */
+/* Under --backtrack_min_col K the backtracker cuts a partial row as soon as
+   its column 1 can no longer be stacked to row 14, and a stop-row cell of
+   columns 2..K whose top nothing can sit on. Set from K; see col_reach. */
+static bool     g_col_check       = false;
 /* --prefix: written in front of the configuration id in every board name. */
 static char     g_prefix[40]      = "";
 /* Boards found at the stop row and written, this configuration's and the
@@ -777,15 +779,19 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
        corners.
 
        Under --free_top_clue the extension treats those cells as ordinary ones
-       and may have put the clue anywhere above the stop row, or another piece
-       on its cell. A clue it did not place goes home only onto an empty cell
-       whose placed neighbours it matches, so the board stays break-free;
-       otherwise it is left for the dives. */
+       and may have put the top-left clue anywhere above the stop row, or
+       another piece on its cell. If it did not place it, the clue goes home
+       only onto an empty cell whose placed neighbours it matches, so the board
+       stays break-free; otherwise it is left for the dives. The top-right clue
+       was held through the extension and is always left for the dives, which
+       place it among the open cells -- the top-right corner the column-major
+       extension leaves -- rather than on its own cell. */
     if (orient >= 0 && (g_clue_mask & CLUE_CORNERS))
-        for (int k = 3; k < CLUE_N; k++) {
+        for (int k = CLUE_TOP_LEFT; k <= CLUE_TOP_RIGHT; k++) {
             const ClueCell *cc = &g_clue[orient][k];
             const int x = cc->row * PUZZLE_SIDE + cc->col;
             if (cell_is_placed(cc->row, cc->col, row, colmask)) continue;
+            if (g_free_top_clue && k == CLUE_TOP_RIGHT) continue;   /* left for the dives */
             if (pos[cc->piece] != 999) continue;          /* the extension placed it */
             if (ext_cell[x]) continue;                     /* another piece holds the cell */
             if (g_free_top_clue) {
@@ -2797,7 +2803,8 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
    placements per board.
 
    --free_top_clue turns the two row-13 clue cells into ordinary cells and lets
-   their pieces go anywhere in the region. --random_edges samples the left
+   the top-left clue go anywhere in the region; the top-right clue stays held
+   (it is left for the dives, see board_arrays). --random_edges samples the left
    column as part of the configuration, but the board is written without it
    above the stop row, so there the extension chooses column 0 too: the
    sampled edges above S are released, and column 0 and column 1 are filled
@@ -2840,14 +2847,13 @@ static void ext_fix_init(void) {
 static inline const int16_t *ext_fix_of(int orient) { return g_ext_fix[orient + 1]; }
 
 /* Pieces a board holds that the extension may still place: the sampled left
-   column above the stop row (--random_edges) and the orientation's two row-13
-   clues (--free_top_clue). */
+   column above the stop row (--random_edges) and the orientation's top-left
+   row-13 clue (--free_top_clue; the top-right one stays held). */
 static void ext_release_mask(int orient, uint64_t rel[4]) {
     rel[0] = rel[1] = rel[2] = rel[3] = 0;
     if (g_random_edges)
         for (int r = (int)g_stop_row + 1; r <= EDGE_LEN; r++) used_set(rel, g_cur_left->p[r]->piece_id);
-    if (g_free_top_clue && orient >= 0)
-        for (int k = CLUE_N_REACHABLE; k < CLUE_N; k++) used_set(rel, g_clue[orient][k].piece);
+    if (g_free_top_clue && orient >= 0) used_set(rel, g_clue[orient][CLUE_TOP_LEFT].piece);
 }
 
 /* The top-border pool by inner colour, for a board whose unavailable pieces
@@ -2988,248 +2994,179 @@ static inline int ext_cols_n(int n, int stop) {
 
 static inline int ext_columns(const Ext *x, int stop) { return ext_cols_n(x->n, stop); }
 
-/* -- The min-col strip check (--min_col_check W) ----------------------------- *
+/* -- The column check (--backtrack_min_col K >= 1) --------------------------- *
 
    Under --backtrack_min_col K a board is written only if its extension fills
-   columns 1..K of rows S+1..14. The row-major search fills every column of the
-   rows up to S, so a partial board at row r can lead to a written board only
-   if columns 1..W (W <= K) can be stacked from row r+1 all the way to row 14.
-   The check asks exactly that, of a RELAXED problem whose every constraint the
-   real board must also meet:
+   columns 1..K of rows S+1..14, so its column 1 runs whole from row 1 to row
+   14. The row-major search fills every column of the rows up to S; so a partial
+   board whose row r has its column-1 piece placed can lead to a written board
+   only if column 1 can still be stacked from row r+1 to row 14. The check
+   searches for one such stack, exactly as the board will have to build it:
 
-     kept     the left column's colours (under --random_edges, column 0 above S
-              is chosen from the edge pool, as the extension does); the vertical
-              colour chain from row r's tops; row 14's tops, as a multiset,
-              inside the top-border pool (ext_avail); the extension's clue cells
-              (g_ext_fix) and the colour a clue cell just right of the strip
-              wants; pieces distinct within one strip row;
-     dropped  distinctness BETWEEN strip rows (a piece may be reused); clue pins
-              and everything right of column W on rows <= S; what right edges
-              and column-0 edges take from the top-border pool.
+     - each piece fits the left column's colour beside it and the top of the
+       piece below; no piece is used twice, and none the board already holds;
+     - under --random_edges, column 0 above the stop row is chosen too, as the
+       extension chooses it: a frame-left edge on the column-0 top below, its
+       inner colour the left colour of column 1 (rows up to S keep the
+       configuration's sampled column);
+     - row 14's top must be a colour the top-border pool still carries, the
+       column-0 edges of the stack taken out of that pool;
+     - the column-1 cell next to a clue cell the extension will fill shows the
+       clue the colour it needs.
 
-   Pieces are those not in `used` at the time of the check, plus the ones the
-   extension may release -- a superset of what is free at the stop row. So a
-   board the extension would accept always has a strip path: a partial row
-   without one is cut, and no written board is lost.
+   Nothing else is asked (not the pins of rows <= S, not the columns to the
+   right), and the pieces the extension may release (ext_release_mask) count as
+   free, so every board the extension would keep has such a stack: a partial
+   row without one is cut and no written board is lost. Checks that exceed
+   COL_BUDGET steps answer "unknown" and cut nothing.
 
-   Dropping distinctness between rows makes a state's future depend only on
-   (row, column-0 top, the W tops) and the pieces available, so refuting a
-   strip costs at most its distinct states, and the first path to row 14 ends
-   the search. A state dead for one set of available pieces stays dead for any
-   smaller one, and every node below a check in the row-major search has fewer
-   pieces than the check had: so a dead state is remembered, per thread, for as
-   long as the search stays below the check that found it (path_gen), and is
-   forgotten at the rows where a subtree may be handed to another thread, so
-   that what a check decides never depends on the thread count. A path found is
-   remembered too (strip_alive): it proves its states live again for as long as
-   none of its pieces is used. Past STRIP_BUDGET steps the answer is "unknown"
-   and nothing is cut.
+   Two caches keep the search short. A state (row, column-0 top, column-1 top)
+   that failed with some pieces taken fails with any more taken, so a dead
+   state is stored with the pieces taken then and recognised whenever they are
+   all taken again; a stack found is stored with its pieces and stands again
+   while none of them is taken (and its row-14 top is still in the pool). Both
+   are emptied at the start of every job and at the rows where a subtree may be
+   handed to another thread, so a check's answer -- budget included -- never
+   depends on the thread count.
 
-   Rows are built piece by piece from the (left, bottom) buckets, dropping a
-   chain at its first used piece. Building them from the chain database's
-   segment-A records instead (one cell per state, every record decoded against
-   the used pieces) was measured slower at width 5 and, under the same step
-   budget, left more checks undecided: deep in the board most records hold a
-   used piece. Widths 1..W are checked in turn as columns 1..W are placed; a
-   strip dead at a narrow width is dead at every wider one. Measured (stop rows
-   9-10, K = 2 and 5), width 1 cuts the nodes by half or more and the search
-   time by about 40%; width 2 cuts the stop-row boards by half again but runs a
-   little slower than width 1, width 3 about as slow as no check, and width 5
-   fifteen times slower -- hence the default of 1. */
-#define STRIP_HBITS  17
-#define STRIP_LBITS  15
-#define STRIP_BUDGET 50000u
-#define STRIP_SLOTS_ROW (STRIP_WMAX + 1)   /* per row: a check per width */
-#define STRIP_NSLOT  (STRIP_SLOTS_ROW * (EDGE_LEN + 1))
+   Measured, the check halves the backtracker's nodes or better and cuts its
+   time by about 40% (PROJECT_E555.md 5.10); wider strips (columns 1..W,
+   pieces reused between rows) cut more boards but cost more than they saved,
+   and so did building strip rows from the chain database's records. */
+#define COL_DBITS  16
+#define COL_LBITS  14
+#define COL_BUDGET 50000u
 
-typedef struct { uint64_t key; uint32_t gen; uint8_t slot; } StripMemo;
-/* A live state: the pieces of a path from it to row 14, and that path's row-14
-   tops. It stays live while none of those pieces is used and the border pool
-   still carries those tops -- tested at every use, so it needs no scope; the
-   epoch only keeps the cache's contents, and so the search's step counts,
-   independent of the thread count. */
-typedef struct { uint64_t key; uint64_t mask[4]; uint32_t epoch; uint8_t t14[STRIP_WMAX]; } StripLive;
+typedef struct { uint64_t key; uint64_t taken[4]; uint32_t epoch; } ColDead;
+typedef struct { uint64_t key; uint64_t mask[4]; uint32_t epoch; uint8_t t14, own; } ColLive;
 
 typedef struct {
-    StripMemo *memo;                      /* dead states, direct-mapped, lossy */
-    StripLive *live;                      /* live states, direct-mapped, lossy */
-    uint32_t  gen_ctr;                    /* the last check's generation */
-    uint32_t  epoch;                      /* the live cache's current epoch */
-    uint32_t  path_gen[STRIP_NSLOT];      /* checks on the current search path */
-    int       slot;                       /* the running check's slot */
-    uint64_t  budget;
-    uint64_t  kbits;                      /* orientation and width bits of every key */
-    uint8_t   t14[STRIP_WMAX];            /* row-14 tops of the path being returned */
-    uint64_t  used[4];                    /* pieces the strip may not use */
-    int       avail[NUM_COLORS_TOTAL];    /* row-14 top colours (ext_avail) */
+    ColDead  *dead;                       /* direct-mapped, lossy */
+    ColLive  *live;
+    uint32_t  epoch;
+    uint64_t  used[4];                    /* pieces taken: the board's, less releases, and the stack's */
+    int       avail[NUM_COLORS_TOTAL];    /* top-border pool, less the stack's column-0 edges */
     const int16_t *fix;                   /* the extension's clue cells */
-    int       W, stop;
+    uint64_t  kbits;                      /* orientation bits of every key */
+    int       stop;
     uint64_t  steps;
     bool      unknown;                    /* the budget ran out */
-    uint64_t  wit[4];                     /* pieces on the path found */
-    uint8_t   bt[EDGE_LEN + 2][STRIP_WMAX + 2];   /* per row: the bottoms (tops below) */
-    uint8_t   nt[EDGE_LEN + 2][STRIP_WMAX + 2];   /* per row: the tops being built */
-    uint16_t  rp[EDGE_LEN + 2][STRIP_WMAX + 2];   /* per row: its pieces so far */
-} Strip;
+    uint64_t  wit[4];                     /* the stack found, from the current state up */
+    uint8_t   t14, own;                   /* its row-14 top; its column-0 edges of that colour */
+} ColCheck;
 
-static Strip *strip_new(void) {
-    Strip *s = xmalloc(sizeof *s);
+static ColCheck *col_new(void) {
+    ColCheck *s = xmalloc(sizeof *s);
     memset(s, 0, sizeof *s);
-    s->memo = xmalloc(((size_t)1 << STRIP_HBITS) * sizeof *s->memo);
-    memset(s->memo, 0, ((size_t)1 << STRIP_HBITS) * sizeof *s->memo);
-    s->live = xmalloc(((size_t)1 << STRIP_LBITS) * sizeof *s->live);
-    memset(s->live, 0, ((size_t)1 << STRIP_LBITS) * sizeof *s->live);
+    s->dead = xmalloc(((size_t)1 << COL_DBITS) * sizeof *s->dead);
+    memset(s->dead, 0, ((size_t)1 << COL_DBITS) * sizeof *s->dead);
+    s->live = xmalloc(((size_t)1 << COL_LBITS) * sizeof *s->live);
+    memset(s->live, 0, ((size_t)1 << COL_LBITS) * sizeof *s->live);
     s->epoch = 1;
-    s->budget = STRIP_BUDGET;
     return s;
 }
 
-/* Forget the checks of slot `from` and every deeper one. */
-static inline void strip_path_reset(Strip *s, int from) {
-    for (int i = from; i < STRIP_NSLOT; i++) s->path_gen[i] = 0;
-}
-
-/* Forget everything: at the start of a job and at the rows where a subtree may
+/* Empty both caches: at the start of a job and at the rows where a subtree may
    be handed to another thread. */
-static void strip_forget(Strip *s) {
-    strip_path_reset(s, 0);
+static void col_forget(ColCheck *s) {
     if (++s->epoch == 0) {
-        memset(s->live, 0, ((size_t)1 << STRIP_LBITS) * sizeof *s->live);
+        memset(s->dead, 0, ((size_t)1 << COL_DBITS) * sizeof *s->dead);
+        memset(s->live, 0, ((size_t)1 << COL_LBITS) * sizeof *s->live);
         s->epoch = 1;
     }
 }
 
-/* Open a check in `slot`: deeper checks are no longer on the path. */
-static void strip_open(Strip *s, int slot) {
-    strip_path_reset(s, slot);
-    if (++s->gen_ctr == 0) {                 /* wrapped: nothing old may look current */
-        memset(s->memo, 0, ((size_t)1 << STRIP_HBITS) * sizeof *s->memo);
-        strip_path_reset(s, 0);
-        s->gen_ctr = 1;
-    }
-    s->path_gen[slot] = s->gen_ctr;
-    s->slot = slot;
+static inline uint64_t col_key(const ColCheck *s, int row, int c0, int b) {
+    return (uint64_t)row | ((uint64_t)(c0 & 7) << 4) | ((uint64_t)(b & 31) << 7) | s->kbits;
 }
 
-static inline uint64_t strip_key(const Strip *s, int row, int c0, const uint8_t tops[]) {
-    uint64_t k = (uint64_t)row | ((uint64_t)(c0 & 7) << 4) | s->kbits;
-    for (int c = 1; c <= s->W; c++) k |= (uint64_t)(tops[c] & 31) << (7 + 5 * (c - 1));
-    return k;
+static inline bool col_dead(const ColCheck *s, uint64_t key) {
+    const ColDead *e = &s->dead[splitmix64(key) & (((uint64_t)1 << COL_DBITS) - 1)];
+    if (e->key != key || e->epoch != s->epoch) return false;
+    return !((e->taken[0] & ~s->used[0]) | (e->taken[1] & ~s->used[1])
+           | (e->taken[2] & ~s->used[2]) | (e->taken[3] & ~s->used[3]));
 }
 
-static bool strip_dead(const Strip *s, uint64_t key) {
-    const StripMemo *e = &s->memo[splitmix64(key) & (((uint64_t)1 << STRIP_HBITS) - 1)];
-    return e->key == key && e->gen && s->path_gen[e->slot] == e->gen;
+static inline void col_bury(ColCheck *s, uint64_t key) {
+    ColDead *e = &s->dead[splitmix64(key) & (((uint64_t)1 << COL_DBITS) - 1)];
+    e->key = key; e->epoch = s->epoch;
+    memcpy(e->taken, s->used, sizeof e->taken);
 }
 
-static void strip_bury(Strip *s, uint64_t key) {
-    StripMemo *e = &s->memo[splitmix64(key) & (((uint64_t)1 << STRIP_HBITS) - 1)];
-    e->key = key; e->gen = s->path_gen[s->slot]; e->slot = (uint8_t)s->slot;
-}
-
-/* A remembered path from this state that is still free of used pieces, with
-   row-14 tops the border pool still carries: the state is live. */
-static bool strip_alive(Strip *s, uint64_t key) {
-    const StripLive *e = &s->live[splitmix64(key) & (((uint64_t)1 << STRIP_LBITS) - 1)];
+static bool col_alive(ColCheck *s, uint64_t key) {
+    const ColLive *e = &s->live[splitmix64(key) & (((uint64_t)1 << COL_LBITS) - 1)];
     if (e->key != key || e->epoch != s->epoch) return false;
     if ((e->mask[0] & s->used[0]) | (e->mask[1] & s->used[1])
         | (e->mask[2] & s->used[2]) | (e->mask[3] & s->used[3])) return false;
-    if (g_free_edges)
-        for (int c = 0; c < s->W; c++) {
-            int n = 0;
-            for (int j = 0; j < s->W; j++) n += (e->t14[j] == e->t14[c]);
-            if (n > s->avail[e->t14[c]]) return false;
-        }
+    if (s->avail[e->t14] - e->own < 1) return false;
     for (int k = 0; k < 4; k++) s->wit[k] |= e->mask[k];
-    memcpy(s->t14, e->t14, sizeof s->t14);
+    s->t14 = e->t14; s->own = e->own;
     return true;
 }
 
-/* On the way back from a path found: s->wit holds the pieces of its rows from
-   this state up, s->t14 its row-14 tops. */
-static void strip_remember(Strip *s, uint64_t key) {
-    StripLive *e = &s->live[splitmix64(key) & (((uint64_t)1 << STRIP_LBITS) - 1)];
+static inline void col_remember(ColCheck *s, uint64_t key) {
+    ColLive *e = &s->live[splitmix64(key) & (((uint64_t)1 << COL_LBITS) - 1)];
     e->key = key; e->epoch = s->epoch;
     memcpy(e->mask, s->wit, sizeof e->mask);
-    memcpy(e->t14, s->t14, sizeof e->t14);
+    e->t14 = s->t14; e->own = s->own;
 }
 
-static bool strip_reach(Strip *s, int row, int c0, const uint8_t tops[]);
+static bool col_reach(ColCheck *s, int row, int c0, int b);
 
-/* Row-14 tops so far (columns 1..c-1) plus t, against the top-border pool. */
-static inline bool strip_top_ok(const Strip *s, int row, int c, int t) {
-    int n = 1;
-    for (int j = 1; j < c; j++) n += (s->nt[row][j] == t);
-    return n <= s->avail[t];
-}
-
-/* Fill column c of strip row `row`, whose left neighbour shows L; c0n is the
-   column-0 top this row hands up. */
-static bool strip_cell(Strip *s, int row, int c, int L, int c0n) {
-    if (c > s->W) return strip_reach(s, row + 1, c0n, s->nt[row]);
-    if (++s->steps > s->budget) { s->unknown = true; return true; }
-    const int x = row * PUZZLE_SIDE + c, B = s->bt[row][c];
-    const int f = s->fix[x];
-    const int rf = (c == s->W && c < EDGE_LEN) ? s->fix[x + 1] : -1;
+/* Column 1 of `row`, its left neighbour showing L, the piece below showing B;
+   c0n is the column-0 top this row hands up. */
+static bool col_cell(ColCheck *s, int row, int L, int B, int c0n) {
+    if (++s->steps > COL_BUDGET) { s->unknown = true; return true; }
+    if (!color_is_inner(L) || !color_is_inner(B)) return false;
+    const int x = row * PUZZLE_SIDE + 1;
+    const int rf = s->fix[x + 1];
     const int need_r = rf >= 0 ? g_cat[rf].left : -1;
     const bool top = (row == EDGE_LEN);
-    if (f >= 0) {                         /* the clue: reserved, placed as is */
-        const Oriented *o = &g_cat[f];
-        if (o->left != L || o->bottom != B || (need_r >= 0 && o->right != need_r)) return false;
-        s->nt[row][c] = o->top; s->rp[row][c] = o->piece_id;
-        if (!strip_cell(s, row, c + 1, o->right, c0n)) return false;
-        if (!s->unknown) used_set(s->wit, o->piece_id);
-        return true;
-    }
     const int nb = g_lb_count[L][B];
     for (int k = 0; k < nb; k++) {
         const Oriented *o = &g_cat[g_lb_bucket[L][B][k]];
         const uint16_t pid = o->piece_id;
         if (need_r >= 0 && o->right != need_r) continue;
         if (used_test(s->used, pid)) continue;
-        bool dup = false;
-        for (int j = 1; j < c; j++) if (s->rp[row][j] == pid) { dup = true; break; }
-        if (dup) continue;
-        if (top && !strip_top_ok(s, row, c, o->top)) continue;
-        s->nt[row][c] = o->top; s->rp[row][c] = pid;
-        if (strip_cell(s, row, c + 1, o->right, c0n)) {
-            if (!s->unknown) used_set(s->wit, pid);
-            return true;
+        if (top && s->avail[o->top] <= 0) continue;
+        bool ok = true;
+        if (top) { s->t14 = o->top; s->own = 0; }
+        else {
+            used_set(s->used, pid);
+            ok = col_reach(s, row + 1, c0n, o->top);
+            used_clear(s->used, pid);
         }
+        if (s->unknown) return true;
+        if (ok) { used_set(s->wit, pid); return true; }
     }
     return false;
 }
 
-/* Can the strip be stacked from row `row` (bottoms tops[1..W], column-0 top
-   c0 below it) to row 14? */
-static bool strip_reach(Strip *s, int row, int c0, const uint8_t tops[]) {
-    if (row > EDGE_LEN) {
-        for (int c = 0; c < s->W; c++) s->t14[c] = s->nt[EDGE_LEN][c + 1];
-        return true;
-    }
-    const uint64_t key = strip_key(s, row, c0, tops);
-    if (strip_dead(s, key)) return false;
-    if (strip_alive(s, key)) return true;
-    for (int c = 1; c <= s->W; c++) s->bt[row][c] = tops[c];
+/* Can column 1 (and, above the stop row under --random_edges, column 0) be
+   stacked from `row` -- column-1 bottom b, column-0 bottom c0 -- to row 14? */
+static bool col_reach(ColCheck *s, int row, int c0, int b) {
+    const uint64_t key = col_key(s, row, c0, b);
+    if (col_dead(s, key)) return false;
+    if (col_alive(s, key)) return true;
     bool ok = false;
     if (g_random_edges && row > s->stop) {
-        for (int k = 0; k < g_edge_left_n && !ok; k++) {  /* column 0 above S */
+        for (int k = 0; k < g_edge_left_n && !ok; k++) {     /* column 0 above S */
             const Oriented *o = &g_edge_left[k];
             if (o->bottom != c0 || !color_is_inner(o->right)) continue;
             if (used_test(s->used, o->piece_id)) continue;
-            if (++s->steps > s->budget) { s->unknown = true; return true; }
-            if (strip_cell(s, row, 1, o->right, o->top)) {
-                if (!s->unknown) used_set(s->wit, o->piece_id);
-                ok = true;
-            }
+            used_set(s->used, o->piece_id); s->avail[o->right]--;
+            ok = col_cell(s, row, o->right, b, o->top);
+            s->avail[o->right]++; used_clear(s->used, o->piece_id);
+            if (s->unknown) return true;
+            if (ok) { used_set(s->wit, o->piece_id); s->own += (o->right == s->t14); }
         }
     } else {
         const int c0n = (g_random_edges && row == s->stop) ? g_cur_left->p[row]->top : 0;
-        ok = strip_cell(s, row, 1, g_cur_left->right[row], c0n);
+        ok = col_cell(s, row, g_cur_left->right[row], b, c0n);
+        if (s->unknown) return true;
     }
-    if (s->unknown) return true;
-    if (ok) { strip_remember(s, key); return true; }
-    strip_bury(s, key);
+    if (ok) { col_remember(s, key); return true; }
+    col_bury(s, key);
     return false;
 }
 
@@ -3267,9 +3204,9 @@ typedef struct {
     double    deadline;
     bool      abort;
     BtNode  **out;                        /* where this job's output goes, made on first use */
-    /* --min_col_check: partial rows cut, checks whose budget ran out. */
+    /* The column check: partial rows cut, checks whose budget ran out. */
     uint64_t  cut_col, strip_unknown;
-    Strip    *strip;
+    ColCheck *col;
     /* The top-row near-duplicate filter: the last stop row not rejected. */
     RowChoice ref;
     bool      ref_ok;
@@ -3285,7 +3222,7 @@ static struct {
     int      ext_max, ext_cols_max, cfg_ext_max;
     uint64_t cfg_found, cfg_dup, cfg_mincol;   /* this configuration's stop-row boards,
                                            exact repeats, under --backtrack_min_col */
-    uint64_t cut_col, strip_unknown, near_dup, cfg_near_dup;   /* --min_col_check, the
+    uint64_t cut_col, strip_unknown, near_dup, cfg_near_dup;   /* the column check, the
                                            near-duplicate filter */
     uint64_t fill[EDGE_LEN + 1];
     double   t;
@@ -3524,7 +3461,7 @@ static void bt_close_row(BtCtx *x, int row) {
     }
     if (row <= x->split_max) {
         x->ref_ok = false;
-        if (x->strip) strip_forget(x->strip);
+        if (x->col) col_forget(x->col);
         if (bt_hungry()) { bt_spawn(x, row); return; }
     }
     bt_row(x, row + 1);
@@ -3536,32 +3473,23 @@ static inline int bt_orient(const BtCtx *x, int row) {
     return (x->flags[row] & FLAG_ORIENT_SET) ? (int)(x->flags[row] & FLAG_ORIENT_MASK) : -1;
 }
 
-/* Lowest column holding a clue cell of unknown orientation above the stop row
-   (g_ext_fix[0]); a strip reaching it cannot be checked before the board knows
-   its frame. */
-static int g_strip_blind_col = PUZZLE_SIDE;
-
-/* Can columns 1..W still be stacked to row 14 above row `row`, whose columns
-   1..W are placed? Cuts and unknowns are counted here. */
-static bool bt_strip_ok(BtCtx *x, int row, int W, int slot) {
+/* Can column 1 still be stacked to row 14 above row `row`, whose column-1
+   piece is placed? Cuts and unknowns are counted here. */
+static bool bt_col_ok(BtCtx *x, int row) {
     const int orient = bt_orient(x, row);
-    if (!x->strip) x->strip = strip_new();
-    Strip *s = x->strip;
-    strip_open(s, row * STRIP_SLOTS_ROW + slot);
-    if (orient < 0 && W + 1 >= g_strip_blind_col) return true;
+    if (!x->col) x->col = col_new();
+    ColCheck *s = x->col;
     uint64_t rel[4];
     ext_release_mask(orient, rel);
     for (int k = 0; k < 4; k++) s->used[k] = x->used[row][k] & ~rel[k];
     ext_avail(s->used, s->avail);
     s->fix = ext_fix_of(orient);
-    s->kbits = ((uint64_t)(orient + 1) << 40) | ((uint64_t)W << 43);
-    s->W = W; s->stop = (int)g_stop_row;
+    s->kbits = (uint64_t)(orient + 1) << 12;
+    s->stop = (int)g_stop_row;
     s->steps = 0; s->unknown = false;
     s->wit[0] = s->wit[1] = s->wit[2] = s->wit[3] = 0;
-    uint8_t tops[STRIP_WMAX + 2];
-    for (int c = 1; c <= s->W; c++) tops[c] = g_cat[x->rows[row].ci[c - 1]].top;
-    const int c0 = (g_random_edges && row == s->stop) ? g_cur_left->p[row]->top : 0;
-    const bool ok = strip_reach(s, row + 1, c0, tops);
+    const int c0 = (g_random_edges && (uint32_t)row == g_stop_row) ? g_cur_left->p[row]->top : 0;
+    const bool ok = col_reach(s, row + 1, c0, g_cat[x->rows[row].ci[0]].top);
     if (s->unknown) { x->strip_unknown++; return true; }
     if (!ok) { x->cut_col++; return false; }
     return true;
@@ -3616,17 +3544,14 @@ static void bt_cell(BtCtx *x, int row, int col, int L) {
             return;
         }
     }
-    /* --min_col_check: the column before this one was just placed. */
+    /* --backtrack_min_col: the column before this one was just placed. */
     if (g_col_check) {
-        if ((uint32_t)row == g_stop_row && col >= 2 && col - 1 <= (int)g_bt_min_col
+        if (col == 2 && !bt_col_ok(x, row)) return;
+        if ((uint32_t)row == g_stop_row && col >= 3 && col - 1 <= (int)g_bt_min_col
             && !bt_top_fits(x, row, col - 1, g_cat[x->rows[row].ci[col - 2]].top)) {
             x->cut_col++;
             return;
         }
-        /* Widths 1..W, each as soon as its columns are placed: a strip dead
-           at a narrow width is dead at every wider one, so the costly wide
-           checks see only the partial rows the cheap narrow ones let through. */
-        if (col >= 2 && col - 1 <= g_col_check && !bt_strip_ok(x, row, col - 1, col - 1)) return;
     }
     const int B = x->lvl[row - 1].rtop[col];
     RowChoice *mv = &x->rows[row];
@@ -3817,7 +3742,7 @@ static void bt_run_job(BtCtx *x, const BtJob *j) {
     x->out = j->out_slot ? j->out_slot : &handoff;
     x->deadline = g_bt.deadline; x->root = j->root;
     x->ref_ok = false;
-    if (x->strip) strip_forget(x->strip);
+    if (x->col) col_forget(x->col);
     #pragma omp atomic read
     x->abort = g_bt.abort;
     if (x->abort) return;
@@ -4384,9 +4309,7 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         }
         if (g_bt_min_col) {
             printf("[sum] min_col %u: ", g_bt_min_col);
-            if (g_col_check) printf("column check (W=%d) cut %s partial rows", g_col_check,
-                                    fmt_cnt(b1, sizeof b1, g_bt_run.cut_col));
-            else             printf("column check off");
+            printf("column check cut %s partial rows", fmt_cnt(b1, sizeof b1, g_bt_run.cut_col));
             if (g_bt_run.strip_unknown)
                 printf(", %s undecided", fmt_cnt(b1, sizeof b1, g_bt_run.strip_unknown));
             printf("\n");
@@ -4644,15 +4567,12 @@ static void usage(const char *a0) {
 "                         N caps the search per board (default 100000; 0 = off)\n"
 "  --backtrack_min_col K  with --backtrack_row: write only boards whose extension\n"
 "                         fills columns 1..K of rows stop+1..14 whole; lets a lower\n"
-"                         --stop_row run without flooding the output (default 0)\n"
-"  --min_col_check W      with --backtrack_min_col K: cut a partial row as soon as\n"
-"                         columns 1..W (W <= K) can no longer be stacked up to row\n"
-"                         14 (a relaxation that may reuse pieces between rows, so it\n"
-"                         never drops a board the extension would keep), and a stop-\n"
-"                         row cell of columns 1..K whose top nothing can sit on. The\n"
-"                         written boards are the same; found ones and time fall.\n"
-"                         Wider strips cut more but cost more than they save in\n"
-"                         measured runs (default 1 with K >= 1; 0 = off; max 6)\n"
+"                         --stop_row run without flooding the output (default 0).\n"
+"                         The search then cuts a partial row as soon as its column 1\n"
+"                         can no longer be stacked to row 14 with unused pieces (and,\n"
+"                         under --random_edges, column 0 above the stop row), and a\n"
+"                         stop-row cell of columns 2..K whose top nothing can sit on:\n"
+"                         the same boards are written, fewer are found, sooner\n"
 "  --no_top_dedup         with --backtrack_row: keep stop-row boards whose top row\n"
 "                         repeats the previous board's columns 1..K and differs from\n"
 "                         it in at most one other cell. By default such a near twin\n"
@@ -4705,9 +4625,11 @@ static void usage(const char *a0) {
 "                         both on row 2; the row-13 pair is only reserved, never pinned,\n"
 "                         and constrains no searched row. Clue pieces leave the database\n"
 "  --free_top_clue        with --clue_corners and --backtrack_row: the extension above\n"
-"                         the stop row may place the two row-13 clues on any cell and\n"
-"                         fills their own cells like any other; a clue it did not place\n"
-"                         goes home only where it matches its neighbours\n"
+"                         the stop row fills both row-13 clue cells like any other and\n"
+"                         may place the top-left clue on any cell (if it does not, the\n"
+"                         clue goes home only where it matches its neighbours). The\n"
+"                         top-right clue stays held through the extension and is then\n"
+"                         left off the board, for the dives to place\n"
 "  --pin_clue N           search ONE of the four clue frames instead of hedging over all\n"
 "                         four. The five clues are one rigid body, so naming where the\n"
 "                         CENTRE clue sits names the whole set. Rows are 0-indexed\n"
@@ -4878,7 +4800,6 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     printf(" --beam_width %u --stop_row %u", g_beam_width, g_stop_row);
     if (g_backtrack_row) printf(" --backtrack_row %u --extend_nodes %u", g_backtrack_row, g_extend_nodes);
     if (g_bt_min_col)    printf(" --backtrack_min_col %u", g_bt_min_col);
-    if (g_col_check_set) printf(" --min_col_check %d", g_col_check);
     if (g_backtrack_row && !g_top_dedup) printf(" --no_top_dedup");
     if (g_free_top_clue) printf(" --free_top_clue");
     if (g_prefix[0])     printf(" --prefix %s", g_prefix);
@@ -5134,12 +5055,6 @@ int main(int argc, char *argv[]) {
                 fatal("--backtrack_min_col expects an integer in 0..%d, got '%s'", EDGE_LEN, argv[i]);
             g_bt_min_col = (uint32_t)v; g_min_col_set = true;
         }
-        else if (!strcmp(argv[i], "--min_col_check") && i+1 < argc) {
-            char *end; long v = strtol(argv[++i], &end, 10);
-            if (*end || v < 0 || v > STRIP_WMAX)
-                fatal("--min_col_check expects a width in 0..%d, got '%s'", STRIP_WMAX, argv[i]);
-            g_col_check = (int)v; g_col_check_set = true;
-        }
         else if (!strcmp(argv[i], "--free_top_clue"))             g_free_top_clue = true;
         else if (!strcmp(argv[i], "--no_top_dedup"))              g_top_dedup = false;
         else if (!strcmp(argv[i], "--prefix")) {
@@ -5294,14 +5209,7 @@ int main(int argc, char *argv[]) {
             fatal("--free_top_clue acts in the extension above the stop row: it needs "
                   "--backtrack_row N and --extend_nodes > 0");
     }
-    if (g_col_check_set) {
-        if (!g_bt_min_col)
-            fatal("--min_col_check tests what --backtrack_min_col asks for: add --backtrack_min_col K");
-        if (g_col_check > (int)g_bt_min_col)
-            fatal("--min_col_check %d is wider than --backtrack_min_col %u", g_col_check, g_bt_min_col);
-    } else {
-        g_col_check = (int)g_bt_min_col < STRIP_W_DEFAULT ? (int)g_bt_min_col : STRIP_W_DEFAULT;
-    }
+    g_col_check = g_bt_min_col > 0;
     if (g_emit_score < 0 || g_emit_score > 480) fatal("--emit_score must be in 0..480");
     if (g_end_polish >= 0 && !g_end_dive)
         fprintf(stderr, "[warn] --end_polish has no effect without --end_dive\n");
@@ -5398,14 +5306,15 @@ int main(int argc, char *argv[]) {
                g_extend_nodes, g_stop_row, g_stop_row + 1, g_extend_nodes);
     if (g_bt_min_col)
         printf("[cfg] backtrack_min_col=%u (only boards whose extension fills columns 1..%u "
-               "of rows %u..14 are written) min_col_check=%d\n", g_bt_min_col, g_bt_min_col,
-               g_stop_row + 1, g_col_check);
+               "of rows %u..14 are written; a partial row whose column 1 cannot reach row 14 is "
+               "cut)\n", g_bt_min_col, g_bt_min_col, g_stop_row + 1);
     if (g_backtrack_row)
         printf("[cfg] top_dedup=%s\n", g_top_dedup
                ? "on (a stop-row board within one top-row cell of the previous one, its "
                  "columns 1..K the same, is dropped before its extension)" : "off");
     if (g_free_top_clue)
-        printf("[cfg] free_top_clue=1 (the extension may place the row-13 clues on any cell)\n");
+        printf("[cfg] free_top_clue=1 (the extension may place the top-left row-13 clue on any "
+               "cell; the top-right one is left for the dives)\n");
     if (g_random_edges && g_backtrack_row && g_extend_nodes)
         printf("[cfg] random edges: the extension chooses column 0 above row %u\n", g_stop_row);
     if (g_prefix[0])
@@ -5482,9 +5391,6 @@ int main(int argc, char *argv[]) {
     clue_dump_schedule();
     ext_fix_init();
     if (g_random_edges) g_edge_left_n = edge_left_pool(&g_edge_left);
-    for (int x = 0; x < NUM_PIECES; x++)
-        if (g_ext_fix[0][x] == -2 && x % PUZZLE_SIDE < g_strip_blind_col)
-            g_strip_blind_col = x % PUZZLE_SIDE;
 
     /* Clue pieces leave the DATABASE, so no chain can hold one and the search
        never rejects a chain for colliding with a clue.

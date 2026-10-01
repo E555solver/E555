@@ -494,16 +494,21 @@ row-13 clue pieces at their cells, so later stages build around them (unless
 
 **`--free_top_clue`** (with `--clue_corners` and `--backtrack_row`): the
 row-13 clues pin two cells the column-major extension (5.10) must fill, and the
-colours of the cells around them. With this flag the extension treats their
-two cells as ordinary cells and may place the two clue pieces on any cell above
-the stop row, in any rotation; rows up to the stop row still hold them in
-reserve. On border row 1, stop row 10, `--backtrack_min_col 1`, it took the
-written boards from 4 to 12: the column-1 cell beside (13,2) no longer has to
-match the clue. A clue the
-extension did not place goes on its home cell only if that cell is empty and it
-matches every placed neighbour; otherwise it is left unplaced for the dives and
-the tail. Corner-seeded dive copies (5.11) find a board's clue frame from its
-(13,2) clue, so a board whose clue is not home gets none.
+colours of the cells around them. With this flag the extension treats both
+cells as ordinary cells, and:
+
+- the **top-left** clue (13,2) is free: the extension may place it on any cell
+  above the stop row, in any rotation. If it does not, the clue goes on its
+  home cell only if that cell is empty and it matches every placed neighbour;
+  otherwise it is left unplaced for the dives and the tail;
+- the **top-right** clue (13,13) stays held through the extension, so it never
+  lands in the left columns, and is then left off the board: the dives place it
+  among the open cells, which the column-major extension leaves in the
+  top-right corner, on its own cell or not.
+
+Rows up to the stop row hold both clues in reserve. Corner-seeded dive copies
+(5.11) find a board's clue frame from its (13,2) clue, so a board whose
+top-left clue is not home gets none.
 
 ### 5.8 What a stop-row board carries
 
@@ -590,73 +595,62 @@ cell of unknown orientation).
   before columns 2..14. An edge placed in column 0 leaves the top-border pool.
   "Whole columns" still count from column 1.
 
-**The min-col check** (`--min_col_check W`, default 1, 0 = off). With
-`--backtrack_min_col K` most stop-row boards are found only to fail the
-extension. A board can be written only if columns 1..K fill rows S+1..14, and
-the row-major search fills every column of the rows below, so from a partial
-board at row r the strip of columns 1..W (W <= K) must still stack up to row
-14. The search checks that on a relaxed problem whose every constraint a
-written board meets too:
+**The column check** (always on with `--backtrack_min_col K >= 1`). Most
+stop-row boards are otherwise found only to fail the extension. A board can be
+written only if its column 1 runs whole up to row 14, and the row-major search
+fills every column of the rows up to S, so each time a row's column-1 piece is
+placed (rows N+1..S), the search looks for one way to stack column 1 from the
+next row to row 14, as the board will have to build it:
 
-- kept: the left column's colours (under `--random_edges`, column 0 above S
-  chosen from the edge pool); the colour chain up from row r's tops; row 14's
-  tops, as a multiset, within the top-border pool; the extension's clue cells
-  and the colour a clue cell just right of the strip wants; pieces distinct
-  within one strip row;
-- dropped: distinctness between strip rows (a piece may be reused); pins and
-  everything right of column W on rows <= S; what right edges and column-0
-  edges take from the top-border pool.
+- each piece fits the left column's colour beside it and the top of the piece
+  below; no piece is used twice, and none the board already holds (the pieces
+  the extension may release, 5.7 and below, count as free);
+- under `--random_edges`, column 0 above the stop row is chosen too, as the
+  extension does: a frame-left edge on the column-0 top below, its inner colour
+  the left colour of column 1; rows up to S keep the sampled column;
+- row 14's top must be a colour the top-border pool still carries, the stack's
+  column-0 edges taken out of the pool;
+- the column-1 cell next to a clue cell the extension will fill shows the clue
+  the colour it needs.
 
-Available pieces are those unused at the check plus those the extension may
-release (a superset of what is free at the stop row), so a board the extension
-would keep always passes: **the written boards are exactly those of
-`--min_col_check 0`**; found boards, nodes and time drop. Widths 1..W are
-checked in turn as columns 1..W of a row are placed (rows N+1..S): a strip dead
-at a narrow width is dead at every wider one, so the costly wide checks see
-only what the cheap narrow ones let through. At the stop row, each of columns
-1..K must also leave a top some available piece can sit on (with the left
-column's colour in column 1, a clue cell's colours around it, a border colour
-on row 14).
+Nothing else is asked, so every board the extension would keep has such a
+stack: **the written boards are exactly those written without the check**,
+while fewer boards are found, sooner. At the stop row, each of columns 2..K
+must also leave a top some available piece can sit on (a clue cell's colours
+around it, a border colour on row 14).
 
-Dropping distinctness between rows makes a state's future depend only on
-(row, column-0 top, the W tops) and the available pieces, so a strip is
-refuted in at most its distinct states and the first path to row 14 ends the
-search. A state dead for some pieces stays dead for fewer, and every node below
-a check has fewer, so dead states are remembered per thread while the search
-stays below the check that found them, and forgotten at the hand-off rows so
-that no decision depends on the thread count; a path found proves its states
-live again while none of its pieces is used. A check that exceeds its step
-budget (50,000) cuts nothing.
+The search keeps two caches. A state (row, column-0 top, column-1 top) that
+failed with some pieces taken fails with any more taken, so a dead state is
+stored with the pieces taken then and recognised whenever all of them are
+taken again; a stack found is stored with its pieces and stands again while
+none of them is taken and its row-14 top is still in the pool. Both are emptied
+at the start of every job and at the hand-off rows, so no answer depends on the
+thread count. A check past 50,000 steps answers "unknown" and cuts nothing.
 
-Measured, 4 threads, `data/borders_annealed_fix12.csv` row 0, `--backtrack_row
-6`, `--no_top_dedup`, one configuration (backtrack time, nodes, boards found
-at the stop row, boards written):
+Measured, `data/borders_annealed_fix12.csv` row 0, `--backtrack_row 6`,
+`--no_top_dedup` (backtrack time, nodes, boards found at the stop row, boards
+written); "no check" and "reuse" are the earlier builds' no-check run and a
+check that let pieces repeat between rows:
 
-| stop row, K | W | backtrack s | nodes | found | written |
+| stop row, K, threads | check | backtrack s | nodes | found | written |
 |---|---|---|---|---|---|
-| 9, 5 | off | 2.07 | 341 M | 1,170,357 | 55 |
-| 9, 5 | **1** | **1.22** | 151 M | 387,105 | 55 |
-| 9, 5 | 2 | 1.41 | 94 M | 163,685 | 55 |
-| 9, 5 | 3 | 2.30 | 67 M | 79,777 | 55 |
-| 9, 5 | 5 | 32.1 | 42 M | 19,843 | 55 |
-| 10, 5 | off | 4.22 | 743 M | 35,049 | 0 |
-| 10, 5 | **1** | **2.53** | 334 M | 7,683 | 0 |
-| 10, 5 | 2 | 2.77 | 210 M | 1,941 | 0 |
+| 9, 5, 4 | none | 2.02 | 341 M | 1,170,357 | 55 |
+| 9, 5, 4 | reuse | 1.26 | 151 M | 387,105 | 55 |
+| 9, 5, 4 | **exact** | **1.15** | 140 M | 354,622 | 55 |
+| 10, 5, 4 | none | 4.29 | 740 M | 34,570 | 0 |
+| 10, 5, 4 | **exact** | **2.23** | 309 M | 7,390 | 0 |
+| 10, 2, 1 (2 configurations) | none | 33.2 | 1504 M | 70,352 | 823 |
+| 10, 2, 1 (2 configurations) | reuse | 20.2 | 699 M | 16,901 | 823 |
+| 10, 2, 1 (2 configurations) | **exact** | **18.0** | 650 M | 15,603 | 823 |
 
-On two configurations at stop row 10 with K = 2, width 1 took 5.24 s against
-8.71 s, and at one thread (where the beam repeats exactly) wrote the same 823
-boards as `--min_col_check 0`, byte for byte, from 16,901 found boards instead
-of 70,352. A wider strip cuts many more partial boards, but each check costs
-more (about 6 steps at width 1, 30 at width 2, hundreds at width 5) and the
-backtracker passes 10-60 million column ends per configuration: width 1 is the
-default, width 2 is close. Two variants were measured and dropped (on an
-earlier build, both arms alike): building width-5 strip rows from the chain
-database's segment-A records instead of piece by piece -- the database holds
-every legal 5-chain -- took 46.5 s against 21.8 s at an equal step budget, with
-five times the undecided checks, because a cell's records are scanned whole and
-deep in the board most hold a used piece; and re-testing a row's strip before
-its right edge, once the row's other pieces are placed, cost more than it cut
-(7.5 s against 5.6 s): the next row's check catches the same boards.
+The written boards were byte for byte the same in every row. Under
+`--random_edges` (two bottoms, stop row 10, K = 2) the check cut little --
+6,597 boards found instead of 6,649 without, the same 4,746 written -- because
+a free column 0 above the stop row lets almost any column 1 reach row 14; its
+cost there is small (0.34 s against 0.28 s). Earlier builds also tried wider
+strips (columns 1..W, W up to 5): they cut more boards but cost more than they
+saved, and building strip rows from the chain database's records was slower
+still; re-testing a row before its right edge cost more than it cut.
 
 Growing by columns keeps many more boards alive than growing whole rows (it
 does not have to chain the right-edge pieces): above row 9, 140 of 1.23 M boards
@@ -888,7 +882,7 @@ pins the row under it too). `emitted` is the configuration's unique boards,
 [sum] extinct: r8:20 r9:41 r10:22
 [sum] backtrack: 1.23G nodes, 180 M/s; r9:5120 r10:880 r11:12345
 [sum] extension: mean 5.40 cols, max 9
-[sum] min_col 5: column check (W=5) cut 3.4M partial rows
+[sum] min_col 5: column check cut 3.4M partial rows
 [sum] corners: TL 61%, TR 55%, both 40%, pair 31%
 [sum] reserve: 12.0 of 26 TOP pieces free
 [sum] boards: found 12345, near-dups 2345, repeats 12, below min_col 9000, dived 988
@@ -934,8 +928,7 @@ boards or roots they write the same file at any thread count.
 | `--stop_row R` | 11 | last row filled, 1..13 |
 | `--backtrack_row N` | off | exhaustive search from row N (5.9) |
 | `--extend_nodes N` | 100000 | column-major extension budget per board; 0 = off (5.10) |
-| `--backtrack_min_col K` | 0 | write only boards whose extension fills K columns |
-| `--min_col_check W` | 1 with K; 0 = off | cut partial rows whose columns 1..W can no longer reach row 14 (5.10); written boards unchanged |
+| `--backtrack_min_col K` | 0 | write only boards whose extension fills K columns; cuts partial rows whose column 1 cannot reach row 14 (5.10) |
 | `--no_top_dedup` | -- | keep top-row near duplicates (5.9) |
 | `--beam_expand E`, `--beam_expand_row R` | 4, 7 | late width multiplier and its row |
 | `--lambda_J F` | 1.0 | closure weight |
@@ -943,7 +936,7 @@ boards or roots they write the same file at any thread count.
 | `--lambda_corners [F]` | off; bare 0.5 | top-corner supply (5.12) |
 | `--lambda_reserve F` | 0 | double-decker TOP reserve penalty (5.12) |
 | `--clue_center`, `--clue_corners` | off | clues (5.7) |
-| `--free_top_clue` | off | the extension may place the row-13 clues anywhere (5.7) |
+| `--free_top_clue` | off | the extension may place the top-left row-13 clue anywhere; the top-right one is left for the dives (5.7) |
 | `--pin_clue N` | 0 | one centre-clue frame, 1..4; implies `--clue_center` |
 | `--end_dive [M]` | off; bare 10000 | finish every stop-row board (5.11) |
 | `--end_polish R` | off | polish plus R kick rounds |
