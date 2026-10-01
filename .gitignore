@@ -2,7 +2,6 @@
 bin/
 *.x
 *.o
-CLAUDE.md
 
 # Solver run products
 beam_out/
