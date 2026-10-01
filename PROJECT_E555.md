@@ -1793,14 +1793,16 @@ make                  # bin/E555_beamer, E555_finalizer, E555_roundhouse, E555_b
 make ARCH=v3          # x86-64-v3 (AVX2): one binary for a mixed cluster
 make ARCH=generic     # CI, containers, cloud sandboxes
 pip install ortools   # topper and ender only
-bash tests/run_tests.sh                       # the release gate
-ARCH=generic SKIP_BEAMER=1 bash tests/run_tests.sh   # without the 6.4 GB database
+bash tests/run_tests.sh                       # the core checks (~20 s)
+bash tests/run_tests.sh beamer                # the checks of one tool (see --list for tags)
+bash tests/run_tests.sh --all                 # the release gate
+ARCH=generic SKIP_BEAMER=1 bash tests/run_tests.sh --all   # without the 6.4 GB database
 ```
 
 `make` compiles for the build machine (`-march=native`); such a binary dies with
 `Illegal instruction` on an older CPU. Changing `ARCH`/`OPT`/`CC` forces a
-rebuild. The gate includes the synthetic regression: the finalizer and the
-roundhouse must rediscover `data/synth_solution_480.csv` from
+rebuild. The core checks include the synthetic regression: the finalizer and
+the roundhouse must rediscover `data/synth_solution_480.csv` from
 `data/synth_seed.txt`.
 
 ## 13. Source files

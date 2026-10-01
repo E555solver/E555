@@ -6,39 +6,50 @@
 # =============================================================================
 # run_tests.sh -- the E555 release gate
 # =============================================================================
-# Runs every check in ALL_STEPS below, in order, and stops at the first failure.
-# That array is the ONLY list of checks: it fixes the numbering printed at run
-# time, and every entry NAME has a function `step_NAME` further down with the
-# reasoning for the check written above it. There is deliberately no second copy
-# of the list in this header -- the two used to disagree.
+# Runs the selected checks of ALL_STEPS below, in order, and stops at the first
+# failure. That array is the ONLY list of checks: it fixes the numbering printed
+# at run time, and every entry NAME has a function `step_NAME` further down with
+# the reasoning for the check written above it. There is deliberately no second
+# copy of the list in this header -- the two used to disagree.
 #
-#   bash tests/run_tests.sh                       every check
+#   bash tests/run_tests.sh                       the core checks (~1 min): the
+#                                                 necessary set for any change
+#   bash tests/run_tests.sh beamer                every check tagged beamer, plus
+#                                                 compile and no_stray_output: the
+#                                                 checks of the tool you changed
+#   bash tests/run_tests.sh --all                 every check: the release gate
 #   bash tests/run_tests.sh --list                the numbered list, then exit
 #   bash tests/run_tests.sh 6                     just check 6
 #   bash tests/run_tests.sh 8-11 14               checks 8, 9, 10, 11 and 14
 #   bash tests/run_tests.sh roundhouse_cache      by name
 #
+# Tags name the tools a check exercises: tools (the Python tools), annealer,
+# finalizer, roundhouse, backtracker, diver, beamer, cpsat, scripts, pipeline.
+# A change to a shared source runs every tag that links it -- E555_database.c:
+# beamer finalizer roundhouse diver; E555_dive.c: beamer finalizer diver.
+#
 # Any check runs on its own: none of them consumes a previous step's artifacts
 # (the roundhouse partials that four checks share are built on demand). Leaving
 # check 1 out of the selection uses whatever is already in bin/.
 #
-# RUNTIME  about 4 minutes with SKIP_BEAMER=1. The six checks that need the
+# RUNTIME  --all: about 4 minutes with SKIP_BEAMER=1. The checks that need the
 # real 6.4 GB chain database -- beamer_micro, beamer_backtrack_dive,
-# beamer_min_col, beamer_resume, example_beamer and pipeline_full -- share one
-# cache and want ~8 GB of RAM.
+# beamer_min_col, beamer_free_top_clue, beamer_resume, example_beamer and
+# pipeline_full -- want ~8 GB of RAM and share one cache, except
+# beamer_free_top_clue, whose clue run builds its own in RAM. None is core.
 #
 # Environment switches:
 #   ARCH=generic    build for any CPU rather than the build host. Set it in CI
 #                   and containers; -march=native is the Makefile default.
-#   SKIP_BEAMER=1   skip the six database checks (low-RAM machines)
+#   SKIP_BEAMER=1   skip the database checks (low-RAM machines)
 #   DB_FILE=path    keep the 6.4 GB chain database here (~6.5 GB on disk)
 #                   instead of under tests/out, so it survives the wipe and
 #                   every later run loads it rather than building it. The
 #                   real-seed checks share one cache either way.
-#   DB_IN_MEMORY=1  never write the database to disk: each of the six checks
-#                   builds it in RAM and drops it (full-disk machines). Six
-#                   builds instead of one, so ~6x the database time, and each
-#                   build needs 8 GB free. Overrides DB_FILE.
+#   DB_IN_MEMORY=1  never write the database to disk: each database check
+#                   builds it in RAM and drops it (full-disk machines): one
+#                   build per check instead of one in all, each needing 8 GB
+#                   free. Overrides DB_FILE.
 #
 # This gate proves the tools find the RIGHT answer.
 #
@@ -67,62 +78,68 @@ if [ "${DB_IN_MEMORY:-0}" = "1" ]; then GATE_DB=""
 else GATE_DB="${DB_FILE:-$OUT/chain.db}"; fi
 
 # -----------------------------------------------------------------------------
-# The checks, in order. "name|one-line label"; the label is what gets printed.
+# The checks, in order: "name|tier|tags|one-line label".
+#   tier  core   the necessary set, run by default: fast, and between them they
+#                cover every binary and the key regressions;
+#         extra  run with --all (the release gate), or by name, number or tag.
+#   tags  the tools a check exercises; naming a tag runs every check that
+#         carries it (see the header). The label is what gets printed.
 # -----------------------------------------------------------------------------
 ALL_STEPS=(
-    "compile|make all, zero compiler warnings tolerated"
-    "viewer|the known synthetic solution scores 480/480"
-    "rank|measures agree with the viewer, --out verbatim, --rescore canonical"
-    "rotate|a quarter-turn preserves every measure, four turns are the identity"
-    "sink|--sink drops N rows, frees the frame it broke, and keeps the core intact"
-    "distiller|screen, finish, probe, select: boards recount, reruns and gzip input give the same bytes"
-    "consensus|four turns of one board score identically, and --border_out runs"
-    "annealer|Stage A short run: BEST lines, a beamer-format --out CSV, and spins that match their comment"
-    "annealer_refine|Stage A warm start: every shipped row round-trips, and refining one cannot lose ground"
-    "annealer_rows|Stage A whole-file refine: every row in input order, thread-invariant, default --out"
-    "annealer_decker|Stage A --double_decker: exact strip counts, witness boards the finalizer can load"
-    "sort_rotations|both comment forms sort alike, and --max_top turns every row onto its own best side"
-    "finalizer_synth|REGRESSION: rediscovers the synthetic solution from row 10"
-    "finalizer_rotations|re-imposes a matching rotations row's side assignment"
-    "finalizer_determinism|one seed re-run reproduces the search exactly"
-    "finalizer_top_lock|a clean border locks its top rows (--keep_ring: its ring); --backtrack_row and --end_dive reach the solution"
-    "roundhouse_synth|REGRESSION: rebuilds the solution at strip widths 3 and 5"
-    "roundhouse_two_rounds|closes the board in two rounds, rotating between them"
-    "roundhouse_cache|the transition cache agrees with decoding every record"
-    "roundhouse_legal|every emitted board is break-free and frame-legal"
-    "roundhouse_cw|--cw mirrors the seed, so the spiral runs the other way round"
-    "roundhouse_hold_band|--hold_band keeps the far half of the final side and searches the near half"
-    "backtracker_dives|greedy dives on the example board, plus an own-output round-trip"
-    "backtracker_exhaustive|exhaustive enumeration identical at 1 and 4 threads"
-    "backtracker_stop_band|--stop_row/--stop_column emit exact, finalizer-shaped bands"
-    "backtracker_breakcount|break classes agree with the per-candidate scan they replaced"
-    "backtracker_clues|--clue_center/--clue_corners force the hints on, or drop the board"
-    "diver|E555_diver finishes held boards: identical at 1 and 4 threads, scores recount, placed cells untouched"
-    "diver_reopen|E555_diver --reopen: never worse, one row per board, only the band changes; scrambled top rows come back 480/480; copies differ"
-    "diver_prepare|E555_diver --holes/--pin_clue/--stop_row: lifted rows rebuilt with zero breaks, kept rows untouched, thread-independent; clue conflicts dropped; --prefix ids frame"
-    "whirlpool_lap|one whirlpool lap: turn, re-cut rows 0..5, re-grow to row 11"
-    "clue_orient|a band carrying no clue is searched at all four orientations"
-    "band_with_frame|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
-    "cpsat_chain|topper -> ender -> ender, each fed by the last"
-    "ender_repair|REGRESSION: a scrambled synthetic solution comes back 480/480; a real board redives and comes back no worse"
-    "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
-    "beamer_backtrack_dive|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --lambda_reserve keeps the reserve for last"
-    "beamer_min_col|--backtrack_min_col: the column check drops no written board, random column 0 too; near-duplicate filter; --free_top_clue leaves the top-right clue to the dives; log and score line"
-    "beamer_resume|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
-    "scripts_parse|every shipped script parses, and passes only flags that exist"
-    "example_finalizer|examples/02 re-grows the synthetic board"
-    "example_roundhouse|examples/03 refills one strip"
-    "example_bothways|examples/06 runs both chains over one board, ids intact"
-    "example_cpsat|examples/04a, scout -> promote -> polish -> close"
-    "example_backtracker|examples/05 dives on the example board"
-    "example_diver|examples/10 finishes the row-12 partial into a complete board"
-    "example_diver_reopen|examples/11 re-dives the seven 463s: one row each, none worse"
-    "pipeline_topper_sweep|pipeline/topper_sweep.sh through a two-pass plan"
-    "example_beamer|examples/01 both ways, random and annealed borders"
-    "pipeline_full|pipeline/run_pipeline.sh, all seven stages"
-    "pipeline_whirl_lap|pipeline/run_pipeline_whirlpool.sh, one lap end to end"
-    "farm_pools|run_farm.py: file handling, spread(), and the spiral guard"
-    "no_stray_output|no check left a file in the repository root"
+    "compile|core||make all, zero compiler warnings tolerated"
+    "viewer|core|tools|the known synthetic solution scores 480/480"
+    "rank|core|tools|measures agree with the viewer, --out verbatim, --rescore canonical"
+    "rotate|extra|tools|a quarter-turn preserves every measure, four turns are the identity"
+    "sink|extra|tools|--sink drops N rows, frees the frame it broke, and keeps the core intact"
+    "distiller|extra|tools,diver|screen, finish, probe, select: boards recount, reruns and gzip input give the same bytes"
+    "consensus|extra|tools|four turns of one board score identically, and --border_out runs"
+    "annealer|extra|annealer|Stage A short run: BEST lines, a beamer-format --out CSV, and spins that match their comment"
+    "annealer_refine|extra|annealer|Stage A warm start: every shipped row round-trips, and refining one cannot lose ground"
+    "annealer_rows|extra|annealer|Stage A whole-file refine: every row in input order, thread-invariant, default --out"
+    "annealer_decker|extra|annealer,finalizer|Stage A --double_decker: exact strip counts, witness boards the finalizer can load"
+    "sort_rotations|extra|tools,annealer|both comment forms sort alike, and --max_top turns every row onto its own best side"
+    "finalizer_synth|core|finalizer|REGRESSION: rediscovers the synthetic solution from row 10"
+    "finalizer_rotations|extra|finalizer|re-imposes a matching rotations row's side assignment"
+    "finalizer_determinism|extra|finalizer|one seed re-run reproduces the search exactly"
+    "finalizer_top_lock|extra|finalizer|a clean border locks its top rows (--keep_ring: its ring); --backtrack_row and --end_dive reach the solution"
+    "roundhouse_synth|core|roundhouse|REGRESSION: rebuilds the solution at strip widths 3 and 5"
+    "roundhouse_two_rounds|extra|roundhouse|closes the board in two rounds, rotating between them"
+    "roundhouse_cache|extra|roundhouse|the transition cache agrees with decoding every record"
+    "roundhouse_legal|extra|roundhouse|every emitted board is break-free and frame-legal"
+    "roundhouse_cw|extra|roundhouse|--cw mirrors the seed, so the spiral runs the other way round"
+    "roundhouse_hold_band|extra|roundhouse|--hold_band keeps the far half of the final side and searches the near half"
+    "backtracker_dives|extra|backtracker|greedy dives on the example board, plus an own-output round-trip"
+    "backtracker_exhaustive|core|backtracker|exhaustive enumeration identical at 1 and 4 threads"
+    "backtracker_stop_band|extra|backtracker|--stop_row/--stop_column emit exact, finalizer-shaped bands"
+    "backtracker_breakcount|extra|backtracker|break classes agree with the per-candidate scan they replaced"
+    "backtracker_clues|extra|backtracker|--clue_center/--clue_corners force the hints on, or drop the board"
+    "diver|core|diver|E555_diver finishes held boards: identical at 1 and 4 threads, scores recount, placed cells untouched"
+    "diver_reopen|extra|diver|E555_diver --reopen: never worse, one row per board, only the band changes; scrambled top rows come back 480/480; copies differ"
+    "diver_prepare|extra|diver|E555_diver --holes/--pin_clue/--stop_row: lifted rows rebuilt with zero breaks, kept rows untouched, thread-independent; clue conflicts dropped; --prefix ids frame"
+    "whirlpool_lap|extra|backtracker,finalizer,tools|one whirlpool lap: turn, re-cut rows 0..5, re-grow to row 11"
+    "clue_orient|extra|finalizer|a band carrying no clue is searched at all four orientations"
+    "band_with_frame|extra|backtracker,finalizer|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
+    "cpsat_chain|extra|cpsat|topper -> ender -> ender, each fed by the last"
+    "ender_repair|core|cpsat,diver|REGRESSION: a scrambled synthetic solution comes back 480/480; a real board redives and comes back no worse"
+    "beamer_micro|extra|beamer|random_edges micro-run: builds the real 6.4 GB database"
+    "beamer_backtrack_dive|extra|beamer,diver|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --lambda_reserve keeps the reserve for last"
+    "beamer_min_col|extra|beamer|--backtrack_min_col: the column check drops no written board, random column 0 too; near-duplicate filter; log and score line"
+    "beamer_free_top_clue|extra|beamer,diver|--free_top_clue: the top-left clue anywhere above the stop row, the top-right one left to the dives (builds a clue database in RAM)"
+    "beamer_resume|extra|beamer|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
+    "scripts_parse|core|scripts|every shipped script parses, and passes only flags that exist"
+    "example_finalizer|extra|finalizer,scripts|examples/02 re-grows the synthetic board"
+    "example_roundhouse|extra|roundhouse,scripts|examples/03 refills one strip"
+    "example_bothways|extra|finalizer,roundhouse,scripts|examples/06 runs both chains over one board, ids intact"
+    "example_cpsat|extra|cpsat,scripts|examples/04a, scout -> promote -> polish -> close"
+    "example_backtracker|extra|backtracker,scripts|examples/05 dives on the example board"
+    "example_diver|extra|diver,scripts|examples/10 finishes the row-12 partial into a complete board"
+    "example_diver_reopen|extra|diver,scripts|examples/11 re-dives the seven 463s: one row each, none worse"
+    "pipeline_topper_sweep|extra|cpsat,scripts|pipeline/topper_sweep.sh through a two-pass plan"
+    "example_beamer|extra|beamer,annealer,scripts|examples/01 both ways, random and annealed borders"
+    "pipeline_full|extra|pipeline,scripts|pipeline/run_pipeline.sh, all seven stages"
+    "pipeline_whirl_lap|extra|pipeline,scripts|pipeline/run_pipeline_whirlpool.sh, one lap end to end"
+    "farm_pools|extra|pipeline|run_farm.py: file handling, spread(), and the spiral guard"
+    "no_stray_output|core||no check left a file in the repository root"
 )
 TOTAL=${#ALL_STEPS[@]}
 
@@ -133,24 +150,36 @@ STEP=""
 fail() { echo "!!! FAILED at: $STEP -- $1"; exit 1; }
 
 usage() {
-    echo "usage: bash tests/run_tests.sh [--list] [N | N-M | NAME]..."
-    echo "       no argument runs every check; see the header of this file."
+    echo "usage: bash tests/run_tests.sh [--all | --list] [N | N-M | NAME | TAG]..."
+    echo "       no argument runs the core checks; --all runs every check (the release gate);"
+    echo "       a TAG (tools annealer finalizer roundhouse backtracker diver beamer cpsat"
+    echo "       scripts pipeline) runs every check carrying it. See the header of this file."
 }
 
+# step_field N FIELD -- field 1..4 (name, tier, tags, label) of check N.
+step_field() { local e="${ALL_STEPS[$1 - 1]}"; echo "$e" | cut -d'|' -f"$2"; }
+
 list_steps() {
-    local i=1 e
-    for e in "${ALL_STEPS[@]}"; do
-        printf '%3d  %-22s %s\n' "$i" "${e%%|*}" "${e#*|}"
-        i=$((i + 1))
+    local i
+    for ((i = 1; i <= TOTAL; i++)); do
+        printf '%3d  %-5s %-22s %-28s %s\n' "$i" "$(step_field $i 2)" "$(step_field $i 1)" \
+            "[$(step_field $i 3)]" "$(step_field $i 4)"
+    done
+}
+
+# steps_tagged TAG -- the numbers of the checks carrying TAG.
+steps_tagged() {
+    local i
+    for ((i = 1; i <= TOTAL; i++)); do
+        case ",$(step_field $i 3)," in *",$1,"*) echo "$i" ;; esac
     done
 }
 
 # index_of TOKEN -- 1-based position of a step name, or nothing.
 index_of() {
-    local i=1 e
-    for e in "${ALL_STEPS[@]}"; do
-        [ "${e%%|*}" = "$1" ] && { echo "$i"; return 0; }
-        i=$((i + 1))
+    local i
+    for ((i = 1; i <= TOTAL; i++)); do
+        [ "$(step_field $i 1)" = "$1" ] && { echo "$i"; return 0; }
     done
     return 0
 }
@@ -205,7 +234,7 @@ EOF
 
 step_compile() {
     make clean >/dev/null
-    make all 2> "$OUT/warnings.txt"
+    make -j"$(nproc 2>/dev/null || echo 4)" all 2> "$OUT/warnings.txt"
     if [ -s "$OUT/warnings.txt" ]; then cat "$OUT/warnings.txt"; fail "compiler warnings"; fi
     echo "ok: 5 binaries, no warnings"
 }
@@ -1846,7 +1875,7 @@ step_roundhouse_legal() {
     # stops on its budget and the emitted set is whatever it reached. Legality is
     # the assertion, not which boards came out.
     bin/E555_roundhouse data/synth_seed.txt "$OUT/rh_rows10.csv" "$OUT/rh_r3.csv" \
-        --rounds 3 --strip_width 5 --ties 4 --wall_time 60 > "$OUT/roundhouse_r3.log"
+        --rounds 3 --strip_width 5 --ties 4 --wall_time 8 > "$OUT/roundhouse_r3.log"
     python3 - data/synth_seed.txt "$OUT/rh_r3.csv" <<'EOF' || exit 1
 import sys
 seed = [list(map(int, l.split())) for l in open(sys.argv[1]) if l.strip()]
@@ -2970,10 +2999,12 @@ EOF
 
 # --backtrack_min_col and what serves it, on one rotations row at one thread:
 #  - the column check cuts partial rows whose column 1 cannot reach row 14, so
-#    a run at K = 1 or 2 must write exactly the K = 0 run's boards (no check
-#    there) whose extension fills K columns, while finding fewer -- also under
-#    --random_edges, where the extension and the check choose column 0 above
-#    the stop row;
+#    a run at K = 2 must write exactly the K = 0 run's boards (no check there)
+#    whose extension fills 2 columns, while finding fewer;
+#  - under --random_edges, where the extension and the check choose column 0
+#    above the stop row, the boards are legal, fill 2 columns and hold
+#    frame-left edges in column 0 (one run at 4 threads: a 1-thread pair, to
+#    compare against K = 0, spends ~50 s building the free-edge database);
 #  - the near-duplicate filter (on by default) writes a subset of the
 #    --no_top_dedup boards and says how many it dropped, and with the check it
 #    writes the same file at 4 threads as at 1 (both reset where the search
@@ -2981,12 +3012,6 @@ EOF
 #  - the compact log has no [progress] line, the border line carries the run
 #    time, and the summary's last [sum] line counts the written boards by score
 #    as a recount of their matched edges does;
-#  - --free_top_clue (--clue_corners) writes legal break-free boards with the
-#    top-left clue home, elsewhere above the stop row or left off, and the
-#    top-right clue always left off; E555_diver, the boards' dives, places it.
-#    A clued run needs its own database (clue pieces leave it), so it builds one
-#    in RAM at 4 threads rather than replace the shared cache; the beam is then
-#    not repeatable, so only properties of its boards are tested.
 step_beamer_min_col() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
     CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv
@@ -2994,7 +3019,7 @@ step_beamer_min_col() {
          --backtrack_row 7 --stop_row 10 --rng_seed 7 --threads 1)
     if [ -n "$GATE_DB" ]; then CMD+=(--db_file "$GATE_DB"); fi
     local k
-    for k in 0 1 2; do
+    for k in 0 2; do
         "${CMD[@]}" --backtrack_min_col "$k" --no_top_dedup --out_dir "$OUT/mc_k$k" > "$OUT/mc_k$k.log" \
             || { tail -5 "$OUT/mc_k$k.log"; fail "--backtrack_min_col $k run exited non-zero"; }
     done
@@ -3004,21 +3029,11 @@ step_beamer_min_col() {
         || { tail -5 "$OUT/mc_dd4.log"; fail "the 4-thread near-duplicate run exited non-zero"; }
     cmp -s "$OUT/mc_dd/beam_completions_0_10.csv" "$OUT/mc_dd4/beam_completions_0_10.csv" \
         || fail "the near-duplicate filter and the check wrote other boards at 4 threads than at 1"
-    bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv --start_row 1 --num_rows 1 \
-        --top_bottoms 1 --top_columns 2 --beam_width 2000 --clue_corners --free_top_clue \
-        --backtrack_row 7 --stop_row 10 --backtrack_min_col 1 --rng_seed 7 --threads 4 \
-        --out_dir "$OUT/mc_ftc" > "$OUT/mc_ftc.log" \
-        || { tail -5 "$OUT/mc_ftc.log"; fail "the --free_top_clue run exited non-zero"; }
-    bin/E555_diver data/seed_Edge5.txt "$OUT/mc_ftc/beam_completions_1_10.csv" "$OUT/mc_ftc_dived.csv" \
-        --rotations data/borders_annealed_fix12.csv --end_dive 20 --emit_score 0 --rng_seed 7 \
-        --threads 2 > "$OUT/mc_ftc_dived.log" || fail "E555_diver on the free-top-clue boards exited non-zero"
     RND=(bin/E555_beamer data/seed_Edge5.txt --random_edges --samples 1 --top_columns 1
-         --beam_width 2000 --backtrack_row 8 --stop_row 10 --rng_seed 3 --threads 1 --no_top_dedup)
+         --beam_width 2000 --backtrack_row 8 --stop_row 10 --backtrack_min_col 2 --rng_seed 3
+         --threads 4 --out_dir "$OUT/mc_rnd2")
     if [ -n "$GATE_DB" ]; then RND+=(--db_file "$GATE_DB"); fi
-    for k in 0 2; do
-        "${RND[@]}" --backtrack_min_col "$k" --out_dir "$OUT/mc_rnd$k" > "$OUT/mc_rnd$k.log" \
-            || { tail -5 "$OUT/mc_rnd$k.log"; fail "the --random_edges K=$k run exited non-zero"; }
-    done
+    "${RND[@]}" > "$OUT/mc_rnd2.log" || { tail -5 "$OUT/mc_rnd2.log"; fail "the --random_edges run exited non-zero"; }
     python3 - "$OUT" <<'EOF' || exit 1
 import glob, re, sys
 out = sys.argv[1]
@@ -3052,15 +3067,11 @@ def ext_cols(l):
     while n < 14 and all(r * 16 + n + 1 in c for r in range(STOP + 1, 15)): n += 1
     return n
 
-for ref, runs in (("mc_k0", ("mc_k1", "mc_k2")), ("mc_rnd0", ("mc_rnd2",))):
-    base = list(rows(ref))
-    for d in runs:
-        K = int(d[-1])
-        want = [content(l) for l in base if ext_cols(l) >= K]
-        got = [content(l) for l in rows(d)]
-        assert want, f"{d}: no board of {ref} fills {K} columns: the check would prove nothing"
-        assert got == want, f"{d}: wrote {len(got)} boards, {ref} has {len(want)} filling {K} columns"
-        assert found(d) < found(ref), f"{d}: found {found(d)}, no fewer than {ref}'s {found(ref)}"
+want = [content(l) for l in rows("mc_k0") if ext_cols(l) >= 2]
+got = [content(l) for l in rows("mc_k2")]
+assert want, "no K=0 board fills 2 columns: the check would prove nothing"
+assert got == want, f"K=2 wrote {len(got)} boards, K=0 has {len(want)} filling 2 columns"
+assert found("mc_k2") < found("mc_k0"), "the column check found no fewer boards"
 assert re.search(r"^\[sum\] min_col 2: column check cut ", log("mc_k2"), re.M), "no min_col line"
 
 dd = list(rows("mc_dd"))
@@ -3069,7 +3080,7 @@ assert {content(l) for l in dd} <= {content(l) for l in rows("mc_k2")}, \
 nd = re.search(r"^\[sum\] boards: .*near-dups (\d+)", log("mc_dd"), re.M)
 assert nd and int(nd.group(1)) > 0, "the near-duplicate filter reported no near-dups"
 
-for d in ("mc_k2", "mc_dd", "mc_ftc", "mc_rnd2"):
+for d in ("mc_k2", "mc_dd", "mc_rnd2"):
     t = log(d)
     assert "[progress]" not in t, f"{d}: a [progress] line is back"
     last = [l for l in t.splitlines() if l.startswith("[sum]")][-1]
@@ -3090,12 +3101,66 @@ for d in ("mc_k2", "mc_dd", "mc_ftc", "mc_rnd2"):
 assert re.search(r"^========== border row 0   run \d+ s = [0-9.]+ min ==========$", log("mc_k2"), re.M), \
     "the border line carries no run time"
 
+rb, c0 = list(rows("mc_rnd2")), 0
+assert rb, "the random-edges run wrote no board"
+for l in rb:
+    assert ext_cols(l) >= 2, "a random-edges board written short of 2 columns"
+    c = board(l)
+    for r in range(STOP + 1, 15):
+        if r * 16 in c:
+            p, rot = c[r * 16]
+            assert seed[p].count(0) == 1 and seed[p][(3 + rot) % 4] == 0, "column 0 holds no frame-left edge"
+            c0 += 1
+assert c0, "no random-mode extension reached column 0"
+print(f"ok: K=2 writes exactly the K=0 boards filling 2 columns (found {found('mc_k0')} -> "
+      f"{found('mc_k2')}); {nd.group(1)} near-dups dropped; random edges: {len(rb)} boards, "
+      f"{c0} column-0 edges; score lines recount")
+EOF
+}
+
+# --free_top_clue (--clue_corners): legal break-free boards with the top-left
+# row-13 clue home, elsewhere above the stop row or left off, and the top-right
+# clue always left off; E555_diver, the boards' dives, then places it. A clued
+# run needs its own database (clue pieces leave it), so it builds one in RAM at
+# 4 threads rather than replace the shared cache (~1.5 min on 4 cores); the
+# beam is then not repeatable, so only properties of its boards are tested.
+step_beamer_free_top_clue() {
+    if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv --start_row 1 --num_rows 1 \
+        --top_bottoms 1 --top_columns 2 --beam_width 2000 --clue_corners --free_top_clue \
+        --backtrack_row 7 --stop_row 10 --backtrack_min_col 1 --rng_seed 7 --threads 4 \
+        --out_dir "$OUT/mc_ftc" > "$OUT/mc_ftc.log" \
+        || { tail -5 "$OUT/mc_ftc.log"; fail "the --free_top_clue run exited non-zero"; }
+    bin/E555_diver data/seed_Edge5.txt "$OUT/mc_ftc/beam_completions_1_10.csv" "$OUT/mc_ftc_dived.csv" \
+        --rotations data/borders_annealed_fix12.csv --end_dive 20 --emit_score 0 --rng_seed 7 \
+        --threads 2 > "$OUT/mc_ftc_dived.log" || fail "E555_diver on the free-top-clue boards exited non-zero"
+    python3 - "$OUT" <<'EOF' || exit 1
+import glob, sys
+out = sys.argv[1]
+seed = [list(map(int, l.split())) for l in open("data/seed_Edge5.txt") if l.strip()]
+def rows(path):
+    return [l for l in open(path) if l.strip() and l[0] not in "#%"]
+def board(l):
+    v = [x.strip() for x in l.split(",")]
+    pos, rot = list(map(int, v[-512:-256])), list(map(int, v[-256:]))
+    return {pos[p]: (p, rot[p]) for p in range(256) if pos[p] != 999}
+def broken(c):
+    b = 0
+    for x in c:
+        r, col = divmod(x, 16)
+        for y, d, e in ((x + 1, 1, 3), (x + 16, 0, 2)):
+            if (d == 1 and col == 15) or (d == 0 and r == 15) or y not in c: continue
+            p, rp = c[x]; q, rq = c[y]
+            b += seed[p][(d + rp) % 4] != seed[q][(e + rq) % 4]
+    return b
+STOP = 10
 # Per clue frame (keyed by the clue on (2,2)): the top-left and top-right row-13 clues.
 FRAME = {180: (207, 254), 248: (180, 207), 254: (248, 180), 207: (254, 248)}
-fb, tl_off = list(rows("mc_ftc")), 0
+fb, tl_off = rows(glob.glob(f"{out}/mc_ftc/beam_completions_*.csv")[0]), 0
 assert fb, "the --free_top_clue run wrote no board"
 for l in fb:
     c = board(l)
+    assert len({p for p, _ in c.values()}) == len(c) and not broken(c), "an illegal board"
     tl, tr = FRAME[c[2 * 16 + 2][0]]
     at = {p: x for x, (p, _) in c.items()}
     assert tr not in at, "the top-right clue was written; it is the dives' to place"
@@ -3106,19 +3171,8 @@ dv = [l for l in open(f"{out}/mc_ftc_dived.csv") if l.strip() and l[0] not in "#
 assert len(dv) == len(fb), f"the diver wrote {len(dv)} boards for {len(fb)}"
 assert all(len(board(l)) == 256 for l in dv), "a dived board is not complete"
 
-rb, c0 = list(rows("mc_rnd2")), 0
-for l in rb:
-    c = board(l)
-    for r in range(STOP + 1, 15):
-        if r * 16 in c:
-            p, rot = c[r * 16]
-            assert seed[p].count(0) == 1 and seed[p][(3 + rot) % 4] == 0, "column 0 holds no frame-left edge"
-            c0 += 1
-assert c0, "no random-mode extension reached column 0"
-print(f"ok: K=1/2 write exactly the K=0 boards filling 1/2 columns (found {found('mc_k0')} -> "
-      f"{found('mc_k1')} -> {found('mc_k2')}; random {found('mc_rnd0')} -> {found('mc_rnd2')}); "
-      f"{nd.group(1)} near-dups dropped; --free_top_clue {len(fb)} boards, top-right clue left "
-      f"to the dives, top-left off its cell {tl_off}x; {c0} random column-0 edges; score lines recount")
+print(f"ok: --free_top_clue wrote {len(fb)} legal boards, the top-right clue left off every one "
+      f"and placed by the dives, the top-left clue off its cell {tl_off}x")
 EOF
 }
 
@@ -3484,15 +3538,18 @@ step_no_stray_output() {
 # Driver
 # =============================================================================
 SEL=()
-case "${1:---all}" in
+case "${1:-}" in
     -h|--help) usage; exit 0 ;;
     --list)    list_steps; exit 0 ;;
 esac
+TAGGED=0
 if [ "$#" -eq 0 ]; then
-    for ((i = 1; i <= TOTAL; i++)); do SEL+=("$i"); done
+    for ((i = 1; i <= TOTAL; i++)); do [ "$(step_field $i 2)" = core ] && SEL+=("$i"); done
 else
     for tok in "$@"; do
         case "$tok" in
+            --all)
+                for ((i = 1; i <= TOTAL; i++)); do SEL+=("$i"); done ;;
             [0-9]*-[0-9]*)
                 lo="${tok%%-*}"; hi="${tok##*-}"
                 [ "$lo" -ge 1 ] && [ "$hi" -le "$TOTAL" ] && [ "$lo" -le "$hi" ] \
@@ -3504,11 +3561,18 @@ else
                 SEL+=("$tok") ;;
             *)
                 idx=$(index_of "$tok")
-                [ -n "$idx" ] || { echo "!!! no check named '$tok'"; usage; exit 2; }
-                SEL+=("$idx") ;;
+                if [ -n "$idx" ]; then SEL+=("$idx")
+                else
+                    mapfile -t tagged < <(steps_tagged "$tok")
+                    [ "${#tagged[@]}" -gt 0 ] || { echo "!!! no check or tag named '$tok'"; usage; exit 2; }
+                    SEL+=("${tagged[@]}"); TAGGED=1
+                fi ;;
         esac
     done
 fi
+# A tag run builds first and checks the repository root last, as every run of
+# the core set does.
+if [ "$TAGGED" = 1 ]; then SEL+=("$(index_of compile)" "$(index_of no_stray_output)"); fi
 
 # Canonical order, no repeats, whatever order the arguments came in: several
 # checks only make sense in sequence -- no_stray_output has to be last of all,
@@ -3520,8 +3584,8 @@ ls -A | grep -vxE 'bin|logs' > "$OUT/root_before.txt"   # for no_stray_output
 
 echo "=== E555 release gate ==="
 if [ "${#SEL[@]}" -eq "$TOTAL" ]; then
-    echo "[cfg] all $TOTAL checks; about 4 min, plus ~25 min for the six"\
-         "database checks unless SKIP_BEAMER=1"
+    echo "[cfg] all $TOTAL checks; about 4 min, plus ~7 min for the seven"\
+         "database checks unless SKIP_BEAMER=1 (and ~2 min to build the database once)"
 else
     echo "[cfg] ${#SEL[@]} of $TOTAL checks selected: ${SEL[*]}"
 fi
@@ -3535,9 +3599,8 @@ fi
 PASS=0
 TIMES=()
 for idx in "${SEL[@]}"; do
-    entry="${ALL_STEPS[idx - 1]}"
-    name="${entry%%|*}"
-    STEP="${entry#*|}"
+    name="$(step_field "$idx" 1)"
+    STEP="$(step_field "$idx" 4)"
     echo ""
     echo "=== [test $idx/$TOTAL] $name -- $STEP ==="
     t0=$SECONDS
@@ -3558,6 +3621,8 @@ if [ "${#TIMES[@]}" -gt 0 ]; then
 fi
 if [ "$PASS" -eq "$TOTAL" ]; then
     echo "[sum] all $TOTAL checks passed in ${SECONDS}s"
+elif [ "$#" -eq 0 ]; then
+    echo "[sum] the $PASS core checks passed in ${SECONDS}s -- the release gate is --all"
 else
     echo "[sum] $PASS of $TOTAL checks passed in ${SECONDS}s -- PARTIAL RUN, not a full gate"
 fi

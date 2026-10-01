@@ -36,7 +36,8 @@ Adding `--sink N` goes further and drops the board N rows, so the bad rows fall 
 altogether and a fresh top comes free.
 
 To validate the whole toolkit on your machine (including a regression against
-a known solution): `bash tests/run_tests.sh`.
+a known solution): `bash tests/run_tests.sh --all`; without `--all` it runs
+only the fast core checks.
 
 ## The pipeline
 
@@ -88,7 +89,7 @@ data/           seeds, example boards, masks (see data/README.md)
 examples/       thirteen short scripts (01-11): one per tool or task, plus the whole chain
 pipeline/       the full pipeline, the whirlpool and the board farm, plus a
                 Slurm wrapper: long unattended runs
-tests/          run_tests.sh: the release gate
+tests/          run_tests.sh: the core checks, or the release gate with --all
 agent/          an experimental self-driving optimisation mode: untested and just for fun
 ```
 

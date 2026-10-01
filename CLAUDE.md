@@ -22,19 +22,20 @@ pip install ortools       # only needed for src/C_tail/E555_topper.py and E555_e
 
 ## Tests
 
-`tests/run_tests.sh` is the release gate. It runs numbered checks in order, stops at the first failure, and writes everything to `tests/out/`, which is wiped at the start of each run.
+`tests/run_tests.sh` holds every check. It runs the selected ones in order, stops at the first failure, and writes everything to `tests/out/`, which is wiped at the start of each run. Run only what a change needs:
 
 ```bash
-ARCH=generic SKIP_BEAMER=1 bash tests/run_tests.sh      # full gate without the 6.4 GB DB (~4 min)
-bash tests/run_tests.sh --list                          # numbered list of checks
-bash tests/run_tests.sh 6                               # one check by number
-bash tests/run_tests.sh 8-11 14                         # ranges
-bash tests/run_tests.sh roundhouse_cache                # by name
+ARCH=generic bash tests/run_tests.sh                    # the core checks (~20 s): run for any change
+ARCH=generic bash tests/run_tests.sh beamer             # every check of one tool (+ compile, no_stray_output)
+ARCH=generic SKIP_BEAMER=1 bash tests/run_tests.sh --all   # the release gate without the 6.4 GB DB (~4 min)
+bash tests/run_tests.sh --list                          # numbered list: tier, name, tags, label
+bash tests/run_tests.sh 6 8-11 roundhouse_cache         # by number, range or name
 ```
 
-- The `ALL_STEPS` array at the top of `run_tests.sh` is the only list of checks. Each entry `name|label` has a matching `step_name` function. To add a check, add both.
+- After a change, run the core set plus the tags of the tools you touched: `tools` (Python tools), `annealer`, `finalizer`, `roundhouse`, `backtracker`, `diver`, `beamer`, `cpsat`, `scripts`, `pipeline`. Shared sources: `E555_database.c` -> `beamer finalizer roundhouse diver`; `E555_dive.c` -> `beamer finalizer diver`. Run `--all` only before a release or when asked.
+- The `ALL_STEPS` array at the top of `run_tests.sh` is the only list of checks. Each entry `name|tier|tags|label` has a matching `step_name` function. To add a check, add both; make it `core` only if it is fast and guards something no core check does.
 - Each check runs on its own and never depends on an earlier check's artifacts. If check 1 (`compile`) isn't selected, the checks use whatever is already in `bin/`.
-- `beamer_micro`, `beamer_backtrack_dive`, `beamer_min_col`, `beamer_resume`, `example_beamer` and `pipeline_full` need the real 6.4 GB chain database (~8 GB RAM). Set `SKIP_BEAMER=1` to skip them, `DB_FILE=path` to keep a persistent DB cache, or `DB_IN_MEMORY=1` to avoid writing it to disk.
+- The `beamer` checks and `pipeline_full` need the real 6.4 GB chain database (~8 GB RAM). Set `SKIP_BEAMER=1` to skip them, `DB_FILE=path` to keep a persistent DB cache, or `DB_IN_MEMORY=1` to avoid writing it to disk.
 - Key regressions: the finalizer and roundhouse must rediscover `data/synth_solution_480.csv` (seed `data/synth_seed.txt`), and `viewer` must score it 480/480.
 - `no_stray_output` fails if any check leaves a file in the repo root, so tools that write to the working directory must run from inside `tests/out`.
 - `scripts_parse` (`tests/check_script_flags.py`) collects each binary's accepted flags from its `strcmp(argv[i], "--x")` sites. Every `--flag` that a script in `pipeline/`, `examples/` or `tests/` passes must be in that set. If you rename or remove a C flag, update every script that uses it.
