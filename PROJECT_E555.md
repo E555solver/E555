@@ -918,7 +918,7 @@ boards or roots they write the same file at any thread count.
 |---|---|---|
 | `--out_dir DIR` | `beam_out` | output directory |
 | `--prefix [NAME]` | -- | name every written board `NAME_<config>`; bare = a random 6-character run code, printed in `[cfg]` and `[sum]` |
-| `--start_row N`, `--num_rows N` | 0, 0 = all | border rows of the rotations file |
+| `--start_row N`, `--num_rows N` | 0, 0 = all | border rows of the rotations file (checked at startup: a missing file or a `--start_row` past its end stops the run at once) |
 | `--db_file PATH` | -- | inner-database cache (~6.8 GB file) |
 | `--free_edges` | off | any unused edge may end a row |
 | `--random_edges`, `--samples N` | off, 1 | sample borders (5.3); 0 = unlimited bottoms |

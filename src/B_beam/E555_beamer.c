@@ -5251,9 +5251,16 @@ int main(int argc, char *argv[]) {
        --random_edges there is no file to exhaust, and --samples governs that
        mode's count instead). Resolved before the banner so [cfg] and --print_cmd
        report the count the run will really use. */
-    if (!g_random_edges && g_num_rows == 0) {
-        uint32_t rot_lines = count_border_rows(csv_path);
-        g_num_rows = (rot_lines > g_start_row) ? rot_lines - g_start_row : 0;
+    /* The rotations file is checked here, before anything slow: with an
+       explicit --num_rows it used to be opened only after the chain database
+       was built or loaded, so a missing file surfaced minutes into the run. */
+    if (!g_random_edges) {
+        uint32_t rot_lines = count_border_rows(csv_path);       /* fatal if unreadable */
+        if (rot_lines == 0) fatal("rotation CSV %s holds no border row", csv_path);
+        if (g_start_row >= rot_lines)
+            fatal("--start_row %u is past the last border row of %s (%u rows)",
+                  g_start_row, csv_path, rot_lines);
+        if (g_num_rows == 0) g_num_rows = rot_lines - g_start_row;
     }
 
     /* --pin_clue: narrow the search to ONE of the four clue frames.

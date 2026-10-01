@@ -637,11 +637,15 @@ static uint64_t g_band_rejected = 0; /* bands dropped for carrying a broken edge
 
 /* -- Utilities ---------------------------------------------------------------- */
 
+/* Report and stop at once: _exit, not exit, so a fatal error reached while
+   other threads are alive cannot hang in the library teardown (the OpenMP
+   runtime's included). Only the log streams are flushed. */
 static void fatal(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     fprintf(stderr, "Fatal: "); vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n"); va_end(ap);
-    exit(EXIT_FAILURE);
+    fflush(stdout); fflush(stderr);
+    _exit(EXIT_FAILURE);
 }
 
 static void *xmalloc(size_t n) {

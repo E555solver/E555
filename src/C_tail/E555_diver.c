@@ -1173,6 +1173,11 @@ int main(int argc, char **argv) {
     }
     if (g_nthreads <= 0) g_nthreads = omp_get_max_threads();
     omp_set_num_threads(g_nthreads);
+    if (g_rot_path) {                       /* read per batch later: check it now */
+        FILE *rf = fopen(g_rot_path, "r");
+        if (!rf) fatal("cannot open rotation CSV %s: %s", g_rot_path, strerror(errno));
+        fclose(rf);
+    }
     if (g_seeds && !g_rot_path) fatal("--corner_seeds needs --rotations: the corner blocks "
                                       "are built from the sides a rotations row deals");
     if ((g_clue_mask & CLUE_CORNERS) && !g_seeds && !g_pin)

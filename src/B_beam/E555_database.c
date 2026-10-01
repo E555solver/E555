@@ -163,10 +163,18 @@ double g_time_db_build = 0.0, g_time_db_sort = 0.0;
 
 /* -- Utility -------------------------------------------------------------- */
 
+/* Report and stop the process at once. _exit, not exit: exit() runs the
+   library teardown first -- the OpenMP runtime's included -- and that can
+   block when fatal() is reached while other threads are alive or hold a lock,
+   leaving a run that has reported its error but never ends. Only the log
+   streams are flushed; a board file loses at most its unflushed tail, as on a
+   kill (the tools flush their outputs after every configuration or batch). */
 void fatal(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     fprintf(stderr, "Fatal: "); vfprintf(stderr, fmt, ap); fprintf(stderr, "\n");
-    va_end(ap); exit(EXIT_FAILURE);
+    va_end(ap);
+    fflush(stdout); fflush(stderr);
+    _exit(EXIT_FAILURE);
 }
 
 void *xmalloc(size_t n) {
