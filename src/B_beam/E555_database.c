@@ -1446,6 +1446,12 @@ static void build_side_pools(void) {
     if (s_corner_n != 4) fatal("seed has %d corner pieces; expected 4", s_corner_n);
 }
 
+int edge_left_pool(const Oriented **out) {
+    build_side_pools();
+    *out = s_edge_leftz;
+    return s_side_edge_n;
+}
+
 /* Orient a corner piece for a board corner role. Roles: 0=BL 1=BR 2=TL 3=TR. */
 static bool orient_corner_role(int pid, int role, Oriented *out) {
     for (uint8_t spin = 0; spin < 4; spin++) {
@@ -2031,6 +2037,12 @@ void tc_tally(uint8_t code) {
     s_tc_hist.tl[ntl]++; s_tc_hist.tr[ntr]++;
     if (ntl && ntr) s_tc_hist.both++;
     if (code >> 4) s_tc_hist.joint++;
+}
+
+void tc_hist_get(uint64_t *boards, uint64_t *tl_dead, uint64_t *tr_dead,
+                 uint64_t *both, uint64_t *joint) {
+    *boards = s_tc_hist.boards; *tl_dead = s_tc_hist.tl[0]; *tr_dead = s_tc_hist.tr[0];
+    *both = s_tc_hist.both; *joint = s_tc_hist.joint;
 }
 
 void tc_print_summary(uint32_t stop_row, bool with_unit) {

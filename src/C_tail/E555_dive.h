@@ -132,6 +132,9 @@ uint64_t dv_written(void);
 /* The best score of the last dv_run batch, -1 when it dived nothing. */
 int      dv_last_best(void);
 uint64_t dv_boards(void);
+/* Written boards at a score (matched edges), and the time spent diving. */
+uint64_t dv_score_count(int score);
+double   dv_seconds(void);
 /* After dv_run: the best board of queued board i of that batch (i counts
    dv_add/dv_queue calls, not copies) -- its best copy, or its incumbent -- and
    its score, whether or not it reached S; -1 when it has none. */

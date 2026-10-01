@@ -614,6 +614,11 @@ bool sample_random_left(RNG *rng, double tau, const BottomOrder *bot, LeftOrder 
    sampling. */
 void finalize_fixed_corners(void);
 
+/* Every non-corner edge piece oriented frame-left (frame colour on the left,
+   its one inner colour on the right): the pool a left column is drawn from.
+   Builds the side pools if needed; returns the count and sets *out. */
+int edge_left_pool(const Oriented **out);
+
 /* Read the want-th non-comment data row's 256 spins from a Stage A CSV. */
 bool read_one_border_row(const char *csv_path, uint32_t want, uint8_t spins[NUM_PIECES]);
 
@@ -708,6 +713,10 @@ void    tc_tally(uint8_t code);
 /* with_unit: also print the tc_unit table (off for a caller that calibrates
    u_row itself). */
 void    tc_print_summary(uint32_t stop_row, bool with_unit);
+/* The emitted boards' corner tallies: boards, boards with no TL / no TR block
+   alive, with both alive, with a piece-disjoint TL+TR pair. */
+void    tc_hist_get(uint64_t *boards, uint64_t *tl_dead, uint64_t *tr_dead,
+                    uint64_t *both, uint64_t *joint);
 
 static inline int tc_slot_of(int orient) { return g_tc_clued ? orient : 0; }
 

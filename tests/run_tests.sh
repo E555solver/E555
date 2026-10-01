@@ -22,22 +22,22 @@
 # (the roundhouse partials that four checks share are built on demand). Leaving
 # check 1 out of the selection uses whatever is already in bin/.
 #
-# RUNTIME  about 4 minutes with SKIP_BEAMER=1. The five checks that need the
+# RUNTIME  about 4 minutes with SKIP_BEAMER=1. The six checks that need the
 # real 6.4 GB chain database -- beamer_micro, beamer_backtrack_dive,
-# beamer_resume, example_beamer and pipeline_full -- share one cache and want
-# ~8 GB of RAM.
+# beamer_min_col, beamer_resume, example_beamer and pipeline_full -- share one
+# cache and want ~8 GB of RAM.
 #
 # Environment switches:
 #   ARCH=generic    build for any CPU rather than the build host. Set it in CI
 #                   and containers; -march=native is the Makefile default.
-#   SKIP_BEAMER=1   skip the five database checks (low-RAM machines)
+#   SKIP_BEAMER=1   skip the six database checks (low-RAM machines)
 #   DB_FILE=path    keep the 6.4 GB chain database here (~6.5 GB on disk)
 #                   instead of under tests/out, so it survives the wipe and
 #                   every later run loads it rather than building it. The
 #                   real-seed checks share one cache either way.
-#   DB_IN_MEMORY=1  never write the database to disk: each of the five checks
-#                   builds it in RAM and drops it (full-disk machines). Five
-#                   builds instead of one, so ~5x the database time, and each
+#   DB_IN_MEMORY=1  never write the database to disk: each of the six checks
+#                   builds it in RAM and drops it (full-disk machines). Six
+#                   builds instead of one, so ~6x the database time, and each
 #                   build needs 8 GB free. Overrides DB_FILE.
 #
 # This gate proves the tools find the RIGHT answer.
@@ -107,6 +107,7 @@ ALL_STEPS=(
     "ender_repair|REGRESSION: a scrambled synthetic solution comes back 480/480; a real board redives and comes back no worse"
     "beamer_micro|random_edges micro-run: builds the real 6.4 GB database"
     "beamer_backtrack_dive|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --lambda_reserve keeps the reserve for last"
+    "beamer_min_col|--backtrack_min_col: --min_col_check drops no written board; near-duplicate filter; --free_top_clue and random column 0 boards legal; log and score line"
     "beamer_resume|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
     "scripts_parse|every shipped script parses, and passes only flags that exist"
     "example_finalizer|examples/02 re-grows the synthetic board"
@@ -2775,16 +2776,20 @@ step_beamer_resume() {
 # through the same checks, their extra fixed corner cells above the stop row.
 step_beamer_backtrack_dive() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    # --no_top_dedup: the near-duplicate filter compares top rows under the
+    # run's --backtrack_min_col, so a K=1 run would drop other twins than the
+    # K=0 run its boards are checked against; beamer_min_col covers it.
     CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv
          --num_rows 1 --top_bottoms 1 --top_columns 1 --beam_width 2000
-         --backtrack_row 8 --stop_row 10 --lambda_corners --rng_seed 7 --threads 1)
+         --backtrack_row 8 --stop_row 10 --lambda_corners --rng_seed 7 --threads 1
+         --no_top_dedup)
     if [ -n "$GATE_DB" ]; then CMD+=(--db_file "$GATE_DB"); fi
     "${CMD[@]}" --out_dir "$OUT/btd_plain" > "$OUT/btd_plain.log" \
         || { tail -5 "$OUT/btd_plain.log"; fail "backtrack run exited non-zero"; }
     "${CMD[@]}" --end_dive 100 --end_polish 50 --emit_score 0 --out_dir "$OUT/btd_dive" \
         > "$OUT/btd_dive.log" \
         || { tail -5 "$OUT/btd_dive.log"; fail "end-dive run exited non-zero"; }
-    grep -q "^\[sum\] backtrack from row 8" "$OUT/btd_plain.log" || fail "no backtrack summary"
+    grep -q "^\[sum\] backtrack: " "$OUT/btd_plain.log" || fail "no backtrack summary"
 
     # --lambda_reserve: mark 26 inner pieces as Stage A --double_decker TOP does
     # (side code 1, Decker= in the comment), then run the same small beam with
@@ -2823,7 +2828,7 @@ EOF
 import re, sys
 def free(path):
     for l in open(path):
-        m = re.match(r"\[sum\] reserve at stop row: TOP pieces still free, mean ([0-9.]+) of 26", l)
+        m = re.match(r"\[sum\] reserve: ([0-9.]+) of 26 TOP pieces free", l)
         if m:
             return float(m.group(1))
     raise SystemExit(f"no reserve summary in {path}")
@@ -2832,7 +2837,7 @@ assert b > a, f"--lambda_reserve 2 left {b} of 26 free, no more than {a} without
 print(f"ok: --lambda_reserve 2 with --lambda_corners keeps {b:.1f} of 26 reserve pieces free "
       f"at the stop row, against {a:.1f} without it; an old-format row is set aside")
 EOF
-    grep -q "^\[sum\] end dives:" "$OUT/btd_dive.log" || fail "no end-dive summary"
+    grep -q "^\[sum\] \*\*\* Output boards score: " "$OUT/btd_dive.log" || fail "no score line in the summary"
     # The diver replaying the plain run's boards is the same finish, so it must
     # write the dived run's rows byte for byte -- corner seeds included, and at
     # another thread count.
@@ -2894,7 +2899,7 @@ EOF
     # from column 1 (checked by the legality pass above: no break anywhere).
     # 4 threads write the same file as 1; --backtrack_min_col 1 writes the
     # subset whose extension fills column 1; --prefix names the boards.
-    grep -q "^\[sum\] extension (--extend_nodes 100000)" "$OUT/btd_plain.log" \
+    grep -q "^\[sum\] extension: " "$OUT/btd_plain.log" \
         || fail "no extension summary"
     "${CMD[@]}" --extend_nodes 0 --out_dir "$OUT/btd_noext" > "$OUT/btd_noext.log" \
         || { tail -5 "$OUT/btd_noext.log"; fail "--extend_nodes 0 run exited non-zero"; }
@@ -2960,6 +2965,139 @@ assert len(a) == len(b), f"the diver wrote {len(b)} boards for the beamer's {len
 bad = sum(x != y for x, y in zip(a, b))
 assert not bad, f"{bad} of {len(a)} boards differ from the beamer's extension"
 print(f"ok: E555_diver --stop_row 10 extends the {len(a)} stop-row boards exactly as the beamer does")
+EOF
+}
+
+# --backtrack_min_col and what serves it, on one rotations row at one thread:
+#  - --min_col_check cuts partial rows that cannot fill the columns, so it must
+#    write exactly the boards --min_col_check 0 writes, at every width, while
+#    finding fewer;
+#  - the near-duplicate filter (on by default) writes a subset of the
+#    --no_top_dedup boards and says how many it dropped, and with the check it
+#    writes the same file at 4 threads as at 1 (both reset where the search
+#    hands work to another thread);
+#  - the compact log has no [progress] line, the border line carries the run
+#    time, and the summary's last [sum] line counts the written boards by score
+#    as a recount of their matched edges does;
+#  - --free_top_clue (--clue_corners) and --random_edges, whose extension also
+#    chooses column 0 above the stop row, write legal break-free boards: the
+#    row-13 clues anywhere above the stop row or left off, frame-left edges in
+#    column 0. A clued run needs its own database (clue pieces leave it), so it
+#    builds one in RAM at 4 threads rather than replace the shared cache; the
+#    beam is then not repeatable, so only properties of its boards are tested.
+step_beamer_min_col() {
+    if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv
+         --num_rows 1 --top_bottoms 1 --top_columns 2 --beam_width 2000
+         --backtrack_row 7 --stop_row 10 --backtrack_min_col 2 --rng_seed 7 --threads 1)
+    if [ -n "$GATE_DB" ]; then CMD+=(--db_file "$GATE_DB"); fi
+    local w
+    for w in 0 1 2; do
+        "${CMD[@]}" --min_col_check "$w" --no_top_dedup --out_dir "$OUT/mc_w$w" > "$OUT/mc_w$w.log" \
+            || { tail -5 "$OUT/mc_w$w.log"; fail "--min_col_check $w run exited non-zero"; }
+    done
+    "${CMD[@]}" --out_dir "$OUT/mc_dd" > "$OUT/mc_dd.log" \
+        || { tail -5 "$OUT/mc_dd.log"; fail "the near-duplicate run exited non-zero"; }
+    "${CMD[@]}" --threads 4 --out_dir "$OUT/mc_dd4" > "$OUT/mc_dd4.log" \
+        || { tail -5 "$OUT/mc_dd4.log"; fail "the 4-thread near-duplicate run exited non-zero"; }
+    cmp -s "$OUT/mc_dd/beam_completions_0_10.csv" "$OUT/mc_dd4/beam_completions_0_10.csv" \
+        || fail "the near-duplicate filter and the check wrote other boards at 4 threads than at 1"
+    bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv --start_row 1 --num_rows 1 \
+        --top_bottoms 1 --top_columns 2 --beam_width 2000 --clue_corners --free_top_clue \
+        --backtrack_row 7 --stop_row 10 --backtrack_min_col 1 --rng_seed 7 --threads 4 \
+        --out_dir "$OUT/mc_ftc" > "$OUT/mc_ftc.log" \
+        || { tail -5 "$OUT/mc_ftc.log"; fail "the --free_top_clue run exited non-zero"; }
+    RND=(bin/E555_beamer data/seed_Edge5.txt --random_edges --samples 1 --top_columns 1
+         --beam_width 2000 --backtrack_row 8 --stop_row 10 --backtrack_min_col 2 --rng_seed 3 --threads 1)
+    if [ -n "$GATE_DB" ]; then RND+=(--db_file "$GATE_DB"); fi
+    "${RND[@]}" --out_dir "$OUT/mc_rnd" > "$OUT/mc_rnd.log" \
+        || { tail -5 "$OUT/mc_rnd.log"; fail "the --random_edges run exited non-zero"; }
+    python3 - "$OUT" <<'EOF' || exit 1
+import glob, re, sys
+out = sys.argv[1]
+seed = [list(map(int, l.split())) for l in open("data/seed_Edge5.txt") if l.strip()]
+def rows(d):
+    for p in sorted(glob.glob(f"{out}/{d}/beam_completions_*.csv")):
+        for l in open(p):
+            if l.strip() and l[0] not in "#%":
+                yield l
+def board(l):
+    v = [x.strip() for x in l.split(",")]
+    pos, rot = list(map(int, v[-512:-256])), list(map(int, v[-256:]))
+    return {pos[p]: (p, rot[p]) for p in range(256) if pos[p] != 999}
+def side(c, x, d):
+    p, r = c[x]; return seed[p][(d + r) % 4]
+def matched_broken(c):
+    m = b = 0
+    for x in c:
+        r, col = divmod(x, 16)
+        for y, d, e in ((x + 1, 1, 3), (x + 16, 0, 2)):
+            if (d == 1 and col == 15) or (d == 0 and r == 15) or y not in c: continue
+            if side(c, x, d) == side(c, y, e): m += 1
+            else: b += 1
+    return m, b
+def log(d): return open(f"{out}/{d}.log").read()
+def content(l): return ",".join(l.split(",")[-512:])
+def found(d): return int(re.search(r"^\[sum\] boards: found (\d+)", log(d), re.M).group(1))
+
+w = [list(rows(f"mc_w{k}")) for k in range(3)]
+assert w[0], "--min_col_check 0 wrote no board: the check would prove nothing"
+assert w[1] == w[0] and w[2] == w[0], "--min_col_check changed the written boards"
+f = [found(f"mc_w{k}") for k in range(3)]
+assert f[2] <= f[1] <= f[0] and f[1] < f[0], f"found boards did not fall with the check: {f}"
+assert re.search(r"^\[sum\] min_col 2: column check \(W=2\) cut ", log("mc_w2"), re.M), "no min_col line"
+
+dd = list(rows("mc_dd"))
+assert {content(l) for l in dd} <= {content(l) for l in w[2]}, \
+    "the near-duplicate filter wrote a board --no_top_dedup did not"
+nd = re.search(r"^\[sum\] boards: .*near-dups (\d+)", log("mc_dd"), re.M)
+assert nd and int(nd.group(1)) > 0, "the near-duplicate filter reported no near-dups"
+
+for d in ("mc_w2", "mc_dd", "mc_ftc", "mc_rnd"):
+    t = log(d)
+    assert "[progress]" not in t, f"{d}: a [progress] line is back"
+    last = [l for l in t.splitlines() if l.startswith("[sum]")][-1]
+    m = re.match(r"\[sum\] \*\*\* Output boards score:(.*) \((\d+) written\)$", last)
+    assert m, f"{d}: the last [sum] line is not the score line: {last}"
+    bs = list(rows(d))
+    assert int(m.group(2)) == len(bs), f"{d}: the score line counts {m.group(2)}, the CSV holds {len(bs)}"
+    hist = {}
+    for l in bs:
+        c = board(l)
+        assert len({p for p, _ in c.values()}) == len(c), f"{d}: a piece placed twice"
+        sc, brk = matched_broken(c)
+        assert brk == 0, f"{d}: a written board has a broken edge"
+        hist[sc] = hist.get(sc, 0) + 1
+    shown = re.findall(r"(\d+):(\d+)", m.group(1))
+    top = sorted(hist.items(), reverse=True)[:len(shown)]
+    assert [(int(a), int(b)) for a, b in shown] == top, f"{d}: score line {shown} vs recount {top}"
+assert re.search(r"^========== border row 0   run \d+ s = [0-9.]+ min ==========$", log("mc_w2"), re.M), \
+    "the border line carries no run time"
+STOP = 10
+fb = list(rows("mc_ftc"))
+assert fb, "the --free_top_clue run wrote no board"
+row2, off = {2 * 16 + 2, 2 * 16 + 13}, 0
+for l in fb:
+    c = {p: x for x, (p, _) in board(l).items()}
+    for p in (180, 207, 248, 254):                   # the four corner clues
+        if p not in c or c[p] in row2: continue
+        assert STOP < c[p] // 16 < 15 and 0 < c[p] % 16 < 15, \
+            f"a row-13 clue sits outside the extension: cell {c[p]}"
+        off += c[p] not in (13 * 16 + 2, 13 * 16 + 13)
+
+rb, c0 = list(rows("mc_rnd")), 0
+assert rb, "the random-edges run wrote no board"
+for l in rb:
+    c = board(l)
+    for r in range(STOP + 1, 15):
+        if r * 16 in c:
+            p, rot = c[r * 16]
+            assert seed[p].count(0) == 1 and seed[p][(3 + rot) % 4] == 0, "column 0 holds no frame-left edge"
+            c0 += 1
+assert c0, "no random-mode extension reached column 0"
+print(f"ok: --min_col_check 1/2 write the {len(w[0])} boards of 0 (found {f[0]} -> {f[1]} -> {f[2]}); "
+      f"{nd.group(1)} near-dups dropped; --free_top_clue {len(fb)} legal boards, {off} clue(s) "
+      f"off their cell; {c0} random-mode column-0 edges; score lines recount")
 EOF
 }
 
@@ -3361,7 +3499,7 @@ ls -A | grep -vxE 'bin|logs' > "$OUT/root_before.txt"   # for no_stray_output
 
 echo "=== E555 release gate ==="
 if [ "${#SEL[@]}" -eq "$TOTAL" ]; then
-    echo "[cfg] all $TOTAL checks; about 4 min, plus ~20 min for the four"\
+    echo "[cfg] all $TOTAL checks; about 4 min, plus ~25 min for the six"\
          "database checks unless SKIP_BEAMER=1"
 else
     echo "[cfg] ${#SEL[@]} of $TOTAL checks selected: ${SEL[*]}"

@@ -833,6 +833,10 @@ void dv_keeping(bool on) { g_dv_keeping = on; }
 uint64_t dv_written(void) { return g_dv_run.written; }
 int      dv_last_best(void) { return g_dv_run.last_best; }
 uint64_t dv_boards(void)  { return g_dv_run.roots; }
+uint64_t dv_score_count(int score) {
+    return score >= 0 && score <= DV_EDGES ? g_dv_run.hist[score] : 0;
+}
+double   dv_seconds(void) { return g_dv_run.t; }
 
 static DvRoot *dv_push_root(void) {
     if (g_dv_qn == g_dv_qcap) {

@@ -48,7 +48,11 @@
  *   row. Every completing board is emitted, exact duplicates aside and without the
  *   EMIT_MAX cap -- first extended column by column above the stop row, from
  *   its deepest zero-break prefix (--extend_nodes, --backtrack_min_col). See
- *   backtrack_emit and extend_board.
+ *   backtrack_emit and extend_board. A stop-row board whose top row nearly
+ *   repeats the previous one's is dropped first (--no_top_dedup keeps it); under
+ *   --backtrack_min_col K a partial row whose columns 1..W can no longer reach
+ *   row 14 is cut on the spot (--min_col_check, strip_reach), which drops no
+ *   written board.
  *
  * END DIVES (--end_dive M --emit_score S)
  *   Instead of being written, each stop-row board is completed to 256 pieces
@@ -129,6 +133,23 @@ static uint32_t g_backtrack_row   = 0;
    at least K whole columns. See extend_board. */
 static uint32_t g_extend_nodes    = 100000;
 static uint32_t g_bt_min_col      = 0;
+/* --free_top_clue (with --clue_corners): the extension may place the two row-13
+   clue pieces on any cell above the stop row, and treats their own cells as
+   ordinary ones. Rows up to the stop row still hold them in reserve. */
+static bool     g_free_top_clue   = false;
+/* The top-row near-duplicate filter (--no_top_dedup turns it off): a stop-row
+   board whose top row repeats the previous one's columns 1..K and differs from
+   it in at most one other cell is dropped before its extension. See
+   bt_close_row. */
+static bool     g_top_dedup       = true;
+/* --min_col_check W: under --backtrack_min_col K, the backtracker cuts a
+   partial row as soon as columns 1..W (W <= K) can no longer be stacked to row
+   14, and a stop-row cell of columns 1..K whose top nothing can sit on. -1 =
+   the default width, 0 = off. See strip_reach. */
+static int      g_col_check       = -1;
+static bool     g_col_check_set   = false;
+#define STRIP_WMAX 6                      /* cols 1..6 never meet a pinned clue cell */
+#define STRIP_W_DEFAULT 1                 /* wider strips cut more, but cost more than they save */
 /* --prefix: written in front of the configuration id in every board name. */
 static char     g_prefix[40]      = "";
 /* Boards found at the stop row and written, this configuration's and the
@@ -678,9 +699,45 @@ static inline bool cell_is_placed(int r, int c, int row, uint16_t colmask) {
 }
 
 /* A stop-row board's extension above its top row (extend_board): n catalog
-   orientations, the k-th on cell[k]. */
-#define EXT_MAX (EDGE_LEN * EDGE_LEN)
+   orientations, the k-th on cell[k]. Under --random_edges the extension also
+   chooses column 0 above the stop row: an index ci >= CATALOG_SIZE is then the
+   frame-left edge g_edge_left[ci - CATALOG_SIZE]. */
+#define EXT_MAX (EDGE_LEN * (EDGE_LEN + 1))
 typedef struct { uint16_t n; uint8_t cell[EXT_MAX]; uint16_t ci[EXT_MAX]; } Ext;
+static const Oriented *g_edge_left = NULL;    /* --random_edges: every edge, frame left */
+static int             g_edge_left_n = 0;
+static inline const Oriented *ext_or(uint16_t ci) {
+    return ci < CATALOG_SIZE ? &g_cat[ci] : &g_edge_left[ci - CATALOG_SIZE];
+}
+
+/* Colour a piece at spin s shows on side d (0 top, 1 right, 2 bottom, 3 left). */
+static inline int seed_side(uint32_t pid, uint32_t s, int d) {
+    const int k = (int)((d + s) & 3u);
+    return k == 0 ? g_seed_top[pid] : k == 1 ? g_seed_right[pid]
+         : k == 2 ? g_seed_bottom[pid] : g_seed_left[pid];
+}
+
+/* Matched edges of a board given as per-piece position/rotation vectors: the
+   junctions between two placed cells whose colours agree, out of 480. */
+static int board_score(const uint32_t pos[NUM_PIECES], const uint32_t rot[NUM_PIECES]) {
+    int16_t at[NUM_PIECES];
+    for (int x = 0; x < NUM_PIECES; x++) at[x] = -1;
+    for (int p = 0; p < NUM_PIECES; p++) if (pos[p] < NUM_PIECES) at[pos[p]] = (int16_t)p;
+    int n = 0;
+    for (int x = 0; x < NUM_PIECES; x++) {
+        if (at[x] < 0) continue;
+        const uint32_t p = (uint32_t)at[x];
+        if (x % PUZZLE_SIDE < PUZZLE_SIDE - 1 && at[x + 1] >= 0) {
+            const uint32_t q = (uint32_t)at[x + 1];
+            n += seed_side(p, rot[p], 1) == seed_side(q, rot[q], 3);
+        }
+        if (x + PUZZLE_SIDE < NUM_PIECES && at[x + PUZZLE_SIDE] >= 0) {
+            const uint32_t q = (uint32_t)at[x + PUZZLE_SIDE];
+            n += seed_side(p, rot[p], 0) == seed_side(q, rot[q], 2);
+        }
+    }
+    return n;
+}
 
 /* Flatten rows[0..row] into per-piece position/rotation vectors and write them
    as the 512 comma-separated fields that follow a line's prefix. colmask says
@@ -702,10 +759,12 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
             pos[pid] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[pid] = rot;
         }
     }
+    bool ext_cell[NUM_PIECES] = { false };
     if (ext)
         for (int k = 0; k < ext->n; k++) {
-            const Oriented *o = &g_cat[ext->ci[k]];
+            const Oriented *o = ext_or(ext->ci[k]);
             pos[o->piece_id] = ext->cell[k]; rot_arr[o->piece_id] = o->rotation;
+            ext_cell[ext->cell[k]] = true;
         }
     /* --clue_corners: also place the two row-13 clue pieces the beam never
        reaches, so every emitted board carries all the clues its orientation
@@ -715,13 +774,41 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
        is scored like any other. Only a searched row 13 (--stop_row 13) fills
        their cells, and then they are left off. There is no choice of
        orientation here -- the board committed to one when it placed its row-2
-       corners. */
+       corners.
+
+       Under --free_top_clue the extension treats those cells as ordinary ones
+       and may have put the clue anywhere above the stop row, or another piece
+       on its cell. A clue it did not place goes home only onto an empty cell
+       whose placed neighbours it matches, so the board stays break-free;
+       otherwise it is left for the dives. */
     if (orient >= 0 && (g_clue_mask & CLUE_CORNERS))
         for (int k = 3; k < CLUE_N; k++) {
             const ClueCell *cc = &g_clue[orient][k];
+            const int x = cc->row * PUZZLE_SIDE + cc->col;
             if (cell_is_placed(cc->row, cc->col, row, colmask)) continue;
             if (pos[cc->piece] != 999) continue;          /* the extension placed it */
-            pos[cc->piece]     = (uint32_t)(cc->row * PUZZLE_SIDE + cc->col);
+            if (ext_cell[x]) continue;                     /* another piece holds the cell */
+            if (g_free_top_clue) {
+                const Oriented *o = &g_cat[g_clue_ci[orient][k]];
+                bool fits = true;
+                for (int d = 0; d < 4 && fits; d++) {
+                    const int rr = cc->row + (d == 0) - (d == 2), cc2 = cc->col + (d == 1) - (d == 3);
+                    const int y = rr * PUZZLE_SIDE + cc2;
+                    int face = -1;                         /* the neighbour's facing colour */
+                    if (cell_is_placed(rr, cc2, row, colmask) && cc2 > 0 && cc2 < PUZZLE_SIDE - 1) {
+                        uint16_t pid; uint8_t rt; board_cell(rows, rr, cc2, &pid, &rt);
+                        face = seed_side(pid, rt, (d + 2) & 3);
+                    } else if (ext_cell[y]) {
+                        for (int j = 0; j < ext->n; j++)
+                            if (ext->cell[j] == y) { face = seed_side(ext_or(ext->ci[j])->piece_id,
+                                                                     ext_or(ext->ci[j])->rotation, (d + 2) & 3); break; }
+                    }
+                    const int mine = d == 0 ? o->top : d == 1 ? o->right : d == 2 ? o->bottom : o->left;
+                    if (face >= 0 && face != mine) fits = false;
+                }
+                if (!fits) continue;
+            }
+            pos[cc->piece]     = (uint32_t)x;
             rot_arr[cc->piece] = cc->spin;
         }
     /* Rotations mode: the rest of the fixed frame the search held -- the whole
@@ -2541,11 +2628,23 @@ static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
 #define DIVE_SLOT_BYTES (NUM_PIECES * (sizeof(uint16_t) + 1))
 _Static_assert(DIVE_SLOT_BYTES <= EMIT_LINE_MAX, "dive slot fits an emission slot");
 
+/* Written boards by matched edges, for the summary's score line when nothing
+   is dived (under --end_dive the dive engine keeps that tally). */
+static uint64_t g_score_hist[DV_EDGES + 1];
+
 static int prepare_board(const RowChoice rows[EDGE_LEN], int row, int orient,
-                         const Ext *ext, char *slot) {
-    if (!g_end_dive) return format_board_tail(rows, row, ROWMASK_FULL, orient, ext, slot);
+                         const Ext *ext, char *slot, uint16_t *score) {
     uint32_t pos[NUM_PIECES], rot[NUM_PIECES];
     board_arrays(rows, row, ROWMASK_FULL, orient, ext, pos, rot);
+    *score = 0;
+    if (!g_end_dive) {
+        *score = (uint16_t)board_score(pos, rot);
+        char *p = slot;
+        for (int i = 0; i < NUM_PIECES; i++) { *p++ = ','; *p++ = ' '; p = u32a(p, pos[i]); }
+        for (int i = 0; i < NUM_PIECES; i++) { *p++ = ','; *p++ = ' '; p = u32a(p, rot[i]); }
+        *p++ = '\n';
+        return (int)(p - slot);
+    }
     uint16_t pid[NUM_PIECES];
     uint8_t *cr = (uint8_t *)slot + NUM_PIECES * sizeof(uint16_t);
     for (int x = 0; x < NUM_PIECES; x++) { pid[x] = DV_EMPTY; cr[x] = 0; }
@@ -2574,6 +2673,7 @@ static uint64_t *g_emit_fps = NULL;
 static int  *g_emit_lens  = NULL;
 static uint8_t *g_emit_corner = NULL;   /* --lambda_corners: corner_emit_code */
 static uint8_t *g_emit_rsv    = NULL;   /* TOP reserve pieces left free */
+static uint16_t *g_emit_sc    = NULL;   /* matched edges (no --end_dive) */
 
 /* Emit the stop-row boards, best-scored first. Reconstructing a board, hashing
    it and converting its 512 fields is ~all of the cost and touches only
@@ -2590,6 +2690,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
         g_emit_lens  = xmalloc((size_t)EMIT_TILE * sizeof(int));
         g_emit_corner = xmalloc((size_t)EMIT_TILE);
         g_emit_rsv    = xmalloc((size_t)EMIT_TILE);
+        g_emit_sc     = xmalloc((size_t)EMIT_TILE * sizeof *g_emit_sc);
     }
     int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
     for (uint32_t base = 0; base < kept && g_emit_count < EMIT_MAX && !g_stop;
@@ -2606,7 +2707,8 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
             g_emit_lens[k] = prepare_board(rows, row,
                                            (pe->flags & FLAG_ORIENT_SET)
                                                ? (int)(pe->flags & FLAG_ORIENT_MASK) : -1,
-                                           NULL, g_emit_lines + (size_t)k * EMIT_LINE_MAX);
+                                           NULL, g_emit_lines + (size_t)k * EMIT_LINE_MAX,
+                                           &g_emit_sc[k]);
             if (g_corners_on)
                 g_emit_corner[k] = corner_emit_code(&beam[pe->parent], &pe->mv, row,
                     (pe->flags & FLAG_ORIENT_SET) ? (int)(pe->flags & FLAG_ORIENT_MASK) : -1);
@@ -2621,6 +2723,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
             if (!htable_insert(g_emit_fps[k])) continue;
             emit_board_line(g_emit_lines + (size_t)k * EMIT_LINE_MAX, (size_t)g_emit_lens[k]);
             g_stats.emitted_total++;
+            if (!g_end_dive) g_score_hist[g_emit_sc[k]]++;
             if (g_corners_on) tc_tally(g_emit_corner[k]);
             if (g_top_n) rsv_tally(g_emit_rsv[k]);
         }
@@ -2691,15 +2794,84 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
    border; next to a clue cell, the colour the clue will show. A clue cell in
    the region takes its piece at its spin when the board's orientation is
    known, and ends the extension when it is not. At most --extend_nodes
-   placements per board. */
+   placements per board.
+
+   --free_top_clue turns the two row-13 clue cells into ordinary cells and lets
+   their pieces go anywhere in the region. --random_edges samples the left
+   column as part of the configuration, but the board is written without it
+   above the stop row, so there the extension chooses column 0 too: the
+   sampled edges above S are released, and column 0 and column 1 are filled
+   together, row by row (a frame-left edge chained on the column-0 top below,
+   then the inner piece next to it), before columns 2..14. An edge placed in
+   column 0 leaves the top-border pool.
+
+   The region's clue cells, the pieces it may use although the board holds
+   them, and its top-border pool are defined once below (g_ext_fix,
+   ext_release_mask, ext_avail) and shared with the strip check and the
+   stop-row test, so the three always agree on what the extension can do. */
+
+/* Per orientation + 1 (0 = not yet known), per cell above the stop row: the
+   catalog index of the clue the extension must place there, -2 for a clue
+   cell of unknown orientation (the extension stops there), -1 otherwise. Rows
+   up to the stop row are -1. Built once by ext_fix_init. */
+static int16_t g_ext_fix[5][NUM_PIECES];
+
+static void ext_fix_init(void) {
+    for (int oi = 0; oi < 5; oi++) {
+        const int orient = oi - 1;
+        int16_t *fix = g_ext_fix[oi];
+        for (int i = 0; i < NUM_PIECES; i++) fix[i] = -1;
+        if (!g_clue_mask) continue;
+        for (int k = 0; k < CLUE_N; k++) {
+            if (!clue_on(k)) continue;
+            if (g_free_top_clue && k >= CLUE_N_REACHABLE) continue;
+            for (int o = 0; o < 4; o++) {
+                if (!(g_clue_orients & (1u << o))) continue;
+                if (orient >= 0 && o != orient) continue;
+                const ClueCell *cc = &g_clue[o][k];
+                if (cc->row <= g_stop_row || cc->row > EDGE_LEN) continue;
+                fix[cc->row * PUZZLE_SIDE + cc->col] =
+                    orient >= 0 ? (int16_t)g_clue_ci[o][k] : (int16_t)-2;
+            }
+        }
+    }
+}
+
+static inline const int16_t *ext_fix_of(int orient) { return g_ext_fix[orient + 1]; }
+
+/* Pieces a board holds that the extension may still place: the sampled left
+   column above the stop row (--random_edges) and the orientation's two row-13
+   clues (--free_top_clue). */
+static void ext_release_mask(int orient, uint64_t rel[4]) {
+    rel[0] = rel[1] = rel[2] = rel[3] = 0;
+    if (g_random_edges)
+        for (int r = (int)g_stop_row + 1; r <= EDGE_LEN; r++) used_set(rel, g_cur_left->p[r]->piece_id);
+    if (g_free_top_clue && orient >= 0)
+        for (int k = CLUE_N_REACHABLE; k < CLUE_N; k++) used_set(rel, g_clue[orient][k].piece);
+}
+
+/* The top-border pool by inner colour, for a board whose unavailable pieces
+   are `used` (releases already taken out). */
+static void ext_avail(const uint64_t used[4], int avail[NUM_COLORS_TOTAL]) {
+    memset(avail, 0, NUM_COLORS_TOTAL * sizeof avail[0]);
+    if (g_free_edges) {
+        for (int t = 0; t < g_edge_term_count; t++)
+            if (!used_test(used, g_edge_term[t].piece_id) && color_is_inner(g_edge_term[t].left))
+                avail[g_edge_term[t].left]++;
+    } else {
+        for (int c = COLOR_MIN; c <= COLOR_MAX; c++) avail[c] = g_top_border_inner_count[c];
+    }
+}
+
 typedef struct {
     uint64_t used[4];
     int      avail[NUM_COLORS_TOTAL];     /* top-border pool, by inner colour */
-    int16_t  fix[NUM_PIECES];             /* per cell: clue catalog index, -1 free, -2 stop */
+    const int16_t *fix;                   /* per cell: clue catalog index, -1 free, -2 stop */
     uint8_t  topc[NUM_PIECES], rgtc[NUM_PIECES];   /* colours a placed region cell shows */
     uint8_t  cell[EXT_MAX];               /* the region, in visit order */
     uint16_t cur[EXT_MAX];
     const uint8_t *rtop;
+    uint8_t  top0;                        /* --random_edges: column 0's top at the stop row */
     int      nreg, best, stop;
     uint64_t nodes, cap;
     Ext     *out;
@@ -2708,17 +2880,38 @@ typedef struct {
 static void ext_dfs(ExtCtx *e, int d);
 
 static inline void ext_place(ExtCtx *e, int d, int cell, uint16_t ci) {
+    const Oriented *o = ext_or(ci);
     e->cur[d] = ci;
-    e->topc[cell] = g_cat[ci].top;
-    e->rgtc[cell] = g_cat[ci].right;
+    e->topc[cell] = o->top;
+    e->rgtc[cell] = o->right;
     ext_dfs(e, d + 1);
+}
+
+/* Column 0 above the stop row (--random_edges): a frame-left edge whose bottom
+   meets the column-0 top below it. */
+static void ext_dfs_col0(ExtCtx *e, int d, int cell, int r) {
+    const int B = (r == e->stop + 1) ? e->top0 : e->topc[cell - PUZZLE_SIDE];
+    for (int k = 0; k < g_edge_left_n; k++) {
+        const Oriented *o = &g_edge_left[k];
+        if (o->bottom != B || !color_is_inner(o->right)) continue;
+        if (used_test(e->used, o->piece_id)) continue;
+        if (e->nodes >= e->cap) return;
+        e->nodes++;
+        used_set(e->used, o->piece_id);
+        e->avail[o->right]--;
+        ext_place(e, d, cell, (uint16_t)(CATALOG_SIZE + k));
+        e->avail[o->right]++;
+        used_clear(e->used, o->piece_id);
+        if (e->best == e->nreg) return;
+    }
 }
 
 static void ext_dfs(ExtCtx *e, int d) {
     if (d > e->best) { e->best = d; memcpy(e->out->ci, e->cur, (size_t)d * sizeof e->cur[0]); }
     if (d == e->nreg || e->nodes >= e->cap) return;
     const int cell = e->cell[d], r = cell / PUZZLE_SIDE, c = cell % PUZZLE_SIDE;
-    const int L = (c == 1) ? g_cur_left->right[r] : e->rgtc[cell - 1];
+    if (c == 0) { ext_dfs_col0(e, d, cell, r); return; }
+    const int L = (c == 1 && !g_random_edges) ? g_cur_left->right[r] : e->rgtc[cell - 1];
     const int B = (r == e->stop + 1) ? e->rtop[c] : e->topc[cell - PUZZLE_SIDE];
     if (!color_is_inner(L) || !color_is_inner(B)) return;
     const int f = e->fix[cell];
@@ -2762,43 +2955,282 @@ static bool extend_board(const uint64_t used[4], const uint8_t rtop[PUZZLE_SIDE]
     out->n = 0;
     if (g_extend_nodes == 0 || stop >= EDGE_LEN) return false;
     ExtCtx e;
-    memcpy(e.used, used, sizeof e.used);
+    uint64_t rel[4];
+    ext_release_mask(orient, rel);
+    for (int k = 0; k < 4; k++) e.used[k] = used[k] & ~rel[k];
     e.rtop = rtop; e.stop = stop; e.out = out;
+    e.top0 = g_random_edges ? g_cur_left->p[stop]->top : 0;
     e.best = 0; e.nodes = 0; e.cap = g_extend_nodes;
     e.nreg = 0;
-    for (int c = 1; c <= EDGE_LEN; c++)
-        for (int r = stop + 1; r <= EDGE_LEN; r++) e.cell[e.nreg++] = (uint8_t)(r * PUZZLE_SIDE + c);
-    for (int i = 0; i < NUM_PIECES; i++) e.fix[i] = -1;
-    if (g_clue_mask)
-        for (int k = 0; k < CLUE_N; k++) {
-            if (!clue_on(k)) continue;
-            for (int o = 0; o < 4; o++) {
-                if (!(g_clue_orients & (1u << o))) continue;
-                if (orient >= 0 && o != orient) continue;
-                const ClueCell *cc = &g_clue[o][k];
-                if (cc->row <= stop || cc->row > EDGE_LEN) continue;
-                e.fix[cc->row * PUZZLE_SIDE + cc->col] =
-                    orient >= 0 ? (int16_t)g_clue_ci[o][k] : (int16_t)-2;
-            }
+    for (int c = g_random_edges ? 0 : 1; c <= EDGE_LEN; c++) {
+        if (g_random_edges && c == 1) continue;               /* filled with column 0 */
+        for (int r = stop + 1; r <= EDGE_LEN; r++) {
+            e.cell[e.nreg++] = (uint8_t)(r * PUZZLE_SIDE + c);
+            if (g_random_edges && c == 0) e.cell[e.nreg++] = (uint8_t)(r * PUZZLE_SIDE + 1);
         }
-    memset(e.avail, 0, sizeof e.avail);
-    if (g_free_edges) {
-        for (int t = 0; t < g_edge_term_count; t++)
-            if (!used_test(used, g_edge_term[t].piece_id) && color_is_inner(g_edge_term[t].left))
-                e.avail[g_edge_term[t].left]++;
-    } else {
-        for (int c = COLOR_MIN; c <= COLOR_MAX; c++) e.avail[c] = g_top_border_inner_count[c];
     }
+    e.fix = ext_fix_of(orient);
+    ext_avail(e.used, e.avail);
     ext_dfs(&e, 0);
     out->n = (uint16_t)e.best;
     for (int k = 0; k < e.best; k++) out->cell[k] = e.cell[k];
     return e.best < e.nreg && e.nodes >= e.cap;
 }
 
-/* Whole columns an extension fills, counted from column 1. */
-static inline int ext_columns(const Ext *x, int stop) {
+/* Whole columns an extension of n cells fills, counted from column 1. Under
+   --random_edges column 0 is filled alongside column 1, row by row. */
+static inline int ext_cols_n(int n, int stop) {
     const int h = EDGE_LEN - stop;
-    return h > 0 ? x->n / h : 0;
+    if (h <= 0) return 0;
+    if (!g_random_edges) return n / h;
+    return n >= 2 * h ? 1 + (n - 2 * h) / h : 0;
+}
+
+static inline int ext_columns(const Ext *x, int stop) { return ext_cols_n(x->n, stop); }
+
+/* -- The min-col strip check (--min_col_check W) ----------------------------- *
+
+   Under --backtrack_min_col K a board is written only if its extension fills
+   columns 1..K of rows S+1..14. The row-major search fills every column of the
+   rows up to S, so a partial board at row r can lead to a written board only
+   if columns 1..W (W <= K) can be stacked from row r+1 all the way to row 14.
+   The check asks exactly that, of a RELAXED problem whose every constraint the
+   real board must also meet:
+
+     kept     the left column's colours (under --random_edges, column 0 above S
+              is chosen from the edge pool, as the extension does); the vertical
+              colour chain from row r's tops; row 14's tops, as a multiset,
+              inside the top-border pool (ext_avail); the extension's clue cells
+              (g_ext_fix) and the colour a clue cell just right of the strip
+              wants; pieces distinct within one strip row;
+     dropped  distinctness BETWEEN strip rows (a piece may be reused); clue pins
+              and everything right of column W on rows <= S; what right edges
+              and column-0 edges take from the top-border pool.
+
+   Pieces are those not in `used` at the time of the check, plus the ones the
+   extension may release -- a superset of what is free at the stop row. So a
+   board the extension would accept always has a strip path: a partial row
+   without one is cut, and no written board is lost.
+
+   Dropping distinctness between rows makes a state's future depend only on
+   (row, column-0 top, the W tops) and the pieces available, so refuting a
+   strip costs at most its distinct states, and the first path to row 14 ends
+   the search. A state dead for one set of available pieces stays dead for any
+   smaller one, and every node below a check in the row-major search has fewer
+   pieces than the check had: so a dead state is remembered, per thread, for as
+   long as the search stays below the check that found it (path_gen), and is
+   forgotten at the rows where a subtree may be handed to another thread, so
+   that what a check decides never depends on the thread count. A path found is
+   remembered too (strip_alive): it proves its states live again for as long as
+   none of its pieces is used. Past STRIP_BUDGET steps the answer is "unknown"
+   and nothing is cut.
+
+   Rows are built piece by piece from the (left, bottom) buckets, dropping a
+   chain at its first used piece. Building them from the chain database's
+   segment-A records instead (one cell per state, every record decoded against
+   the used pieces) was measured slower at width 5 and, under the same step
+   budget, left more checks undecided: deep in the board most records hold a
+   used piece. Widths 1..W are checked in turn as columns 1..W are placed; a
+   strip dead at a narrow width is dead at every wider one. Measured (stop rows
+   9-10, K = 2 and 5), width 1 cuts the nodes by half or more and the search
+   time by about 40%; width 2 cuts the stop-row boards by half again but runs a
+   little slower than width 1, width 3 about as slow as no check, and width 5
+   fifteen times slower -- hence the default of 1. */
+#define STRIP_HBITS  17
+#define STRIP_LBITS  15
+#define STRIP_BUDGET 50000u
+#define STRIP_SLOTS_ROW (STRIP_WMAX + 1)   /* per row: a check per width */
+#define STRIP_NSLOT  (STRIP_SLOTS_ROW * (EDGE_LEN + 1))
+
+typedef struct { uint64_t key; uint32_t gen; uint8_t slot; } StripMemo;
+/* A live state: the pieces of a path from it to row 14, and that path's row-14
+   tops. It stays live while none of those pieces is used and the border pool
+   still carries those tops -- tested at every use, so it needs no scope; the
+   epoch only keeps the cache's contents, and so the search's step counts,
+   independent of the thread count. */
+typedef struct { uint64_t key; uint64_t mask[4]; uint32_t epoch; uint8_t t14[STRIP_WMAX]; } StripLive;
+
+typedef struct {
+    StripMemo *memo;                      /* dead states, direct-mapped, lossy */
+    StripLive *live;                      /* live states, direct-mapped, lossy */
+    uint32_t  gen_ctr;                    /* the last check's generation */
+    uint32_t  epoch;                      /* the live cache's current epoch */
+    uint32_t  path_gen[STRIP_NSLOT];      /* checks on the current search path */
+    int       slot;                       /* the running check's slot */
+    uint64_t  budget;
+    uint64_t  kbits;                      /* orientation and width bits of every key */
+    uint8_t   t14[STRIP_WMAX];            /* row-14 tops of the path being returned */
+    uint64_t  used[4];                    /* pieces the strip may not use */
+    int       avail[NUM_COLORS_TOTAL];    /* row-14 top colours (ext_avail) */
+    const int16_t *fix;                   /* the extension's clue cells */
+    int       W, stop;
+    uint64_t  steps;
+    bool      unknown;                    /* the budget ran out */
+    uint64_t  wit[4];                     /* pieces on the path found */
+    uint8_t   bt[EDGE_LEN + 2][STRIP_WMAX + 2];   /* per row: the bottoms (tops below) */
+    uint8_t   nt[EDGE_LEN + 2][STRIP_WMAX + 2];   /* per row: the tops being built */
+    uint16_t  rp[EDGE_LEN + 2][STRIP_WMAX + 2];   /* per row: its pieces so far */
+} Strip;
+
+static Strip *strip_new(void) {
+    Strip *s = xmalloc(sizeof *s);
+    memset(s, 0, sizeof *s);
+    s->memo = xmalloc(((size_t)1 << STRIP_HBITS) * sizeof *s->memo);
+    memset(s->memo, 0, ((size_t)1 << STRIP_HBITS) * sizeof *s->memo);
+    s->live = xmalloc(((size_t)1 << STRIP_LBITS) * sizeof *s->live);
+    memset(s->live, 0, ((size_t)1 << STRIP_LBITS) * sizeof *s->live);
+    s->epoch = 1;
+    s->budget = STRIP_BUDGET;
+    return s;
+}
+
+/* Forget the checks of slot `from` and every deeper one. */
+static inline void strip_path_reset(Strip *s, int from) {
+    for (int i = from; i < STRIP_NSLOT; i++) s->path_gen[i] = 0;
+}
+
+/* Forget everything: at the start of a job and at the rows where a subtree may
+   be handed to another thread. */
+static void strip_forget(Strip *s) {
+    strip_path_reset(s, 0);
+    if (++s->epoch == 0) {
+        memset(s->live, 0, ((size_t)1 << STRIP_LBITS) * sizeof *s->live);
+        s->epoch = 1;
+    }
+}
+
+/* Open a check in `slot`: deeper checks are no longer on the path. */
+static void strip_open(Strip *s, int slot) {
+    strip_path_reset(s, slot);
+    if (++s->gen_ctr == 0) {                 /* wrapped: nothing old may look current */
+        memset(s->memo, 0, ((size_t)1 << STRIP_HBITS) * sizeof *s->memo);
+        strip_path_reset(s, 0);
+        s->gen_ctr = 1;
+    }
+    s->path_gen[slot] = s->gen_ctr;
+    s->slot = slot;
+}
+
+static inline uint64_t strip_key(const Strip *s, int row, int c0, const uint8_t tops[]) {
+    uint64_t k = (uint64_t)row | ((uint64_t)(c0 & 7) << 4) | s->kbits;
+    for (int c = 1; c <= s->W; c++) k |= (uint64_t)(tops[c] & 31) << (7 + 5 * (c - 1));
+    return k;
+}
+
+static bool strip_dead(const Strip *s, uint64_t key) {
+    const StripMemo *e = &s->memo[splitmix64(key) & (((uint64_t)1 << STRIP_HBITS) - 1)];
+    return e->key == key && e->gen && s->path_gen[e->slot] == e->gen;
+}
+
+static void strip_bury(Strip *s, uint64_t key) {
+    StripMemo *e = &s->memo[splitmix64(key) & (((uint64_t)1 << STRIP_HBITS) - 1)];
+    e->key = key; e->gen = s->path_gen[s->slot]; e->slot = (uint8_t)s->slot;
+}
+
+/* A remembered path from this state that is still free of used pieces, with
+   row-14 tops the border pool still carries: the state is live. */
+static bool strip_alive(Strip *s, uint64_t key) {
+    const StripLive *e = &s->live[splitmix64(key) & (((uint64_t)1 << STRIP_LBITS) - 1)];
+    if (e->key != key || e->epoch != s->epoch) return false;
+    if ((e->mask[0] & s->used[0]) | (e->mask[1] & s->used[1])
+        | (e->mask[2] & s->used[2]) | (e->mask[3] & s->used[3])) return false;
+    if (g_free_edges)
+        for (int c = 0; c < s->W; c++) {
+            int n = 0;
+            for (int j = 0; j < s->W; j++) n += (e->t14[j] == e->t14[c]);
+            if (n > s->avail[e->t14[c]]) return false;
+        }
+    for (int k = 0; k < 4; k++) s->wit[k] |= e->mask[k];
+    memcpy(s->t14, e->t14, sizeof s->t14);
+    return true;
+}
+
+/* On the way back from a path found: s->wit holds the pieces of its rows from
+   this state up, s->t14 its row-14 tops. */
+static void strip_remember(Strip *s, uint64_t key) {
+    StripLive *e = &s->live[splitmix64(key) & (((uint64_t)1 << STRIP_LBITS) - 1)];
+    e->key = key; e->epoch = s->epoch;
+    memcpy(e->mask, s->wit, sizeof e->mask);
+    memcpy(e->t14, s->t14, sizeof e->t14);
+}
+
+static bool strip_reach(Strip *s, int row, int c0, const uint8_t tops[]);
+
+/* Row-14 tops so far (columns 1..c-1) plus t, against the top-border pool. */
+static inline bool strip_top_ok(const Strip *s, int row, int c, int t) {
+    int n = 1;
+    for (int j = 1; j < c; j++) n += (s->nt[row][j] == t);
+    return n <= s->avail[t];
+}
+
+/* Fill column c of strip row `row`, whose left neighbour shows L; c0n is the
+   column-0 top this row hands up. */
+static bool strip_cell(Strip *s, int row, int c, int L, int c0n) {
+    if (c > s->W) return strip_reach(s, row + 1, c0n, s->nt[row]);
+    if (++s->steps > s->budget) { s->unknown = true; return true; }
+    const int x = row * PUZZLE_SIDE + c, B = s->bt[row][c];
+    const int f = s->fix[x];
+    const int rf = (c == s->W && c < EDGE_LEN) ? s->fix[x + 1] : -1;
+    const int need_r = rf >= 0 ? g_cat[rf].left : -1;
+    const bool top = (row == EDGE_LEN);
+    if (f >= 0) {                         /* the clue: reserved, placed as is */
+        const Oriented *o = &g_cat[f];
+        if (o->left != L || o->bottom != B || (need_r >= 0 && o->right != need_r)) return false;
+        s->nt[row][c] = o->top; s->rp[row][c] = o->piece_id;
+        if (!strip_cell(s, row, c + 1, o->right, c0n)) return false;
+        if (!s->unknown) used_set(s->wit, o->piece_id);
+        return true;
+    }
+    const int nb = g_lb_count[L][B];
+    for (int k = 0; k < nb; k++) {
+        const Oriented *o = &g_cat[g_lb_bucket[L][B][k]];
+        const uint16_t pid = o->piece_id;
+        if (need_r >= 0 && o->right != need_r) continue;
+        if (used_test(s->used, pid)) continue;
+        bool dup = false;
+        for (int j = 1; j < c; j++) if (s->rp[row][j] == pid) { dup = true; break; }
+        if (dup) continue;
+        if (top && !strip_top_ok(s, row, c, o->top)) continue;
+        s->nt[row][c] = o->top; s->rp[row][c] = pid;
+        if (strip_cell(s, row, c + 1, o->right, c0n)) {
+            if (!s->unknown) used_set(s->wit, pid);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Can the strip be stacked from row `row` (bottoms tops[1..W], column-0 top
+   c0 below it) to row 14? */
+static bool strip_reach(Strip *s, int row, int c0, const uint8_t tops[]) {
+    if (row > EDGE_LEN) {
+        for (int c = 0; c < s->W; c++) s->t14[c] = s->nt[EDGE_LEN][c + 1];
+        return true;
+    }
+    const uint64_t key = strip_key(s, row, c0, tops);
+    if (strip_dead(s, key)) return false;
+    if (strip_alive(s, key)) return true;
+    for (int c = 1; c <= s->W; c++) s->bt[row][c] = tops[c];
+    bool ok = false;
+    if (g_random_edges && row > s->stop) {
+        for (int k = 0; k < g_edge_left_n && !ok; k++) {  /* column 0 above S */
+            const Oriented *o = &g_edge_left[k];
+            if (o->bottom != c0 || !color_is_inner(o->right)) continue;
+            if (used_test(s->used, o->piece_id)) continue;
+            if (++s->steps > s->budget) { s->unknown = true; return true; }
+            if (strip_cell(s, row, 1, o->right, o->top)) {
+                if (!s->unknown) used_set(s->wit, o->piece_id);
+                ok = true;
+            }
+        }
+    } else {
+        const int c0n = (g_random_edges && row == s->stop) ? g_cur_left->p[row]->top : 0;
+        ok = strip_cell(s, row, 1, g_cur_left->right[row], c0n);
+    }
+    if (s->unknown) return true;
+    if (ok) { strip_remember(s, key); return true; }
+    strip_bury(s, key);
+    return false;
 }
 
 /* One search job's output: formatted boards and, between them, the outputs of
@@ -2810,6 +3242,7 @@ typedef struct BtNode {
     uint8_t  *cc;                         /* corner code (--lambda_corners) */
     uint8_t  *rs;                         /* TOP reserve pieces left free */
     uint8_t  *ex;                         /* extension cells (--extend_nodes) */
+    uint16_t *sc;                         /* matched edges (no --end_dive) */
     uint32_t  n, ncap;
     struct BtNode **kid;
     uint32_t *kid_at;
@@ -2834,6 +3267,13 @@ typedef struct {
     double    deadline;
     bool      abort;
     BtNode  **out;                        /* where this job's output goes, made on first use */
+    /* --min_col_check: partial rows cut, checks whose budget ran out. */
+    uint64_t  cut_col, strip_unknown;
+    Strip    *strip;
+    /* The top-row near-duplicate filter: the last stop row not rejected. */
+    RowChoice ref;
+    bool      ref_ok;
+    uint64_t  near_dup;
 } BtCtx;
 
 static struct {
@@ -2845,6 +3285,8 @@ static struct {
     int      ext_max, ext_cols_max, cfg_ext_max;
     uint64_t cfg_found, cfg_dup, cfg_mincol;   /* this configuration's stop-row boards,
                                            exact repeats, under --backtrack_min_col */
+    uint64_t cut_col, strip_unknown, near_dup, cfg_near_dup;   /* --min_col_check, the
+                                           near-duplicate filter */
     uint64_t fill[EDGE_LEN + 1];
     double   t;
 } g_bt_run;
@@ -2914,7 +3356,8 @@ static inline BtNode *bt_out(BtCtx *x) {
 static void bt_node_free(BtNode *o) {
     if (!o) return;
     for (uint32_t i = 0; i < o->nkid; i++) bt_node_free(o->kid[i]);
-    free(o->buf); free(o->off); free(o->fp); free(o->cc); free(o->rs); free(o->ex); free(o->kid); free(o->kid_at);
+    free(o->buf); free(o->off); free(o->fp); free(o->cc); free(o->rs); free(o->ex); free(o->sc);
+    free(o->kid); free(o->kid_at);
     free(o);
 }
 
@@ -2989,6 +3432,7 @@ static void bt_out_push(BtNode *o, BtCtx *x, int stop) {
         o->cc  = xrealloc(o->cc,  (size_t)o->ncap * sizeof *o->cc);
         o->rs  = xrealloc(o->rs,  (size_t)o->ncap * sizeof *o->rs);
         o->ex  = xrealloc(o->ex,  (size_t)o->ncap * sizeof *o->ex);
+        o->sc  = xrealloc(o->sc,  (size_t)o->ncap * sizeof *o->sc);
     }
     const BeamEntry *t = &x->lvl[stop];
     const int orient = ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) : -1;
@@ -3001,7 +3445,7 @@ static void bt_out_push(BtNode *o, BtCtx *x, int stop) {
                  ? tc_board_code(orient, t->used, t->rtop, stop == PUZZLE_SIDE - 4) : 0;
     o->rs[o->n]  = (uint8_t)(g_top_n ? top_free(t->used) : 0);
     o->ex[o->n]  = (uint8_t)ext.n;
-    o->len += (size_t)prepare_board(x->rows, stop, orient, &ext, o->buf + o->len);
+    o->len += (size_t)prepare_board(x->rows, stop, orient, &ext, o->buf + o->len, &o->sc[o->n]);
     o->n++;
 }
 
@@ -3039,7 +3483,28 @@ static bool bt_corners_ok(BtCtx *x, int row, const BeamEntry *t) {
     return any;
 }
 
-/* Row `row` is complete in x->rows[row]: commit, test, then go up or emit. */
+/* The top-row near-duplicate test: does stop row b repeat a's columns 1..K
+   exactly and differ from it in at most one other cell (columns K+1..15)? A
+   board with a new piece in columns 1..K is never a near duplicate -- those
+   columns are where the extension starts from. */
+static bool top_near_dup(const RowChoice *a, const RowChoice *b) {
+    const int K = (int)g_bt_min_col;
+    for (int c = 1; c <= K; c++) if (a->ci[c - 1] != b->ci[c - 1]) return false;
+    int diff = (a->rterm != b->rterm);
+    for (int c = K + 1; c <= EDGE_LEN && diff <= 1; c++) diff += (a->ci[c - 1] != b->ci[c - 1]);
+    return diff <= 1;
+}
+
+/* Row `row` is complete in x->rows[row]: commit, test, then go up or emit.
+
+   At the stop row, the near-duplicate filter compares the row with the last
+   stop row that was not itself rejected, emitted or not: if the previous board
+   could not fill the columns, its near twin will not either, and if it could,
+   the twin's extension and dives would only repeat its own. The reference is
+   cleared wherever the search may hand a subtree to another thread (rows up to
+   split_max, and at the start of every job), so each subtree is judged the
+   same way whichever thread runs it, and the output does not depend on the
+   thread count. */
 static void bt_close_row(BtCtx *x, int row) {
     BeamEntry *t = &x->lvl[row];
     *t = x->lvl[row - 1];
@@ -3049,9 +3514,92 @@ static void bt_close_row(BtCtx *x, int row) {
     if (!parity_ok(t)) { x->cut_parity++; return; }
     if (g_corners_on && !bt_corners_ok(x, row, t)) { x->cut_corner++; return; }
     x->fill[row]++;
-    if ((uint32_t)row == g_stop_row) { bt_out_push(bt_out(x), x, row); return; }
-    if (row <= x->split_max && bt_hungry()) { bt_spawn(x, row); return; }
+    if ((uint32_t)row == g_stop_row) {
+        if (g_top_dedup) {
+            if (x->ref_ok && top_near_dup(&x->ref, &x->rows[row])) { x->near_dup++; return; }
+            x->ref = x->rows[row]; x->ref_ok = true;
+        }
+        bt_out_push(bt_out(x), x, row);
+        return;
+    }
+    if (row <= x->split_max) {
+        x->ref_ok = false;
+        if (x->strip) strip_forget(x->strip);
+        if (bt_hungry()) { bt_spawn(x, row); return; }
+    }
     bt_row(x, row + 1);
+}
+
+/* -- The min-col checks, as the row-major search meets them ------------------ */
+
+static inline int bt_orient(const BtCtx *x, int row) {
+    return (x->flags[row] & FLAG_ORIENT_SET) ? (int)(x->flags[row] & FLAG_ORIENT_MASK) : -1;
+}
+
+/* Lowest column holding a clue cell of unknown orientation above the stop row
+   (g_ext_fix[0]); a strip reaching it cannot be checked before the board knows
+   its frame. */
+static int g_strip_blind_col = PUZZLE_SIDE;
+
+/* Can columns 1..W still be stacked to row 14 above row `row`, whose columns
+   1..W are placed? Cuts and unknowns are counted here. */
+static bool bt_strip_ok(BtCtx *x, int row, int W, int slot) {
+    const int orient = bt_orient(x, row);
+    if (!x->strip) x->strip = strip_new();
+    Strip *s = x->strip;
+    strip_open(s, row * STRIP_SLOTS_ROW + slot);
+    if (orient < 0 && W + 1 >= g_strip_blind_col) return true;
+    uint64_t rel[4];
+    ext_release_mask(orient, rel);
+    for (int k = 0; k < 4; k++) s->used[k] = x->used[row][k] & ~rel[k];
+    ext_avail(s->used, s->avail);
+    s->fix = ext_fix_of(orient);
+    s->kbits = ((uint64_t)(orient + 1) << 40) | ((uint64_t)W << 43);
+    s->W = W; s->stop = (int)g_stop_row;
+    s->steps = 0; s->unknown = false;
+    s->wit[0] = s->wit[1] = s->wit[2] = s->wit[3] = 0;
+    uint8_t tops[STRIP_WMAX + 2];
+    for (int c = 1; c <= s->W; c++) tops[c] = g_cat[x->rows[row].ci[c - 1]].top;
+    const int c0 = (g_random_edges && row == s->stop) ? g_cur_left->p[row]->top : 0;
+    const bool ok = strip_reach(s, row + 1, c0, tops);
+    if (s->unknown) { x->strip_unknown++; return true; }
+    if (!ok) { x->cut_col++; return false; }
+    return true;
+}
+
+/* Stop row S, column c (<= K) just placed with top colour B: the extension
+   must put a piece on (S+1, c), so some piece it may use has to sit on B --
+   with the left column's colour beside it in column 1 (rotations mode), the
+   colour a clue cell next to it or above it wants, and a top the border pool
+   still carries on row 14. A clue cell takes only its clue; a clue cell of
+   unknown orientation ends the extension, so the board cannot fill column c. */
+static bool bt_top_fits(BtCtx *x, int row, int c, int B) {
+    const int orient = bt_orient(x, row);
+    const int16_t *fix = ext_fix_of(orient);
+    const int y = (row + 1) * PUZZLE_SIDE + c;
+    const int f = fix[y];
+    if (f == -2) return false;
+    if (f >= 0) return g_cat[f].bottom == B;
+    uint64_t u[4], rel[4];
+    ext_release_mask(orient, rel);
+    for (int k = 0; k < 4; k++) u[k] = x->used[row][k] & ~rel[k];
+    const bool top = (row + 1 == EDGE_LEN);
+    int avail[NUM_COLORS_TOTAL];
+    if (top) ext_avail(u, avail);
+    const int rf = c < EDGE_LEN ? fix[y + 1] : -1, uf = !top ? fix[y + PUZZLE_SIDE] : -1;
+    const int need_r = rf >= 0 ? g_cat[rf].left : -1, need_t = uf >= 0 ? g_cat[uf].bottom : -1;
+    const int Lfix = (c == 1 && !g_random_edges) ? g_cur_left->right[row + 1] : -1;
+    const int L0 = Lfix >= 0 ? Lfix : COLOR_MIN, L1 = Lfix >= 0 ? Lfix : COLOR_MAX;
+    for (int L = L0; L <= L1; L++)
+        for (int k = 0; k < g_lb_count[L][B]; k++) {
+            const Oriented *o = &g_cat[g_lb_bucket[L][B][k]];
+            if (need_r >= 0 && o->right != need_r) continue;
+            if (need_t >= 0 && o->top != need_t) continue;
+            if (top && avail[o->top] <= 0) continue;
+            if (used_test(u, o->piece_id)) continue;
+            return true;
+        }
+    return false;
 }
 
 /* Fill column `col` of row `row`, whose left neighbour exposes colour L. */
@@ -3067,6 +3615,18 @@ static void bt_cell(BtCtx *x, int row, int col, int L) {
             g_bt.abort = true;
             return;
         }
+    }
+    /* --min_col_check: the column before this one was just placed. */
+    if (g_col_check) {
+        if ((uint32_t)row == g_stop_row && col >= 2 && col - 1 <= (int)g_bt_min_col
+            && !bt_top_fits(x, row, col - 1, g_cat[x->rows[row].ci[col - 2]].top)) {
+            x->cut_col++;
+            return;
+        }
+        /* Widths 1..W, each as soon as its columns are placed: a strip dead
+           at a narrow width is dead at every wider one, so the costly wide
+           checks see only the partial rows the cheap narrow ones let through. */
+        if (col >= 2 && col - 1 <= g_col_check && !bt_strip_ok(x, row, col - 1, col - 1)) return;
     }
     const int B = x->lvl[row - 1].rtop[col];
     RowChoice *mv = &x->rows[row];
@@ -3183,8 +3743,9 @@ static void bt_emit_node(const BtNode *o, uint64_t *boards) {
         const size_t end = (i + 1 < o->n) ? o->off[i + 1] : o->len;
         emit_board_line(o->buf + o->off[i], end - o->off[i]);
         g_stats.emitted_total++; g_bt.emitted++;
+        if (!g_end_dive) g_score_hist[o->sc[i]]++;
         if (g_extend_nodes) {
-            const int n = o->ex[i], h = EDGE_LEN - (int)g_stop_row, cols = h > 0 ? n / h : 0;
+            const int n = o->ex[i], cols = ext_cols_n(n, (int)g_stop_row);
             g_bt_run.ext_cells += (uint64_t)n; g_bt_run.ext_cols += (uint64_t)cols;
             if (n > g_bt_run.ext_max) g_bt_run.ext_max = n;
             if (cols > g_bt_run.ext_cols_max) g_bt_run.ext_cols_max = cols;
@@ -3255,6 +3816,8 @@ static void bt_run_job(BtCtx *x, const BtJob *j) {
     r->depth = (uint16_t)N; r->flags = pe->flags;
     x->out = j->out_slot ? j->out_slot : &handoff;
     x->deadline = g_bt.deadline; x->root = j->root;
+    x->ref_ok = false;
+    if (x->strip) strip_forget(x->strip);
     #pragma omp atomic read
     x->abort = g_bt.abort;
     if (x->abort) return;
@@ -3336,6 +3899,7 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
         BtCtx *x = g_bt_ctx[t];
         x->nodes = x->cut_parity = x->cut_corner = 0;
         x->ext_nodes_cap = x->cut_mincol = 0;
+        x->cut_col = x->strip_unknown = x->near_dup = 0;
         memset(x->fill, 0, sizeof x->fill);
         x->abort = false;
         x->split_max = split_max;
@@ -3399,11 +3963,13 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     }
 
     uint64_t fill[EDGE_LEN + 1] = {0}, nodes = 0, cut_p = 0, cut_c = 0, ecap = 0, cut_m = 0;
+    uint64_t cut_col = 0, unknown = 0, near_dup = 0;
     bool aborted = g_bt.abort;
     for (int t = 0; t < nt; t++) {
         BtCtx *x = g_bt_ctx[t];
         nodes += x->nodes; cut_p += x->cut_parity; cut_c += x->cut_corner;
         ecap += x->ext_nodes_cap; cut_m += x->cut_mincol;
+        cut_col += x->cut_col; unknown += x->strip_unknown; near_dup += x->near_dup;
         for (int r = 0; r <= EDGE_LEN; r++) fill[r] += x->fill[r];
         if (x->abort) aborted = true;
     }
@@ -3422,6 +3988,8 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     g_bt_run.dup += g_bt.dup;
     g_bt_run.cfg_found = fill[g_stop_row];
     g_bt_run.cfg_dup = g_bt.dup; g_bt_run.cfg_mincol = cut_m;
+    g_bt_run.cut_col += cut_col; g_bt_run.strip_unknown += unknown;
+    g_bt_run.near_dup += near_dup; g_bt_run.cfg_near_dup = near_dup;
     for (int r = 0; r <= EDGE_LEN; r++) g_bt_run.fill[r] += fill[r];
 
     if (fill[g_stop_row]) {
@@ -3445,6 +4013,8 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
         if (g_corners_on) printf(" cut_corner=%" PRIu64, cut_c);
         if (g_extend_nodes) printf(" ext_max=%d", g_bt_run.cfg_ext_max);
         if (g_bt_min_col)   printf(" cut_mincol=%" PRIu64, cut_m);
+        if (g_col_check)    printf(" cut_col=%" PRIu64 " unknown=%" PRIu64, cut_col, unknown);
+        if (g_top_dedup)    printf(" near_dups=%" PRIu64, near_dup);
         printf(" reached");
         for (int r = N + 1; r <= (int)g_stop_row; r++) printf(" r%d:%" PRIu64, r, fill[r]);
         printf(" emitted=%" PRIu64 "%s t=%.2fs\n", emitted,
@@ -3648,8 +4218,8 @@ static void print_time_stamp(const char *what, double wall) {
     printf("\n");
 }
 
-static void print_summary(double wall_total, double init_s, double sweep_s) {
-    printf("\n================= run summary =================\n");
+/* --verbose: every detail line of the run, ahead of the short summary. */
+static void print_summary_detail(double wall_total, double init_s, double sweep_s) {
     printf("[sum] wall %.1fs = init %.1fs (DB build %.1fs, sort %.1fs) + sweep %.1fs\n",
            wall_total, init_s, g_time_db_build, g_time_db_sort, sweep_s);
     if (g_stats.configs) {
@@ -3752,19 +4322,113 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
                 printf("[clue] row %2d: parents=%llu sumA=%llu sumB=%llu sumC=%llu\n", r,
                        (unsigned long long)g_dbg_calls[r], (unsigned long long)g_dbg_nA[r],
                        (unsigned long long)g_dbg_nB[r], (unsigned long long)g_dbg_nC[r]);
-    printf("[sum] boards: found %" PRIu64 " at row %u", g_found_total, g_stop_row);
-    if (g_backtrack_row && g_bt_run.dup) printf(", %" PRIu64 " exact repeats dropped", g_bt_run.dup);
-    if (g_bt_min_col) printf(", %" PRIu64 " under --backtrack_min_col %u", g_bt_run.cut_mincol, g_bt_min_col);
-    printf(", written %" PRIu64, g_written_total);
-    if (g_end_dive) printf(" (dived %" PRIu64 ", kept >= %d)", dv_boards(), g_emit_score);
+}
+
+/* "45s", "11m08s", "1h02m03s". */
+static const char *fmt_dur(char *b, size_t n, double sec) {
+    const long t = (long)(sec + 0.5);
+    if (t < 60)        snprintf(b, n, "%lds", t);
+    else if (t < 3600) snprintf(b, n, "%ldm%02lds", t / 60, t % 60);
+    else               snprintf(b, n, "%ldh%02ldm%02lds", t / 3600, (t / 60) % 60, t % 60);
+    return b;
+}
+
+/* "12345", "1.2M", "3.4G": counts that stay short. */
+static const char *fmt_cnt(char *b, size_t n, uint64_t v) {
+    if (v < 1000000ULL)         snprintf(b, n, "%" PRIu64, v);
+    else if (v < 1000000000ULL) snprintf(b, n, "%.1fM", (double)v / 1e6);
+    else                        snprintf(b, n, "%.2fG", (double)v / 1e9);
+    return b;
+}
+
+#define SCORE_LINE_MAX 6                  /* scores shown on the summary's last line */
+
+/* The run summary: one short line per topic, only those that apply, nothing
+   said twice; --verbose prints every detail line first. The last [sum] line
+   is the written boards by score. */
+static void print_summary(double wall_total, double init_s, double sweep_s) {
+    char b1[32], b2[32];
+    printf("\n================= run summary =================\n");
+    if (g_verbose) print_summary_detail(wall_total, init_s, sweep_s);
+
+    const double bt_t = g_backtrack_row ? g_bt_run.t : 0.0;
+    const double dv_t = g_end_dive ? dv_seconds() : 0.0;
+    const double beam_t = sweep_s - bt_t - dv_t > 0.0 ? sweep_s - bt_t - dv_t : 0.0;
+    printf("[sum] time: init %s, beam %s", fmt_dur(b1, sizeof b1, init_s), fmt_dur(b2, sizeof b2, beam_t));
+    if (g_backtrack_row) printf(", backtrack %s", fmt_dur(b1, sizeof b1, bt_t));
+    if (g_end_dive)      printf(", dives %s", fmt_dur(b1, sizeof b1, dv_t));
     printf("\n");
-    if (g_prefix[0]) printf("[sum] run prefix: %s -> %s\n", g_prefix, g_out_dir);
+    if (g_stats.configs) {
+        printf("[sum] configs: %" PRIu64 ", %.1f s each; %" PRIu64 " reached row %u\n",
+               g_stats.configs, sweep_s / (double)g_stats.configs, g_stats.reached_stop, g_stop_row);
+        bool any = false;
+        for (int r = 1; r <= (int)g_stop_row; r++) {
+            if (!g_stats.extinct_at[r]) continue;
+            printf("%s r%d:%" PRIu64, any ? "" : "[sum] extinct:", r, g_stats.extinct_at[r]);
+            any = true;
+        }
+        if (any) printf("\n");
+    }
+    if (g_backtrack_row && g_bt_run.roots) {
+        printf("[sum] backtrack: %s nodes, %.0f M/s;", fmt_cnt(b1, sizeof b1, g_bt_run.nodes),
+               g_bt_run.t > 0 ? (double)g_bt_run.nodes / g_bt_run.t / 1e6 : 0.0);
+        for (int r = (int)g_backtrack_row + 1; r <= (int)g_stop_row; r++)
+            printf(" r%d:%s", r, fmt_cnt(b1, sizeof b1, g_bt_run.fill[r]));
+        printf("\n");
+        if (g_extend_nodes) {
+            const uint64_t b = g_bt_run.emitted;
+            printf("[sum] extension: mean %.2f cols, max %d", b ? (double)g_bt_run.ext_cols / (double)b : 0.0,
+                   g_bt_run.ext_cols_max);
+            if (g_bt_run.ext_cap) printf("; node cap hit %" PRIu64, g_bt_run.ext_cap);
+            printf("\n");
+        }
+        if (g_bt_min_col) {
+            printf("[sum] min_col %u: ", g_bt_min_col);
+            if (g_col_check) printf("column check (W=%d) cut %s partial rows", g_col_check,
+                                    fmt_cnt(b1, sizeof b1, g_bt_run.cut_col));
+            else             printf("column check off");
+            if (g_bt_run.strip_unknown)
+                printf(", %s undecided", fmt_cnt(b1, sizeof b1, g_bt_run.strip_unknown));
+            printf("\n");
+        }
+    }
+    if (g_corners_on) {
+        uint64_t nb, tl0, tr0, both, joint;
+        tc_hist_get(&nb, &tl0, &tr0, &both, &joint);
+        if (nb) {
+            const double pc = 100.0 / (double)nb;
+            printf("[sum] corners: TL %.0f%%, TR %.0f%%, both %.0f%%, pair %.0f%%\n",
+                   (double)(nb - tl0) * pc, (double)(nb - tr0) * pc, (double)both * pc, (double)joint * pc);
+        }
+    }
+    if (g_rsv_boards)
+        printf("[sum] reserve: %.1f of %.0f TOP pieces free\n",
+               (double)g_rsv_free_sum / (double)g_rsv_boards,
+               (double)g_rsv_marked_sum / (double)g_rsv_boards);
+    printf("[sum] boards: found %" PRIu64, g_found_total);
+    if (g_backtrack_row && g_bt_run.near_dup) printf(", near-dups %" PRIu64, g_bt_run.near_dup);
+    if (g_backtrack_row && g_bt_run.dup)      printf(", repeats %" PRIu64, g_bt_run.dup);
+    if (g_bt_min_col)                         printf(", below min_col %" PRIu64, g_bt_run.cut_mincol);
+    if (g_end_dive)                           printf(", dived %" PRIu64, dv_boards());
+    printf("\n");
     if (g_incomplete_top) {
-        printf("[sum] incomplete-top partials: %zu  (", g_partial_total);
+        printf("[sum] partials: %zu (", g_partial_total);
         for (int k = 0; k < PART_N; k++)
             printf("%s%s %zu", k ? ", " : "", g_part_name[k], g_part_total[k]);
         printf(")\n");
     }
+    if (g_prefix[0]) printf("[sum] run prefix: %s -> %s\n", g_prefix, g_out_dir);
+    printf("[sum] *** Output boards score:");
+    int shown = 0;
+    bool more = false;
+    for (int sc = DV_EDGES; sc >= 0; sc--) {
+        const uint64_t n = g_end_dive ? dv_score_count(sc) : g_score_hist[sc];
+        if (!n) continue;
+        if (shown == SCORE_LINE_MAX) { more = true; break; }
+        printf("%s%d:%" PRIu64, shown ? "  " : " ", sc, n);
+        shown++;
+    }
+    printf("%s%s (%" PRIu64 " written)\n", shown ? "" : " none", more ? " ..." : "", g_written_total);
     print_time_stamp("ended", wall_total);
     fflush(stdout);
 }
@@ -3981,6 +4645,19 @@ static void usage(const char *a0) {
 "  --backtrack_min_col K  with --backtrack_row: write only boards whose extension\n"
 "                         fills columns 1..K of rows stop+1..14 whole; lets a lower\n"
 "                         --stop_row run without flooding the output (default 0)\n"
+"  --min_col_check W      with --backtrack_min_col K: cut a partial row as soon as\n"
+"                         columns 1..W (W <= K) can no longer be stacked up to row\n"
+"                         14 (a relaxation that may reuse pieces between rows, so it\n"
+"                         never drops a board the extension would keep), and a stop-\n"
+"                         row cell of columns 1..K whose top nothing can sit on. The\n"
+"                         written boards are the same; found ones and time fall.\n"
+"                         Wider strips cut more but cost more than they save in\n"
+"                         measured runs (default 1 with K >= 1; 0 = off; max 6)\n"
+"  --no_top_dedup         with --backtrack_row: keep stop-row boards whose top row\n"
+"                         repeats the previous board's columns 1..K and differs from\n"
+"                         it in at most one other cell. By default such a near twin\n"
+"                         is dropped before its extension and dives, whether the\n"
+"                         previous board was written or not\n"
 "  --beam_expand E      late-search width multiplier (default 4; 1 = no expansion)\n"
 "  --beam_expand_row R    row with the full ExK width; half of the extra width is\n"
 "                         granted one row earlier (default 7)\n"
@@ -4027,6 +4704,10 @@ static void usage(const char *a0) {
 "  --clue_corners         force the two published corner clues the beam can reach,\n"
 "                         both on row 2; the row-13 pair is only reserved, never pinned,\n"
 "                         and constrains no searched row. Clue pieces leave the database\n"
+"  --free_top_clue        with --clue_corners and --backtrack_row: the extension above\n"
+"                         the stop row may place the two row-13 clues on any cell and\n"
+"                         fills their own cells like any other; a clue it did not place\n"
+"                         goes home only where it matches its neighbours\n"
 "  --pin_clue N           search ONE of the four clue frames instead of hedging over all\n"
 "                         four. The five clues are one rigid body, so naming where the\n"
 "                         CENTRE clue sits names the whole set. Rows are 0-indexed\n"
@@ -4197,6 +4878,9 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     printf(" --beam_width %u --stop_row %u", g_beam_width, g_stop_row);
     if (g_backtrack_row) printf(" --backtrack_row %u --extend_nodes %u", g_backtrack_row, g_extend_nodes);
     if (g_bt_min_col)    printf(" --backtrack_min_col %u", g_bt_min_col);
+    if (g_col_check_set) printf(" --min_col_check %d", g_col_check);
+    if (g_backtrack_row && !g_top_dedup) printf(" --no_top_dedup");
+    if (g_free_top_clue) printf(" --free_top_clue");
     if (g_prefix[0])     printf(" --prefix %s", g_prefix);
     if (g_end_dive) printf(" --end_dive %u --emit_score %d", g_end_dive, g_emit_score);
     if (g_end_dive && g_end_polish >= 0) printf(" --end_polish %d", g_end_polish);
@@ -4241,7 +4925,13 @@ static bool     g_sw_armed = false;    /* a run is open, even at zero suppressed
 static long     g_sw_first = -1, g_sw_last = -1;   /* the SUPPRESSED span      */
 static uint32_t g_sw_n     = 0;        /* suppressed since the printed one     */
 static double   g_sw_wall  = 0.0;      /* their combined wall time             */
-static double   g_progress_last = 0.0;
+/* Compact log: the run of consecutive barren configurations (nothing found,
+   ordinary end) of one bottom, printed as one line when the run ends. */
+static char     g_cb_group[64] = "";
+static long     g_cb_first = -1, g_cb_last = -1;
+static uint32_t g_cb_n = 0;
+static double   g_cb_wall = 0.0;
+static uint32_t g_cb_died[EDGE_LEN + 2];
 
 /* Does any enabled orientation pin something on this row? A row is pinned by a
    clue ON it and, one row earlier, by the colour that clue will sit on -- which
@@ -4275,8 +4965,21 @@ static void cfg_count_written(uint64_t dv_written_before) {
     g_found_total += g_cfg_found; g_written_total += g_cfg_written;
 }
 
+static void barren_flush(void) {
+    if (!g_cb_n) return;
+    if (g_cb_n == 1) printf("[sweep] %sl%ld found=0 died", g_cb_group, g_cb_first);
+    else printf("[sweep] %sl%ld-l%ld x%u found=0 died", g_cb_group, g_cb_first, g_cb_last, g_cb_n);
+    for (int r = 0; r < EDGE_LEN + 2; r++)
+        if (g_cb_died[r]) printf(" r%d:%u", r, g_cb_died[r]);
+    printf(" wall=%.1fs\n", g_cb_wall);
+    fflush(stdout);
+    g_cb_group[0] = '\0'; g_cb_first = g_cb_last = -1; g_cb_n = 0; g_cb_wall = 0.0;
+    memset(g_cb_died, 0, sizeof g_cb_died);
+}
+
 static void sweep_flush(void) {
     if (!g_verbose) {
+        barren_flush();
         g_sw_group[0] = g_sw_key[0] = '\0';
         g_sw_armed = false; g_sw_first = g_sw_last = -1; g_sw_n = 0; g_sw_wall = 0.0;
         return;
@@ -4303,9 +5006,10 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
 
     if (!g_verbose) {
         /* Compact log: a line for configurations that found boards or
-           two-segment partials, or ended for an unusual reason; the rest are
-           counted in the periodic progress line and the summary. Every count is
-           this configuration's; run totals are in [progress] and the summary. */
+           two-segment partials, or ended for an unusual reason; the barren
+           rest of a bottom collapse into one line per run of them, with the
+           rows they died at. Every count is this configuration's (or the
+           run's); run totals are in the summary. */
         const size_t strong_partials = g_part_count[PART_AB]
                                      + g_part_count[PART_AC]
                                      + g_part_count[PART_BC];
@@ -4313,8 +5017,11 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
         const bool exceptional = strcmp(br->reason, "extinct") != 0
                               && strcmp(br->reason, "stop_row") != 0;
         if (productive || exceptional) {
+            barren_flush();
             printf("[sweep] %sl%ld found=%" PRIu64, group, li, g_cfg_found);
             if (g_backtrack_row && g_bt_run.cfg_dup) printf(" repeats=%" PRIu64, g_bt_run.cfg_dup);
+            if (g_backtrack_row && g_bt_run.cfg_near_dup)
+                printf(" near_dups=%" PRIu64, g_bt_run.cfg_near_dup);
             if (g_bt_min_col) printf(" below_min_col=%" PRIu64, g_bt_run.cfg_mincol);
             printf(" written=%" PRIu64, g_cfg_written);
             if (g_backtrack_row && g_extend_nodes && g_cfg_found)
@@ -4327,22 +5034,10 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
             return;
         }
 
-        double now = omp_get_wtime();
-        if (g_progress_last == 0.0) g_progress_last = now;
-        if (now - g_progress_last >= SWEEP_QUIET_SEC) {
-            printf("[progress] %sl%ld configs=%" PRIu64 " reached_stop=%" PRIu64
-                   " found=%" PRIu64 " written=%" PRIu64,
-                   group, li, g_stats.configs, g_stats.reached_stop,
-                   g_found_total, g_written_total);
-            if (g_incomplete_top) printf(" partials=%zu", g_partial_total);
-            printf(" deaths");
-            for (int r = 1; r <= (int)g_stop_row; r++)
-                if (g_stats.extinct_at[r])
-                    printf(" r%d=%" PRIu64, r, g_stats.extinct_at[r]);
-            printf("\n");
-            fflush(stdout);
-            g_progress_last = now;
-        }
+        if (g_cb_n && strcmp(g_cb_group, group)) barren_flush();
+        if (!g_cb_n) { snprintf(g_cb_group, sizeof g_cb_group, "%s", group); g_cb_first = li; }
+        g_cb_last = li; g_cb_n++; g_cb_wall += wall;
+        if (br->row < (uint32_t)(EDGE_LEN + 2)) g_cb_died[br->row]++;
         return;
     }
 
@@ -4439,6 +5134,14 @@ int main(int argc, char *argv[]) {
                 fatal("--backtrack_min_col expects an integer in 0..%d, got '%s'", EDGE_LEN, argv[i]);
             g_bt_min_col = (uint32_t)v; g_min_col_set = true;
         }
+        else if (!strcmp(argv[i], "--min_col_check") && i+1 < argc) {
+            char *end; long v = strtol(argv[++i], &end, 10);
+            if (*end || v < 0 || v > STRIP_WMAX)
+                fatal("--min_col_check expects a width in 0..%d, got '%s'", STRIP_WMAX, argv[i]);
+            g_col_check = (int)v; g_col_check_set = true;
+        }
+        else if (!strcmp(argv[i], "--free_top_clue"))             g_free_top_clue = true;
+        else if (!strcmp(argv[i], "--no_top_dedup"))              g_top_dedup = false;
         else if (!strcmp(argv[i], "--prefix")) {
             /* The name is optional: bare, the run draws a 6-character code. */
             if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0) {
@@ -4581,6 +5284,24 @@ int main(int argc, char *argv[]) {
     if ((g_extend_set || g_min_col_set) && !g_backtrack_row_set)
         fatal("--extend_nodes and --backtrack_min_col extend the backtracker's stop-row "
               "boards: add --backtrack_row N");
+    if (!g_top_dedup && !g_backtrack_row_set)
+        fatal("--no_top_dedup turns off a filter of the backtracker's stop-row boards: "
+              "add --backtrack_row N");
+    if (g_free_top_clue) {
+        if (!(g_clue_mask & CLUE_CORNERS))
+            fatal("--free_top_clue frees the row-13 corner clues: add --clue_corners");
+        if (!g_backtrack_row_set || !g_extend_nodes)
+            fatal("--free_top_clue acts in the extension above the stop row: it needs "
+                  "--backtrack_row N and --extend_nodes > 0");
+    }
+    if (g_col_check_set) {
+        if (!g_bt_min_col)
+            fatal("--min_col_check tests what --backtrack_min_col asks for: add --backtrack_min_col K");
+        if (g_col_check > (int)g_bt_min_col)
+            fatal("--min_col_check %d is wider than --backtrack_min_col %u", g_col_check, g_bt_min_col);
+    } else {
+        g_col_check = (int)g_bt_min_col < STRIP_W_DEFAULT ? (int)g_bt_min_col : STRIP_W_DEFAULT;
+    }
     if (g_emit_score < 0 || g_emit_score > 480) fatal("--emit_score must be in 0..480");
     if (g_end_polish >= 0 && !g_end_dive)
         fprintf(stderr, "[warn] --end_polish has no effect without --end_dive\n");
@@ -4677,7 +5398,16 @@ int main(int argc, char *argv[]) {
                g_extend_nodes, g_stop_row, g_stop_row + 1, g_extend_nodes);
     if (g_bt_min_col)
         printf("[cfg] backtrack_min_col=%u (only boards whose extension fills columns 1..%u "
-               "of rows %u..14 are written)\n", g_bt_min_col, g_bt_min_col, g_stop_row + 1);
+               "of rows %u..14 are written) min_col_check=%d\n", g_bt_min_col, g_bt_min_col,
+               g_stop_row + 1, g_col_check);
+    if (g_backtrack_row)
+        printf("[cfg] top_dedup=%s\n", g_top_dedup
+               ? "on (a stop-row board within one top-row cell of the previous one, its "
+                 "columns 1..K the same, is dropped before its extension)" : "off");
+    if (g_free_top_clue)
+        printf("[cfg] free_top_clue=1 (the extension may place the row-13 clues on any cell)\n");
+    if (g_random_edges && g_backtrack_row && g_extend_nodes)
+        printf("[cfg] random edges: the extension chooses column 0 above row %u\n", g_stop_row);
     if (g_prefix[0])
         printf("[cfg] run prefix: %s (boards are named %s_<config>) -> %s\n",
                g_prefix, g_prefix, g_out_dir);
@@ -4750,6 +5480,11 @@ int main(int argc, char *argv[]) {
        eighty seconds of database. */
     init_clue_tables();
     clue_dump_schedule();
+    ext_fix_init();
+    if (g_random_edges) g_edge_left_n = edge_left_pool(&g_edge_left);
+    for (int x = 0; x < NUM_PIECES; x++)
+        if (g_ext_fix[0][x] == -2 && x % PUZZLE_SIDE < g_strip_blind_col)
+            g_strip_blind_col = x % PUZZLE_SIDE;
 
     /* Clue pieces leave the DATABASE, so no chain can hold one and the search
        never rejects a chain for colliding with a clue.
@@ -4883,6 +5618,7 @@ int main(int argc, char *argv[]) {
 
                 g_emit_count = 0; memset(g_emit_htable, 0, g_emit_htable_sz*sizeof(uint64_t));
                 g_bt_run.cfg_found = g_bt_run.cfg_dup = g_bt_run.cfg_mincol = 0;
+                g_bt_run.cfg_near_dup = 0;
                 g_bt_run.cfg_ext_max = 0;
                 if (g_incomplete_top) partial_config_reset();
                 double tc0 = omp_get_wtime();
@@ -4916,7 +5652,12 @@ int main(int argc, char *argv[]) {
     } else
     for (uint32_t cur_row = g_start_row; cur_row < g_start_row + g_num_rows; cur_row++) {
         if (g_stop) break;
-        printf("\n========== border row %u ==========\n", cur_row); fflush(stdout);
+        {
+            const double el = omp_get_wtime() - t_start;
+            printf("\n========== border row %u   run %.0f s = %.1f min ==========\n",
+                   cur_row, el, el / 60.0);
+            fflush(stdout);
+        }
 
         uint8_t spins[NUM_PIECES];
         if (!read_one_border_row(csv_path, cur_row, spins)) { printf("[sweep] border row %u not found; stopping.\n", cur_row); break; }
@@ -5029,6 +5770,7 @@ int main(int argc, char *argv[]) {
 
                 g_emit_count = 0; memset(g_emit_htable, 0, g_emit_htable_sz*sizeof(uint64_t));
                 g_bt_run.cfg_found = g_bt_run.cfg_dup = g_bt_run.cfg_mincol = 0;
+                g_bt_run.cfg_near_dup = 0;
                 g_bt_run.cfg_ext_max = 0;
                 if (g_incomplete_top) partial_config_reset();
                 double tc0 = omp_get_wtime();

@@ -34,7 +34,7 @@ bash tests/run_tests.sh roundhouse_cache                # by name
 
 - The `ALL_STEPS` array at the top of `run_tests.sh` is the only list of checks. Each entry `name|label` has a matching `step_name` function. To add a check, add both.
 - Each check runs on its own and never depends on an earlier check's artifacts. If check 1 (`compile`) isn't selected, the checks use whatever is already in `bin/`.
-- `beamer_micro`, `beamer_backtrack_dive`, `beamer_resume`, `example_beamer` and `pipeline_full` need the real 6.4 GB chain database (~8 GB RAM). Set `SKIP_BEAMER=1` to skip them, `DB_FILE=path` to keep a persistent DB cache, or `DB_IN_MEMORY=1` to avoid writing it to disk.
+- `beamer_micro`, `beamer_backtrack_dive`, `beamer_min_col`, `beamer_resume`, `example_beamer` and `pipeline_full` need the real 6.4 GB chain database (~8 GB RAM). Set `SKIP_BEAMER=1` to skip them, `DB_FILE=path` to keep a persistent DB cache, or `DB_IN_MEMORY=1` to avoid writing it to disk.
 - Key regressions: the finalizer and roundhouse must rediscover `data/synth_solution_480.csv` (seed `data/synth_seed.txt`), and `viewer` must score it 480/480.
 - `no_stray_output` fails if any check leaves a file in the repo root, so tools that write to the working directory must run from inside `tests/out`.
 - `scripts_parse` (`tests/check_script_flags.py`) collects each binary's accepted flags from its `strcmp(argv[i], "--x")` sites. Every `--flag` that a script in `pipeline/`, `examples/` or `tests/` passes must be in that set. If you rename or remove a C flag, update every script that uses it.
