@@ -278,6 +278,14 @@ extern bool     g_has_cBL, g_has_cBR, g_has_cTL, g_has_cTR;
    role. Set by the beamer CLI, resolved/validated by finalize_fixed_corners. */
 extern int      g_fixed_corner_pid[4];
 
+/* --exhaust_border_color (beamer): when g_exhaust_colour is a frame colour
+   1..5, the random samplers below only publish borders that use it up within
+   the bottom row and left rows 1..g_exhaust_rows (the stop row): every edge
+   piece carrying it lies there, and neither top corner nor BR's top carries
+   it. Pieces carrying it are drawn EXHAUST_WEIGHT times as often. 0 = off. */
+extern int      g_exhaust_colour;
+extern int      g_exhaust_rows;
+
 /* Edge-terminal pool: every edge piece that may END a chain, oriented
    frame-right (frame on the right, exposing an edge-interface top/bottom and an
    inner left). Free mode: all non-corner edges. Fixed mode: the border row's

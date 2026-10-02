@@ -13,7 +13,9 @@
  *   --random_edges there is no Stage A input at all: bottoms and left columns
  *   are sampled at random from the seed's edge pieces (best of 32 fan-out-ranked
  *   samples each; see E555_database.c), so the search can run indefinitely,
- *   generating partials over ever-fresh border combinations. Each configuration
+ *   generating partials over ever-fresh border combinations;
+ *   --exhaust_border_color makes each such border use up one frame colour
+ *   within the rows it writes. Each configuration
  *   is searched by ONE beam of --beam_width partial boards, advanced one row at
  *   a time:
  *     EXPAND      every beam board fills its next row left-to-right as three
@@ -199,6 +201,8 @@ static bool     g_random_edges    = false;
 
 static uint32_t g_start_row        = 0;
 static uint32_t g_num_rows         = 0;   /* rows to sweep; 0 = every remaining row of rotation.csv */
+static bool     g_exhaust          = false;   /* --exhaust_border_color */
+static uint64_t g_exhaust_cfgs[MAX_EDGE_SIDE_COLOR + 1];  /* configs run, by colour used up */
 static uint32_t g_samples          = 1;   /* --samples: random borders to try under --random_edges;
                                               0 = uncapped, run until --wall_time/--max_emitted stops you */
 static double   g_config_time_sec  = 600.0;
@@ -223,6 +227,26 @@ static const LeftOrder   *g_cur_left   = NULL;
 /* Wide enough that snprintf cannot truncate the longest id the sweep can build
    ("r<row>b<bottom>l<column>"), which -Wformat-truncation checks. */
 static char     g_config_id_str[96] = "c0";
+
+/* --exhaust_border_color: a random bottom for a frame colour drawn per bottom
+   (g_exhaust_colour), kept only if a left column can then use the colour up.
+   A colour whose bottoms never sample, or whose bottoms keep failing that
+   probe, is dropped for the rest of the run; false once none is left. */
+static bool sample_exhaust_bottom(RNG *rng, BottomOrder *bot) {
+    static bool dead[MAX_EDGE_SIDE_COLOR + 1];
+    static uint32_t misses[MAX_EDGE_SIDE_COLOR + 1];
+    for (;;) {
+        int alive[MAX_EDGE_SIDE_COLOR], n = 0;
+        for (int c = 1; c <= MAX_EDGE_SIDE_COLOR; c++) if (!dead[c]) alive[n++] = c;
+        if (n == 0) return false;
+        const int c = alive[rng_uniform(rng, (uint32_t)n)];
+        g_exhaust_colour = c;
+        if (!sample_random_bottom(rng, g_tau_bottoms, bot)) { dead[c] = true; continue; }
+        LeftOrder probe;
+        if (sample_random_left(rng, g_tau_columns, bot, &probe)) { misses[c] = 0; return true; }
+        if (++misses[c] >= 64) dead[c] = true;
+    }
+}
 
 /* A run code for a bare --prefix: 6 characters of [A-Z0-9] from the kernel's
    random source (clock and pid if that fails), never from the master RNG, so
@@ -4340,6 +4364,12 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
             printf("%s%s %zu", k ? ", " : "", g_part_name[k], g_part_total[k]);
         printf(")\n");
     }
+    if (g_exhaust) {
+        printf("[sum] exhausted colour:");
+        for (int c = 1, k = 0; c <= MAX_EDGE_SIDE_COLOR; c++)
+            if (g_exhaust_cfgs[c]) printf("%s c%d %" PRIu64, k++ ? "," : "", c, g_exhaust_cfgs[c]);
+        printf(" configs\n");
+    }
     if (g_prefix[0]) printf("[sum] run prefix: %s -> %s\n", g_prefix, g_out_dir);
     printf("[sum] *** Output boards score:");
     int shown = 0;
@@ -4527,6 +4557,14 @@ static void usage(const char *a0) {
 "                         each border is the best of 32 fan-out-ranked samples.\n"
 "                         --start_row/--num_rows, --top_bottoms and --resume do\n"
 "                         not apply\n"
+"  --samples N            --random_edges: random bottoms to try (default 1; 0 = until\n"
+"                         --wall_time/--max_emitted); --top_columns lefts each\n"
+"  --exhaust_border_color --random_edges: every border uses up one frame colour\n"
+"                         (drawn per bottom) within the bottom row and column 0\n"
+"                         rows 1..stop_row, so the right column, the top row and\n"
+"                         the left column above the stop row see only the other\n"
+"                         four. Pieces with the colour are drawn far more often and\n"
+"                         a border that does not use it up is resampled\n"
 "  --BL N / --BR N        pin a seed piece index (0..255) to the Bottom-Left /\n"
 "  --TL N / --TR N        Bottom-Right / Top-Left / Top-Right corner (--random_edges\n"
 "                         only); unpinned corners are sampled, and with 3 pinned the\n"
@@ -4802,6 +4840,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_bt_min_col)    printf(" --backtrack_min_col %u", g_bt_min_col);
     if (g_backtrack_row && !g_top_dedup) printf(" --no_top_dedup");
     if (g_free_top_clue) printf(" --free_top_clue");
+    if (g_exhaust) printf(" --exhaust_border_color");
     if (g_prefix[0])     printf(" --prefix %s", g_prefix);
     if (g_end_dive) printf(" --end_dive %u --emit_score %d", g_end_dive, g_emit_score);
     if (g_end_dive && g_end_polish >= 0) printf(" --end_polish %d", g_end_polish);
@@ -5057,6 +5096,7 @@ int main(int argc, char *argv[]) {
         }
         else if (!strcmp(argv[i], "--free_top_clue"))             g_free_top_clue = true;
         else if (!strcmp(argv[i], "--no_top_dedup"))              g_top_dedup = false;
+        else if (!strcmp(argv[i], "--exhaust_border_color"))      g_exhaust = true;
         else if (!strcmp(argv[i], "--prefix")) {
             /* The name is optional: bare, the run draws a 6-character code. */
             if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0) {
@@ -5234,6 +5274,9 @@ int main(int argc, char *argv[]) {
     }
     if (any_fixed_corner && !g_random_edges)
         fatal("--BL/--BR/--TL/--TR are only valid with --random_edges");
+    if (g_exhaust && !g_random_edges)
+        fatal("--exhaust_border_color needs --random_edges (a rotations file fixes the frame)");
+    g_exhaust_rows = (int)g_stop_row;
     if (g_random_edges) {
         g_free_edges = true;               /* the border is not a fixed assignment */
         if (resume) fatal("--resume is not supported with --random_edges (borders are sampled fresh)");
@@ -5322,6 +5365,9 @@ int main(int argc, char *argv[]) {
     if (g_free_top_clue)
         printf("[cfg] free_top_clue=1 (the extension may place the top-left row-13 clue on any "
                "cell; the top-right one is left for the dives)\n");
+    if (g_exhaust)
+        printf("[cfg] exhaust_border_color=1 (each random border uses up one frame colour, drawn "
+               "per bottom, within the bottom row and column 0 rows 1..%u)\n", g_stop_row);
     if (g_random_edges && g_backtrack_row && g_extend_nodes)
         printf("[cfg] random edges: the extension chooses column 0 above row %u\n", g_stop_row);
     if (g_prefix[0])
@@ -5493,7 +5539,11 @@ int main(int argc, char *argv[]) {
         RNG srng = rng_for(g_master_seed, 0xB07D0135u, 0, 0);
         BottomOrder bot; LeftOrder lft;
         for (size_t bi = 0; bi < run_b && !g_stop; bi++) {
-            if (!sample_random_bottom(&srng, g_tau_bottoms, &bot))
+            if (g_exhaust) {
+                if (!sample_exhaust_bottom(&srng, &bot))
+                    fatal("--exhaust_border_color: no frame colour can be used up within the "
+                          "bottom row and left rows 1..%u", g_stop_row);
+            } else if (!sample_random_bottom(&srng, g_tau_bottoms, &bot))
                 fatal("random bottom sampling failed; seed edge pool too constrained");
             validate_color_constants();
             g_border_stats.bottoms_ranked++;
@@ -5522,6 +5572,7 @@ int main(int argc, char *argv[]) {
                     break;
                 }
                 g_border_stats.columns_run++;
+                if (g_exhaust) g_exhaust_cfgs[g_exhaust_colour]++;
                 g_cur_bottom = &bot;
                 g_cur_left   = &lft;
                 snprintf(g_config_id_str, sizeof g_config_id_str, "rndb%zul%zu", bi, li);

@@ -3004,7 +3004,10 @@ EOF
 #  - under --random_edges, where the extension and the check choose column 0
 #    above the stop row, the boards are legal, fill 2 columns and hold
 #    frame-left edges in column 0 (one run at 4 threads: a 1-thread pair, to
-#    compare against K = 0, spends ~50 s building the free-edge database);
+#    compare against K = 0, spends ~50 s building the free-edge database); the
+#    run also passes --exhaust_border_color, so no border piece outside the
+#    bottom row and column 0 rows 1..10 carries the colour the border used up
+#    (beamer_micro keeps the plain random path);
 #  - the near-duplicate filter (on by default) writes a subset of the
 #    --no_top_dedup boards and says how many it dropped, and with the check it
 #    writes the same file at 4 threads as at 1 (both reset where the search
@@ -3029,7 +3032,7 @@ step_beamer_min_col() {
         || { tail -5 "$OUT/mc_dd4.log"; fail "the 4-thread near-duplicate run exited non-zero"; }
     cmp -s "$OUT/mc_dd/beam_completions_0_10.csv" "$OUT/mc_dd4/beam_completions_0_10.csv" \
         || fail "the near-duplicate filter and the check wrote other boards at 4 threads than at 1"
-    RND=(bin/E555_beamer data/seed_Edge5.txt --random_edges --samples 1 --top_columns 1
+    RND=(bin/E555_beamer data/seed_Edge5.txt --random_edges --exhaust_border_color --samples 1 --top_columns 1
          --beam_width 2000 --backtrack_row 8 --stop_row 10 --backtrack_min_col 2 --rng_seed 3
          --threads 4 --out_dir "$OUT/mc_rnd2")
     if [ -n "$GATE_DB" ]; then RND+=(--db_file "$GATE_DB"); fi
@@ -3112,9 +3115,17 @@ for l in rb:
             assert seed[p].count(0) == 1 and seed[p][(3 + rot) % 4] == 0, "column 0 holds no frame-left edge"
             c0 += 1
 assert c0, "no random-mode extension reached column 0"
+frame = [p for p in range(256) if seed[p].count(0) >= 1]
+for l in rb:
+    c = board(l)
+    kept = {c[x][0] for x in list(range(16)) + [r * 16 for r in range(1, STOP + 1)]}
+    assert any(not any(k in seed[p] for p in frame if p not in kept)
+               and side(c, STOP * 16, 0) != k and side(c, 15, 0) != k for k in range(1, 6)), \
+        "--exhaust_border_color: a frame colour is left outside the written border"
+assert re.search(r"^\[sum\] exhausted colour: c\d \d+ configs$", log("mc_rnd2"), re.M), "no exhausted-colour line"
 print(f"ok: K=2 writes exactly the K=0 boards filling 2 columns (found {found('mc_k0')} -> "
       f"{found('mc_k2')}); {nd.group(1)} near-dups dropped; random edges: {len(rb)} boards, "
-      f"{c0} column-0 edges; score lines recount")
+      f"{c0} column-0 edges, a frame colour used up; score lines recount")
 EOF
 }
 

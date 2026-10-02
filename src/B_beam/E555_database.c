@@ -71,6 +71,8 @@ Oriented g_cBL, g_cBR, g_cTL, g_cTR;
 bool     g_has_cBL = false, g_has_cBR = false;
 bool     g_has_cTL = false, g_has_cTR = false;
 int      g_fixed_corner_pid[4] = { -1, -1, -1, -1 };  /* role 0=BL 1=BR 2=TL 3=TR */
+int      g_exhaust_colour = 0;
+int      g_exhaust_rows   = 0;
 
 Oriented g_edge_term[MAX_EDGE_TERMINALS];
 int      g_edge_term_count = 0;
@@ -1460,6 +1462,25 @@ int edge_left_pool(const Oriented **out) {
     return s_side_edge_n;
 }
 
+/* --exhaust_border_color: an edge piece carrying the colour is drawn this many
+   times as often as one that does not, so the walks reach the colour-heavy
+   borders the filters below accept in a few tries rather than thousands. */
+#define EXHAUST_WEIGHT 16
+
+static bool carries(int pid, int c) {
+    return g_seed_top[pid] == c || g_seed_right[pid] == c ||
+           g_seed_bottom[pid] == c || g_seed_left[pid] == c;
+}
+
+/* Edge pieces carrying the exhaust colour that `used` does not hold yet. */
+static int exhaust_left_over(const uint64_t used[4]) {
+    int n = 0;
+    for (int k = 0; k < s_side_edge_n; k++)
+        if (!used_test(used, (uint16_t)s_side_edge_ids[k]) &&
+            carries(s_side_edge_ids[k], g_exhaust_colour)) n++;
+    return n;
+}
+
 /* Orient a corner piece for a board corner role. Roles: 0=BL 1=BR 2=TL 3=TR. */
 static bool orient_corner_role(int pid, int role, Oriented *out) {
     for (uint8_t spin = 0; spin < 4; spin++) {
@@ -1546,9 +1567,14 @@ static bool attempt_random_bottom(RNG *rng, Oriented seq[PUZZLE_SIDE],
     for (int r = 0; r < 4; r++)
         role_pid[r] = (g_fixed_corner_pid[r] >= 0) ? g_fixed_corner_pid[r] : rem[ri++];
 
+    const int xc = g_exhaust_colour;
+    /* The top corners are never written in random mode, so they must not
+       carry the colour; nor may BR's top, which the right column sits on. */
+    if (xc && (carries(role_pid[2], xc) || carries(role_pid[3], xc))) return false;
     Oriented BL, BR;
     if (!orient_corner_role(role_pid[0], 0, &BL)) return false;
     if (!orient_corner_role(role_pid[1], 1, &BR)) return false;
+    if (xc && BR.top == xc) return false;
     *tl_id = role_pid[2];
     *tr_id = role_pid[3];
     seq[0] = BL; seq[PUZZLE_SIDE-1] = BR;
@@ -1557,13 +1583,14 @@ static bool attempt_random_bottom(RNG *rng, Oriented seq[PUZZLE_SIDE],
     used_set(used, BL.piece_id); used_set(used, BR.piece_id);
     int prev = BL.right;
     for (int col = 1; col <= EDGE_LEN; col++) {
-        int cand[MAX_EDGE_TERMINALS], nc = 0;
+        int cand[MAX_EDGE_TERMINALS * EXHAUST_WEIGHT], nc = 0;
         for (int k = 0; k < s_side_edge_n; k++) {
             const Oriented *o = &s_edge_down[k];
             if (used_test(used, o->piece_id)) continue;
             if (o->left != prev) continue;
             if (col == EDGE_LEN && o->right != BR.left) continue;
-            cand[nc++] = k;
+            for (int w = (xc && carries(o->piece_id, xc)) ? EXHAUST_WEIGHT : 1; w > 0; w--)
+                cand[nc++] = k;
         }
         if (nc == 0) return false;
         const Oriented *o = &s_edge_down[cand[rng_uniform(rng, (uint32_t)nc)]];
@@ -1571,7 +1598,8 @@ static bool attempt_random_bottom(RNG *rng, Oriented seq[PUZZLE_SIDE],
         used_set(used, o->piece_id);
         prev = o->right;
     }
-    return true;
+    /* What the bottom leaves of the colour must fit in left rows 1..S. */
+    return !xc || exhaust_left_over(used) <= g_exhaust_rows;
 }
 
 bool sample_random_bottom(RNG *rng, double tau, BottomOrder *out) {
@@ -1632,14 +1660,20 @@ bool sample_random_left(RNG *rng, double tau, const BottomOrder *bot, LeftOrder 
         used_set(used, TL.piece_id);
         int prev_top = g_cBL.top;
         bool ok = true;
+        const int xc = g_exhaust_colour;
         for (int row = 1; row <= EDGE_LEN; row++) {
-            int cand[MAX_EDGE_TERMINALS], nc = 0;
+            int cand[MAX_EDGE_TERMINALS * EXHAUST_WEIGHT], nc = 0;
             for (int k = 0; k < s_side_edge_n; k++) {
                 const Oriented *o = &s_edge_leftz[k];
                 if (used_test(used, o->piece_id)) continue;
                 if (o->bottom != prev_top) continue;
                 if (row == EDGE_LEN && o->top != TL.bottom) continue;
-                cand[nc++] = k;
+                int w = 1;
+                if (xc && carries(o->piece_id, xc)) {
+                    if (row > g_exhaust_rows) continue;     /* not written: keep it out */
+                    w = EXHAUST_WEIGHT;
+                }
+                while (w-- > 0) cand[nc++] = k;
             }
             if (nc == 0) { ok = false; break; }
             const Oriented *o = &s_edge_leftz[cand[rng_uniform(rng, (uint32_t)nc)]];
@@ -1647,6 +1681,9 @@ bool sample_random_left(RNG *rng, double tau, const BottomOrder *bot, LeftOrder 
             used_set(used, o->piece_id);
             prev_top = o->top;
         }
+        /* Every piece of the colour placed (so row S+1, free of it, also keeps
+           row S's top off it): the colour is used up. */
+        if (ok && xc && exhaust_left_over(used) > 0) ok = false;
         if (!ok) {
             if (++restarts > RAND_BORDER_MAX_RESTARTS) break;
             continue;

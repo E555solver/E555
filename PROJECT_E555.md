@@ -375,6 +375,29 @@ the edges the bottom left, each the best of 32 samples by the ranks above.
 `--max_emitted`); corners can be pinned with `--BL/--BR/--TL/--TR`. Free edges
 are implied.
 
+**`--exhaust_border_color`** makes every random border use up one frame colour
+(the 5 colours on the joints between border pieces, 12 joints each), drawn per
+bottom:
+- In random mode only the bottom row and column 0 rows 1..S are written, so
+  "used up" means every edge piece carrying the colour lies there, neither top
+  corner carries it, and BR's top is not it. The right column, the top row and
+  the left column above S then see only the other four colours. A frame-only
+  count on the real seed gives those sides about 300 times more legal
+  arrangements than a plain random border (a plain walk uses up a colour once
+  in 4000 borders).
+- How: pieces carrying the colour are drawn 16 times as often in both walks;
+  a bottom that leaves more of them than the left can hold, a left that leaves
+  any unused or puts one above S, and a corner draw that breaks the rule are
+  resampled. Each bottom must also admit one such left before it is used.
+  Best of 32 by the fan-out ranks as before, so borders stay distinct (1200
+  configs: 299 distinct bottoms of 300, 1160 distinct lefts).
+- Colour 3 can never be used up (three corners carry it) and colour 2 rarely;
+  a colour that keeps failing is dropped for the run, and the run stops with
+  a fatal error once none is left. The 20-21 edges carrying a colour must fit
+  in 14 + S cells, so the borders get few below S = 8 (S = 6: colour 4 only,
+  3 distinct lefts in 12 configs) and none below S = 6.
+- `[sum] exhausted colour:` counts the configs by colour.
+
 **`--free_edges`** lets any unused edge piece end a row on the right (and so any
 edge serve the top border later) instead of only the rotations row's right side.
 
@@ -892,7 +915,9 @@ pins the row under it too). `emitted` is the configuration's unique boards,
 
 `backtrack` lists the boards completing each searched row; `corners` the share
 of written boards with a TL / TR block alive, both, and a piece-disjoint pair
-(5.12); `reserve` the TOP reserve left free at the stop row. The last `[sum]`
+(5.12); `reserve` the TOP reserve left free at the stop row; `exhausted colour`
+the configs by the frame colour their border used up (`--exhaust_border_color`,
+5.3). The last `[sum]`
 line counts the written boards by score, highest first (at most six, `...` if
 there are more): the dives' matched edges under `--end_dive`, otherwise the
 matched edges of each written partial board, as `E555_rank` scores it.
@@ -923,6 +948,7 @@ boards or roots they write the same file at any thread count.
 | `--free_edges` | off | any unused edge may end a row |
 | `--random_edges`, `--samples N` | off, 1 | sample borders (5.3); 0 = unlimited bottoms |
 | `--BL/--BR/--TL/--TR P` | -- | pin a corner piece (`--random_edges`) |
+| `--exhaust_border_color` | off | every random border uses up one frame colour within the bottom row and column 0 rows 1..S (5.3) |
 | `--incomplete_top` | off | also write stop-row boards with two of the three segments (`_partial.csv`) or segment B alone (`_partial_B.csv`); not with `--backtrack_row` |
 | `--beam_width K` | 250000 | boards per row |
 | `--stop_row R` | 11 | last row filled, 1..13 |
