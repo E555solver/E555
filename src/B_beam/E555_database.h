@@ -286,6 +286,11 @@ extern int      g_fixed_corner_pid[4];
 extern int      g_exhaust_colour;
 extern int      g_exhaust_rows;
 
+/* Whether colour c can be used up at all under the pinned corners: some corner
+   assignment keeps it off both top corners and BR's top, and its edges fit in
+   the bottom row plus `rows` left cells. Deterministic: no sampling. */
+bool exhaust_colour_possible(int c, int rows);
+
 /* Edge-terminal pool: every edge piece that may END a chain, oriented
    frame-right (frame on the right, exposing an edge-interface top/bottom and an
    inner left). Free mode: all non-corner edges. Fixed mode: the border row's

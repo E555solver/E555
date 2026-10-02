@@ -381,22 +381,29 @@ bottom:
 - In random mode only the bottom row and column 0 rows 1..S are written, so
   "used up" means every edge piece carrying the colour lies there, neither top
   corner carries it, and BR's top is not it. The right column, the top row and
-  the left column above S then see only the other four colours. A frame-only
-  count on the real seed gives those sides about 300 times more legal
-  arrangements than a plain random border (a plain walk uses up a colour once
-  in 4000 borders).
+  the left column above S then see only the other four colours (a plain walk
+  uses up a colour once in 4000 borders).
+- Why: by the BEST theorem a side's trail count is `t_w * prod_c (d_c - 1)!`
+  over its joint colours, so concentrating the joints on fewer colours is what
+  makes a frame flexible. Using a colour up gives the free frame (the right
+  column from row 1, the top row, the left column above S) about 250 times
+  more legal orderings, and the beam, which fills the right column row by row,
+  writes about twice as many stop-row boards.
 - How: pieces carrying the colour are drawn 16 times as often in both walks;
   a bottom that leaves more of them than the left can hold, a left that leaves
   any unused or puts one above S, and a corner draw that breaks the rule are
   resampled. Each bottom must also admit one such left before it is used.
   Best of 32 by the fan-out ranks as before, so borders stay distinct (1200
   configs: 299 distinct bottoms of 300, 1160 distinct lefts).
-- Colour 3 can never be used up (three corners carry it) and colour 2 rarely;
-  a colour that keeps failing is dropped for the run, and the run stops with
-  a fatal error once none is left. The 20-21 edges carrying a colour must fit
-  in 14 + S cells, so the borders get few below S = 8 (S = 6: colour 4 only,
-  3 distinct lefts in 12 configs) and none below S = 6.
-- `[sum] exhausted colour:` counts the configs by colour.
+- Colour 3 can never be used up (three corners carry it), and corner pins can
+  rule out others; the colours left are listed at startup (`[cfg] exhaust
+  colours possible`), and the run stops at once only if none is. Colour 2 is
+  accepted 1 time in 5: it allows just two corner placements, so its borders
+  keep leaving the same edges for the top.
+- A bottom that fails 4 colour draws is run as a plain random border, so a
+  long run never stops on bad luck. The 20-21 edges carrying a colour must fit
+  in 14 + S cells, so below S = 8 most borders are plain.
+- `[sum] exhausted colour:` counts the configs by colour, `plain` the fallbacks.
 
 **`--free_edges`** lets any unused edge piece end a row on the right (and so any
 edge serve the top border later) instead of only the rotations row's right side.
