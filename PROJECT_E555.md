@@ -383,27 +383,12 @@ bottom:
   corner carries it, and BR's top is not it. The right column, the top row and
   the left column above S then see only the other four colours (a plain walk
   uses up a colour once in 4000 borders).
-- Why it works. By the BEST theorem a side's trail count is
-  `t_w * prod_c (d_c - 1)!`, where `d_c` counts the joints of colour c. The
-  factorial term carries the variance: over the 4120 sides of two Stage A
-  files, the joint-colour entropy explains R^2 = 0.89 of log count, the number
-  of colours present only 0.32, and each extra joint on a side's dominant
-  colour multiplies the count by about 2.6. Using a colour up hands the free
-  frame (right column from row 1, top row, left column above S: one path from
-  row S to BR) about 33 joints on four colours instead of five. Counted exactly
-  (a DP over the free edges, corners at their cells), that path has about 250
-  times more legal orderings at S = 10 and 11 (330 at S = 8, 170 at S = 12).
-  Even the best of 8000 plain borders falls short of a typical exhausted one.
-  Picking the best of 8 exhausted borders by the count adds only 1.3x.
-- Where the gain lands. The beam fills the right column itself, row by row.
-  A/B on the real database (10 seeds, one config each, `--backtrack_row 6
-  --stop_row 11 --extend_nodes 0 --time_limit 45`, 150 boards per config
-  dived at `--end_dive 2000`): row-11 boards 5700 -> 13200 (10/10 seeds), dive
-  mean +0.4, top-10 mean +0.5, best +1.1. Across those 20 configs, log of the
-  exact count tracks log of the boards found (r = 0.86). The dives close the
-  top and right frame equally well in both arms (no frame break on 84% of
-  boards). The score gain comes from fewer breaks in the interior of rows
-  12-14 (-0.6), against +0.2 at the inward faces of the free border.
+- Why: by the BEST theorem a side's trail count is `t_w * prod_c (d_c - 1)!`
+  over its joint colours, so concentrating the joints on fewer colours is what
+  makes a frame flexible. Using a colour up gives the free frame (the right
+  column from row 1, the top row, the left column above S) about 250 times
+  more legal orderings, and the beam, which fills the right column row by row,
+  writes about twice as many stop-row boards.
 - How: pieces carrying the colour are drawn 16 times as often in both walks;
   a bottom that leaves more of them than the left can hold, a left that leaves
   any unused or puts one above S, and a corner draw that breaks the rule are
