@@ -1494,6 +1494,38 @@ static bool orient_corner_role(int pid, int role, Oriented *out) {
     return false;
 }
 
+/* --exhaust_border_color's corner rule for colour c and a corner assignment
+   (role_pid by role 0=BL 1=BR 2=TL 3=TR): the top corners are never written in
+   random mode, so they must not carry c; nor may BR's top, which the right
+   column sits on. */
+static bool exhaust_corners_ok(const int role_pid[4], int c) {
+    Oriented BR;
+    if (carries(role_pid[2], c) || carries(role_pid[3], c)) return false;
+    return orient_corner_role(role_pid[1], 1, &BR) && BR.top != c;
+}
+
+bool exhaust_colour_possible(int c, int rows) {
+    build_side_pools();
+    int n = 0;
+    for (int k = 0; k < s_side_edge_n; k++) n += carries(s_side_edge_ids[k], c);
+    if (n > EDGE_LEN + rows) return false;          /* cannot fit below the stop row */
+    static const int perm[24][4] = {
+        {0,1,2,3},{0,1,3,2},{0,2,1,3},{0,2,3,1},{0,3,1,2},{0,3,2,1},
+        {1,0,2,3},{1,0,3,2},{1,2,0,3},{1,2,3,0},{1,3,0,2},{1,3,2,0},
+        {2,0,1,3},{2,0,3,1},{2,1,0,3},{2,1,3,0},{2,3,0,1},{2,3,1,0},
+        {3,0,1,2},{3,0,2,1},{3,1,0,2},{3,1,2,0},{3,2,0,1},{3,2,1,0}};
+    for (int q = 0; q < 24; q++) {
+        int role_pid[4];
+        bool ok = true;
+        for (int r = 0; r < 4 && ok; r++) {
+            role_pid[r] = s_corner_ids[perm[q][r]];
+            if (g_fixed_corner_pid[r] >= 0 && g_fixed_corner_pid[r] != role_pid[r]) ok = false;
+        }
+        if (ok && exhaust_corners_ok(role_pid, c)) return true;
+    }
+    return false;
+}
+
 /* Board-corner role name for diagnostics. Roles: 0=BL 1=BR 2=TL 3=TR. */
 static const char *corner_role_name(int role) {
     return role == 0 ? "BL" : role == 1 ? "BR" : role == 2 ? "TL" : "TR";
@@ -1503,6 +1535,9 @@ static const char *corner_role_name(int role) {
    role must name a genuine, distinct corner piece orientable into that role;
    with exactly three pinned the fourth is forced to the one remaining corner. */
 void finalize_fixed_corners(void) {
+    static bool done = false;                 /* the beamer may call it early */
+    if (done) return;
+    done = true;
     build_side_pools();                       /* fills s_corner_ids[4]; idempotent */
     int nfixed = 0;
     for (int r = 0; r < 4; r++) {
@@ -1568,13 +1603,10 @@ static bool attempt_random_bottom(RNG *rng, Oriented seq[PUZZLE_SIDE],
         role_pid[r] = (g_fixed_corner_pid[r] >= 0) ? g_fixed_corner_pid[r] : rem[ri++];
 
     const int xc = g_exhaust_colour;
-    /* The top corners are never written in random mode, so they must not
-       carry the colour; nor may BR's top, which the right column sits on. */
-    if (xc && (carries(role_pid[2], xc) || carries(role_pid[3], xc))) return false;
+    if (xc && !exhaust_corners_ok(role_pid, xc)) return false;
     Oriented BL, BR;
     if (!orient_corner_role(role_pid[0], 0, &BL)) return false;
     if (!orient_corner_role(role_pid[1], 1, &BR)) return false;
-    if (xc && BR.top == xc) return false;
     *tl_id = role_pid[2];
     *tr_id = role_pid[3];
     seq[0] = BL; seq[PUZZLE_SIDE-1] = BR;

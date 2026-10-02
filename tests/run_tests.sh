@@ -3006,8 +3006,9 @@ EOF
 #    frame-left edges in column 0 (one run at 4 threads: a 1-thread pair, to
 #    compare against K = 0, spends ~50 s building the free-edge database); the
 #    run also passes --exhaust_border_color, so no border piece outside the
-#    bottom row and column 0 rows 1..10 carries the colour the border used up
-#    (beamer_micro keeps the plain random path);
+#    bottom row and column 0 rows 1..10 carries the colour the border used up,
+#    unless the summary says the bottom fell back to a plain one (beamer_micro
+#    keeps the plain random path);
 #  - the near-duplicate filter (on by default) writes a subset of the
 #    --no_top_dedup boards and says how many it dropped, and with the check it
 #    writes the same file at 4 threads as at 1 (both reset where the search
@@ -3115,17 +3116,18 @@ for l in rb:
             assert seed[p].count(0) == 1 and seed[p][(3 + rot) % 4] == 0, "column 0 holds no frame-left edge"
             c0 += 1
 assert c0, "no random-mode extension reached column 0"
+xm = re.search(r"^\[sum\] exhausted colour: (c\d|plain) 1 configs$", log("mc_rnd2"), re.M)
+assert xm, "no exhausted-colour line for the one config"
 frame = [p for p in range(256) if seed[p].count(0) >= 1]
-for l in rb:
+for l in rb if xm.group(1) != "plain" else []:      # a plain fallback uses nothing up
     c = board(l)
     kept = {c[x][0] for x in list(range(16)) + [r * 16 for r in range(1, STOP + 1)]}
     assert any(not any(k in seed[p] for p in frame if p not in kept)
                and side(c, STOP * 16, 0) != k and side(c, 15, 0) != k for k in range(1, 6)), \
         "--exhaust_border_color: a frame colour is left outside the written border"
-assert re.search(r"^\[sum\] exhausted colour: c\d \d+ configs$", log("mc_rnd2"), re.M), "no exhausted-colour line"
 print(f"ok: K=2 writes exactly the K=0 boards filling 2 columns (found {found('mc_k0')} -> "
       f"{found('mc_k2')}); {nd.group(1)} near-dups dropped; random edges: {len(rb)} boards, "
-      f"{c0} column-0 edges, a frame colour used up; score lines recount")
+      f"{c0} column-0 edges, exhausted colour {xm.group(1)}; score lines recount")
 EOF
 }
 
