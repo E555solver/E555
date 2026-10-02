@@ -626,6 +626,9 @@ void finalize_fixed_corners(void);
    its one inner colour on the right): the pool a left column is drawn from.
    Builds the side pools if needed; returns the count and sets *out. */
 int edge_left_pool(const Oriented **out);
+/* The same pool oriented frame-up (frame colour on top, the inner colour at
+   the bottom): the pieces a top border is made of. */
+int edge_up_pool(const Oriented **out);
 
 /* Read the want-th non-comment data row's 256 spins from a Stage A CSV. */
 bool read_one_border_row(const char *csv_path, uint32_t want, uint8_t spins[NUM_PIECES]);

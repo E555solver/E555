@@ -134,6 +134,7 @@ static uint32_t g_backtrack_row   = 0;
    (0 = off). --backtrack_min_col K writes only boards whose extension fills
    at least K whole columns. See extend_board. */
 static uint32_t g_extend_nodes    = 100000;
+static bool     g_cap_top         = true;    /* --cap_top: close the top-left border exactly */
 static uint32_t g_bt_min_col      = 0;
 /* --free_top_clue (with --clue_corners): the extension treats the two row-13
    clue cells as ordinary ones and may place the top-LEFT clue (13,2) on any
@@ -729,9 +730,18 @@ static inline bool cell_is_placed(int r, int c, int row, uint16_t colmask) {
    chooses column 0 above the stop row: an index ci >= CATALOG_SIZE is then the
    frame-left edge g_edge_left[ci - CATALOG_SIZE]. */
 #define EXT_MAX (EDGE_LEN * (EDGE_LEN + 1))
-typedef struct { uint16_t n; uint8_t cell[EXT_MAX]; uint16_t ci[EXT_MAX]; } Ext;
+/* --cap_top: up to the TL corner and 14 top edges on row 15. */
+typedef struct {
+    uint8_t  n;
+    uint8_t  cell[PUZZLE_SIDE], rot[PUZZLE_SIDE];
+    uint16_t pid[PUZZLE_SIDE];
+} Cap;
+typedef struct { uint16_t n; uint8_t cell[EXT_MAX]; uint16_t ci[EXT_MAX]; Cap cap; } Ext;
 static const Oriented *g_edge_left = NULL;    /* --random_edges: every edge, frame left */
 static int             g_edge_left_n = 0;
+static const Oriented *g_edge_up = NULL;      /* every edge, frame up (--cap_top) */
+static uint8_t         g_up_by_in[NUM_COLORS_TOTAL][MAX_EDGE_TERMINALS];   /* by inner colour */
+static uint8_t         g_up_by_in_n[NUM_COLORS_TOTAL];
 static inline const Oriented *ext_or(uint16_t ci) {
     return ci < CATALOG_SIZE ? &g_cat[ci] : &g_edge_left[ci - CATALOG_SIZE];
 }
@@ -786,12 +796,16 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
         }
     }
     bool ext_cell[NUM_PIECES] = { false };
-    if (ext)
+    if (ext) {
         for (int k = 0; k < ext->n; k++) {
             const Oriented *o = ext_or(ext->ci[k]);
             pos[o->piece_id] = ext->cell[k]; rot_arr[o->piece_id] = o->rotation;
             ext_cell[ext->cell[k]] = true;
         }
+        for (int k = 0; k < ext->cap.n; k++) {          /* --cap_top, on row 15 */
+            pos[ext->cap.pid[k]] = ext->cap.cell[k]; rot_arr[ext->cap.pid[k]] = ext->cap.rot[k];
+        }
+    }
     /* --clue_corners: also place the two row-13 clue pieces the beam never
        reaches, so every emitted board carries all the clues its orientation
        holds -- the viewer shows the corners pinned, and Stage C (and the end
@@ -2839,7 +2853,19 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
    The region's clue cells, the pieces it may use although the board holds
    them, and its top-border pool are defined once below (g_ext_fix,
    ext_release_mask, ext_avail) and shared with the strip check and the
-   stop-row test, so the three always agree on what the extension can do. */
+   stop-row test, so the three always agree on what the extension can do.
+
+   --cap_top (on by default) closes the top-left border exactly over the whole
+   columns the extension fills: the TL corner (rotations mode: the fixed one;
+   --random_edges: either corner not on the board, its bottom on column 0's
+   row-14 top), then top edges (15,1), (15,2), ... left to right, each unused,
+   frame up, its inner colour the row-14 top below it and its left frame colour
+   its neighbour's right one. The cap is only a tie-break: the search, its
+   order and its node cap are unchanged and the most cells still win, so every
+   board keeps its extension length and whole columns (--backtrack_min_col
+   writes exactly the same boards); among fillings of that length the one with
+   the longest cap is kept, and the cap is written with it. A cap is worked out
+   only for a path that reaches the best length, once per whole column. */
 
 /* Per orientation + 1 (0 = not yet known), per cell above the stop row: the
    catalog index of the clue the extension must place there, -2 for a clue
@@ -2893,6 +2919,8 @@ static void ext_avail(const uint64_t used[4], int avail[NUM_COLORS_TOTAL]) {
     }
 }
 
+static inline int ext_cols_n(int n, int stop);
+
 typedef struct {
     uint64_t used[4];
     int      avail[NUM_COLORS_TOTAL];     /* top-border pool, by inner colour */
@@ -2905,7 +2933,66 @@ typedef struct {
     int      nreg, best, stop;
     uint64_t nodes, cap;
     Ext     *out;
+    /* --cap_top: the best cap over whole columns 1..m of the current path
+       (worked out when first needed after the path completes column m), the
+       recorded filling's cap length, the longest a cap can be, and the corners
+       that may start it (--random_edges). */
+    Cap      cap_at[EDGE_LEN + 1];
+    bool     cap_ok[EDGE_LEN + 1];
+    int      best_cap, cap_full, ncorner;
+    uint16_t corner_pid[2];
+    uint8_t  corner_rot[2], corner_bot[2], corner_rgt[2];
 } ExtCtx;
+
+/* The longest run of top edges on (15,c..m), c's left frame colour `frame`;
+   *cur holds the cap so far, *best the longest found, `full` the longest
+   possible (the search stops once it is reached). */
+static void cap_edges(const ExtCtx *e, uint64_t used[4], int c, int m, int frame,
+                      int full, Cap *cur, Cap *best) {
+    if (cur->n > best->n) *best = *cur;
+    if (c > m || best->n == full) return;
+    const int in = e->topc[EDGE_LEN * PUZZLE_SIDE + c];
+    for (int j = 0; j < g_up_by_in_n[in]; j++) {
+        const Oriented *o = &g_edge_up[g_up_by_in[in][j]];
+        if (o->left != frame || used_test(used, o->piece_id)) continue;
+        if (!g_free_edges && g_spin[o->piece_id] != o->rotation) continue;  /* not a top edge here */
+        used_set(used, o->piece_id);
+        cur->cell[cur->n] = (uint8_t)((PUZZLE_SIDE - 1) * PUZZLE_SIDE + c);
+        cur->pid[cur->n] = o->piece_id; cur->rot[cur->n] = o->rotation; cur->n++;
+        cap_edges(e, used, c + 1, m, o->right, full, cur, best);
+        cur->n--;
+        used_clear(used, o->piece_id);
+        if (best->n == full) return;
+    }
+}
+
+/* The best cap over whole columns 1..m of the current path into cap_at[m]. */
+static const Cap *ext_cap(ExtCtx *e, int m) {
+    Cap *best = &e->cap_at[m];
+    if (e->cap_ok[m]) return best;
+    e->cap_ok[m] = true;
+    best->n = 0;
+    uint64_t used[4];
+    memcpy(used, e->used, sizeof used);
+    Cap cur; cur.n = 0;
+    if (!g_random_edges) {
+        cap_edges(e, used, 1, m, g_cur_left->p[PUZZLE_SIDE - 1]->right, m, &cur, best);
+        return best;
+    }
+    const int b0 = e->topc[EDGE_LEN * PUZZLE_SIDE];
+    for (int j = 0; j < e->ncorner && best->n < m + 1; j++) {
+        if (e->corner_bot[j] != b0) continue;
+        cur.cell[0] = (uint8_t)((PUZZLE_SIDE - 1) * PUZZLE_SIDE);
+        cur.pid[0] = e->corner_pid[j]; cur.rot[0] = e->corner_rot[j]; cur.n = 1;
+        cap_edges(e, used, 1, m, e->corner_rgt[j], m + 1, &cur, best);
+    }
+    return best;
+}
+
+/* Done: every region cell filled and, under --cap_top, its cap complete. */
+static inline bool ext_done(const ExtCtx *e) {
+    return e->best == e->nreg && (!g_cap_top || e->best_cap == e->cap_full);
+}
 
 static void ext_dfs(ExtCtx *e, int d);
 
@@ -2932,12 +3019,25 @@ static void ext_dfs_col0(ExtCtx *e, int d, int cell, int r) {
         ext_place(e, d, cell, (uint16_t)(CATALOG_SIZE + k));
         e->avail[o->right]++;
         used_clear(e->used, o->piece_id);
-        if (e->best == e->nreg) return;
+        if (ext_done(e)) return;
     }
 }
 
 static void ext_dfs(ExtCtx *e, int d) {
-    if (d > e->best) { e->best = d; memcpy(e->out->ci, e->cur, (size_t)d * sizeof e->cur[0]); }
+    int m = 0;
+    if (g_cap_top && d > 0) {
+        m = ext_cols_n(d, e->stop);
+        if (m != ext_cols_n(d - 1, e->stop)) e->cap_ok[m] = false;   /* column m just completed */
+    }
+    if (d > 0 && d >= e->best) {
+        const Cap *cap = m > 0 ? ext_cap(e, m) : NULL;
+        const int cn = cap ? cap->n : 0;
+        if (d > e->best || cn > e->best_cap) {
+            e->best = d; e->best_cap = cn;
+            memcpy(e->out->ci, e->cur, (size_t)d * sizeof e->cur[0]);
+            if (cap) e->out->cap = *cap; else e->out->cap.n = 0;
+        }
+    }
     if (d == e->nreg || e->nodes >= e->cap) return;
     const int cell = e->cell[d], r = cell / PUZZLE_SIDE, c = cell % PUZZLE_SIDE;
     if (c == 0) { ext_dfs_col0(e, d, cell, r); return; }
@@ -2974,7 +3074,7 @@ static void ext_dfs(ExtCtx *e, int d) {
         ext_place(e, d, cell, (uint16_t)ci);
         if (top_row) e->avail[o->top]++;
         used_clear(e->used, o->piece_id);
-        if (e->best == e->nreg) return;
+        if (ext_done(e)) return;
     }
 }
 
@@ -2982,7 +3082,7 @@ static void ext_dfs(ExtCtx *e, int d) {
    out; returns whether the node cap cut the search short. */
 static bool extend_board(const uint64_t used[4], const uint8_t rtop[PUZZLE_SIDE],
                          int stop, int orient, Ext *out) {
-    out->n = 0;
+    out->n = 0; out->cap.n = 0;
     if (g_extend_nodes == 0 || stop >= EDGE_LEN) return false;
     ExtCtx e;
     uint64_t rel[4];
@@ -3001,6 +3101,25 @@ static bool extend_board(const uint64_t used[4], const uint8_t rtop[PUZZLE_SIDE]
     }
     e.fix = ext_fix_of(orient);
     ext_avail(e.used, e.avail);
+    e.best_cap = 0;
+    e.cap_full = EDGE_LEN + (g_random_edges ? 1 : 0);
+    memset(e.cap_ok, 0, sizeof e.cap_ok);
+    e.ncorner = 0;
+    if (g_cap_top && g_random_edges) {
+        /* The two corners off the board; a pinned --TL takes the corner, a
+           pinned --TR keeps its piece for (15,15). */
+        const bool pinned = g_fixed_corner_pid[2] >= 0 || g_fixed_corner_pid[3] >= 0;
+        const uint16_t cand[2] = { g_cTL.piece_id, g_cTR.piece_id };
+        for (int j = 0; j < (pinned ? 1 : 2); j++)
+            for (uint8_t sp = 0; sp < 4; sp++)
+                if (seed_side(cand[j], sp, 0) == 0 && seed_side(cand[j], sp, 3) == 0) {
+                    e.corner_pid[e.ncorner] = cand[j]; e.corner_rot[e.ncorner] = sp;
+                    e.corner_bot[e.ncorner] = (uint8_t)seed_side(cand[j], sp, 2);
+                    e.corner_rgt[e.ncorner] = (uint8_t)seed_side(cand[j], sp, 1);
+                    e.ncorner++;
+                    break;
+                }
+    }
     ext_dfs(&e, 0);
     out->n = (uint16_t)e.best;
     for (int k = 0; k < e.best; k++) out->cell[k] = e.cell[k];
@@ -3203,6 +3322,7 @@ typedef struct BtNode {
     uint8_t  *cc;                         /* corner code (--lambda_corners) */
     uint8_t  *rs;                         /* TOP reserve pieces left free */
     uint8_t  *ex;                         /* extension cells (--extend_nodes) */
+    uint8_t  *cp;                         /* --cap_top: cap cells on row 15 */
     uint16_t *sc;                         /* matched edges (no --end_dive) */
     uint32_t  n, ncap;
     struct BtNode **kid;
@@ -3248,6 +3368,9 @@ static struct {
                                            exact repeats, under --backtrack_min_col */
     uint64_t cut_col, strip_unknown, near_dup, cfg_near_dup;   /* the column check, the
                                            near-duplicate filter */
+    uint64_t cap_cells, cap_boards, cap_closed;   /* --cap_top over the written boards:
+                                           cells, boards with a whole column, of
+                                           those closed over all of them */
     uint64_t fill[EDGE_LEN + 1];
     double   t;
 } g_bt_run;
@@ -3317,7 +3440,7 @@ static inline BtNode *bt_out(BtCtx *x) {
 static void bt_node_free(BtNode *o) {
     if (!o) return;
     for (uint32_t i = 0; i < o->nkid; i++) bt_node_free(o->kid[i]);
-    free(o->buf); free(o->off); free(o->fp); free(o->cc); free(o->rs); free(o->ex); free(o->sc);
+    free(o->buf); free(o->off); free(o->fp); free(o->cc); free(o->rs); free(o->ex); free(o->cp); free(o->sc);
     free(o->kid); free(o->kid_at);
     free(o);
 }
@@ -3393,6 +3516,7 @@ static void bt_out_push(BtNode *o, BtCtx *x, int stop) {
         o->cc  = xrealloc(o->cc,  (size_t)o->ncap * sizeof *o->cc);
         o->rs  = xrealloc(o->rs,  (size_t)o->ncap * sizeof *o->rs);
         o->ex  = xrealloc(o->ex,  (size_t)o->ncap * sizeof *o->ex);
+        o->cp  = xrealloc(o->cp,  (size_t)o->ncap * sizeof *o->cp);
         o->sc  = xrealloc(o->sc,  (size_t)o->ncap * sizeof *o->sc);
     }
     const BeamEntry *t = &x->lvl[stop];
@@ -3406,6 +3530,7 @@ static void bt_out_push(BtNode *o, BtCtx *x, int stop) {
                  ? tc_board_code(orient, t->used, t->rtop, stop == PUZZLE_SIDE - 4) : 0;
     o->rs[o->n]  = (uint8_t)(g_top_n ? top_free(t->used) : 0);
     o->ex[o->n]  = (uint8_t)ext.n;
+    o->cp[o->n]  = ext.cap.n;
     o->len += (size_t)prepare_board(x->rows, stop, orient, &ext, o->buf + o->len, &o->sc[o->n]);
     o->n++;
 }
@@ -3699,6 +3824,10 @@ static void bt_emit_node(const BtNode *o, uint64_t *boards) {
             if (n > g_bt_run.ext_max) g_bt_run.ext_max = n;
             if (cols > g_bt_run.ext_cols_max) g_bt_run.ext_cols_max = cols;
             if (n > g_bt_run.cfg_ext_max) g_bt_run.cfg_ext_max = n;
+            if (g_cap_top && cols > 0) {
+                g_bt_run.cap_cells += o->cp[i]; g_bt_run.cap_boards++;
+                g_bt_run.cap_closed += o->cp[i] == cols + (g_random_edges ? 1 : 0);
+            }
         }
         if (g_corners_on) tc_tally(o->cc[i]);
         rsv_tally(o->rs[i]);
@@ -4330,6 +4459,11 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
                    g_bt_run.ext_cols_max);
             if (g_bt_run.ext_cap) printf("; node cap hit %" PRIu64, g_bt_run.ext_cap);
             printf("\n");
+            if (g_cap_top && g_bt_run.cap_boards)
+                printf("[sum] top cap: %.2f cells per board; %.0f%% of the boards with a whole "
+                       "column closed over all of them\n",
+                       (double)g_bt_run.cap_cells / (double)g_bt_run.cap_boards,
+                       100.0 * (double)g_bt_run.cap_closed / (double)g_bt_run.cap_boards);
         }
         if (g_bt_min_col) {
             printf("[sum] min_col %u: ", g_bt_min_col);
@@ -4603,6 +4737,13 @@ static void usage(const char *a0) {
 "                         open cells in the top-right corner. Row-14 cells must\n"
 "                         show a colour the unplaced top border still carries.\n"
 "                         N caps the search per board (default 100000; 0 = off)\n"
+"  --cap_top [N]          with the extension: of its longest fillings, keep the one\n"
+"                         whose top-left border closes exactly -- the TL corner, then\n"
+"                         top edges over the whole columns, matching the row-14\n"
+"                         colours below and each other -- and write that closure\n"
+"                         on row 15. Never changes which boards are written or how\n"
+"                         far they extend. N = 0 turns it off; bare or nonzero = on\n"
+"                         (default 1)\n"
 "  --backtrack_min_col K  with --backtrack_row: write only boards whose extension\n"
 "                         fills columns 1..K of rows stop+1..14 whole; lets a lower\n"
 "                         --stop_row run without flooding the output (default 0).\n"
@@ -4841,6 +4982,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_backtrack_row && !g_top_dedup) printf(" --no_top_dedup");
     if (g_free_top_clue) printf(" --free_top_clue");
     if (g_exhaust) printf(" --exhaust_border_color");
+    if (!g_cap_top) printf(" --cap_top 0");
     if (g_prefix[0])     printf(" --prefix %s", g_prefix);
     if (g_end_dive) printf(" --end_dive %u --emit_score %d", g_end_dive, g_emit_score);
     if (g_end_dive && g_end_polish >= 0) printf(" --end_polish %d", g_end_polish);
@@ -5097,6 +5239,16 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--free_top_clue"))             g_free_top_clue = true;
         else if (!strcmp(argv[i], "--no_top_dedup"))              g_top_dedup = false;
         else if (!strcmp(argv[i], "--exhaust_border_color"))      g_exhaust = true;
+        else if (!strcmp(argv[i], "--cap_top")) {
+            /* Bare or nonzero = on, 0 = off; the value is taken only when the
+               next token is an integer in its entirety. */
+            g_cap_top = true;
+            if (i + 1 < argc) {
+                char *end = NULL;
+                long v = strtol(argv[i + 1], &end, 10);
+                if (end != argv[i + 1] && *end == '\0') { g_cap_top = v != 0; i++; }
+            }
+        }
         else if (!strcmp(argv[i], "--prefix")) {
             /* The name is optional: bare, the run draws a 6-character code. */
             if (i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0) {
@@ -5370,6 +5522,10 @@ int main(int argc, char *argv[]) {
                "per bottom, within the bottom row and column 0 rows 1..%u)\n", g_stop_row);
     if (g_random_edges && g_backtrack_row && g_extend_nodes)
         printf("[cfg] random edges: the extension chooses column 0 above row %u\n", g_stop_row);
+    if (g_backtrack_row && g_extend_nodes)
+        printf("[cfg] cap_top=%d%s\n", g_cap_top ? 1 : 0,
+               g_cap_top ? " (of its longest fillings, the extension keeps the one whose top-left "
+                           "border closes exactly over the most whole columns, and writes that cap)" : "");
     if (g_prefix[0])
         printf("[cfg] run prefix: %s (boards are named %s_<config>) -> %s\n",
                g_prefix, g_prefix, g_out_dir);
@@ -5444,6 +5600,13 @@ int main(int argc, char *argv[]) {
     clue_dump_schedule();
     ext_fix_init();
     if (g_random_edges) g_edge_left_n = edge_left_pool(&g_edge_left);
+    {   /* --cap_top: the frame-up edges, by the inner colour they show down */
+        const int n = edge_up_pool(&g_edge_up);
+        for (int k = 0; k < n; k++) {
+            const int c = g_edge_up[k].bottom;
+            g_up_by_in[c][g_up_by_in_n[c]++] = (uint8_t)k;
+        }
+    }
 
     /* Clue pieces leave the DATABASE, so no chain can hold one and the search
        never rejects a chain for colliding with a clue.

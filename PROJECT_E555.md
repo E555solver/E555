@@ -617,6 +617,21 @@ cell of unknown orientation).
   frame-left edge on the column-0 top below, then the inner piece beside it)
   before columns 2..14. An edge placed in column 0 leaves the top-border pool.
   "Whole columns" still count from column 1.
+- `--cap_top [N]` (on by default; `0` = off) closes the top-left border
+  exactly over the whole columns. The extension's own row-14 test counts top
+  colours only: it never asks whether the top edges chain by frame colour or a
+  corner fits on column 0, so the break there was often decided before the
+  dives. The cap is the TL corner (the fixed one; under `--random_edges` either
+  corner off the board, its bottom on column 0's row-14 top), then top edges
+  on (15,1), (15,2), ..., each unused, frame up, its inner colour the row-14
+  top below and its left frame colour its neighbour's right one. It is only a
+  tie-break: the search, its order and its node cap are unchanged and the most
+  cells still win, so every board keeps its extension length and whole columns
+  and `--backtrack_min_col` writes exactly the same boards; among the fillings
+  of that length the one with the longest cap is kept and the cap is written
+  on row 15. A cap is worked out once per whole column of a path that reaches
+  the best length. `[sum] top cap:` gives the cap cells per board and the share
+  of boards (with a whole column) closed over all of them.
 
 **The column check** (always on with `--backtrack_min_col K >= 1`). Most
 stop-row boards are otherwise found only to fail the extension. A board can be
@@ -905,6 +920,7 @@ pins the row under it too). `emitted` is the configuration's unique boards,
 [sum] extinct: r8:20 r9:41 r10:22
 [sum] backtrack: 1.23G nodes, 180 M/s; r9:5120 r10:880 r11:12345
 [sum] extension: mean 5.40 cols, max 9
+[sum] top cap: 2.31 cells per board; 41% of the boards with a whole column closed over all of them
 [sum] min_col 5: column check cut 3.4M partial rows
 [sum] corners: TL 61%, TR 55%, both 40%, pair 31%
 [sum] reserve: 12.0 of 26 TOP pieces free
@@ -915,7 +931,8 @@ pins the row under it too). `emitted` is the configuration's unique boards,
 
 `backtrack` lists the boards completing each searched row; `corners` the share
 of written boards with a TL / TR block alive, both, and a piece-disjoint pair
-(5.12); `reserve` the TOP reserve left free at the stop row; `exhausted colour`
+(5.12); `top cap` the row-15 closure `--cap_top` wrote (5.10); `reserve` the
+TOP reserve left free at the stop row; `exhausted colour`
 the configs by the frame colour their border used up (`--exhaust_border_color`,
 5.3). The last `[sum]`
 line counts the written boards by score, highest first (at most six, `...` if
@@ -954,6 +971,7 @@ boards or roots they write the same file at any thread count.
 | `--stop_row R` | 11 | last row filled, 1..13 |
 | `--backtrack_row N` | off | exhaustive search from row N (5.9) |
 | `--extend_nodes N` | 100000 | column-major extension budget per board; 0 = off (5.10) |
+| `--cap_top [N]` | 1 | close the top-left border exactly over the extension's whole columns; 0 = off (5.10) |
 | `--backtrack_min_col K` | 0 | write only boards whose extension fills K columns; cuts partial rows whose column 1 cannot reach row 14 (5.10) |
 | `--no_top_dedup` | -- | keep top-row near duplicates (5.9) |
 | `--beam_expand E`, `--beam_expand_row R` | 4, 7 | late width multiplier and its row |
@@ -1508,6 +1526,7 @@ The breaks a dive leaves in the top rows of a Stage B board are forced by the pi
 | `--backtrack` | off | zero-break row-major fill of rows 0..14, deepest prefix kept |
 | `--stop_row S` | off | rows up to S, then the column extension; the deepest extension kept (implies `--backtrack`) |
 | `--extend_nodes N` | 100000 | node budget of each extension (0 = the first board to reach S) |
+| `--cap_top [N]` | 1 | as the beamer's: of the longest extensions keep the one whose top-left border closes over the most whole columns, and place that closure (0 = off) |
 | `--end_dive M` | 10000 | dives per board; 0 = write the prepared boards |
 | `--end_polish R` | off | polish plus R kick rounds |
 | `--emit_score S` | 450 | write boards whose best is >= S |

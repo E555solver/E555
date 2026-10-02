@@ -1431,6 +1431,7 @@ size_t rank_lefts(const BottomOrder *bot, double tau, RNG *rng, size_t *distinct
 static int      s_side_edge_ids[MAX_EDGE_TERMINALS];
 static Oriented s_edge_down[MAX_EDGE_TERMINALS];    /* frame at the bottom */
 static Oriented s_edge_leftz[MAX_EDGE_TERMINALS];   /* frame on the left  */
+static Oriented s_edge_up[MAX_EDGE_TERMINALS];      /* frame on top       */
 static int      s_side_edge_n = 0;
 static int      s_corner_ids[4];
 static int      s_corner_n = 0;
@@ -1446,8 +1447,9 @@ static void build_side_pools(void) {
             int k = s_side_edge_n++;
             s_side_edge_ids[k] = i;
             if (!orient_with_zero_side((uint16_t)i, 2, &s_edge_down[k]) ||
-                !orient_with_zero_side((uint16_t)i, 3, &s_edge_leftz[k]))
-                fatal("edge piece %d cannot be oriented frame-down/left", i);
+                !orient_with_zero_side((uint16_t)i, 3, &s_edge_leftz[k]) ||
+                !orient_with_zero_side((uint16_t)i, 0, &s_edge_up[k]))
+                fatal("edge piece %d cannot be oriented frame-down/left/up", i);
         } else if (z == 2) {
             if (s_corner_n >= 4) fatal("more than 4 corner pieces");
             s_corner_ids[s_corner_n++] = i;
@@ -1459,6 +1461,12 @@ static void build_side_pools(void) {
 int edge_left_pool(const Oriented **out) {
     build_side_pools();
     *out = s_edge_leftz;
+    return s_side_edge_n;
+}
+
+int edge_up_pool(const Oriented **out) {
+    build_side_pools();
+    *out = s_edge_up;
     return s_side_edge_n;
 }
 

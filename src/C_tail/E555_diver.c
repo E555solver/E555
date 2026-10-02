@@ -422,6 +422,7 @@ static bool        g_backtrack = false;      /* --backtrack */
 static int         g_stop_row  = -1;         /* --stop_row S; -1 = off */
 static uint32_t    g_ext_nodes = 100000;     /* --extend_nodes N */
 static bool        g_ext_set   = false;
+static bool        g_cap_top   = true;       /* --cap_top: as the beamer's */
 
 #define DR_BT_NODES 10000000ULL              /* per board: rows and extensions together */
 
@@ -498,6 +499,8 @@ static void dr_bt_init(void) {
 }
 
 #define DR_OPEN 0xFF
+/* --cap_top: open row-15 cells the closure fills, left to right. */
+typedef struct { int n; uint8_t cell[PUZZLE_SIDE], rot[PUZZLE_SIDE]; uint16_t pid[PUZZLE_SIDE]; } DrCap;
 typedef struct {
     uint16_t pid[NUM_PIECES];
     uint8_t  rot[NUM_PIECES];
@@ -515,6 +518,18 @@ typedef struct {
     uint8_t  br[NUM_PIECES];
     uint64_t nodes, enodes;
     bool     capped, done;
+    /* --cap_top, exactly as the beamer: among the extensions of the best length
+       the one whose top-left border closes over the most whole columns wins.
+       colend[c]: the extension prefix that completes column c (0 = no open
+       cell); ebnd[d]: prefix d completes a column; the cap of the current
+       path (cached for its whole columns cap_m until a column is completed
+       again), the recorded extension's cap, the kept leaf's, and the most open
+       cells of row 15 a cap can fill. */
+    uint8_t  colend[PUZZLE_SIDE];
+    bool     ebnd[NUM_PIECES + 1];
+    bool     cap_ok;
+    int      cap_m, ecap, leaf_cap, cap_full;
+    DrCap    capc, ecp;
 } DrBt;
 
 static inline void bt_put(DrBt *t, int x, uint16_t p, uint8_t s, int tc, int rc, int bc, int lc) {
@@ -580,24 +595,73 @@ static bool bt_cell(DrBt *t, int x, int d, uint64_t *nodes, uint64_t cap, DrNext
     return true;
 }
 
+/* The longest exact run on row 15 from (15,c) rightwards to (15,m), c's left
+   colour L: an open cell takes an unused frame-up piece (the TL corner on
+   column 0) matching the piece below and L; a placed one passes the chain on. */
+static void dr_cap_dfs(DrBt *t, int c, int m, int L, int full, DrCap *cur, DrCap *best) {
+    if (cur->n > best->n) *best = *cur;
+    if (c > m || best->n == full) return;
+    const int x = (PUZZLE_SIDE - 1) * PUZZLE_SIDE + c;
+    if (t->pid[x] != DV_EMPTY) {
+        if (t->side[x][3] == L) dr_cap_dfs(t, c + 1, m, t->side[x][1], full, cur, best);
+        return;
+    }
+    const int B = t->side[x - PUZZLE_SIDE][0];
+    if (B == DR_OPEN) return;
+    for (int k = g_eo_at[L][B]; k < g_eo_at[L][B + 1]; k++) {
+        const DrOr *o = &g_eo[k];
+        if (o->t != 0 || o->r == 0) continue;                 /* frame up; not the TR corner */
+        if (t->framed && o->rot != g_spin[o->pid]) continue;
+        if (used_test(t->used, o->pid)) continue;
+        used_set(t->used, o->pid);
+        cur->cell[cur->n] = (uint8_t)x; cur->pid[cur->n] = o->pid; cur->rot[cur->n] = o->rot; cur->n++;
+        dr_cap_dfs(t, c + 1, m, o->r, full, cur, best);
+        cur->n--;
+        used_clear(t->used, o->pid);
+        if (best->n == full) return;
+    }
+}
+
+/* The cap of extension prefix d: over its whole columns 1..m (none, no cap). */
+static int dr_cap(DrBt *t, int d) {
+    int m = 0;
+    while (m < EDGE_LEN && t->colend[m + 1] <= d) m++;
+    if (m == 0) return 0;
+    if (t->cap_ok && t->cap_m == m) return t->capc.n;
+    t->cap_ok = true; t->cap_m = m;
+    int full = 0;
+    for (int c = 0; c <= m; c++) full += t->pid[(PUZZLE_SIDE - 1) * PUZZLE_SIDE + c] == DV_EMPTY;
+    DrCap cur; cur.n = 0;
+    t->capc.n = 0;
+    dr_cap_dfs(t, 0, m, 0, full, &cur, &t->capc);
+    return t->capc.n;
+}
+
 /* Extension: column-major over the open cells of rows S+1..14, cols 0..14;
-   the deepest prefix, first found. */
+   the deepest prefix, first found -- under --cap_top, of the deepest the one
+   with the longest cap. A full region with a full cap ends the search. */
 static bool bt_ext(DrBt *t, int d) {
-    if (d > t->ebest) {
-        t->ebest = d;
-        for (int k = 0; k < d; k++) {
-            t->ep[k] = t->pid[t->ecell[k]]; t->er[k] = t->rot[t->ecell[k]];
+    if (t->ebnd[d]) t->cap_ok = false;                 /* a column just completed */
+    if (d > 0 && d >= t->ebest) {
+        const int cn = g_cap_top ? dr_cap(t, d) : 0;
+        if (d > t->ebest || cn > t->ecap) {
+            t->ebest = d; t->ecap = cn;
+            for (int k = 0; k < d; k++) {
+                t->ep[k] = t->pid[t->ecell[k]]; t->er[k] = t->rot[t->ecell[k]];
+            }
+            if (cn) t->ecp = t->capc; else t->ecp.n = 0;
         }
     }
-    if (d == t->next) return false;
+    if (d == t->next) return g_cap_top && t->ecap < t->cap_full;
     return bt_cell(t, t->ecell[d], d, &t->enodes, g_ext_nodes, bt_ext);
 }
 
-/* Keep the board as it stands plus its extension prefix. */
+/* Keep the board as it stands plus its extension prefix and cap. */
 static void bt_keep(DrBt *t) {
     memcpy(t->bp, t->pid, sizeof t->bp);
     memcpy(t->br, t->rot, sizeof t->br);
     for (int k = 0; k < t->ebest; k++) { t->bp[t->ecell[k]] = t->ep[k]; t->br[t->ecell[k]] = t->er[k]; }
+    for (int k = 0; k < t->ecp.n; k++) { t->bp[t->ecp.cell[k]] = t->ecp.pid[k]; t->br[t->ecp.cell[k]] = t->ecp.rot[k]; }
 }
 
 /* Row phase: row-major over the open cells of rows 0..S (0..14 without S). */
@@ -609,12 +673,15 @@ static bool bt_row(DrBt *t, int d) {
     if (d < t->nrow)
         return bt_cell(t, t->rcell[d], d, &t->nodes, DR_BT_NODES, bt_row);
     if (g_stop_row < 0) return false;                  /* every open cell filled */
-    t->ebest = 0; t->enodes = 0;
+    t->ebest = 0; t->enodes = 0; t->ecap = 0; t->ecp.n = 0; t->cap_ok = false;
     if (g_ext_nodes) bt_ext(t, 0);
     t->nodes += t->enodes;                             /* one budget for both phases */
-    if (t->ebest > t->leaf_best) { t->leaf_best = t->ebest; bt_keep(t); }
+    if (t->ebest > t->leaf_best || (t->ebest == t->leaf_best && t->ecap > t->leaf_cap)) {
+        t->leaf_best = t->ebest; t->leaf_cap = t->ecap; bt_keep(t);
+    }
     if (t->enodes >= g_ext_nodes && t->ebest < t->next) t->capped = true;
-    return t->leaf_best < t->next && g_ext_nodes > 0;  /* a full region, or the first leaf, ends it */
+    /* A full region (with a full cap under --cap_top), or the first leaf, ends it. */
+    return !(t->leaf_best == t->next && (!g_cap_top || t->leaf_cap == t->cap_full)) && g_ext_nodes > 0;
 }
 
 /* Prepare one board in place: the best leaf at S, else the deepest row prefix. */
@@ -641,10 +708,17 @@ static void dr_backtrack(DrBoard *b, bool framed, DrBt *t) {
     const int top = g_stop_row >= 0 ? g_stop_row : EDGE_LEN;
     for (int x = 0; x < (top + 1) * PUZZLE_SIDE; x++)
         if (b->pid[x] == DV_EMPTY) t->rcell[t->nrow++] = (uint8_t)x;
-    if (g_stop_row >= 0)
+    if (g_stop_row >= 0) {
         for (int c = 0; c < EDGE_LEN + 1; c++)
             for (int r = g_stop_row + 1; r <= EDGE_LEN; r++)
-                if (b->pid[r * PUZZLE_SIDE + c] == DV_EMPTY) t->ecell[t->next++] = (uint8_t)(r * PUZZLE_SIDE + c);
+                if (b->pid[r * PUZZLE_SIDE + c] == DV_EMPTY) {
+                    t->ecell[t->next++] = (uint8_t)(r * PUZZLE_SIDE + c);
+                    t->colend[c] = (uint8_t)t->next;
+                }
+        for (int c = 0; c < EDGE_LEN + 1; c++) if (t->colend[c]) t->ebnd[t->colend[c]] = true;
+        for (int c = 0; c < EDGE_LEN + 1; c++)
+            t->cap_full += b->pid[(PUZZLE_SIDE - 1) * PUZZLE_SIDE + c] == DV_EMPTY;
+    }
     t->leaf_best = -1;
     bt_row(t, 0);
     if (t->nodes >= DR_BT_NODES) t->capped = true;
@@ -1022,6 +1096,9 @@ static void usage(const char *prog) {
         "                      --backtrack\n"
         "  --extend_nodes N    node budget of each extension (default 100000; 0 = keep the\n"
         "                      first board to reach S)\n"
+        "  --cap_top [N]       as the beamer's: of the longest extensions keep the one whose\n"
+        "                      top-left border closes exactly over the most whole columns,\n"
+        "                      and place that closure on row 15 (0 = off; default on)\n"
         "  --end_dive 0        write the prepared boards (score = matched edges) without diving\n"
         "\n"
         "  --print_cmd         echo the full command line\n"
@@ -1054,6 +1131,7 @@ static void print_cmd(const char *a0, const char *seed, const char *in, const ch
     if (g_holes_arg)                  printf(" --holes %s", g_holes_arg);
     if (g_pin)                        printf(" --pin_clue %d", g_pin);
     if (g_stop_row >= 0)              printf(" --stop_row %d --extend_nodes %u", g_stop_row, g_ext_nodes);
+    if (g_stop_row >= 0 && !g_cap_top) printf(" --cap_top 0");
     else if (g_backtrack)             printf(" --backtrack");
     if (g_print_cmd)                  printf(" --print_cmd");
     if (g_verbose)                    printf(" --verbose");
@@ -1167,6 +1245,14 @@ int main(int argc, char **argv) {
             g_ext_nodes = (uint32_t)v;
             g_ext_set = true;
         }
+        else if (!strcmp(argv[i], "--cap_top")) {
+            g_cap_top = true;                  /* bare or nonzero = on, 0 = off */
+            if (i + 1 < argc) {
+                char *e = NULL;
+                const long v = strtol(argv[i + 1], &e, 10);
+                if (e != argv[i + 1] && *e == '\0') { g_cap_top = v != 0; i++; }
+            }
+        }
         else if (!strcmp(argv[i], "--print_cmd"))  g_print_cmd = true;
         else if (!strcmp(argv[i], "--verbose"))    g_verbose = true;
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); usage(argv[0]); return 1; }
@@ -1210,8 +1296,8 @@ int main(int argc, char **argv) {
         if (g_pin) printf("pin %d (%s)%s", g_pin, clue_pin_quadrant_name(g_pin),
                           (g_clue_mask & CLUE_CORNERS) ? " + corners" : "");
         else       printf("as read");
-        if (g_stop_row >= 0) printf(" backtrack=rows to %d, then columns (extend_nodes=%u)",
-                                    g_stop_row, g_ext_nodes);
+        if (g_stop_row >= 0) printf(" backtrack=rows to %d, then columns (extend_nodes=%u, cap_top=%d)",
+                                    g_stop_row, g_ext_nodes, g_cap_top ? 1 : 0);
         else if (g_backtrack) printf(" backtrack=rows");
         printf("\n");
     }

@@ -123,7 +123,7 @@ ALL_STEPS=(
     "ender_repair|core|cpsat,diver|REGRESSION: a scrambled synthetic solution comes back 480/480; a real board redives and comes back no worse"
     "beamer_micro|extra|beamer|random_edges micro-run: builds the real 6.4 GB database"
     "beamer_backtrack_dive|extra|beamer,diver|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --lambda_reserve keeps the reserve for last"
-    "beamer_min_col|extra|beamer|--backtrack_min_col: the column check drops no written board, random column 0 too; near-duplicate filter; log and score line"
+    "beamer_min_col|extra|beamer|--backtrack_min_col: the column check drops no written board, random column 0 too; near-duplicate filter; --cap_top changes only row 15; log and score line"
     "beamer_free_top_clue|extra|beamer,diver|--free_top_clue: the top-left clue anywhere above the stop row, the top-right one left to the dives (builds a clue database in RAM)"
     "beamer_resume|extra|beamer|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
     "scripts_parse|core|scripts|every shipped script parses, and passes only flags that exist"
@@ -2925,7 +2925,9 @@ EOF
     # The column-major extension (on by default under --backtrack_row): the
     # same run with --extend_nodes 0 must write the same stop-row boards, the
     # extension only adding cells above the stop row, in column-major order
-    # from column 1 (checked by the legality pass above: no break anywhere).
+    # from column 1, and its --cap_top closure a run on row 15 from column 1
+    # over the whole columns (checked by the legality pass above: no break
+    # anywhere).
     # 4 threads write the same file as 1; --backtrack_min_col 1 writes the
     # subset whose extension fills column 1; --prefix names the boards.
     grep -q "^\[sum\] extension: " "$OUT/btd_plain.log" \
@@ -2955,8 +2957,11 @@ def rows(p):
             v = [x.strip() for x in l.split(",")]
             yield v[0], list(map(int, v[-512:-256])), v[-256:]
 def split(pos, rot):
-    core = tuple(sorted((c, p, rot[p]) for p, c in enumerate(pos) if c != 999 and (c < 16 * (STOP + 1) or c % 16 in (0, 15) or c >= 240)))
+    core = tuple(sorted((c, p, rot[p]) for p, c in enumerate(pos) if c != 999 and (c < 16 * (STOP + 1) or c % 16 in (0, 15))))
     ext = sorted(c for c in pos if c != 999 and STOP < c // 16 < 15 and 0 < c % 16 < 15)
+    cap = sorted(c for c in pos if c != 999 and c >= 240 and 0 < c % 16 < 15)
+    assert cap == list(range(241, 241 + len(cap))) and len(cap) <= len(ext) // H, \
+        f"the --cap_top cells are not a run over the whole columns: {cap}"
     return core, ext
 order = [r * 16 + c for c in range(1, 15) for r in range(STOP + 1, 15)]
 ext_rows = list(rows(sys.argv[1]))
@@ -3012,6 +3017,11 @@ EOF
 #    --no_top_dedup boards and says how many it dropped, and with the check it
 #    writes the same file at 4 threads as at 1 (both reset where the search
 #    hands work to another thread);
+#  - --cap_top (on by default) only breaks ties between extensions of equal
+#    length: a --cap_top 0 run writes the same boards, line for line, with the
+#    same rows up to the stop row and the same extension cells count; the cap
+#    puts grey-on-top pieces on row 15 that match (a corner first in random
+#    mode);
 #  - the compact log has no [progress] line, the border line carries the run
 #    time, and the summary's last [sum] line counts the written boards by score
 #    as a recount of their matched edges does;
@@ -3026,6 +3036,8 @@ step_beamer_min_col() {
         "${CMD[@]}" --backtrack_min_col "$k" --no_top_dedup --out_dir "$OUT/mc_k$k" > "$OUT/mc_k$k.log" \
             || { tail -5 "$OUT/mc_k$k.log"; fail "--backtrack_min_col $k run exited non-zero"; }
     done
+    "${CMD[@]}" --backtrack_min_col 2 --no_top_dedup --cap_top 0 --out_dir "$OUT/mc_nocap" > "$OUT/mc_nocap.log" \
+        || { tail -5 "$OUT/mc_nocap.log"; fail "the --cap_top 0 run exited non-zero"; }
     "${CMD[@]}" --backtrack_min_col 2 --out_dir "$OUT/mc_dd" > "$OUT/mc_dd.log" \
         || { tail -5 "$OUT/mc_dd.log"; fail "the near-duplicate run exited non-zero"; }
     "${CMD[@]}" --backtrack_min_col 2 --threads 4 --out_dir "$OUT/mc_dd4" > "$OUT/mc_dd4.log" \
@@ -3069,6 +3081,20 @@ def ext_cols(l):
     c, n = board(l), 0
     while n < 14 and all(r * 16 + n + 1 in c for r in range(STOP + 1, 15)): n += 1
     return n
+
+nc, kc = [board(l) for l in rows("mc_nocap")], [board(l) for l in rows("mc_k2")]
+assert nc and len(nc) == len(kc), f"--cap_top 0 wrote {len(nc)} boards, the default {len(kc)}"
+capped = 0
+for a, b in zip(nc, kc):
+    assert all(a.get(x) == b.get(x) for x in range(16 * (STOP + 1))), "--cap_top changed rows up to the stop row"
+    ext = lambda c: sum(1 for x in c if 16 * (STOP + 1) <= x < 240)
+    assert ext(a) == ext(b), "--cap_top changed an extension's length"
+    for x in b:
+        if x >= 240 and x not in a:
+            assert seed[b[x][0]][b[x][1] % 4] == 0, "a cap piece without grey on top"
+            capped += 1
+assert capped, "--cap_top placed nothing: the check would prove nothing"
+assert re.search(r"^\[sum\] top cap: [0-9.]+ cells per board; \d+% ", log("mc_k2"), re.M), "no top-cap line"
 
 want = [content(l) for l in rows("mc_k0") if ext_cols(l) >= 2]
 got = [content(l) for l in rows("mc_k2")]
@@ -3115,6 +3141,13 @@ for l in rb:
             assert seed[p].count(0) == 1 and seed[p][(3 + rot) % 4] == 0, "column 0 holds no frame-left edge"
             c0 += 1
 assert c0, "no random-mode extension reached column 0"
+for l in rb:
+    c = board(l)
+    top = sorted(x for x in c if x >= 240)
+    if top:                                   # the cap: the TL corner, then edges rightwards
+        assert top == list(range(240, 240 + len(top))), "a random-mode cap with a hole"
+        p, r = c[240]
+        assert seed[p][r % 4] == 0 and seed[p][(3 + r) % 4] == 0, "no TL corner at (15,0)"
 frame = [p for p in range(256) if seed[p].count(0) >= 1]
 for l in rb:
     c = board(l)
@@ -3123,7 +3156,8 @@ for l in rb:
                and side(c, STOP * 16, 0) != k and side(c, 15, 0) != k for k in range(1, 6)), \
         "--exhaust_border_color: a frame colour is left outside the written border"
 assert re.search(r"^\[sum\] exhausted colour: c\d \d+ configs$", log("mc_rnd2"), re.M), "no exhausted-colour line"
-print(f"ok: K=2 writes exactly the K=0 boards filling 2 columns (found {found('mc_k0')} -> "
+print(f"ok: --cap_top changes only row 15 ({capped} cap cells over {len(kc)} boards); "
+      f"K=2 writes exactly the K=0 boards filling 2 columns (found {found('mc_k0')} -> "
       f"{found('mc_k2')}); {nd.group(1)} near-dups dropped; random edges: {len(rb)} boards, "
       f"{c0} column-0 edges, a frame colour used up; score lines recount")
 EOF
