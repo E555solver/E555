@@ -878,18 +878,22 @@ completed the stop row; **written** = rows appended to the CSV (under
 `--end_dive`, dived boards kept at `>= --emit_score`; otherwise found boards
 less near duplicates, exact repeats and `--backtrack_min_col` drops). A
 `[sweep]` line appears for a configuration that found something or stopped for
-an unusual reason; its counts are that configuration's:
+an unusual reason; its counts are that configuration's. The line is written in
+three steps: the id (when the beam starts under `--random_edges`, when it ends
+otherwise), then what the beam hands on, then the counts once the backtracking
+(and the dives) are done:
 
 ```
-[sweep] r1b0l1 found=1827 near_dups=212 repeats=64 written=1551 ext_max=9 wall=4.7s
-[sweep] r0b0l0 found=1549 written=1549 ext_max=12 best=458 wall=104.1s
+[sweep] r1b0l1 beam: 412 roots | found=1827 dups=212 repeats=64 written=1551 wall=4.7s
+[sweep] r0b0l0 beam: 1549 boards | found=1549 written=1549 best=458 wall=104.1s
 ```
 
 A configuration cut short also shows `stopped=<reason> at row R` (`time`,
-`interrupted`). `near_dups` counts boards the near-duplicate filter dropped
+`interrupted`). `dups` counts boards the near-duplicate filter dropped
 (5.9), `repeats` boards the backtracker reached twice (clue frames cause it),
-`below_min_col` appears with `--backtrack_min_col`, `ext_max` is the deepest
-extension, `best` the best dived score. Configurations that found nothing
+`below_min_col` appears with `--backtrack_min_col`, `best` the best dived
+score. A random-edges configuration that dies in the beam ends its line with
+`died rN`. In rotations mode the configurations that found nothing
 collapse into one line per run of them under a bottom, with the rows they died
 at:
 
@@ -933,6 +937,8 @@ pins the row under it too). `emitted` is the configuration's unique boards,
 [sum] reserve: 12.0 of 26 TOP pieces free
 [sum] boards: found 12345, near-dups 2345, repeats 12, below min_col 9000, dived 988
 [sum] *** Output boards score: 458:1  457:3  456:12  455:40  454:101  453:255 ... (412 written)
+[sum] best boards: 458 row 120, 457 row 7, 457 row 311, 457 row 390, 456 row 2 in beam_out/beam_completions_0_11.csv
+[sum] *** Output boards extension (cells above row 11, top cap not counted): 32:1  31:4 ...
 [time] run ended 2026-10-01 14:03:11 UTC (wall 1:02:03)
 ```
 
@@ -941,10 +947,14 @@ of written boards with a TL / TR block alive, both, and a piece-disjoint pair
 (5.12); `top cap` the row-15 closure `--cap_top` wrote (5.10); `reserve` the
 TOP reserve left free at the stop row; `exhausted colour`
 the configs by the frame colour their border used up (`--exhaust_border_color`,
-5.3). The last `[sum]`
-line counts the written boards by score, highest first (at most six, `...` if
-there are more): the dives' matched edges under `--end_dive`, otherwise the
-matched edges of each written partial board, as `E555_rank` scores it.
+5.3). `Output boards score` counts the written boards by score, highest first
+(at most six, `...` if there are more): the dives' matched edges under
+`--end_dive`, otherwise the matched edges of each written partial board, as
+`E555_rank` scores it. `best boards` says where the five best are: the 0-based
+data row of the CSV, as `tools/E555_viewer.py FILE --row N` takes it (the file
+is appended to, so rows of earlier runs count). With the extension, the same
+two lines follow for its length; `longest extensions` (the row of each) is left
+out under `--end_dive`, whose rows are the dived boards.
 `--verbose` first prints every detail line: time split, extinctions, row flow
 (`attempts:candidates/retained/selected` per row), backtrack and extension
 totals, end-dive totals (dives, polish gains, time and CPU use per phase, where

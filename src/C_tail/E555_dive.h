@@ -128,6 +128,9 @@ void     dv_run(const char *id);
 /* Write the kept boards, best first, as "id, score, pos[256], rot[256]", and
    forget them. Called after every batch, so a killed run loses at most one. */
 void     dv_flush(FILE *fp);
+/* Optional: called with the score of each row dv_flush writes, in order
+   (NULL, the default, for none). */
+void     dv_set_row_hook(void (*hook)(int score));
 uint64_t dv_written(void);
 /* The best score of the last dv_run batch, -1 when it dived nothing. */
 int      dv_last_best(void);

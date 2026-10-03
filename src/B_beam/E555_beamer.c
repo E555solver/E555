@@ -2680,6 +2680,73 @@ _Static_assert(DIVE_SLOT_BYTES <= EMIT_LINE_MAX, "dive slot fits an emission slo
 /* Written boards by matched edges, for the summary's score line when nothing
    is dived (under --end_dive the dive engine keeps that tally). */
 static uint64_t g_score_hist[DV_EDGES + 1];
+/* Extension cells above the stop row (--cap_top cells excluded) of every
+   written board, or of every dived one under --end_dive. */
+static uint64_t g_ext_hist[PUZZLE_SIDE * PUZZLE_SIDE + 1];
+
+/* Where the summary's best boards are: each output CSV this run appended to,
+   and the data row (0-based, comments not counted -- the index
+   tools/E555_viewer.py --row takes) the next written board lands on. The
+   files are opened for append, so the rows earlier runs left are counted at
+   open. */
+static char   **g_out_files = NULL;
+static int      g_out_file_n = 0, g_out_file_cur = -1;
+static uint64_t g_file_rows = 0;
+
+/* Data rows already in a board CSV: lines not starting with '#' or '%' that
+   hold at least 512 fields, as the viewer counts them. */
+static uint64_t count_board_rows(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    static char buf[1 << 20];
+    uint64_t rows = 0;
+    size_t commas = 0;
+    bool at_start = true, comment = false;
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0)
+        for (size_t i = 0; i < n; i++) {
+            const char ch = buf[i];
+            if (at_start) { comment = ch == '#' || ch == '%'; at_start = false; }
+            if (ch == ',') commas++;
+            else if (ch == '\n') {
+                if (!comment && commas >= 2 * NUM_PIECES - 1) rows++;
+                commas = 0; at_start = true;
+            }
+        }
+    if (!at_start && !comment && commas >= 2 * NUM_PIECES - 1) rows++;
+    fclose(f);
+    return rows;
+}
+
+/* Open a completions CSV for append and make it the file new rows are
+   credited to. */
+static FILE *open_completions(const char *path) {
+    FILE *fp = fopen(path, "a");
+    if (!fp) fatal("cannot open %s: %s", path, strerror(errno));
+    setvbuf(fp, NULL, _IOFBF, EMIT_FILE_BUF);
+    g_file_rows = (fseek(fp, 0, SEEK_END) == 0 && ftell(fp) > 0) ? count_board_rows(path) : 0;
+    g_out_files = xrealloc(g_out_files, (size_t)(g_out_file_n + 1) * sizeof *g_out_files);
+    g_out_files[g_out_file_n] = xmalloc(strlen(path) + 1);
+    strcpy(g_out_files[g_out_file_n], path);
+    g_out_file_cur = g_out_file_n++;
+    return fp;
+}
+
+/* The five best values seen, each with the file and row it was written to;
+   ties keep the earliest. */
+#define TOP_KEEP 5
+typedef struct { int v, file; uint64_t row; } TopRec;
+typedef struct { int n; TopRec r[TOP_KEEP]; } TopList;
+static TopList g_top_score, g_top_ext;
+static void top_add(TopList *t, int v, uint64_t row) {
+    if (t->n == TOP_KEEP && v <= t->r[TOP_KEEP - 1].v) return;
+    int i = t->n < TOP_KEEP ? t->n++ : TOP_KEEP - 1;
+    while (i > 0 && t->r[i - 1].v < v) { t->r[i] = t->r[i - 1]; i--; }
+    t->r[i] = (TopRec){ v, g_out_file_cur, row };
+}
+
+/* --end_dive: dv_flush writes the rows; it reports each one's score here. */
+static void dive_row_written(int score) { top_add(&g_top_score, score, g_file_rows++); }
 
 static int prepare_board(const RowChoice rows[EDGE_LEN], int row, int orient,
                          const Ext *ext, char *slot, uint16_t *score) {
@@ -2703,15 +2770,18 @@ static int prepare_board(const RowChoice rows[EDGE_LEN], int row, int orient,
     return (int)DIVE_SLOT_BYTES;
 }
 
-static void emit_board_line(const char *slot, size_t len) {
+/* Write one board, or queue it for the dives; returns the data row it was
+   written to (UINT64_MAX when queued). */
+static uint64_t emit_board_line(const char *slot, size_t len) {
     if (g_end_dive) {
         uint16_t pid[NUM_PIECES];
         memcpy(pid, slot, sizeof pid);
         dv_add(pid, (const uint8_t *)slot + sizeof pid);
-        return;
+        return UINT64_MAX;
     }
     fprintf(g_completions_fp, "%s, %" PRIu64, g_board_id_str, g_solution_idx++);
     fwrite(slot, 1, len, g_completions_fp);
+    return g_file_rows++;
 }
 
 /* Stop-row emission buffers, allocated on first use (emission is entered from
@@ -2770,9 +2840,10 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
         }
         for (uint32_t k = 0; k < tile && g_emit_count < EMIT_MAX; k++) {
             if (!htable_insert(g_emit_fps[k])) continue;
-            emit_board_line(g_emit_lines + (size_t)k * EMIT_LINE_MAX, (size_t)g_emit_lens[k]);
+            const uint64_t at = emit_board_line(g_emit_lines + (size_t)k * EMIT_LINE_MAX,
+                                                (size_t)g_emit_lens[k]);
             g_stats.emitted_total++;
-            if (!g_end_dive) g_score_hist[g_emit_sc[k]]++;
+            if (!g_end_dive) { g_score_hist[g_emit_sc[k]]++; top_add(&g_top_score, g_emit_sc[k], at); }
             if (g_corners_on) tc_tally(g_emit_corner[k]);
             if (g_top_n) rsv_tally(g_emit_rsv[k]);
         }
@@ -3820,11 +3891,13 @@ static void bt_emit_node(const BtNode *o, uint64_t *boards) {
         (*boards)++;
         if (!htable_insert(o->fp[i])) { g_bt.dup++; continue; }
         const size_t end = (i + 1 < o->n) ? o->off[i + 1] : o->len;
-        emit_board_line(o->buf + o->off[i], end - o->off[i]);
+        const uint64_t at = emit_board_line(o->buf + o->off[i], end - o->off[i]);
         g_stats.emitted_total++; g_bt.emitted++;
-        if (!g_end_dive) g_score_hist[o->sc[i]]++;
+        if (!g_end_dive) { g_score_hist[o->sc[i]]++; top_add(&g_top_score, o->sc[i], at); }
         if (g_extend_nodes) {
             const int n = o->ex[i], cols = ext_cols_n(n, (int)g_stop_row);
+            g_ext_hist[n]++;
+            if (!g_end_dive) top_add(&g_top_ext, n, at);
             g_bt_run.ext_cells += (uint64_t)n; g_bt_run.ext_cols += (uint64_t)cols;
             if (n > g_bt_run.ext_max) g_bt_run.ext_max = n;
             if (cols > g_bt_run.ext_cols_max) g_bt_run.ext_cols_max = cols;
@@ -4108,6 +4181,27 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
 
 /* -- Beam driver ------------------------------------------------------------ */
 
+/* The compact log writes a configuration's [sweep] line in stages, so a long
+   backtrack is not silent: the id (at the start of the beam under
+   --random_edges; in rotations mode, where the configurations that die in the
+   beam collapse into one line, only once the beam has candidates), then what
+   the beam handed on, then sweep_report's counts. */
+static bool g_sweep_open = false;
+static void barren_flush(void);
+static void sweep_head(void) {
+    if (g_verbose || g_sweep_open) return;
+    barren_flush();
+    printf("[sweep] %s", g_config_id_str);
+    fflush(stdout);
+    g_sweep_open = true;
+}
+static void sweep_beam_done(uint32_t kept) {
+    if (g_verbose) return;
+    sweep_head();
+    printf(" beam: %u %s |", kept, g_backtrack_row ? "roots" : "boards");
+    fflush(stdout);
+}
+
 static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
                                      uint64_t cfg_hash, double deadline) {
     BeamResult res = {0, 1, "stop_row"};
@@ -4163,6 +4257,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
                        g_config_id_str, row, pool_n, kept, kept, omp_get_wtime() - t_row);
                 fflush(stdout);
             }
+            sweep_beam_done(kept);
             double t0 = omp_get_wtime();
             backtrack_emit(ctx, cur, kept, row, deadline, &res);
             g_stats.t_emit += omp_get_wtime() - t0;
@@ -4172,6 +4267,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         if ((uint32_t)row == g_stop_row) {
             res.width = kept;
             g_stats.row_selected[row] += kept;
+            sweep_beam_done(kept);
             double t0 = omp_get_wtime();
             emit_stop_row(ctx, cur, kept, row);
             g_stats.t_emit += omp_get_wtime() - t0;
@@ -4424,11 +4520,32 @@ static const char *fmt_cnt(char *b, size_t n, uint64_t v) {
     return b;
 }
 
-#define SCORE_LINE_MAX 6                  /* scores shown on the summary's last line */
+#define SCORE_LINE_MAX 6                  /* values shown on the summary's score lines */
+
+/* "[sum] best boards: 388 row 120, 386 row 7, ... in FILE": where the listed
+   boards were written, as the 0-based data row tools/E555_viewer.py --row
+   takes. The file is named once when all of them share it. Extensions also
+   give their whole columns. */
+static void print_top_list(const char *what, const TopList *t, bool ext) {
+    if (!t->n) return;
+    bool one_file = true;
+    for (int i = 1; i < t->n; i++) one_file &= t->r[i].file == t->r[0].file;
+    printf("[sum] %s:", what);
+    for (int i = 0; i < t->n; i++) {
+        const TopRec *r = &t->r[i];
+        printf("%s %d", i ? "," : "", r->v);
+        if (ext) printf(" (%d cols)", ext_cols_n(r->v, (int)g_stop_row));
+        if (!one_file) printf(" %s", g_out_files[r->file]);
+        printf(" row %" PRIu64, r->row);
+    }
+    if (one_file) printf(" in %s", g_out_files[t->r[0].file]);
+    printf("\n");
+}
 
 /* The run summary: one short line per topic, only those that apply, nothing
-   said twice; --verbose prints every detail line first. The last [sum] line
-   is the written boards by score. */
+   said twice; --verbose prints every detail line first. It ends with the
+   written boards by score and where the best are, then, with the extension,
+   the same two for its length. */
 static void print_summary(double wall_total, double init_s, double sweep_s) {
     char b1[32], b2[32];
     printf("\n================= run summary =================\n");
@@ -4523,6 +4640,20 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         shown++;
     }
     printf("%s%s (%" PRIu64 " written)\n", shown ? "" : " none", more ? " ..." : "", g_written_total);
+    print_top_list("best boards", &g_top_score, false);
+    if (g_backtrack_row && g_extend_nodes) {
+        printf("[sum] *** Output boards extension (cells above row %u, top cap not counted):",
+               g_stop_row);
+        shown = 0; more = false;
+        for (int n = (int)(sizeof g_ext_hist / sizeof g_ext_hist[0]) - 1; n >= 0; n--) {
+            if (!g_ext_hist[n]) continue;
+            if (shown == SCORE_LINE_MAX) { more = true; break; }
+            printf("%s%d:%" PRIu64, shown ? "  " : " ", n, g_ext_hist[n]);
+            shown++;
+        }
+        printf("%s%s\n", shown ? "" : " none", more ? " ..." : "");
+        print_top_list("longest extensions", &g_top_ext, true);
+    }
     print_time_stamp("ended", wall_total);
     fflush(stdout);
 }
@@ -5126,16 +5257,24 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
         const bool productive = g_cfg_found != 0 || strong_partials != 0;
         const bool exceptional = strcmp(br->reason, "extinct") != 0
                               && strcmp(br->reason, "stop_row") != 0;
-        if (productive || exceptional) {
+        const bool open = g_sweep_open;   /* the head is out: always finish the line */
+        g_sweep_open = false;
+        if (open && !productive && !exceptional && !filled) {
+            printf(" died r%u wall=%.1fs\n", br->row, wall);
+            fflush(stdout);
+            return;
+        }
+        if (!open && (productive || exceptional)) {
             barren_flush();
-            printf("[sweep] %sl%ld found=%" PRIu64, group, li, g_cfg_found);
+            printf("[sweep] %sl%ld", group, li);
+        }
+        if (open || productive || exceptional) {
+            printf(" found=%" PRIu64, g_cfg_found);
             if (g_backtrack_row && g_bt_run.cfg_dup) printf(" repeats=%" PRIu64, g_bt_run.cfg_dup);
             if (g_backtrack_row && g_bt_run.cfg_near_dup)
-                printf(" near_dups=%" PRIu64, g_bt_run.cfg_near_dup);
+                printf(" dups=%" PRIu64, g_bt_run.cfg_near_dup);
             if (g_bt_min_col) printf(" below_min_col=%" PRIu64, g_bt_run.cfg_mincol);
             printf(" written=%" PRIu64, g_cfg_written);
-            if (g_backtrack_row && g_extend_nodes && g_cfg_found)
-                printf(" ext_max=%d", g_bt_run.cfg_ext_max);
             if (g_end_dive && dv_last_best() >= 0) printf(" best=%d", dv_last_best());
             if (g_incomplete_top && g_partial_count) printf(" partials=%zu", g_partial_count);
             if (exceptional) printf(" stopped=%s at row %u", sweep_reason(br), br->row);
@@ -5688,6 +5827,7 @@ int main(int argc, char *argv[]) {
             .threads = g_nthreads, .stop = &g_stop,
         };
         dv_init(&dp);
+        dv_set_row_hook(dive_row_written);
     }
     double t_sweep0 = omp_get_wtime();
     double init_s = t_sweep0 - t_start;
@@ -5709,9 +5849,7 @@ int main(int argc, char *argv[]) {
         if (g_incomplete_top) partial_dedup_init();
         char comp_path[1024];
         snprintf(comp_path, sizeof comp_path, "%s/beam_completions_random_%u.csv", g_out_dir, g_stop_row);
-        g_completions_fp = fopen(comp_path, "a");
-        if (!g_completions_fp) fatal("cannot open %s: %s", comp_path, strerror(errno));
-        setvbuf(g_completions_fp, NULL, _IOFBF, EMIT_FILE_BUF);
+        g_completions_fp = open_completions(comp_path);
         printf("[out] completions -> %s (append)\n", comp_path);
         manifest_add(comp_path);
         if (g_incomplete_top) {
@@ -5775,6 +5913,7 @@ int main(int argc, char *argv[]) {
                 double slice_end = tc0 + g_config_time_sec;
                 if (g_max_wall_sec > 0.0) { double ge = t_start + g_max_wall_sec; if (ge < slice_end) slice_end = ge; }
 
+                sweep_head();
                 BeamResult br = beam_search_config(&ctx, scratch, cfg_hash, slice_end);
                 const uint64_t w0 = dv_written();
                 if (g_end_dive) dive_config();
@@ -5865,9 +6004,7 @@ int main(int argc, char *argv[]) {
         partial_outputs_close();
         char comp_path[1024];
         snprintf(comp_path, sizeof comp_path, "%s/beam_completions_%u_%u.csv", g_out_dir, cur_row, g_stop_row);
-        g_completions_fp = fopen(comp_path, "a");
-        if (!g_completions_fp) fatal("cannot open %s: %s", comp_path, strerror(errno));
-        setvbuf(g_completions_fp, NULL, _IOFBF, EMIT_FILE_BUF);
+        g_completions_fp = open_completions(comp_path);
         printf("[out] completions -> %s (append)\n", comp_path);
         manifest_add(comp_path);
         if (g_incomplete_top) {

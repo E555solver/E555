@@ -2028,6 +2028,9 @@ static inline char *dv_u32a(char *p, uint32_t v) {
     return p;
 }
 
+static void (*g_dv_row_hook)(int score) = NULL;
+void dv_set_row_hook(void (*hook)(int score)) { g_dv_row_hook = hook; }
+
 void dv_flush(FILE *fp) {
     if (!g_dv_kn || !fp) return;
     qsort(g_dv_keep, g_dv_kn, sizeof *g_dv_keep, dv_cmp_keep);
@@ -2055,6 +2058,7 @@ void dv_flush(FILE *fp) {
         fwrite(line, 1, (size_t)(p - line), fp);
         g_dv_run.written++;
         g_dv_run.hist[kp->score]++;
+        if (g_dv_row_hook) g_dv_row_hook(kp->score);
         if (kp->top_row < g_dv_run.top_min) g_dv_run.top_min = kp->top_row;
         if (kp->top_row > g_dv_run.top_max) g_dv_run.top_max = kp->top_row;
         dv_break_places(kp);

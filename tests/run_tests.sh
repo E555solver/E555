@@ -3113,9 +3113,9 @@ assert nd and int(nd.group(1)) > 0, "the near-duplicate filter reported no near-
 for d in ("mc_k2", "mc_dd", "mc_rnd2"):
     t = log(d)
     assert "[progress]" not in t, f"{d}: a [progress] line is back"
-    last = [l for l in t.splitlines() if l.startswith("[sum]")][-1]
-    m = re.match(r"\[sum\] \*\*\* Output boards score:(.*) \((\d+) written\)$", last)
-    assert m, f"{d}: the last [sum] line is not the score line: {last}"
+    m = re.search(r"^\[sum\] \*\*\* Output boards score:(.*) \((\d+) written\)$", t, re.M)
+    assert m, f"{d}: no score line in the summary"
+    assert "ext_max=" not in t and " near_dups=" not in t, f"{d}: the [sweep] line kept ext_max/near_dups"
     bs = list(rows(d))
     assert int(m.group(2)) == len(bs), f"{d}: the score line counts {m.group(2)}, the CSV holds {len(bs)}"
     hist = {}
@@ -3128,6 +3128,22 @@ for d in ("mc_k2", "mc_dd", "mc_rnd2"):
     shown = re.findall(r"(\d+):(\d+)", m.group(1))
     top = sorted(hist.items(), reverse=True)[:len(shown)]
     assert [(int(a), int(b)) for a, b in shown] == top, f"{d}: score line {shown} vs recount {top}"
+    # The location lines: each listed row (0-based data row of the named file)
+    # holds that score / that many extension cells, best first.
+    best = sorted((s for s in (matched_broken(board(l))[0] for l in bs)), reverse=True)
+    for what, pat in (("best boards", r"(\d+) row (\d+)"), ("longest extensions", r"(\d+) \(\d+ cols\) row (\d+)")):
+        lm = re.search(rf"^\[sum\] {what}: (.*) in (\S+)$", t, re.M)
+        assert lm, f"{d}: no '{what}' line"
+        fr = [l for l in open(lm.group(2)) if l.strip() and l[0] not in "#%"]
+        got = [(int(v), int(r)) for v, r in re.findall(pat, lm.group(1))]
+        assert got and [v for v, _ in got] == sorted((v for v, _ in got), reverse=True), f"{d}: {what} not best first"
+        for v, r in got:
+            c = board(fr[r])
+            have = matched_broken(c)[0] if what == "best boards" else \
+                sum(1 for x in c if STOP < x // 16 < 15 and (x % 16 < 15) and (x % 16 > 0 or d == "mc_rnd2"))
+            assert have == v, f"{d}: {what} row {r} holds {have}, the line says {v}"
+        if what == "best boards":
+            assert [v for v, _ in got] == best[:len(got)], f"{d}: best boards {got} vs recount {best[:5]}"
 assert re.search(r"^========== border row 0   run \d+ s = [0-9.]+ min ==========$", log("mc_k2"), re.M), \
     "the border line carries no run time"
 
