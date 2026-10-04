@@ -556,9 +556,14 @@ exhaustive search from those boards is cheap because its tree dies out within a
 few rows. With `--backtrack_row N` (1..stop_row-1):
 
 1. rows 1..N-1 are the ordinary beam;
-2. row N is expanded like a stop row and its candidates are kept raw, without
-   frontier dedup (two roots sharing a frontier reach the same upper rows under
-   different lower rows): these are the **roots**, in rank order;
+2. row N is an ordinary beam row (lookahead, `--bc_window`, frontier dedup) and
+   its best `--backtrack_row_factor` M x width boards, chosen by the beam's own
+   selection (per-parent cap, random band), are the **roots**, in rank order
+   (default M = 2). `--pool_factor` then sets how many candidates the roots are
+   chosen from, not how many there are. With M = 0, the behaviour before the
+   flag, row N is expanded like a stop row and every candidate is a root, kept
+   raw without frontier dedup: up to `--pool_factor` x width roots, mostly
+   siblings that differ only in the last segments of row N;
 3. rows N+1..stop_row are searched exhaustively from every root, cell by cell in
    row-major order: col 0 is the fixed left column, cols 1-14 take every unused
    inner orientation matching left and bottom, col 15 every unused right edge of
@@ -856,6 +861,9 @@ while the border row did (19/72 on row 4, 67/72 on row 5). `--tau_bottoms/--tau_
 ranks cost nothing (168/288 against 159/288 at 0); tau 2 is near-uniform and
 lost 10%. Spend the budget on border rows first.
 
+These measurements predate `--backtrack_row_factor`: they used every row-N
+candidate as a root, i.e. `--backtrack_row_factor 0`.
+
 **Recommended pass** (the command of §3.1): width 10000, `--backtrack_row 6`,
 `--stop_row 11`, 6 bottoms x 12 columns, tau 0.1; repeat promising borders with
 `--backtrack_row 5`. Read the database once after boot (`cat chain.db >
@@ -987,6 +995,7 @@ boards or roots they write the same file at any thread count.
 | `--beam_width K` | 250000 | boards per row |
 | `--stop_row R` | 11 | last row filled, 1..13 |
 | `--backtrack_row N` | off | exhaustive search from row N (5.9) |
+| `--backtrack_row_factor M` | 2 | roots = best M x width boards of row N; 0 = every candidate, raw (5.9) |
 | `--extend_nodes N` | 100000 | column-major extension budget per board; 0 = off (5.10) |
 | `--cap_top [N]` | 1 | close the top-left border exactly over the extension's whole columns; 0 = off (5.10) |
 | `--backtrack_min_col K` | 0 | write only boards whose extension fills K columns; cuts partial rows whose column 1 cannot reach row 14 (5.10) |
@@ -1005,14 +1014,14 @@ boards or roots they write the same file at any thread count.
 | `--corner_seeds N` | 4 | corner-seeded copies per board (with `--lambda_corners`) |
 | `--frac_rand F` | 0.10 | random selection band |
 | `--parent_cap N` | 4 | children per parent in the score band; 0 = uncapped |
-| `--pool_factor N` | 8 | candidate pool, x beam width |
-| `--bc_window nB,nC` | 3,3 | B/C completions scored per A record while the beam is full |
+| `--pool_factor N` | 8 | candidate pool, x beam width; at least min(8, N) children per parent |
+| `--bc_window nB,nC` | 3,3 | B/C completions scored per A record while the beam is full; each 1..128 |
 | `--no_free_demand` | -- | disable the free-edge demand accounting |
 | `--top_bottoms N`, `--top_columns N` | 10, 12 | bottoms per border row, columns per bottom; < 1 = all |
 | `--tau_bottoms T`, `--tau_columns T` | 0 | ranking temperatures |
 | `--bail_columns N` | 0 | abandon a bottom after N barren columns |
 | `--time_limit S` | 600 | per-row deadline within a configuration |
-| `--wall_time S` | 0 | total budget |
+| `--wall_time S` | 0 | total budget; SIGINT/SIGTERM also stop cleanly (current configuration, summary), a second signal kills |
 | `--max_emitted N` | 0 | stop after N boards written (with `--end_dive`: cap written boards, never stop the search) |
 | `--resume` | off | continue from `sweep_checkpoint.txt`; give the original `--start_row/--num_rows` (and `--rng_seed` at tau > 0) |
 | `--threads N`, `--rng_seed S` | all, random | |
@@ -1208,6 +1217,7 @@ enumeration grows explosively as rows are freed; 7 is a practical value.
 | `--incomplete_top` | off | also write two-segment stop-row boards |
 | `--beam_width K`, `--stop_row R` | 250000, 11 | width; last row, up to 14 |
 | `--backtrack_row N` | off | exhaustive search (6.7) |
+| `--backtrack_row_factor M` | 2 | roots of the search, as the beamer (5.9) |
 | `--beam_expand E`, `--beam_expand_row R` | 4, 8 | late width |
 | `--lambda_J`, `--lambda_Mahalanobis` | 1.0, 1.0 | scoring (5.5) |
 | `--lambda_corners [F]` | off; bare 0.5 | top-corner supply; needs known sides |
@@ -1216,7 +1226,7 @@ enumeration grows explosively as rows are freed; 7 is a practical value.
 | `--no_free_demand` | -- | as the beamer |
 | `--top_columns N` | 12 | sampled columns per repeat; <= 0 enumerates all |
 | `--tau_columns T`, `--bail_columns N` | 0, 0 | column sampling temperature; abandon a line after N barren columns |
-| `--time_limit S`, `--wall_time S`, `--max_emitted N` | 600, 0, 0 | budgets |
+| `--time_limit S`, `--wall_time S`, `--max_emitted N` | 600, 0, 0 | budgets; SIGINT/SIGTERM stop cleanly, a second signal kills |
 | `--threads N`, `--rng_seed S`, `--verbose`, `--print_cmd` | all, random, off, off | |
 
 ---

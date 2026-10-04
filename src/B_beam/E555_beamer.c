@@ -11,8 +11,9 @@
  *   legal bottom-row and left-column orderings, ranks both by fan-out, and
  *   sweeps the most productive (bottom x left-column) configurations. With
  *   --random_edges there is no Stage A input at all: bottoms and left columns
- *   are sampled at random from the seed's edge pieces (best of 32 fan-out-ranked
- *   samples each; see E555_database.c), so the search can run indefinitely,
+ *   are sampled at random from the seed's edge pieces (the best of 32 random
+ *   draws each by fan-out rank, drawn biased and filtered under
+ *   --exhaust_border_color), so the search can run indefinitely,
  *   generating partials over ever-fresh border combinations;
  *   --exhaust_border_color makes each such border use up one frame colour
  *   within the rows it writes. Each configuration
@@ -43,13 +44,14 @@
  *   row fits above it is deliberately left to the next stage.
  *
  * BACKTRACKING (--backtrack_row N)
- *   The beam stops at row N, expanded as a stop row, and every row-N candidate
- *   is then searched exhaustively, cell by cell in row-major order, up to
- *   --stop_row: parity at every row and clue pins, and under --lambda_corners
- *   at least one top corner still closable (a TL or TR block alive) at every
- *   row. Every completing board is emitted, exact duplicates aside and without the
- *   EMIT_MAX cap -- first extended column by column above the stop row, from
- *   its deepest zero-break prefix (--extend_nodes, --backtrack_min_col). See
+ *   The beam stops at row N, whose best --backtrack_row_factor x width boards
+ *   (0: every candidate, raw) are then searched exhaustively, cell by cell in
+ *   row-major order, up to --stop_row: parity at every row and clue pins, and
+ *   under --lambda_corners at least one top corner still closable (a TL or TR
+ *   block alive) at every row. Every completing board is emitted, exact
+ *   duplicates aside and without the EMIT_MAX cap -- first extended column by
+ *   column above the stop row, from its deepest zero-break prefix
+ *   (--extend_nodes, --backtrack_min_col). See
  *   backtrack_emit and extend_board. A stop-row board whose top row nearly
  *   repeats the previous one's is dropped first (--no_top_dedup keeps it); under
  *   --backtrack_min_col K a partial row whose column 1 can no longer be
@@ -116,7 +118,7 @@
    running best, not an array -- but b_left is B_TRY + nB - 1 in an int, so an
    unbounded nB would overflow it negative and the B loop would never run, which
    would empty the beam silently instead of merely slowing it. */
-#define BC_WINDOW_MAX 64
+#define BC_WINDOW_MAX 128
 
 /* Stop-row emission safety cap (lines per config; the CSV rows are ~2 KB). */
 #define EMIT_MAX 1000000u
@@ -125,9 +127,13 @@ static uint64_t g_master_seed = 0;
 
 static uint32_t g_beam_width      = 250000;
 static uint32_t g_stop_row        = 11;
-/* --backtrack_row N (0 = off): the beam stops at row N, and every row-N
-   candidate is searched exhaustively, cell by cell, up to --stop_row. */
+/* --backtrack_row N (0 = off): the beam stops at row N, and its roots are
+   searched exhaustively, cell by cell, up to --stop_row. */
 static uint32_t g_backtrack_row   = 0;
+/* --backtrack_row_factor M: row N is an ordinary beam row and its best
+   M x (row width) boards are the roots; 0 = every row-N candidate, expanded
+   as a stop row and kept raw (the behaviour before the flag). */
+static uint32_t g_bt_factor       = 2;
 /* --extend_nodes N: every board the backtracker completes at --stop_row is
    extended by an exhaustive column-major search over rows stop+1..14, cols
    1..14, of at most N nodes, and written from its deepest zero-break prefix
@@ -163,10 +169,19 @@ static uint64_t g_cfg_found = 0, g_cfg_written = 0, g_found_total = 0, g_written
 static char     g_board_id_str[140] = "c0";
 
 static bool     g_backtrack_row_set = false;
+static bool     g_bt_factor_set = false;
 static bool     g_extend_set = false, g_min_col_set = false;
-/* The row the beam treats as its last: expanded like a stop row (every
-   conflict-free completion, raw ranking) and never pruned. */
+/* The row the beam treats as its last: the stop row, or the backtrack row,
+   whose candidates (or, under --backtrack_row_factor M > 0, its best M x width
+   boards) are the backtracker's roots. */
 static inline uint32_t gen_stop_row(void) { return g_backtrack_row ? g_backtrack_row : g_stop_row; }
+/* Is `row` expanded as a stop row (every completion, no lookahead, raw
+   ranking)? The stop row always is; the backtrack row only under
+   --backtrack_row_factor 0, otherwise it is an ordinary beam row whose
+   selection gives the roots. */
+static inline bool row_is_stop(uint32_t row) {
+    return row == g_stop_row || (g_backtrack_row && row == g_backtrack_row && g_bt_factor == 0);
+}
 /* --end_dive M (0 = off): stop-row boards are completed by M random dives
    each and emitted by score (>= --emit_score S) instead of written as found. */
 #define DV_M_DEFAULT 10000         /* --end_dive without a value */
@@ -315,7 +330,9 @@ static size_t g_partial_total = 0;      /* whole run, all kinds */
 static size_t g_part_total[PART_N];     /* whole run by kind */
 
 static volatile sig_atomic_t g_stop = 0;
-static void handle_stop(int sig) { (void)sig; g_stop = 1; }
+/* The first SIGINT/SIGTERM finishes the configuration and the summary; the
+   second kills at once. */
+static void handle_stop(int sig) { g_stop = 1; signal(sig, SIG_DFL); }
 
 /* Run statistics for the end-of-run summary. */
 static struct {
@@ -2327,7 +2344,11 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
     }
     uint64_t pool_target = (uint64_t)g_pool_factor * g_beam_width;
     uint32_t quota_parent = (uint32_t)(pool_target / beam_n);
-    if (quota_parent < 8) quota_parent = 8;
+    /* At least 8 children per parent (the pool target uses the base width, so
+       the floor is what keeps the expanded rows' pool at 8 per board), but
+       never more than --pool_factor asks: --pool_factor 1 keeps 1. */
+    const uint32_t quota_floor = g_pool_factor < 8 ? g_pool_factor : 8;
+    if (quota_parent < quota_floor) quota_parent = quota_floor;
     uint64_t budget_parent = (uint64_t)quota_parent * SCAN_FACTOR;
     if (budget_parent < MIN_DECODE_BUDGET) budget_parent = MIN_DECODE_BUDGET;
     /* Slicing is a pure parallel decomposition: both scan phases below are
@@ -2338,7 +2359,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
     if (n_slices > quota_parent) n_slices = quota_parent;
     uint32_t quota_slice = quota_parent / n_slices; if (quota_slice == 0) quota_slice = 1;
     uint64_t budget_slice = budget_parent / n_slices; if (budget_slice < 64) budget_slice = 64;
-    const bool at_stop = ((uint32_t)row == gen_stop_row());
+    const bool at_stop = row_is_stop((uint32_t)row);
     /* Did the PREVIOUS row keep everything it generated? Then selection is not
        discarding anything -- select_beam early-returns on kept <= K -- and this
        row is very likely in the same regime. There, keeping one child per
@@ -2643,6 +2664,27 @@ static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t beam_n,
         ctx->taken[i] = 1; ctx->sel[n_sel++] = i;
     }
     return n_sel;
+}
+
+static int cmp_u32_asc(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return (x > y) - (x < y);
+}
+
+/* --backtrack_row_factor M > 0: the backtrack row's deduplicated, ranked
+   candidates are cut to M x the row's width by the beam's own selection (same
+   per-parent cap, random band and selection seed as a beam row), and the
+   survivors are left in ctx->keep[0..n), still in rank order, as the roots. */
+static uint32_t select_roots(BeamCtx *ctx, uint32_t kept, uint32_t beam_n, int row,
+                             uint64_t cfg_hash) {
+    uint64_t target = (uint64_t)g_bt_factor * beam_eff_K(row);
+    if (target >= kept) return kept;
+    RNG sel_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFFu, 1u);
+    uint32_t n = select_beam(ctx, kept, beam_n, (uint32_t)target,
+                             parent_cap_eff(row), g_frac_rand, &sel_rng);
+    qsort(ctx->sel, n, sizeof *ctx->sel, cmp_u32_asc);
+    for (uint32_t i = 0; i < n; i++) ctx->keep[i] = ctx->keep[ctx->sel[i]];  /* sel[i] >= i */
+    return n;
 }
 
 static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
@@ -4237,29 +4279,35 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
             break;
         }
 
-        /* The backtrack row keeps its candidates raw: every one is a root of the
-           exhaustive search, and two roots sharing a frontier still differ below
-           it. Every other row deduplicates by frontier. ctx->keep drives the
-           emission, so the stop row's emission order IS this ranking. */
-        const bool raw = g_backtrack_row && (uint32_t)row == last_row;
+        /* Under --backtrack_row_factor 0 the backtrack row keeps its candidates
+           raw: every one is a root of the exhaustive search, and two roots
+           sharing a frontier still differ below it. Every other row, the
+           backtrack row included otherwise, deduplicates by frontier. ctx->keep
+           drives the emission, so the stop row's emission order IS this
+           ranking. */
+        const bool bt_row = g_backtrack_row && (uint32_t)row == last_row;
+        const bool raw = bt_row && g_bt_factor == 0;
         uint32_t kept = raw ? rank_pool_raw(ctx, pool_n, nt)
                             : dedup_and_rank(ctx, pool_n, nt);
         g_stats.row_retained[row] += kept;
+        uint32_t roots = kept;
+        if (bt_row && !raw) roots = select_roots(ctx, kept, beam_n, row, cfg_hash);
         g_stats.t_select += omp_get_wtime() - t_exp;
         res.row = (uint32_t)row;
         g_stats.rows_advanced++;
 
-        if ((uint32_t)row == last_row && g_backtrack_row) {
-            res.width = kept;
-            g_stats.row_selected[row] += kept;
+        if (bt_row) {
+            res.width = roots;
+            g_stats.row_selected[row] += roots;
             if (g_verbose) {
-                printf("[beam] %s row=%d cands=%" PRIu64 " ranked=%u roots=%u t=%.2fs\n",
-                       g_config_id_str, row, pool_n, kept, kept, omp_get_wtime() - t_row);
+                printf("[beam] %s row=%d cands=%" PRIu64 " %s=%u roots=%u t=%.2fs\n",
+                       g_config_id_str, row, pool_n, raw ? "ranked" : "uniq", kept, roots,
+                       omp_get_wtime() - t_row);
                 fflush(stdout);
             }
-            sweep_beam_done(kept);
+            sweep_beam_done(roots);
             double t0 = omp_get_wtime();
-            backtrack_emit(ctx, cur, kept, row, deadline, &res);
+            backtrack_emit(ctx, cur, roots, row, deadline, &res);
             g_stats.t_emit += omp_get_wtime() - t0;
             partials_budget_spent();
             break;
@@ -4335,7 +4383,12 @@ static void beam_ctx_alloc(BeamCtx *ctx) {
     ctx->srt_tmp = arena_map(ctx->pool_cap * sizeof(SortRec));
     ctx->taken = xmalloc(ctx->pool_cap);
     ctx->offspring = xmalloc(KE * sizeof(uint32_t));
-    ctx->sel = xmalloc(KE * sizeof(uint32_t));
+    /* select_beam fills up to its target: the row width, or for the roots of
+       --backtrack_row_factor M up to M x the width, never more than the pool. */
+    uint64_t sel_n = KE;
+    if (g_backtrack_row && g_bt_factor > 1)
+        sel_n = KE * g_bt_factor < ctx->pool_cap ? KE * g_bt_factor : ctx->pool_cap;
+    ctx->sel = xmalloc(sel_n * sizeof(uint32_t));
     ctx->beam_a = alloc_beam(KE);
     ctx->beam_b = alloc_beam(KE);
     double gb = ((double)ctx->pool_cap*(sizeof(PoolEntry)+2*sizeof(SortRec)+sizeof(uint32_t)+1)
@@ -4825,8 +4878,13 @@ static void usage(const char *a0) {
 "                         rotation.csv may be omitted and is ignored if given).\n"
 "                         --samples = number of random bottoms to try (default 1;\n"
 "                         0 = uncapped, run until --wall_time/--max_emitted stops\n"
-"                         you), --top_columns = random left columns per bottom;\n"
-"                         each border is the best of 32 fan-out-ranked samples.\n"
+"                         you), --top_columns = random left columns per bottom.\n"
+"                         Each bottom is a random legal chain of edges between\n"
+"                         randomly placed corners, the best of 32 such draws by\n"
+"                         fan-out rank (--tau_bottoms softens the choice); each\n"
+"                         left column is drawn the same way from the edges the\n"
+"                         bottom left over (--tau_columns). --exhaust_border_color\n"
+"                         changes how both are drawn: see there.\n"
 "                         --start_row/--num_rows, --top_bottoms and --resume do\n"
 "                         not apply\n"
 "  --samples N            --random_edges: random bottoms to try (default 1; 0 = until\n"
@@ -4835,9 +4893,16 @@ static void usage(const char *a0) {
 "                         (drawn per bottom) within the bottom row and column 0\n"
 "                         rows 1..stop_row, so the right column, the top row and\n"
 "                         the left column above the stop row see only the other\n"
-"                         four. Pieces with the colour are drawn far more often and\n"
-"                         a border that does not use it up is resampled; a bottom\n"
-"                         that cannot is a plain random one\n"
+"                         four. The draws are no longer uniform: a colour is\n"
+"                         picked per bottom (only colours that can be used up;\n"
+"                         colour 2 rarely), edges carrying it are drawn 16x as\n"
+"                         often, and draws are rejected and redrawn when the\n"
+"                         corners break the rule, when a bottom leaves more of the\n"
+"                         colour than column 0 rows 1..stop_row can hold, or when\n"
+"                         a left column leaves any unplaced or puts one above the\n"
+"                         stop row. A bottom must admit at least one such column.\n"
+"                         The best of 32 ACCEPTED draws is kept, as above. After 4\n"
+"                         colours fail, the bottom is a plain random one\n"
 "  --BL N / --BR N        pin a seed piece index (0..255) to the Bottom-Left /\n"
 "  --TL N / --TR N        Bottom-Right / Top-Left / Top-Right corner (--random_edges\n"
 "                         only); unpinned corners are sampled, and with 3 pinned the\n"
@@ -4857,10 +4922,9 @@ static void usage(const char *a0) {
 "                         (default 11: the beam reliably FILLS row 11 and reliably\n"
 "                         dies attempting 12, so stopping at 11 emits that material\n"
 "                         instead of discarding it -- hand row 12 to the finalizer)\n"
-"  --backtrack_row N      stop the BEAM at row N (1..stop_row-1), expanded as a stop\n"
-"                         row whose candidates are kept raw (no frontier dedup), then\n"
-"                         search every row-N candidate EXHAUSTIVELY, cell by cell in\n"
-"                         row-major order, up to --stop_row: the fixed left column,\n"
+"  --backtrack_row N      stop the BEAM at row N (1..stop_row-1), then search every\n"
+"                         root (--backtrack_row_factor) EXHAUSTIVELY, cell by cell\n"
+"                         in row-major order, up to --stop_row: the fixed left column,\n"
 "                         right edges from the border's own pool, clue pins enforced\n"
 "                         and colour parity checked at every row; with\n"
 "                         --lambda_corners a path also ends once NEITHER top corner\n"
@@ -4868,6 +4932,14 @@ static void usage(const char *a0) {
 "                         completing the stop row is emitted (exact duplicates\n"
 "                         dropped); pair with --max_emitted. --incomplete_top is\n"
 "                         ignored with a warning (default 0 = off)\n"
+"  --backtrack_row_factor M\n"
+"                         with --backtrack_row: row N is an ordinary beam row, and\n"
+"                         its best M x (row width) boards -- same dedup, per-parent\n"
+"                         cap and random band as any row -- are the roots, so\n"
+"                         --pool_factor can grow without growing the search. 0 = row\n"
+"                         N expanded as a stop row and EVERY candidate a root, raw\n"
+"                         (up to pool_factor x width near-twins; the behaviour\n"
+"                         before this flag) (default 2)\n"
 "  --extend_nodes N       with --backtrack_row: every stop-row board goes on,\n"
 "                         cell by cell in COLUMN-major order (column 1 bottom up,\n"
 "                         then column 2, ...) over rows stop+1..14, cols 1..14, with\n"
@@ -5068,7 +5140,9 @@ static void usage(const char *a0) {
 "  --resume               continue from <out_dir>/sweep_checkpoint.txt. Give the\n"
 "                         original --start_row/--num_rows: the run ends where the\n"
 "                         original would have. A configuration cut by --wall_time or\n"
-"                         a signal before it wrote anything is run again\n"
+"                         a signal before it wrote anything is run again. SIGINT/\n"
+"                         SIGTERM finish the current configuration and print the\n"
+"                         summary; a second signal kills\n"
 "\n"
 "Misc:\n"
 "  --threads N            OpenMP threads (default: all cores)\n"
@@ -5116,7 +5190,8 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     else                 printf(" --start_row %u --num_rows %u", g_start_row, g_num_rows);
     if (g_db_file) printf(" --db_file %s", g_db_file);
     printf(" --beam_width %u --stop_row %u", g_beam_width, g_stop_row);
-    if (g_backtrack_row) printf(" --backtrack_row %u --extend_nodes %u", g_backtrack_row, g_extend_nodes);
+    if (g_backtrack_row) printf(" --backtrack_row %u --backtrack_row_factor %u --extend_nodes %u",
+                                g_backtrack_row, g_bt_factor, g_extend_nodes);
     if (g_bt_min_col)    printf(" --backtrack_min_col %u", g_bt_min_col);
     if (g_backtrack_row && !g_top_dedup) printf(" --no_top_dedup");
     if (g_free_top_clue) printf(" --free_top_clue");
@@ -5371,6 +5446,12 @@ int main(int argc, char *argv[]) {
             int v = atoi(argv[++i]);
             g_backtrack_row = v > 0 ? (uint32_t)v : 0; g_backtrack_row_set = true;
         }
+        else if (!strcmp(argv[i], "--backtrack_row_factor") && i+1 < argc) {
+            char *end; long v = strtol(argv[++i], &end, 10);
+            if (*end || v < 0 || v > 1000000L)
+                fatal("--backtrack_row_factor needs an integer in 0..1000000, got '%s'", argv[i]);
+            g_bt_factor = (uint32_t)v; g_bt_factor_set = true;
+        }
         else if (!strcmp(argv[i], "--extend_nodes") && i+1 < argc) {
             char *end; long long v = strtoll(argv[++i], &end, 10);
             if (*end || v < 0 || v > 1000000000LL)
@@ -5535,6 +5616,9 @@ int main(int argc, char *argv[]) {
             g_incomplete_top = false;
         }
     }
+    if (g_bt_factor_set && !g_backtrack_row_set)
+        fatal("--backtrack_row_factor sets how many roots the backtracker gets: "
+              "add --backtrack_row N");
     if ((g_extend_set || g_min_col_set) && !g_backtrack_row_set)
         fatal("--extend_nodes and --backtrack_min_col extend the backtracker's stop-row "
               "boards: add --backtrack_row N");
@@ -5645,8 +5729,12 @@ int main(int argc, char *argv[]) {
            g_fixed_corner_pid[2], g_fixed_corner_pid[3]);
     printf("[cfg] beam_width=%u stop_row=%u expand=%ux@row%u\n",
            g_beam_width, g_stop_row, g_beam_expand, g_beam_expand_row);
-    if (g_backtrack_row)
-        printf("[cfg] backtrack_row=%u (beam through row %u, then an exhaustive "
+    if (g_backtrack_row && g_bt_factor)
+        printf("[cfg] backtrack_row=%u factor=%u (beam through row %u, its best %u x width "
+               "boards the roots of an exhaustive row-major search to row %u)\n",
+               g_backtrack_row, g_bt_factor, g_backtrack_row, g_bt_factor, g_stop_row);
+    else if (g_backtrack_row)
+        printf("[cfg] backtrack_row=%u factor=0 (beam through row %u, then an exhaustive "
                "row-major search of every row-%u candidate to row %u)\n",
                g_backtrack_row, g_backtrack_row, g_backtrack_row, g_stop_row);
     if (g_backtrack_row && g_extend_nodes)

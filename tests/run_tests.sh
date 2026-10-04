@@ -1598,10 +1598,46 @@ EOF
     [ "$nb" -ge 50 ] || fail "the free-mode backtrack wrote only $nb boards (want >= 50)"
     cmp -s "$d/low1/beam_completions_finalized_10.csv" "$d/low4/beam_completions_finalized_10.csv" \
         || fail "the free-mode backtrack differs between 1 and 4 threads"
+
+    # --backtrack_row_factor: the roots are the beam's own selection of row N,
+    # so M = 1 at row 8 selects the very boards a factor-0 run at row 9 grows
+    # its row 9 from, and searches row 9 exhaustively: it must write every board
+    # that run writes. The root cut must bind (width 20, no expansion), and the
+    # pool is large enough that no per-slice quota binds, so the beam rows do
+    # not depend on the thread count either.
+    tl_run bt7f data/synth_solution_480.csv --finalize_from 6 --stop_row 9 --backtrack_row 7 \
+        --backtrack_row_factor 1 --threads 4
+    python3 "$d/match.py" "$d/bt7f/beam_completions_finalized_9.csv" data/synth_solution_480.csv 256 \
+        || fail "--backtrack_row_factor 1 missed the solution"
+    local cut=(--finalize_from 7 --stop_row 10 --top_columns 3 --beam_width 20 --beam_expand 1
+               --pool_factor 1000 --verbose)
+    tl_run f0 "$d/low.csv" "${cut[@]}" --backtrack_row 9 --backtrack_row_factor 0 --threads 4
+    tl_run f1 "$d/low.csv" "${cut[@]}" --backtrack_row 8 --backtrack_row_factor 1 --threads 1
+    tl_run f1t4 "$d/low.csv" "${cut[@]}" --backtrack_row 8 --backtrack_row_factor 1 --threads 4
+    grep -q "^\[beam\] .* row=8 cands=.* uniq=.* roots=20 " "$d/f1.log" \
+        || fail "--backtrack_row_factor 1 did not cut row 8 to 20 roots"
+    grep -q "^\[beam\] .* row=9 cands=\([0-9]*\) ranked=\1 roots=\1 " "$d/f0.log" \
+        || fail "--backtrack_row_factor 0 did not keep every row-9 candidate"
+    cmp -s "$d/f1/beam_completions_finalized_10.csv" "$d/f1t4/beam_completions_finalized_10.csv" \
+        || fail "--backtrack_row_factor 1 differs between 1 and 4 threads"
+    python3 - "$d/f0/beam_completions_finalized_10.csv" "$d/f1/beam_completions_finalized_10.csv" <<'EOF' || exit 1
+import sys
+def boards(p):
+    return {",".join(x.strip() for x in l.split(",")[-512:])
+            for l in open(p) if l.strip() and l[0] not in "#%"}
+f0, f1 = boards(sys.argv[1]), boards(sys.argv[2])
+assert f0, "the factor-0 run wrote no boards"
+assert f0 <= f1, f"{len(f0 - f1)} of {len(f0)} factor-0 boards missing from the factor-1 run"
+EOF
+    if bin/E555_finalizer data/synth_seed.txt "$d/low.csv" --backtrack_row_factor 2 \
+            --out_dir "$d/fbad" > "$d/fbad.log" 2>&1; then
+        fail "--backtrack_row_factor without --backtrack_row was accepted"
+    fi
     echo "ok: top rows locked (and the ring with --keep_ring); the solution found by beam, by backtrack from the lock and"
     echo "    from row 7, and by dives across a gap; --free_sides samples the sides under the"
     echo "    locked top; --free_top keeps sides only;"
-    echo "    $nb free-mode backtrack boards identical at 1 and 4 threads"
+    echo "    $nb free-mode backtrack boards identical at 1 and 4 threads;"
+    echo "    --backtrack_row_factor 1 cuts the roots, finds the solution and contains the factor-0 run one row up"
 }
 
 # The roundhouse rebuilds a board from a rotated frame, so a wrong rotation, a
