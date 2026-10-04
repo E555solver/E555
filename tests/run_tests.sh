@@ -121,7 +121,7 @@ ALL_STEPS=(
     "band_with_frame|extra|backtracker,finalizer|--with_frame carries all 60 frame cells, so the finalizer fixes the sides"
     "cpsat_chain|extra|cpsat|topper -> ender -> ender, each fed by the last"
     "ender_repair|core|cpsat,diver|REGRESSION: a scrambled synthetic solution comes back 480/480; a real board redives and comes back no worse"
-    "beamer_micro|extra|beamer|random_edges micro-run: builds the real 6.4 GB database"
+    "beamer_micro|extra|beamer|random_edges micro-run: builds the real 6.4 GB database; no border runs twice"
     "beamer_backtrack_dive|extra|beamer,diver|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --lambda_reserve keeps the reserve for last"
     "beamer_min_col|extra|beamer|--backtrack_min_col: the column check drops no written board, random column 0 too; near-duplicate filter; --cap_top changes only row 15; log and score line"
     "beamer_free_top_clue|extra|beamer,diver|--free_top_clue: the top-left clue anywhere above the stop row, the top-right one left to the dives (builds a clue database in RAM)"
@@ -2801,6 +2801,22 @@ step_beamer_micro() {
     else
         echo "ok: run complete (this config went extinct -- normal for a micro-run)"
     fi
+    # No (bottom, column) pair runs twice in a run: E555_BORDER_KEYS writes the
+    # key of every border run to stderr, and 80 tiny configs over 2 bottoms
+    # must give 80 distinct keys.
+    DD=(bin/E555_beamer data/seed_Edge5.txt --random_edges --exhaust_border_color --pin_clue 1
+        --samples 2 --top_columns 40 --stop_row 8 --beam_width 1 --pool_factor 1
+        --rng_seed 3 --threads 4 --out_dir "$OUT/beam_dd")
+    if [ -n "$GATE_DB" ]; then DD+=(--db_file "$GATE_DB"); fi
+    E555_BORDER_KEYS=1 "${DD[@]}" > "$OUT/beam_dd.log" 2> "$OUT/beam_dd.err" \
+        || { tail -5 "$OUT/beam_dd.log" "$OUT/beam_dd.err"; fail "the border-dedup run exited non-zero"; }
+    grep "^\[bkey\]" "$OUT/beam_dd.err" > "$OUT/beam_dd.keys" || true
+    nk=$(wc -l < "$OUT/beam_dd.keys")
+    nu=$(sort -u "$OUT/beam_dd.keys" | wc -l)
+    ncfg=$(sed -n 's/^\[sum\] configs: \([0-9]*\)[ ,].*/\1/p' "$OUT/beam_dd.log" | head -1)
+    [ "$nk" -gt 0 ] && [ "$nk" = "$nu" ] && [ "$nk" = "${ncfg:-x}" ] \
+        || fail "border dedup: $nk keys, $nu distinct, ${ncfg:-?} configs"
+    echo "ok: $nk random borders run, all distinct"
 }
 
 # --resume: one sweep over border rows 1..2, and the same sweep stopped by

@@ -255,6 +255,9 @@ static char     g_config_id_str[96] = "c0";
    (g_exhaust_colour = 0), so sampling luck never stops a run. The colour stays
    set for every left column sampled for this bottom. */
 #define EXHAUST_TRIES 4
+/* --random_edges: repeated (bottom, column) draws tolerated before the exhaust
+   colour is dropped for the bottom, or, with none to drop, the bottom is left. */
+#define BORDER_REPEAT_TRIES 16
 static bool sample_exhaust_bottom(RNG *rng, BottomOrder *bot) {
     for (int t = 0; t < EXHAUST_TRIES && g_exhaust_ok_n; t++) {
         int c;
@@ -355,6 +358,9 @@ static struct {
     uint64_t columns_ordinary_viable;
     uint64_t columns_clue_compatible;
     uint64_t columns_run;
+    uint64_t columns_repeated;      /* --random_edges: a run border drawn again */
+    uint64_t plain_fallbacks;       /* ... so often the exhaust colour was dropped */
+    uint64_t bottoms_left;          /* ... so often the bottom was abandoned */
     double   clue_seconds;
 } g_border_stats;
 
@@ -574,6 +580,50 @@ static void htable_init(void) {
     g_emit_htable = xmalloc(sz * sizeof(uint64_t));
     memset(g_emit_htable, 0, sz * sizeof(uint64_t));
     g_emit_htable_sz = sz; g_emit_count = 0;
+}
+
+/* --random_edges: every (bottom, left column) pair run so far, keyed by
+   border_key, so that a run never searches the same border twice. */
+static uint64_t *g_border_seen = NULL;
+static size_t    g_border_seen_sz = 0, g_border_seen_n = 0;
+
+static uint64_t border_key(const BottomOrder *b, const LeftOrder *l) {
+    uint64_t h = 0xB0DE5EE4C0FFEE77ULL;
+    for (int i = 0; i < PUZZLE_SIDE; i++)
+        h = splitmix64(h ^ ((uint64_t)b->p[i]->piece_id << 2 | b->p[i]->rotation));
+    for (int i = 0; i < PUZZLE_SIDE; i++)
+        h = splitmix64(h ^ ((uint64_t)l->p[i]->piece_id << 2 | l->p[i]->rotation) ^ 0x10000);
+    return h ? h : 1;
+}
+static bool border_seen(uint64_t k) {
+    if (!g_border_seen_sz) return false;
+    size_t h = (size_t)k & (g_border_seen_sz - 1);
+    while (g_border_seen[h]) {
+        if (g_border_seen[h] == k) return true;
+        h = (h + 1) & (g_border_seen_sz - 1);
+    }
+    return false;
+}
+static void border_seen_add(uint64_t k) {
+    if ((g_border_seen_n + 1) * 2 > g_border_seen_sz) {
+        size_t nsz = g_border_seen_sz ? g_border_seen_sz * 2 : 1024;
+        uint64_t *nt = xmalloc(nsz * sizeof(uint64_t));
+        memset(nt, 0, nsz * sizeof(uint64_t));
+        for (size_t i = 0; i < g_border_seen_sz; i++) {
+            uint64_t x = g_border_seen[i];
+            if (!x) continue;
+            size_t h = (size_t)x & (nsz - 1);
+            while (nt[h]) h = (h + 1) & (nsz - 1);
+            nt[h] = x;
+        }
+        free(g_border_seen); g_border_seen = nt; g_border_seen_sz = nsz;
+    }
+    size_t h = (size_t)k & (g_border_seen_sz - 1);
+    while (g_border_seen[h]) {
+        if (g_border_seen[h] == k) return;
+        h = (h + 1) & (g_border_seen_sz - 1);
+    }
+    g_border_seen[h] = k; g_border_seen_n++;
 }
 
 static bool pdedup_has(uint64_t k) {
@@ -4511,13 +4561,18 @@ static void print_summary_detail(double wall_total, double init_s, double sweep_
         printf("[sum] border prefilter: bottom-slots=%" PRIu64
                " no-clue-column=%" PRIu64
                " columns ordinary=%" PRIu64 " clue-compatible=%" PRIu64
-               " run=%" PRIu64 " time=%.1fs\n",
+               " run=%" PRIu64 " time=%.1fs",
                g_border_stats.bottoms_ranked,
                g_border_stats.bottoms_no_clue_column,
                g_border_stats.columns_ordinary_viable,
                g_border_stats.columns_clue_compatible,
                g_border_stats.columns_run,
                g_border_stats.clue_seconds);
+        if (g_border_stats.columns_repeated)
+            printf(" repeats=%" PRIu64 " plain-fallbacks=%" PRIu64 " bottoms-left=%" PRIu64,
+                   g_border_stats.columns_repeated, g_border_stats.plain_fallbacks,
+                   g_border_stats.bottoms_left);
+        printf("\n");
     }
     if (g_corners_on) {
         tc_print_summary(g_stop_row, false);
@@ -4884,7 +4939,11 @@ static void usage(const char *a0) {
 "                         fan-out rank (--tau_bottoms softens the choice); each\n"
 "                         left column is drawn the same way from the edges the\n"
 "                         bottom left over (--tau_columns). --exhaust_border_color\n"
-"                         changes how both are drawn: see there.\n"
+"                         changes how both are drawn: see there. A (bottom,\n"
+"                         column) pair never runs twice in a run: a repeated\n"
+"                         column is redrawn, and after 16 repeats the bottom's\n"
+"                         columns are drawn plain (no exhaust colour), then the\n"
+"                         bottom is left.\n"
 "                         --start_row/--num_rows, --top_bottoms and --resume do\n"
 "                         not apply\n"
 "  --samples N            --random_edges: random bottoms to try (default 1; 0 = until\n"
@@ -5924,8 +5983,9 @@ int main(int argc, char *argv[]) {
         /* Random-border sweep: no rotation CSV. --samples random bottoms,
            --top_columns random left columns per bottom, each border the best of
            RANDOM_SIDE_SAMPLES fan-out-ranked samples (--top_bottoms is moot:
-           every sampled bottom is used). No checkpoint: borders are not
-           re-derivable, so a run is continued simply by starting another. */
+           every sampled bottom is used). No (bottom, column) pair runs twice
+           (border_seen). No checkpoint: borders are not re-derivable, so a run
+           is continued simply by starting another. */
         printf("\n========== random borders ==========\n");
         size_t run_b = (g_samples == 0) ? SIZE_MAX : g_samples;
         size_t run_l = g_top_columns  >= 1 ? (size_t)g_top_columns : 1;
@@ -5963,11 +6023,32 @@ int main(int argc, char *argv[]) {
             for (size_t li = 0; li < run_l && !g_stop; li++) {
                 if (g_max_wall_sec > 0.0 && omp_get_wtime() - t_start >= g_max_wall_sec) { printf("[sweep] max_wall reached.\n"); g_stop = 1; break; }
                 if (partials_budget_spent()) { partials_budget_announce(); break; }
-                bool got_left = false;
+                bool got_left = false, out_of_columns = false;
                 double clue_t0 = omp_get_wtime();
                 unsigned left_tries = (g_clue_mask & CLUE_CORNERS) ? 64u : 1u;
-                for (unsigned tr = 0; tr < left_tries; tr++) {
+                unsigned dup = 0;
+                uint64_t bkey = 0;
+                for (unsigned tr = 0; tr < left_tries; ) {
                     if (!sample_random_left(&srng, g_tau_columns, &bot, &lft)) break;
+                    bkey = border_key(&bot, &lft);
+                    if (border_seen(bkey)) {
+                        /* A border this run already searched: draw again. After
+                           BORDER_REPEAT_TRIES repeats the exhaust colour's columns
+                           are spent for this bottom, so its columns are drawn
+                           plain from here; with nothing left to drop, the bottom
+                           is left. */
+                        g_border_stats.columns_repeated++;
+                        if (++dup < BORDER_REPEAT_TRIES) continue;
+                        if (g_exhaust_colour) {
+                            g_exhaust_colour = 0;
+                            g_border_stats.plain_fallbacks++;
+                            dup = 0;
+                            continue;
+                        }
+                        out_of_columns = true;
+                        break;
+                    }
+                    tr++;
                     g_border_stats.columns_ordinary_viable++;
                     if (row1_corner_compatible(&bot, &lft)) {
                         g_border_stats.columns_clue_compatible++;
@@ -5976,6 +6057,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 g_border_stats.clue_seconds += omp_get_wtime() - clue_t0;
+                if (out_of_columns) { g_border_stats.bottoms_left++; break; }
                 if (!got_left) {
                     g_border_stats.bottoms_no_clue_column++;
                     if (g_verbose)
@@ -5984,6 +6066,8 @@ int main(int argc, char *argv[]) {
                     break;
                 }
                 g_border_stats.columns_run++;
+                border_seen_add(bkey);
+                if (getenv("E555_BORDER_KEYS")) fprintf(stderr, "[bkey] %016" PRIx64 "\n", bkey);
                 if (g_exhaust) g_exhaust_cfgs[g_exhaust_colour]++;
                 g_cur_bottom = &bot;
                 g_cur_left   = &lft;
