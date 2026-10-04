@@ -38,8 +38,9 @@ bash tests/run_tests.sh 6 8-11 roundhouse_cache         # by number, range or na
 - Each check runs on its own and never depends on an earlier check's artifacts. If check 1 (`compile`) isn't selected, the checks use whatever is already in `bin/`.
 - The `beamer` checks and `pipeline_full` need the real 6.4 GB chain database (~8 GB RAM). Set `SKIP_BEAMER=1` to skip them, `DB_FILE=path` to keep a persistent DB cache, or `DB_IN_MEMORY=1` to avoid writing it to disk.
 - Key regressions: the finalizer and roundhouse must rediscover `data/synth_solution_480.csv` (seed `data/synth_seed.txt`), and `viewer` must score it 480/480.
+- Checks that need OR-Tools print `SKIPPED` and **pass** when it is missing. That includes the core regression `ender_repair`. Run `pip install ortools` before trusting a green run that touches the ender, topper or diver.
 - `no_stray_output` fails if any check leaves a file in the repo root, so tools that write to the working directory must run from inside `tests/out`.
-- `scripts_parse` (`tests/check_script_flags.py`) collects each binary's accepted flags from its `strcmp(argv[i], "--x")` sites. Every `--flag` that a script in `pipeline/`, `examples/` or `tests/` passes must be in that set. If you rename or remove a C flag, update every script that uses it.
+- `scripts_parse` (`tests/check_script_flags.py`) collects each binary's accepted flags from its `strcmp(argv[i], "--x")` sites. Every `--flag` that a script in `pipeline/`, `examples/` or `tests/` passes must be in that set. If you rename or remove a C flag, update every script that uses it. The check also fails when a tool's hand-written `print_cmd()` doesn't mention every flag its parser accepts, or when a comment sits between two backslash-continued lines.
 - Bash idiom used in the gate (`set -euo pipefail`): don't write `$(ls GLOB | head -1)`; use `first_match`. Don't pipe a tool's long output into `grep -q`, because SIGPIPE plus pipefail causes false failures. Write to a file and grep that instead.
 
 ## Architecture
@@ -73,6 +74,13 @@ tools/   viewer, rank (--rescore), rotate (--sink), distiller (dive screen -> fi
 - Run products (`beam_out/`, `final_out/`, `tests/out/`, `*.db_cache`, `rotations.csv`, …) are gitignored. Don't commit them.
 - **End-dive engine** (`E555_dive.c`): its tuning constants are the `DV_*` defines at the top of the file (measured; PROJECT_E555.md 5.11). To expose one in a single tool, add a `DvParams` field whose 0 means the built-in default; tools that don't set it keep byte-identical output (example: the diver's `--polish_top`).
 - `agent/` holds an experimental, untested autonomous `/goal` kit. It is not part of the toolchain.
+
+## Making changes
+
+- **A C flag lives in four places:** the `strcmp(argv[i], "--x")` parser, the usage text, `print_cmd()`, and that tool's Options table in `PROJECT_E555.md` (beamer §5.16, finalizer §6.10, roundhouse §7.5, Stage C §9.x). A behaviour change normally updates `PROJECT_E555.md` and adds or extends a check in `tests/run_tests.sh` in the same commit.
+- **Determinism contract** (PROJECT_E555.md §5.15): the backtracker, the column extension, the dives and the diver write byte-identical output at any thread count, and checks compare 1 vs 4 threads. The beam is not like that: with `--rng_seed`, it repeats only on the same build and thread count. Keep work partitioning in the exact engines independent of the thread count.
+- Python code (Stage A, `tools/`, runners, tests) targets Python ≥ 3.9 and uses only the standard library. The exception is `ortools`, in the two CP-SAT tools.
+- Commit subjects name the area first: `Beamer: …`, `Beamer/finalizer: …`, `PROJECT_E555: …`, `Gate: …`.
 
 ## Working conventions
 
