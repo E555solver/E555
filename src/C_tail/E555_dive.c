@@ -12,6 +12,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
+#include <stddef.h>
 #include <omp.h>
 #include <sched.h>
 #include <stdlib.h>
@@ -77,8 +78,34 @@ static inline int dv_piece_kind(int p) {       /* grey sides: 0 inner, 1 edge, 2
     return (g_seed_top[p] == 0) + (g_seed_right[p] == 0)
          + (g_seed_bottom[p] == 0) + (g_seed_left[p] == 0);
 }
-static uint8_t g_dv_clsof[NUM_PIECES];
+static uint8_t g_dv_clsof[NUM_PIECES];          /* frame class of each cell */
 static inline int dv_cls(int x) { return g_dv_clsof[x]; }
+
+/* Local-search tables.  An Oriented holds its four sides as consecutive bytes
+   (top, right, bottom, left = sides 0..3), so they read as one 32-bit word, and
+   what a cell's neighbours show it packs the same way (0xFF where there is no
+   neighbour, which no colour matches): the edges a piece matches at a cell are
+   the zero bytes of the XOR of the two words. */
+static int16_t  g_dv_nbr[NUM_PIECES][4];               /* neighbour toward d; -1 = none */
+static uint8_t  g_dv_nnb[NUM_PIECES];                  /* neighbours on the board */
+static uint32_t g_dv_or32[NUM_PIECES][4];              /* packed sides per orientation */
+static uint8_t  g_dv_legal4[NUM_PIECES][DV_CLASSES];   /* frame-legal spins, one bit each */
+_Static_assert(offsetof(Oriented, right) == offsetof(Oriented, top) + 1 &&
+               offsetof(Oriented, bottom) == offsetof(Oriented, top) + 2 &&
+               offsetof(Oriented, left) == offsetof(Oriented, top) + 3,
+               "an Oriented's sides must be four consecutive bytes");
+
+static inline uint32_t dv_s32(const Oriented *o) {
+    uint32_t v;
+    memcpy(&v, (const unsigned char *)o + offsetof(Oriented, top), 4);
+    return v;
+}
+static inline int dv_byte(uint32_t v, int d) { return (int)((v >> (8 * d)) & 0xFFu); }
+/* Zero bytes of v (exact: no carry crosses a byte). */
+static inline int dv_zc(uint32_t v) {
+    const uint32_t t = ((v & 0x7F7F7F7Fu) + 0x7F7F7F7Fu) | v | 0x7F7F7F7Fu;
+    return __builtin_popcount(~t);
+}
 /* Neighbour of x toward d (0 up, 1 right, 2 down, 3 left), or -1. */
 static inline int dv_nb(int x, int d) {
     int r = x / PUZZLE_SIDE, c = x % PUZZLE_SIDE;
@@ -103,8 +130,7 @@ static inline int dv_ipop(const DvMask *a, const DvMask *b) {
 }
 /* May piece p sit at spin s in a cell of class cls? */
 static inline bool dv_legal(int p, int s, int cls) {
-    return (g_dv_spins[p] >> s & 1u) &&
-           (g_dv_base[cls].w[(p * 4 + s) >> 6] >> ((p * 4 + s) & 63) & 1ULL);
+    return (g_dv_legal4[p][cls] >> s) & 1u;
 }
 
 static void dv_build_static(void) {
@@ -112,6 +138,13 @@ static void dv_build_static(void) {
         const int r = x / PUZZLE_SIDE, c = x % PUZZLE_SIDE;
         g_dv_clsof[x] = (uint8_t)(((r == 0) ? 1 : (r == PUZZLE_SIDE - 1) ? 2 : 0) * 3
                                 + ((c == 0) ? 1 : (c == PUZZLE_SIDE - 1) ? 2 : 0));
+    }
+    for (int x = 0; x < NUM_PIECES; x++) {
+        g_dv_nnb[x] = 0;
+        for (int d = 0; d < 4; d++) {
+            g_dv_nbr[x][d] = (int16_t)dv_nb(x, d);
+            g_dv_nnb[x] += g_dv_nbr[x][d] >= 0;
+        }
     }
     memset(g_dv_fit, 0, sizeof g_dv_fit);
     for (int p = 0; p < NUM_PIECES; p++) {
@@ -130,6 +163,7 @@ static void dv_build_static(void) {
                     dup = true;
             if (dup) continue;
             g_dv_spins[p] |= (uint8_t)(1u << s);
+            g_dv_or32[p][s] = dv_s32(&g_dv_or[p][s]);
             const int bit = p * 4 + s;
             dv_set(&g_dv_fit[0][o.top], bit);    dv_set(&g_dv_fit[1][o.right], bit);
             dv_set(&g_dv_fit[2][o.bottom], bit); dv_set(&g_dv_fit[3][o.left], bit);
@@ -167,6 +201,15 @@ void dv_frame(bool by_side) {
             }
         }
     }
+    for (int p = 0; p < NUM_PIECES; p++)
+        for (int k = 0; k < DV_CLASSES; k++) {
+            uint8_t m = 0;
+            for (int s = 0; s < 4; s++)
+                if ((g_dv_spins[p] >> s & 1u) &&
+                    (g_dv_base[k].w[(p * 4 + s) >> 6] >> ((p * 4 + s) & 63) & 1ULL))
+                    m |= (uint8_t)(1u << s);
+            g_dv_legal4[p][k] = m;
+        }
 }
 
 /* Connected edges of a full board, out of 480. */
@@ -232,7 +275,7 @@ static void dv_compute(const DvBoard *b, DvFc *f, int x) {
     if (f->dom[x] == 0) f->zero--;
     DvMask m = g_dv_base[dv_cls(x)];
     for (int d = 0; d < 4; d++) {
-        const int y = dv_nb(x, d);
+        const int y = g_dv_nbr[x][d];
         if (y < 0 || b->c[y].piece_id == DV_EMPTY) continue;
         dv_and(&m, &g_dv_fit[d][dv_side(&b->c[y], (d + 2) & 3)]);
     }
@@ -262,8 +305,8 @@ static inline void dv_adjust(DvFc *f, int p, int sign) {
     for (int k = 0; k < DV_CLASSES; k++)
         f->avail[k] += sign * __builtin_popcountll(g_dv_base[k].w[wi] & bits);
     /* Branch-free: most cells do not hold p (delta 0), but which ones is data,
-       and a mispredicted skip costs more than the update it saves.  No cell here
-       is DV_PLACED: dv_unplace() adjusts before its own cell rejoins the list. */
+       and a mispredicted skip costs more than the update it saves.  The placed
+       cell has already left the open list. */
     int zero = 0;
     for (int i = 0; i < f->n_empty; i++) {
         const int x = f->elist[i];
@@ -277,7 +320,7 @@ static inline void dv_adjust(DvFc *f, int p, int sign) {
 
 static inline void dv_refresh(const DvBoard *b, DvFc *f, int x) {
     for (int d = 0; d < 4; d++) {
-        const int y = dv_nb(x, d);
+        const int y = g_dv_nbr[x][d];
         if (y >= 0 && b->c[y].piece_id == DV_EMPTY) dv_compute(b, f, y);
     }
 }
@@ -292,21 +335,11 @@ static inline void dv_place(DvBoard *b, DvFc *f, int x, int p, int s) {
     dv_refresh(b, f, x);
 }
 
-static inline void dv_unplace(DvBoard *b, DvFc *f, int x) {
-    const int p = b->c[x].piece_id;
-    b->c[x].piece_id = DV_EMPTY;
-    f->unused4.w[(p * 4) >> 6] |= (uint64_t)g_dv_spins[p] << ((p * 4) & 63);
-    dv_adjust(f, p, +1);                     /* before x rejoins: dom[x] is DV_PLACED */
-    dv_empty_add(f, x);
-    dv_compute(b, f, x);
-    dv_refresh(b, f, x);
-}
-
 /* Fit masks of x's PLACED neighbours; returns how many. */
 static inline int dv_fit_masks(const DvBoard *b, int x, const DvMask *fit[4]) {
     int n = 0;
     for (int d = 0; d < 4; d++) {
-        const int y = dv_nb(x, d);
+        const int y = g_dv_nbr[x][d];
         if (y >= 0 && b->c[y].piece_id != DV_EMPTY)
             fit[n++] = &g_dv_fit[d][dv_side(&b->c[y], (d + 2) & 3)];
     }
@@ -430,7 +463,7 @@ static void dv_lcv_ctx(const DvBoard *b, const DvFc *f, int x, DvLcvCtx *c) {
     c->ny = 0;
     c->zero_base = f->zero - (f->dom[x] == 0);
     for (int d = 0; d < 4; d++) {
-        const int y = dv_nb(x, d);
+        const int y = g_dv_nbr[x][d];
         if (y < 0 || b->c[y].piece_id != DV_EMPTY) continue;
         c->y[c->ny] = y; c->dir[c->ny] = d; c->ny++;
         c->zero_base -= (f->dom[y] == 0);
@@ -446,7 +479,7 @@ static void dv_lcv_ctx(const DvBoard *b, const DvFc *f, int x, DvLcvCtx *c) {
     for (int i = 0; i < c->ncrit; i++) {
         const int y = c->crit[i];
         bool nb = (y == x);
-        for (int d = 0; d < 4 && !nb; d++) nb = (dv_nb(x, d) == y);
+        for (int d = 0; d < 4 && !nb; d++) nb = (g_dv_nbr[x][d] == y);
         if (!nb) c->crit[k++] = (uint8_t)y;
     }
     c->ncrit = k;
@@ -600,49 +633,77 @@ static void dv_dive(DvBoard *b, DvFc *f, const uint8_t *cells, int n, RNG *rng,
  * Local search: moves, polish, kick-and-polish walks
  * ========================================================================== */
 
+/* What x's neighbours show it, packed like dv_s32 (0xFF off the board): the
+   edges an orientation v matches at x are dv_zc(v ^ dv_need(b, x)). */
+static inline uint32_t dv_need(const DvBoard *b, int x) {
+    uint32_t v = 0;
+    for (int d = 0; d < 4; d++) {
+        const int y = g_dv_nbr[x][d];
+        const uint32_t c = y < 0 ? 0xFFu : (uint32_t)dv_byte(dv_s32(&b->c[y]), (d + 2) & 3);
+        v |= c << (8 * d);
+    }
+    return v;
+}
 /* Matched edges between x and its neighbours (a full board). */
 static inline int dv_local(const DvBoard *b, int x) {
-    int m = 0;
-    for (int d = 0; d < 4; d++) {
-        const int y = dv_nb(x, d);
-        if (y >= 0 && dv_side(&b->c[x], d) == dv_side(&b->c[y], (d + 2) & 3)) m++;
-    }
-    return m;
+    return dv_zc(dv_s32(&b->c[x]) ^ dv_need(b, x));
 }
-/* 1 if the shared edge of adjacent x, y matches. */
-static inline int dv_local_edge(const DvBoard *b, int x, int y) {
-    for (int d = 0; d < 4; d++)
-        if (dv_nb(x, d) == y) return dv_side(&b->c[x], d) == dv_side(&b->c[y], (d + 2) & 3);
-    return 0;
-}
-static inline int dv_pair(const DvBoard *b, int x, int y) {
-    return dv_local(b, x) + dv_local(b, y) - dv_local_edge(b, x, y);   /* shared edge once */
-}
-static inline bool dv_adjacent(int x, int y) {
-    const int d = x > y ? x - y : y - x;
-    return d == PUZZLE_SIDE || (d == 1 && x / PUZZLE_SIDE == y / PUZZLE_SIDE);
+/* The side d of x toward y, or -1 when they do not touch. */
+static inline int dv_dir(int x, int y) {
+    for (int d = 0; d < 4; d++) if (g_dv_nbr[x][d] == y) return d;
+    return -1;
 }
 
-/* The first spin of piece p, in spin order, that matches the most edges at
-   cell y, or -1 when p has no frame-legal spin there; the count in *v.
+/* The first spin of piece p, in spin order, that matches the most edges at a
+   cell of class cls whose neighbours show `need`, or -1 when p has no
+   frame-legal spin there; the count in *v.
 
    A swap of two cells that do not touch scores as two independent choices:
    the edges y gains depend only on p's spin at y, and x's only on q's spin at
    x. So the swap's best spin pair, and the first one in the (spin at y, spin at
    x) scan order, is each cell's first best spin -- 4 + 4 evaluations for the
    16 a joint scan makes, and exactly the same move. */
-static inline int dv_best_spin(DvBoard *b, int y, int p, int cls, int *v) {
-    const Oriented keep = b->c[y];
+static inline int dv_best_spin(uint32_t need, int p, int cls, int *v) {
+    const unsigned legal = g_dv_legal4[p][cls];
     int bs = -1, bv = -1;
     for (int s = 0; s < 4; s++) {
-        if (!dv_legal(p, s, cls)) continue;
-        b->c[y] = g_dv_or[p][s];
-        const int val = dv_local(b, y);
+        if (!(legal >> s & 1u)) continue;
+        const int val = dv_zc(g_dv_or32[p][s] ^ need);
         if (val > bv) { bv = val; bs = s; }
     }
-    b->c[y] = keep;
     *v = bv;
     return bs;
+}
+
+/* The best swap of touching cells x and y, y on side d of x: p (now at x) to y
+   and q (now at y) to x, scanned (spin at y, spin at x), the pair counting the
+   shared edge once.  mx and my are what x and y see from their other
+   neighbours (0xFF toward each other).  Returns the best pair value above
+   `best`, setting *bsp and *bsq, or `best` itself when nothing beats it. */
+static inline int dv_touching_swap(uint32_t mx, uint32_t my, int d, int p, int q,
+                                   int cx, int cy, int *bsp, int *bsq, int best) {
+    const int e = (d + 2) & 3;
+    const unsigned lp = g_dv_legal4[p][cy], lq = g_dv_legal4[q][cx];
+    for (int sp = 0; sp < 4; sp++) {
+        if (!(lp >> sp & 1u)) continue;
+        const uint32_t op = g_dv_or32[p][sp];
+        const int vy = dv_zc(op ^ my), pe = dv_byte(op, e);
+        for (int sq = 0; sq < 4; sq++) {
+            if (!(lq >> sq & 1u)) continue;
+            const uint32_t oq = g_dv_or32[q][sq];
+            const int v = vy + dv_zc(oq ^ mx) + (dv_byte(oq, d) == pe);
+            if (v > best) { best = v; *bsp = sp; *bsq = sq; }
+        }
+    }
+    return best;
+}
+
+/* The current value of the pair x, y (the shared edge once when they touch). */
+static inline int dv_pair_now(uint32_t ox, uint32_t nx, uint32_t oy, uint32_t ny, int d) {
+    if (d < 0) return dv_zc(ox ^ nx) + dv_zc(oy ^ ny);
+    const int e = (d + 2) & 3;
+    return dv_zc(ox ^ (nx | (0xFFu << (8 * d)))) + dv_zc(oy ^ (ny | (0xFFu << (8 * e))))
+         + (dv_byte(ox, d) == dv_byte(oy, e));
 }
 
 /* Hill-climb a finished board over cells[0..n): every re-rotation of one piece
@@ -654,51 +715,46 @@ static int dv_polish(DvBoard *b, const uint8_t *cells, int n) {
         int improved = 0;
         for (int i = 0; i < n; i++) {
             const int x = cells[i];
+            const int cx = dv_cls(x);
+            uint32_t nx = dv_need(b, x);
             {                                             /* re-rotate in place */
-                const int p = b->c[x].piece_id, cls = dv_cls(x);
-                const Oriented keep = b->c[x];
-                int best = dv_local(b, x), bs = -1;
+                const int p = b->c[x].piece_id, rot = b->c[x].rotation;
+                const unsigned legal = g_dv_legal4[p][cx];
+                const int cur = dv_zc(dv_s32(&b->c[x]) ^ nx);
+                int best = cur, bs = -1;
                 for (int s = 0; s < 4; s++) {
-                    if (s == keep.rotation || !dv_legal(p, s, cls)) continue;
-                    b->c[x] = g_dv_or[p][s];
-                    const int v = dv_local(b, x);
+                    if (s == rot || !(legal >> s & 1u)) continue;
+                    const int v = dv_zc(g_dv_or32[p][s] ^ nx);
                     if (v > best) { best = v; bs = s; }
                 }
-                b->c[x] = keep;
-                if (bs >= 0) { gained += best - dv_local(b, x); b->c[x] = g_dv_or[p][bs]; improved++; }
+                if (bs >= 0) { gained += best - cur; b->c[x] = g_dv_or[p][bs]; improved++; }
             }
             for (int j = i + 1; j < n; j++) {
                 const int y = cells[j];
-                const int p = b->c[x].piece_id, q = b->c[y].piece_id;
-                const int cx = dv_cls(x), cy = dv_cls(y);
+                const int p = b->c[x].piece_id, q = b->c[y].piece_id, cy = dv_cls(y);
                 if (!(g_dv_pclass[p] >> cy & 1u) || !(g_dv_pclass[q] >> cx & 1u)) continue;
-                const int before = dv_pair(b, x, y);
-                if (!dv_adjacent(x, y)) {
+                const uint32_t ox = dv_s32(&b->c[x]), oy = dv_s32(&b->c[y]), ny = dv_need(b, y);
+                const int d = dv_dir(x, y);
+                const int before = dv_pair_now(ox, nx, oy, ny, d);
+                if (d < 0) {
                     int va, vb;
-                    const int sp = dv_best_spin(b, y, p, cy, &va);
-                    const int sq = dv_best_spin(b, x, q, cx, &vb);
+                    const int sp = dv_best_spin(ny, p, cy, &va);
+                    const int sq = dv_best_spin(nx, q, cx, &vb);
                     if (sp >= 0 && sq >= 0 && va + vb > before) {
                         b->c[y] = g_dv_or[p][sp]; b->c[x] = g_dv_or[q][sq];
                         gained += va + vb - before; improved++;
                     }
                     continue;
                 }
-                const Oriented ox = b->c[x], oy = b->c[y];
-                int best = before, bsp = -1, bsq = -1;
-                for (int sp = 0; sp < 4; sp++) {
-                    if (!dv_legal(p, sp, cy)) continue;
-                    b->c[y] = g_dv_or[p][sp];
-                    for (int sq = 0; sq < 4; sq++) {
-                        if (!dv_legal(q, sq, cx)) continue;
-                        b->c[x] = g_dv_or[q][sq];
-                        const int v = dv_pair(b, x, y);
-                        if (v > best) { best = v; bsp = sp; bsq = sq; }
-                    }
-                }
+                const int e = (d + 2) & 3;
+                int bsp = -1, bsq = -1;
+                const int best = dv_touching_swap(nx | (0xFFu << (8 * d)), ny | (0xFFu << (8 * e)),
+                                                  d, p, q, cx, cy, &bsp, &bsq, before);
                 if (bsp >= 0) {
                     b->c[y] = g_dv_or[p][bsp]; b->c[x] = g_dv_or[q][bsq];
                     gained += best - before; improved++;
-                } else { b->c[x] = ox; b->c[y] = oy; }
+                    nx = dv_need(b, x);                   /* x's neighbour y changed */
+                }
             }
         }
         if (!improved) break;
@@ -706,50 +762,83 @@ static int dv_polish(DvBoard *b, const uint8_t *cells, int n) {
     return gained;
 }
 
+/* The queue polish's view of the region: what each cell's neighbours show it
+   and its deficit (neighbours minus matched edges), kept current as moves land.
+   A move of x and y gains at most def[x] + def[y] -- a rotation at most def[x]
+   -- so a partner whose bound cannot beat the best gain found so far is skipped
+   unread, and on a good board most cells have no deficit at all. */
+typedef struct {
+    uint32_t need[NUM_PIECES];
+    uint8_t  def[NUM_PIECES];
+    /* The region's cells by frame class, in region order: a piece only ever
+       moves to the classes it is legal in, so an inner cell's partners are the
+       inner cells alone. */
+    uint8_t  bycls[DV_CLASSES][NUM_PIECES];
+    int      nbycls[DV_CLASSES];
+} DvLs;
+
+static inline void dv_ls_cell(const DvBoard *b, DvLs *c, int x) {
+    c->need[x] = dv_need(b, x);
+    c->def[x] = (uint8_t)(g_dv_nnb[x] - dv_zc(dv_s32(&b->c[x]) ^ c->need[x]));
+}
+/* x's piece changed: x and its neighbours in the region see it. */
+static inline void dv_ls_touch(const DvBoard *b, DvLs *c, const bool *inreg, int x) {
+    dv_ls_cell(b, c, x);
+    for (int d = 0; d < 4; d++) {
+        const int y = g_dv_nbr[x][d];
+        if (y >= 0 && inreg[y]) dv_ls_cell(b, c, y);
+    }
+}
+
 /* The best move involving cell x: re-rotate it, or swap it with any other cell
    of the region. Applies it if it gains; returns the partner cell moved (x
-   itself for a rotation), or -1. */
-static int dv_best_move_at(DvBoard *b, const uint8_t *cells, int n, int x, int *gain) {
+   itself for a rotation), or -1.  The caller refreshes `ls` around the move. */
+static int dv_best_move_at(DvBoard *b, const DvLs *ls, int x, int *gain) {
     const int p = b->c[x].piece_id, cx = dv_cls(x);
-    const Oriented ox = b->c[x];
+    const uint32_t ox = dv_s32(&b->c[x]), nx = ls->need[x];
+    const int dx = ls->def[x], lx = g_dv_nnb[x] - dx;
     int best_g = 0, by = -1, bsp = -1, bsq = -1;
-    {
-        const int base = dv_local(b, x);
+    if (dx > 0) {
+        const unsigned legal = g_dv_legal4[p][cx];
+        const int rot = b->c[x].rotation;
         for (int s = 0; s < 4; s++) {
-            if (s == ox.rotation || !dv_legal(p, s, cx)) continue;
-            b->c[x] = g_dv_or[p][s];
-            const int g = dv_local(b, x) - base;
+            if (s == rot || !(legal >> s & 1u)) continue;
+            const int g = dv_zc(g_dv_or32[p][s] ^ nx) - lx;
             if (g > best_g) { best_g = g; by = x; bsp = s; }
         }
-        b->c[x] = ox;
     }
-    for (int j = 0; j < n; j++) {
-        const int y = cells[j];
-        if (y == x) continue;
-        const int q = b->c[y].piece_id, cy = dv_cls(y);
-        if (!(g_dv_pclass[p] >> cy & 1u) || !(g_dv_pclass[q] >> cx & 1u)) continue;
-        const int before = dv_pair(b, x, y);
-        if (!dv_adjacent(x, y)) {
+    const int n0 = g_dv_nbr[x][0], n1 = g_dv_nbr[x][1], n2 = g_dv_nbr[x][2], n3 = g_dv_nbr[x][3];
+    for (unsigned km = g_dv_pclass[p]; km; km &= km - 1) {
+    const int cy = __builtin_ctz(km);                       /* classes p may move to */
+    const uint8_t *lst = ls->bycls[cy];
+    for (int j = 0, m = ls->nbycls[cy]; j < m; j++) {
+        const int y = lst[j];
+        if (dx + ls->def[y] <= best_g || y == x) continue;   /* cannot beat best_g */
+        const int q = b->c[y].piece_id;
+        if (!(g_dv_pclass[q] >> cx & 1u)) continue;          /* q cannot come to x */
+        const uint32_t oy = dv_s32(&b->c[y]), ny = ls->need[y];
+        const int d = y == n0 ? 0 : y == n1 ? 1 : y == n2 ? 2 : y == n3 ? 3 : -1;
+        if (d < 0) {
+            /* q's side first (x's neighbours are fixed for the whole scan): p at
+               y gains at most def[y], so most partners stop here. */
             int va, vb;
-            const int sp = dv_best_spin(b, y, p, cy, &va);
-            const int sq = dv_best_spin(b, x, q, cx, &vb);
-            if (sp >= 0 && sq >= 0 && va + vb - before > best_g) {
+            const int sq = dv_best_spin(nx, q, cx, &vb);
+            if (sq < 0 || vb - lx + ls->def[y] <= best_g) continue;
+            const int sp = dv_best_spin(ny, p, cy, &va);
+            const int before = lx + g_dv_nnb[y] - ls->def[y];
+            if (sp >= 0 && va + vb - before > best_g) {
                 best_g = va + vb - before; by = y; bsp = sp; bsq = sq;
             }
             continue;
         }
-        const Oriented oy = b->c[y];
-        for (int sp = 0; sp < 4; sp++) {
-            if (!dv_legal(p, sp, cy)) continue;
-            b->c[y] = g_dv_or[p][sp];
-            for (int sq = 0; sq < 4; sq++) {
-                if (!dv_legal(q, sq, cx)) continue;
-                b->c[x] = g_dv_or[q][sq];
-                const int g = dv_pair(b, x, y) - before;
-                if (g > best_g) { best_g = g; by = y; bsp = sp; bsq = sq; }
-            }
-        }
-        b->c[x] = ox; b->c[y] = oy;
+        const int e = (d + 2) & 3;
+        const int before = dv_pair_now(ox, nx, oy, ny, d);
+        const int thr = before + best_g;
+        int sp = -1, sq = -1;
+        const int v = dv_touching_swap(nx | (0xFFu << (8 * d)), ny | (0xFFu << (8 * e)),
+                                       d, p, q, cx, cy, &sp, &sq, thr);
+        if (v > thr) { best_g = v - before; by = y; bsp = sp; bsq = sq; }
+    }
     }
     if (by < 0) return -1;
     if (by == x) b->c[x] = g_dv_or[p][bsp];
@@ -765,18 +854,27 @@ static int dv_polish_q(DvBoard *b, const uint8_t *cells, int n, const bool *inre
                        int *queue, int qn, bool *inq) {
     int gained = 0, head = 0, tail = qn;   /* ring of NUM_PIECES slots */
     int cnt = qn;
+    DvLs ls;
+    memset(ls.nbycls, 0, sizeof ls.nbycls);
+    for (int i = 0; i < n; i++) {
+        const int x = cells[i], k = dv_cls(x);
+        dv_ls_cell(b, &ls, x);
+        ls.bycls[k][ls.nbycls[k]++] = (uint8_t)x;
+    }
     while (cnt > 0) {
         const int x = queue[head]; head = (head + 1) % NUM_PIECES; cnt--;
         inq[x] = false;
         int g = 0;
-        const int y = dv_best_move_at(b, cells, n, x, &g);
+        const int y = dv_best_move_at(b, &ls, x, &g);
         if (y < 0) continue;
         gained += g;
+        dv_ls_touch(b, &ls, inreg, x);
+        if (y != x) dv_ls_touch(b, &ls, inreg, y);
         const int touched[2] = { x, y };
         for (int t = 0; t < 2; t++) {
             const int z = touched[t];
             for (int d = -1; d < 4; d++) {
-                const int w = d < 0 ? z : dv_nb(z, d);
+                const int w = d < 0 ? z : g_dv_nbr[z][d];
                 if (w < 0 || !inreg[w] || inq[w]) continue;
                 inq[w] = true; queue[tail] = w; tail = (tail + 1) % NUM_PIECES; cnt++;
             }
@@ -798,9 +896,7 @@ static int dv_kick(DvBoard *b, const uint8_t *cells, int nc, const bool *inreg,
     int nb = 0;
     for (int i = 0; i < nc; i++) {
         const int x = cells[i];
-        int nn = 0;
-        for (int d = 0; d < 4; d++) nn += dv_nb(x, d) >= 0;
-        if (dv_local(b, x) < nn) brk[nb++] = (uint8_t)x;
+        if (dv_local(b, x) < g_dv_nnb[x]) brk[nb++] = (uint8_t)x;
     }
     for (int kk = 0; kk < DV_KICK; kk++) {
         for (int tries = 0; tries < 32; tries++) {
@@ -817,7 +913,7 @@ static int dv_kick(DvBoard *b, const uint8_t *cells, int nc, const bool *inreg,
             const int kicked[2] = { x, y };
             for (int t = 0; t < 2; t++)
                 for (int d = -1; d < 4; d++) {
-                    const int w = d < 0 ? kicked[t] : dv_nb(kicked[t], d);
+                    const int w = d < 0 ? kicked[t] : g_dv_nbr[kicked[t]][d];
                     if (w < 0 || !inreg[w] || inq[w]) continue;
                     inq[w] = true; queue[qn++] = w;
                 }
@@ -1795,7 +1891,7 @@ static float *dv_prior(const DvRoot *r) {
         const int x = k->cells[j], ps = k->pslot[r->inc_pid[x]];
         if (ps < 0) continue;
         int nn = 0;
-        for (int d = 0; d < 4; d++) nn += dv_nb(x, d) >= 0;
+        for (int d = 0; d < 4; d++) nn += g_dv_nbr[x][d] >= 0;
         w[(size_t)ps * (size_t)k->ncell + (size_t)j] = dv_local(&inc, x) == nn ? up : -down;
     }
     free(k);
