@@ -424,6 +424,8 @@ per-parent cap doubles there.
    the beam is full, up to nB workable B chains x nC C completions are scored per
    A record and the best child kept; while it is below capacity every completion
    is kept, since selection would discard nothing anyway.
+   **`--bc_window_accept F`** (default 1) keeps that best child with probability
+   F and the window's second best otherwise, for variety between runs.
 2. **Score** (5.5), after the feasibility test (5.6).
 3. **Select.** Children are deduplicated by a 64-bit frontier signature (a hash
    of the used-piece set, the exposed tops and the clue orientation, which
@@ -1025,6 +1027,7 @@ boards or roots they write the same file at any thread count.
 | `--parent_cap N` | 4 | children per parent in the score band; 0 = uncapped |
 | `--pool_factor N` | 8 | candidate pool, x beam width; at least min(8, N) children per parent |
 | `--bc_window nB,nC` | 3,3 | B/C completions scored per A record while the beam is full; each 1..128 |
+| `--bc_window_accept F` | 1 | probability of keeping the window's best child, else its second best |
 | `--no_free_demand` | -- | disable the free-edge demand accounting |
 | `--top_bottoms N`, `--top_columns N` | 10, 12 | bottoms per border row, columns per bottom; < 1 = all |
 | `--tau_bottoms T`, `--tau_columns T` | 0 | ranking temperatures |

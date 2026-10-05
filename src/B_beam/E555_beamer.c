@@ -204,6 +204,7 @@ static double   g_lambda_J        = 1.0;    /* --lambda_J, the closure weight */
 static bool     g_free_demand     = true;   /* --no_free_demand turns it off */
 static uint32_t g_bc_nB           = 3;      /* --bc_window nB,nC; 1,1 = legacy */
 static uint32_t g_bc_nC           = 3;
+static double   g_bc_accept       = 1.0;    /* --bc_window_accept F: P(keep the best) */
 static uint32_t g_parent_cap      = 4;
 static uint32_t g_pool_factor     = 8;
 /* Segment-A decode budget per requested child. Was --scan_factor; a sweep found
@@ -2310,6 +2311,11 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     RowChoice best_mv; float best_score = 0.0f; uint64_t best_sig = 0;
     uint8_t best_flags = 0;
     bool have_best = false;
+    /* The runner-up, for --bc_window_accept F < 1. */
+    RowChoice sec_mv; float sec_score = 0.0f; uint64_t sec_sig = 0;
+    uint8_t sec_flags = 0;
+    bool have_sec = false;
+    const bool track_sec = window && g_bc_accept < 1.0;
     uint32_t nb_done = 0;
     /* The retry budget has to grow with the window, or the window cannot fill.
        b_left is spent on every conflict-free B chain, while nb_done counts only a
@@ -2359,12 +2365,30 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
             }
             nc_done++;
             if (!have_best || score > best_score) {
+                if (track_sec && have_best) {
+                    sec_score = best_score; sec_mv = best_mv; sec_sig = best_sig;
+                    sec_flags = best_flags; have_sec = true;
+                }
                 best_score = score; best_mv = mv; best_sig = frontier_sig(t);
                 best_flags = t->flags;
                 have_best = true;
+            } else if (track_sec && (!have_sec || score > sec_score)) {
+                sec_score = score; sec_mv = mv; sec_sig = frontier_sig(t);
+                sec_flags = t->flags; have_sec = true;
             }
         }
         if (nc_done) nb_done++;                 /* a B chain that produced a child */
+    }
+    if (have_sec) {
+        /* Keyed on the record, not drawn from e->rng: the choice is the same
+           however the parent is sliced over threads, and the phase-2 stream is
+           untouched. */
+        RNG r = rng_for(e->cfg_hash ^ 0xACCE97ULL, (uint32_t)e->row, e->parent_idx, j);
+        double u = (double)(rng_next(&r) >> 11) * (1.0 / 9007199254740992.0);
+        if (u >= g_bc_accept) {
+            best_score = sec_score; best_mv = sec_mv; best_sig = sec_sig;
+            best_flags = sec_flags;
+        }
     }
     if (have_best) {
         pool_append_sig(ctx, sc, best_sig, e->parent_idx, best_score, &best_mv, best_flags);
@@ -2471,6 +2495,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
         e.rng = rng_for(cfg_hash, (uint32_t)row, pi, 0xFFFFFFFFu);
         e.quota = quota_slice; e.budget = budget_slice;
         e.keep_all = keep_all;
+        e.cfg_hash = cfg_hash;
 
         /* Phase 1: this slice's stride of the cell in promise order (the cell is
            fan-out sorted, so the prefix holds the most continuable chains),
@@ -5157,6 +5182,8 @@ static void usage(const char *a0) {
 "                         width, so where it does not, an extra child costs nothing and\n"
 "                         a discarded sibling is a completion thrown away. 1,1 makes\n"
 "                         the full-beam regime take the first fit (default 3,3)\n"
+"  --bc_window_accept F   full-beam regime: keep the window's best child with\n"
+"                         probability F, else its second best (default 1)\n"
 "\n"
 "Sweep control:\n"
 "  --top_bottoms N        bottom-row orderings tried per border row, best-ranked\n"
@@ -5229,49 +5256,54 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     static const char *corner[4] = { "--BL", "--BR", "--TL", "--TR" };
     printf("[cmd] %s %s", a0, seed_path);
     if (csv_path) printf(" %s", csv_path);
-    if (g_random_edges)   printf(" --random_edges");
-    if (g_free_edges)     printf(" --free_edges");
-    if (g_incomplete_top) printf(" --incomplete_top");
-    if (resume)           printf(" --resume");
-    if (g_verbose)        printf(" --verbose");
-    if (g_print_cmd)      printf(" --print_cmd");
-    if (g_pin_clue)                 printf(" --pin_clue %d", g_pin_clue);
+    /* Grouped, most important first: borders, clues, beam, score, the top of the
+       board, the finish, budget, I/O. A flag at its default or inert without its
+       parent flag is left out; everything else is printed, so the line replays. */
+    if (g_random_edges)  printf(" --random_edges --samples %u", g_samples);
+    else                 printf(" --start_row %u --num_rows %u", g_start_row, g_num_rows);
+    if (g_exhaust)       printf(" --exhaust_border_color");
+    if (g_free_edges)    printf(" --free_edges");
+    for (int k = 0; k < 4; k++)
+        if (g_fixed_corner_pid[k] >= 0) printf(" %s %d", corner[k], g_fixed_corner_pid[k]);
+    printf(" --top_bottoms %ld --top_columns %ld", g_top_bottoms, g_top_columns);
+    printf(" --tau_bottoms %g --tau_columns %g", g_tau_bottoms, g_tau_columns);
+    printf(" --bail_columns %u", g_bail_columns);
+    printf(" --rng_seed %" PRIu64, g_master_seed);
     /* --pin_clue turns CLUE_CENTER on itself, so printing both is not a
        contradiction -- the line stays correct if the implication ever changes. */
     if (g_clue_mask & CLUE_CENTER)  printf(" --clue_center");
     if (g_clue_mask & CLUE_CORNERS) printf(" --clue_corners");
+    if (g_pin_clue)      printf(" --pin_clue %d", g_pin_clue);
+    if (g_free_top_clue) printf(" --free_top_clue");
+    printf(" --beam_width %u --beam_expand %u --beam_expand_row %u",
+           g_beam_width, g_beam_expand, g_beam_expand_row);
+    printf(" --pool_factor %u --bc_window %u,%u", g_pool_factor, g_bc_nB, g_bc_nC);
+    if (g_bc_accept < 1.0) printf(" --bc_window_accept %g", g_bc_accept);
+    printf(" --parent_cap %u --frac_rand %g", g_parent_cap, g_frac_rand);
+    printf(" --lambda_J %g --lambda_Mahalanobis %g", g_lambda_J, g_lambda_maha);
+    if (g_lambda_corners > 0.0) printf(" --lambda_corners %g", g_lambda_corners);
     if (g_lambda_reserve > 0.0) printf(" --lambda_reserve %g", g_lambda_reserve);
-    if (!g_free_demand)   printf(" --no_free_demand");
-    for (int k = 0; k < 4; k++)
-        if (g_fixed_corner_pid[k] >= 0) printf(" %s %d", corner[k], g_fixed_corner_pid[k]);
-    printf(" --out_dir %s", g_out_dir);
-    if (g_random_edges) printf(" --samples %u", g_samples);
-    else                 printf(" --start_row %u --num_rows %u", g_start_row, g_num_rows);
-    if (g_db_file) printf(" --db_file %s", g_db_file);
-    printf(" --beam_width %u --stop_row %u", g_beam_width, g_stop_row);
+    if (!g_free_demand)  printf(" --no_free_demand");
+    printf(" --stop_row %u", g_stop_row);
+    if (g_incomplete_top) printf(" --incomplete_top");
+    if (!g_cap_top)      printf(" --cap_top 0");
     if (g_backtrack_row) printf(" --backtrack_row %u --backtrack_row_factor %u --extend_nodes %u",
                                 g_backtrack_row, g_bt_factor, g_extend_nodes);
     if (g_bt_min_col)    printf(" --backtrack_min_col %u", g_bt_min_col);
     if (g_backtrack_row && !g_top_dedup) printf(" --no_top_dedup");
-    if (g_free_top_clue) printf(" --free_top_clue");
-    if (g_exhaust) printf(" --exhaust_border_color");
-    if (!g_cap_top) printf(" --cap_top 0");
-    if (g_prefix[0])     printf(" --prefix %s", g_prefix);
-    if (g_end_dive) printf(" --end_dive %u --emit_score %d", g_end_dive, g_emit_score);
+    if (g_end_dive) printf(" --end_dive %u", g_end_dive);
     if (g_end_dive && g_end_polish >= 0) printf(" --end_polish %d", g_end_polish);
+    if (g_end_dive) printf(" --emit_score %d", g_emit_score);
     if (g_end_dive && g_corners_on && g_corner_seeds != 4) printf(" --corner_seeds %d", g_corner_seeds);
-    printf(" --beam_expand %u --beam_expand_row %u", g_beam_expand, g_beam_expand_row);
-    printf(" --lambda_J %g --lambda_Mahalanobis %g", g_lambda_J, g_lambda_maha);
-    if (g_lambda_corners > 0.0) printf(" --lambda_corners %g", g_lambda_corners);
-    printf(" --frac_rand %g --parent_cap %u --pool_factor %u",
-           g_frac_rand, g_parent_cap, g_pool_factor);
-    printf(" --bc_window %u,%u", g_bc_nB, g_bc_nC);
-    printf(" --top_bottoms %ld --top_columns %ld", g_top_bottoms, g_top_columns);
-    printf(" --tau_bottoms %g --tau_columns %g", g_tau_bottoms, g_tau_columns);
-    printf(" --bail_columns %u", g_bail_columns);
-    printf(" --threads %d --rng_seed %" PRIu64, g_nthreads, g_master_seed);
-    printf(" --time_limit %g --wall_time %g --max_emitted %" PRIu64 "\n",
-           g_config_time_sec, g_max_wall_sec, g_max_partials);
+    printf(" --time_limit %g --wall_time %g --max_emitted %" PRIu64 " --threads %d",
+           g_config_time_sec, g_max_wall_sec, g_max_partials, g_nthreads);
+    printf(" --out_dir %s", g_out_dir);
+    if (g_prefix[0])     printf(" --prefix %s", g_prefix);
+    if (g_db_file)       printf(" --db_file %s", g_db_file);
+    if (resume)          printf(" --resume");
+    if (g_verbose)       printf(" --verbose");
+    if (g_print_cmd)     printf(" --print_cmd");
+    printf("\n");
 }
 
 /* -- The [sweep] line, and the run-length collapse behind it ----------------- */
@@ -5604,6 +5636,11 @@ int main(int argc, char *argv[]) {
                 fatal("--bc_window needs nB,nC in 1..%d (e.g. 3,2)", BC_WINDOW_MAX);
             g_bc_nB = nb; g_bc_nC = nc;
         }
+        else if (!strcmp(argv[i], "--bc_window_accept") && i+1 < argc) {
+            char *end; g_bc_accept = strtod(argv[++i], &end);
+            if (*end || !(g_bc_accept >= 0.0 && g_bc_accept <= 1.0))
+                fatal("--bc_window_accept needs F in [0,1]");
+        }
         else if (!strcmp(argv[i], "--frac_rand")   && i+1 < argc) g_frac_rand = atof(argv[++i]);
         else if (!strcmp(argv[i], "--parent_cap")  && i+1 < argc) g_parent_cap = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pool_factor") && i+1 < argc) g_pool_factor = (uint32_t)atoi(argv[++i]);
@@ -5865,8 +5902,10 @@ int main(int argc, char *argv[]) {
             if (clue_row_pinned(r)) { printf("%s%d", sep, r); sep = ","; }
         printf("%s (a clue pins its own row and the one below it)\n", *sep ? "" : "none");
     }
-    printf("[cfg] lambda_J=%.3f lambda_Maha=%.3f free_demand=%d bc_window=%u,%u\n",
+    printf("[cfg] lambda_J=%.3f lambda_Maha=%.3f free_demand=%d bc_window=%u,%u",
            g_lambda_J, g_lambda_maha, g_free_demand?1:0, g_bc_nB, g_bc_nC);
+    if (g_bc_accept < 1.0) printf(" accept=%.2f", g_bc_accept);
+    printf("\n");
     if (g_corners_on)
         printf("[cfg] lambda_corners=%.3f (score-SD units; %s top-corner blocks)\n",
                g_lambda_corners, (g_clue_mask & CLUE_CORNERS) ? "clue 2x3" : "3-cell");

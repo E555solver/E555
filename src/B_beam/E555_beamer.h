@@ -161,6 +161,7 @@ typedef struct {
     uint32_t  quota;             /* accepted children remaining */
     bool      keep_all;          /* beam under capacity: keep every B/C child,
                                     not just the best-scored one (see expand_row) */
+    uint64_t  cfg_hash;          /* keys the --bc_window_accept draw */
 } Expand;
 
 typedef struct { uint32_t row, width; const char *reason; } BeamResult;
