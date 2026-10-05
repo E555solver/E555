@@ -1753,6 +1753,14 @@ is read from a board that carries a clue; `--clue_orient` applies only to a boar
 carrying none. A board whose clue cell is taken, or whose clue piece sits
 elsewhere, is reported and not written. Refused with a stop band.
 
+**Early release.** `--early_release N` stops the exact search at the first
+break-free board with only N of its searched cells still empty, the last N of
+`--order` (so `--reverse` moves them), and writes it as the record's board.
+`--holes H --order spiralout --early_release 60 --breaks 0`, with H opening the
+frame and the rings to re-grow, leaves the border ring for the CP-SAT tools.
+The search above the gate is unchanged. Requires `--breaks 0`; the usage text
+(run without arguments) lists where the gate falls per order.
+
 **Parallelism.** One record per thread, or all threads on one record when there
 are no more records than threads (`--all_for_one` forces it). The search is
 memory-bandwidth bound (four independent single-thread runs reach 2.44x
@@ -1771,6 +1779,7 @@ node rate).
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record |
 | `--max_emitted N` | 1 | completions per record (0 = all) |
 | `--stop_row N`, `--stop_column N`, `--with_frame` | -- | band enumeration |
+| `--early_release N` | 0 | emit the break-free board N searched cells before the end |
 | `--clue_center`, `--clue_corners`, `--clue_orient N` | off | clues |
 | `--start_row`, `--num_rows`, `--dedup`/`--no_dedup` | 0, all, dedup | input |
 | `--best_n N`, `--status` | --, off | side files |

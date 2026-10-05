@@ -64,6 +64,13 @@
  *     spent: stuck (dead-end cells only), any (everywhere; complete but
  *     exponential), or lds (discrepancy-limited widening from stuck toward
  *     any, --lds_max caps the allowance).
+ *   - --early_release N moves the DFS leaf N cells before the end of the
+ *     search sequence: the exact search stops at the first break-free board
+ *     with only N searched cells still empty and reports it as the record's
+ *     solution.  Above that gate the search is unchanged -- the released cells
+ *     still count in every completion prune -- so a released board is a state
+ *     the full search passes through.  Where the gate falls follows --order and
+ *     --reverse (rowmajor N=16: the top row; spiralout N=60: the border ring).
  *
  * OUTPUT
  *   - The mandatory output.csv gets ONE line per processed record: the best
@@ -109,7 +116,7 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 
-#define E555_BUILD_TAG "backtracker-20260719"
+#define E555_BUILD_TAG "backtracker-20261005"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -293,6 +300,21 @@ static int         g_total_records      = 0;
 static double      g_t_start_wall       = 0.0;
 static int         g_rotation           = 0;    /* --rotate K */
 static uint64_t    g_solution_limit     = 1;    /* per record; 0 = enumerate all */
+
+/* --early_release N: the DFS leaf sits N cells before the end of the search
+ * sequence, so the search stops at a break-free board that still has N of its
+ * searched cells empty.  0 = off, the leaf is the end of the sequence.  Only the
+ * leaf moves: the released cells stay in every completion prune, so the search
+ * above the gate is exactly the full one.  For a static order the released cells
+ * are the last N of the sequence order_key() builds, which is how --reverse
+ * moves the gate; under mrv they are whichever N cells are still empty. */
+static int         g_early_release      = 0;
+
+/* Sequence position of the DFS leaf for a search over n_rem cells. */
+static inline int search_gate(int n_rem) {
+    int g = n_rem - g_early_release;
+    return g > 0 ? g : 0;
+}
 
 /* -- Mismatch budget ---------------------------------------------------------- */
 /*
@@ -508,6 +530,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     printf(" --breaks %d", g_max_mismatch);
     if (g_lds_max >= 0) printf(" --lds_max %d", g_lds_max);
     printf(" --max_emitted %" PRIu64, g_solution_limit);
+    if (g_early_release > 0) printf(" --early_release %d", g_early_release);
     printf(" --restarts %lld", (long long)g_stuck_restarts);
     if (!g_lcv) printf(" --no_lcv");
     if (g_hall_mode == HALL_OFF) printf(" --no_hall");
@@ -2784,6 +2807,34 @@ static uint64_t write_solution(const Board *b,
         out_b = b;
     }
 
+    /* A released board stops short of the end on purpose, so the full-board
+     * validator below cannot run.  It is an exact search (--early_release
+     * requires --breaks 0), so a broken edge or a frame violation here is an
+     * internal error, never a result. */
+    if (g_early_release > 0) {
+        int placed = board_count_placed(out_b);
+        if (!validate_partial_board_ex(out_b, placed, 0, why, sizeof(why)))
+            fatal("internal error: invalid released board from sol_id=%lld: %s",
+                  input_sol_id, why);
+        uint64_t n;
+        #pragma omp atomic capture
+        n = ++g_total_solutions;
+        if (g_verbose) {
+            int conn = 0, brk = 0;
+            board_edge_counts(out_b, &conn, &brk);
+            #pragma omp critical(stdout_print)
+            {
+                printf("*** RELEASED %" PRIu64 " from config=%s sol_id=%lld  t=%.3fs"
+                       "  placed=%d/%d  connected_edges=%d ***\n",
+                       n, config_id_str, input_sol_id, elapsed_wall(),
+                       placed, NUM_PIECES, conn);
+                print_board_ascii(stdout, b, "=== RELEASED BOARD (rotated frame) ===");
+                fflush(stdout);
+            }
+        }
+        return n;
+    }
+
     int sol_breaks = 0, sol_break_pieces = 0;
     /* Tolerate up to the theoretical maximum of internal breaks: the board may
      * legitimately carry breaks (from a break-carrying input and/or the budget).
@@ -4109,9 +4160,13 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
     st->visits[depth]++;
     if (depth > st->max_depth_entered) st->max_depth_entered = depth;
 
-    if (pos == n_rem) {
-        if (g_stop_active ? band_is_complete(b)
-                          : board_count_placed(b) == NUM_PIECES) {
+    /* The leaf: the end of the sequence, or the --early_release gate before it.
+     * A released board needs no completeness test -- --jump is refused with the
+     * option, so every position before the gate holds a placed piece. */
+    if (pos == search_gate(n_rem)) {
+        if (g_early_release > 0 ||
+            (g_stop_active ? band_is_complete(b)
+                           : board_count_placed(b) == NUM_PIECES)) {
             if (!claim_complete_solution(cx->live)) return;
             st->completed_leaves++;
             (*local_solutions)++;
@@ -4432,9 +4487,13 @@ static void afo_build_frontier(Board *b, FcState *fc, Cell *rem, int n_rem, int 
     st->visits[depth]++;
     if (depth > st->max_depth_entered) st->max_depth_entered = depth;
 
-    if (pos == n_rem) {
-        if (g_stop_active ? band_is_complete(b)
-                          : board_count_placed(b) == NUM_PIECES) {
+    /* The leaf: the end of the sequence, or the --early_release gate before it.
+     * A released board needs no completeness test -- --jump is refused with the
+     * option, so every position before the gate holds a placed piece. */
+    if (pos == search_gate(n_rem)) {
+        if (g_early_release > 0 ||
+            (g_stop_active ? band_is_complete(b)
+                           : board_count_placed(b) == NUM_PIECES)) {
             if (!claim_complete_solution(cx->live)) return;
             st->completed_leaves++;
             (*local_solutions)++;
@@ -4618,7 +4677,9 @@ static void run_search_at_k_search_parallel(Board *base, const SearchCtx *cx,
      * partial update is ever emitted twice. */
     int refine_depth = fr.max_pos;
     {
-        int depth_cap = n_rem - 1;
+        /* Never refine past the leaf, which --early_release moves before the
+         * end of the sequence; an item already at the gate is a leaf. */
+        int depth_cap = search_gate(n_rem) - 1;
         long long max_exp_ll = 16LL * (long long)fr.target;
         int max_expansions = (max_exp_ll > INT_MAX) ? INT_MAX : (int)max_exp_ll;
         int expansions = 0;
@@ -4627,7 +4688,7 @@ static void run_search_at_k_search_parallel(Board *base, const SearchCtx *cx,
             int pick = -1;
             for (int i = 0; i < fr.count; i++) {
                 const AfoWorkItem *it = &fr.items[i];
-                if (it->pos >= it->n_rem || it->pos >= depth_cap) continue;
+                if (it->pos >= search_gate(it->n_rem) || it->pos >= depth_cap) continue;
                 if (pick < 0 || it->pos < fr.items[pick].pos) pick = i;
             }
             if (pick < 0) break;                      /* nothing refinable left */
@@ -5329,10 +5390,17 @@ static void process_line(const char *config_id_str, long long sol_id,
     if (strcmp(status, "solution") == 0 || strcmp(status, "solution_cutoff") == 0) {
         int sbroken    = collect ? (mres.found ? mres.items[0].breaks : solved_k) : 0;
         int sconnected = total_internal - sbroken;  /* complete board: all 480 edges exist */
-        char brk[96];
-        snprintf(brk, sizeof(brk), " connected_edges=%d broken_edges=%d pieces_with_breaks=%d kept=%d",
-                 sconnected, sbroken, collect && mres.found ? mres.items[0].pieces : 0,
-                 collect ? mres.count : 0);
+        /* A released board is not complete: its edges are counted, not assumed.
+         * The streamed board is the record's best, which is a released one. */
+        if (g_early_release > 0) sconnected = rstat.best_connected;
+        char brk[128];
+        int boff = snprintf(brk, sizeof(brk),
+                            " connected_edges=%d broken_edges=%d pieces_with_breaks=%d kept=%d",
+                            sconnected, sbroken, collect && mres.found ? mres.items[0].pieces : 0,
+                            collect ? mres.count : 0);
+        if (g_early_release > 0 && boff > 0 && (size_t)boff < sizeof(brk))
+            snprintf(brk + boff, sizeof(brk) - (size_t)boff, " released=%d",
+                     n_seq - search_gate(n_seq));
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
                 "[cfg=%s sol=%lld] %s found=%" PRIu64
                 " placed=%d/%d empty=%d holes=%d"
@@ -5629,7 +5697,20 @@ static void usage(const char *prog) {
         "                         Unset: unlimited for exact search, 30 s for mismatch.\n\n"
         "  --max_emitted N        Stop after N completions per record (default 1; 0=all).\n"
         "                         Ignored in stuck mode (--restarts governs).\n"
-        "                         Use --max_emitted 0 to enumerate every completion.\n\n"
+        "                         Use --max_emitted 0 to enumerate every completion.\n"
+        "  --early_release N      Stop at the first break-free board with only N of the\n"
+        "                         searched cells still empty, and report it as the\n"
+        "                         solution (default 0 = search to the end).  The open\n"
+        "                         cells are the last N of --order, so --reverse moves\n"
+        "                         them: rowmajor N=16 leaves the top row, spiralout\n"
+        "                         N=60 the border ring, centerout a disc (not a ring);\n"
+        "                         mrv leaves whichever N cells remain.  The search above\n"
+        "                         is unchanged: the open cells still count in every\n"
+        "                         completion prune.  --max_emitted counts releases.\n"
+        "                         Requires --breaks 0; refused with 2sides/4sides,\n"
+        "                         --jump and --stop_row/--stop_column.  Exact search\n"
+        "                         has no default time limit: set --time_limit for big\n"
+        "                         batches.\n\n"
         "Stop band (emit partials for the finalizer):\n"
         "  --stop_row N           Search ONLY rows 0..N and emit every way to fill\n"
         "                         them, as the beamer's --stop_row does.  Cells above\n"
@@ -5845,6 +5926,13 @@ int main(int argc, char **argv) {
             if (errno || end == arg || *end)
                 fatal("--max_emitted expects a non-negative integer, got '%s'", arg);
             g_solution_limit = (uint64_t)v;
+        } else if (strcmp(argv[i], "--early_release") == 0 && i+1 < argc) {
+            char *end = NULL; errno = 0;
+            long v = strtol(argv[++i], &end, 10);
+            if (errno || end == argv[i] || *end || v < 0 || v > NUM_PIECES)
+                fatal("--early_release expects an integer in [0,%d], got '%s'",
+                      NUM_PIECES, argv[i]);
+            g_early_release = (int)v;
         } else if (strcmp(argv[i], "--order") == 0 && i+1 < argc) {
             const char *m = argv[++i];
             if      (!strcmp(m, "rowmajor"))  g_order_mode = ORD_ROWMAJOR;
@@ -5943,6 +6031,25 @@ int main(int argc, char **argv) {
          * proofs are intentionally irrelevant here and must never stop the
          * sweep, even when the caller supplied --hall adaptive/always. */
         g_hall_mode = HALL_OFF;
+    }
+
+    /* A released board is the exact search's state N cells before the end, so
+     * everything that makes "N cells before the end" mean something else is
+     * refused rather than reinterpreted. */
+    if (g_early_release > 0) {
+        if (order_is_side_growth(g_order_mode))
+            fatal("--early_release does not apply to --order %s: side growth defers "
+                  "dead cells and has no fixed end to count back from",
+                  order_name(g_order_mode));
+        if (g_max_mismatch != 0)
+            fatal("--early_release requires --breaks 0: a released board is the "
+                  "exact search's, with no broken edge");
+        if (g_jump)
+            fatal("--early_release requires --jump off: a jumped cell stays empty, "
+                  "so the cells left open would no longer be the last N");
+        if (g_stop_active)
+            fatal("--early_release cannot be combined with --stop_%s: a band is "
+                  "already its own end point", g_stop_isrow ? "row" : "column");
     }
     if (g_lds_max >= 0 && g_break_mode != BREAK_LDS)
         fprintf(stderr, "[warn] --lds_max has no effect unless --break_mode lds is selected.\n");
@@ -6054,6 +6161,9 @@ int main(int argc, char **argv) {
     printf("  max_emitted=");
     if (g_solution_limit > 0) printf("%" PRIu64 " per record\n", g_solution_limit);
     else                      printf("all\n");
+    if (g_early_release > 0)
+        printf("  early_release=%d (emit when %d searched cells remain; each release "
+               "counts as a solution)\n", g_early_release, g_early_release);
     printf("  dedup=%s  status_report=%s\n",
            g_dedup ? "on (default)" : "off",
            g_write_status ? "on" : "off (use --status)");
@@ -6314,7 +6424,10 @@ int main(int argc, char **argv) {
     printf("    solution_cutoff      = %" PRIu64 "\n", g_cnt_solution_cutoff);
     printf("    no_solution          = %" PRIu64 "\n", g_cnt_no_solution);
     printf("    cutoff               = %" PRIu64 "\n", g_cnt_cutoff);
-    printf("    full_solutions       = %" PRIu64 "\n", g_total_solutions);
+    if (g_early_release > 0)
+        printf("    released_boards      = %" PRIu64 "\n", g_total_solutions);
+    else
+        printf("    full_solutions       = %" PRIu64 "\n", g_total_solutions);
     if (g_stop_active) {
         /* The accept rate is the diagnostic that matters under --break_mode
          * stuck, whose dives take a minimal break when no exact fit exists and

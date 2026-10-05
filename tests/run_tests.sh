@@ -111,6 +111,7 @@ ALL_STEPS=(
     "backtracker_dives|extra|backtracker|greedy dives on the example board, plus an own-output round-trip"
     "backtracker_exhaustive|core|backtracker|exhaustive enumeration identical at 1 and 4 threads"
     "backtracker_stop_band|extra|backtracker|--stop_row/--stop_column emit exact, finalizer-shaped bands"
+    "backtracker_release|extra|backtracker|--early_release stops N cells early in every order; --reverse moves the gate"
     "backtracker_breakcount|extra|backtracker|break classes agree with the per-candidate scan they replaced"
     "backtracker_clues|extra|backtracker|--clue_center/--clue_corners force the hints on, or drop the board"
     "diver|core|diver|E555_diver finishes held boards: identical at 1 and 4 threads, scores recount, placed cells untouched"
@@ -2017,6 +2018,79 @@ step_backtracker_stop_band() {
     grep -q "requires --breaks 0" "$OUT/sbx.log" || fail "wrong error for --breaks"
 
     echo "ok: $n exact row-0 bands, thread-independent, --reverse and guards correct"
+}
+
+# --early_release N moves the DFS leaf N cells before the end of the search
+# sequence.  N=44 on the 48 cells holes_top3.csv opens adds four pieces, so every
+# run is instant.  Every order must stop with exactly 44 cells open and no break;
+# rowmajor and spiralout also pin WHICH four cells, both ways round, which is
+# what shows the gate follows --order and --reverse.  The gate can fall inside
+# the frontier builder that splits one record across threads, and N=0 must be
+# exactly the run without the flag.
+step_backtracker_release() {
+    local o rev extra tags=()
+    local bt=(bin/E555_backtracker data/synth_seed.txt data/synth_solution_480.csv)
+    local open=(--holes tests/fixtures/holes_top3.csv --breaks 0)
+    for o in rowmajor colmajor snake spiral centerout spiralout mrv; do
+        for rev in "" --reverse; do
+            "${bt[@]}" "$OUT/er_$o$rev.csv" "${open[@]}" --order "$o" $rev \
+                --early_release 44 --threads 1 > "$OUT/er_$o$rev.log" \
+                || fail "--early_release 44 --order $o $rev failed"
+            tags+=("$o$rev")
+        done
+    done
+    # Gate at sequence position 2, inside the search-parallel frontier builder.
+    "${bt[@]}" "$OUT/er_par.csv" "${open[@]}" --order rowmajor --early_release 46 \
+        --threads 4 > "$OUT/er_par.log" || fail "--early_release 46 --threads 4 failed"
+    python3 - "$OUT" "${tags[@]}" par <<'EOF' || exit 1
+import sys
+out, tags = sys.argv[1], sys.argv[2:]
+seed = [list(map(int, l.split())) for l in open("data/synth_seed.txt") if l.strip()]
+face = lambda p, s, d: seed[p][(d + s) % 4]
+want = {                       # the cells placed before the gate, in board order
+    "rowmajor": [(13, 0), (13, 1), (13, 2), (13, 3)],
+    "rowmajor--reverse": [(13, 12), (13, 13), (13, 14), (13, 15)],
+    "spiralout": [(13, 10), (13, 11), (13, 12), (13, 13)],
+    "spiralout--reverse": [(13, 2), (13, 3), (13, 4), (13, 5)],
+    "par": [(13, 0), (13, 1)],
+}
+for tag in tags:
+    path = "%s/er_%s.csv" % (out, tag)
+    rows = [l for l in open(path) if l.strip() and l.lstrip()[0] not in "#%"]
+    assert len(rows) == 1, "%s: %d rows, expected 1" % (path, len(rows))
+    f = [t.strip() for t in rows[0].split(",")][-512:]
+    cell = {int(x): (p, int(f[256 + p])) for p, x in enumerate(f[:256]) if int(x) != 999}
+    for x, (p, s) in cell.items():
+        r, c = divmod(x, 16)
+        if c < 15 and x + 1 in cell:
+            assert face(p, s, 1) == face(*cell[x + 1], 3), "%s: break right of (%d,%d)" % (path, r, c)
+        if r < 15 and x + 16 in cell:
+            assert face(p, s, 0) == face(*cell[x + 16], 2), "%s: break above (%d,%d)" % (path, r, c)
+        for d, edge in ((0, r == 15), (1, c == 15), (2, r == 0), (3, c == 0)):
+            assert (face(p, s, d) == 0) == edge, "%s: frame violation at (%d,%d)" % (path, r, c)
+    assert all(x >= 208 for x in range(256) if x not in cell), "%s: a cell outside the holes is open" % path
+    added = sorted(divmod(x, 16) for x in cell if x >= 208)
+    k = 2 if tag == "par" else 4
+    assert len(added) == k, "%s: %d pieces added, expected %d" % (path, len(added), k)
+    if tag in want:
+        assert added == want[tag], "%s: placed %s, expected %s" % (path, added, want[tag])
+print("ok: %d runs stop at the gate break-free; rowmajor and spiralout place the expected cells both ways" % len(tags))
+EOF
+
+    # N=0 is off: byte-identical to the run without the flag.
+    "${bt[@]}" "$OUT/er_off0.csv" "${open[@]}" --order rowmajor --early_release 0 \
+        --threads 1 > "$OUT/er_off0.log" || fail "--early_release 0 failed"
+    "${bt[@]}" "$OUT/er_off.csv" "${open[@]}" --order rowmajor \
+        --threads 1 > "$OUT/er_off.log" || fail "the run without --early_release failed"
+    cmp -s "$OUT/er_off0.csv" "$OUT/er_off.csv" || fail "--early_release 0 changed the output"
+
+    # Anything that would make "N cells before the end" mean something else is refused.
+    for extra in "--breaks 5" "--jump" "--order 2sides" "--stop_row 3"; do
+        "${bt[@]}" "$OUT/er_bad.csv" --early_release 10 $extra > "$OUT/er_bad.log" 2>&1 \
+            && fail "--early_release accepted $extra"
+        grep -q -- "--early_release" "$OUT/er_bad.log" || fail "no --early_release refusal for $extra"
+    done
+    echo "ok: N=0 is the plain run; --breaks, --jump, 2sides and --stop_row refused"
 }
 
 # The mismatch engines no longer test candidates one at a time: a placement's
