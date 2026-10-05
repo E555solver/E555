@@ -5112,9 +5112,9 @@ static void usage(const char *a0) {
 "                         written boards instead of stopping the search. Bare flag =\n"
 "                         10000; absent = off\n"
 "  --end_polish R         with --end_dive: on boards whose best dive is within 6 of S,\n"
-"                         hill-climb the 16 best distinct dives (best swap or\n"
+"                         hill-climb the 32 best distinct dives (best swap or\n"
 "                         re-rotation, repeated), then run R kick-and-polish rounds\n"
-"                         (3 random swaps, re-polish, keep if not worse) over 8\n"
+"                         (3 random swaps, re-polish, keep if not worse) over 16\n"
 "                         walks. 0 = polish only; absent = off\n"
 "  --emit_score S         connected edges (of 480) a finished board needs to be\n"
 "                         written (default 450)\n"
@@ -5829,8 +5829,8 @@ int main(int argc, char *argv[]) {
                "boards >= S-4, or the top 10%% if that is under 20%%) emit_score=%d\n",
                g_end_dive, g_end_dive / 10, g_end_dive - g_end_dive / 10, g_emit_score);
         if (g_end_polish >= 0)
-            printf("[cfg] end_polish=%d (polish the 16 best dives of each board within 6 "
-                   "of S, then %d kick-and-polish rounds over 8 walks)\n",
+            printf("[cfg] end_polish=%d (polish the 32 best dives of each board within 6 "
+                   "of S, then %d kick-and-polish rounds over 16 walks)\n",
                    g_end_polish, g_end_polish);
         if (g_corners_on)
             printf("[cfg] corner_seeds=%d (%s)\n", g_corner_seeds, g_corner_seeds

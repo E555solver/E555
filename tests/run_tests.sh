@@ -2993,12 +2993,12 @@ print(f"ok: --lambda_reserve 2 with --lambda_corners keeps {b:.1f} of 26 reserve
       f"at the stop row, against {a:.1f} without it; an old-format row is set aside")
 EOF
     grep -q "^\[sum\] \*\*\* Output boards score: " "$OUT/btd_dive.log" || fail "no score line in the summary"
-    # The diver replaying the plain run's boards is the same finish, so it must
-    # write the dived run's rows byte for byte -- corner seeds included, and at
-    # another thread count.
+    # The diver replaying the plain run's boards is the same finish (at the
+    # beamer's --polish_top), so it must write the dived run's rows byte for
+    # byte -- corner seeds included, and at another thread count.
     bin/E555_diver data/seed_Edge5.txt "$OUT/btd_plain/beam_completions_0_10.csv" \
         "$OUT/btd_replay.csv" --rotations data/borders_annealed_fix12.csv --corner_seeds 4 \
-        --end_dive 100 --end_polish 50 --emit_score 0 --rng_seed 7 --threads 3 \
+        --end_dive 100 --end_polish 50 --polish_top 32 --emit_score 0 --rng_seed 7 --threads 3 \
         > "$OUT/btd_replay.log" || fail "E555_diver replay exited non-zero"
     grep -v '^#' "$OUT/btd_dive/beam_completions_0_10.csv" > "$OUT/btd_dive_rows.csv" || true
     cmp -s "$OUT/btd_dive_rows.csv" "$OUT/btd_replay.csv" \

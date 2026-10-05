@@ -34,7 +34,7 @@
 #define DV_S2_MARGIN     4      /* stage 2 for stage-1 best >= S - this... */
 #define DV_S2_MIN_SHARE  0.20   /* ...and if that promotes under this share, */
 #define DV_S2_TOP_SHARE  0.10   /* also this top share by stage-1 best */
-#define DV_POLISH_TOP    16     /* K: dives polished per board; K/2 walks (rounded up) */
+#define DV_POLISH_TOP    32     /* K: dives polished per board; K/2 walks (rounded up) */
 #define DV_POLISH_MAX    256    /* largest K (diver --polish_top) */
 #define DV_POLISH_MARGIN 6      /* on boards whose best is >= S - this */
 #define DV_KICK          3      /* random swaps per kick */

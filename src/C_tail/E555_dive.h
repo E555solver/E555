@@ -25,7 +25,7 @@
  *            under 20% of the batch) get the other M - M/10 dives, in 18
  *            cross-entropy rounds learning from the board's own best dives
  *   polish   (R >= 0) boards within 6 of S: their K best distinct dives are
- *            hill-climbed (K = 16, diver --polish_top), then R kick-and-polish
+ *            hill-climbed (K = 32; diver --polish_top, default 64), then R kick-and-polish
  *            rounds run over K/2 walks
  *   keep     boards whose best is >= S, written by dv_flush sorted by score
  *
@@ -67,7 +67,7 @@ typedef struct {
     uint32_t dives;            /* M: dives per board (stage 1 + stage 2) */
     int      emit_score;       /* S: a finished board is kept when its best >= S */
     int      polish;           /* R: kick-and-polish rounds; < 0 = no polish */
-    int      polish_top;       /* K: dives polished per board, K/2 (rounded up) walks; 0 = 16 */
+    int      polish_top;       /* K: dives polished per board, K/2 (rounded up) walks; 0 = 32 */
     int      corner_seeds;     /* seeded copies per board with an alive corner block */
     bool     seed_corners;     /* the tc_* catalog is built and seeding may use it */
     uint64_t master_seed;      /* keys every board's random streams */
