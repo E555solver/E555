@@ -757,8 +757,9 @@ side under `--free_edges`/`--random_edges`.
      and the walks share `R` rounds. A round makes 4 swaps, each the least
      damaging of 16 random pairs with one piece at a broken edge, climbs again
      around the swapped cells, and accepts a board d edges worse with
-     probability `exp(-d/T)`, T cooling 3 -> 0.3 over the walk; each walk
-     returns the best board it met.
+     probability `exp(-d/T)`, T cooling 3 -> 0.3 over the walk. After each
+     quarter the worse half of the walks moves to the better half's boards;
+     each walk returns the best board it met.
    - The best board found replaces the board's best dive. `R = 0` runs the
      climb only.
 

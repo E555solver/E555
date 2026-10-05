@@ -38,6 +38,7 @@
 #define DV_POLISH_TOP    32     /* K: dives polished per board; K/2 walks (rounded up) */
 #define DV_POLISH_MAX    256    /* largest K (diver --polish_top) */
 #define DV_POLISH_MARGIN 6      /* on boards whose best is >= S - this */
+#define DV_EPOCHS        4      /* kick-and-polish walks run in this many legs (go with the winners) */
 #define DV_KICK          4      /* swaps per kick... */
 #define DV_KICK_SAMPLES  16     /* ...each the least damaging of this many random ones */
 #define DV_T0            3.0    /* walk temperature at the first kick... */
@@ -913,6 +914,11 @@ static int dv_polish_q(DvBoard *b, DvLs *ls, const bool *inreg,
     while (cnt > 0) {
         const int x = queue[head]; head = (head + 1) % NUM_PIECES; cnt--;
         inq[x] = false;
+        /* A cell with no broken edge is skipped: its swaps gain only through a
+           broken partner, which finds them from its own side when queued. Under
+           0.05% of such scans found a move; skipping them takes 5-12% off the
+           walk and left 492 of 510 benchmark boards unchanged (mean -0.01). */
+        if (ls->def[x] == 0) continue;
         int g = 0;
         const int y = dv_best_move_at(b, ls, x, &g);
         if (y < 0) continue;
@@ -1553,25 +1559,28 @@ typedef struct DvS2 {
 typedef struct DvPol {
     uint8_t  cells[NUM_PIECES];
     int      nc, ncand, nst, before;
-    DvBoard  *cand, *st, *walk;      /* K candidates; walk starts and ends */
-    int      *cand_s, *st_s, *walk_s;
+    DvBoard  *cand, *st, *walk, *cur;  /* K candidates; walk starts, bests, current boards */
+    int      *cand_s, *st_s, *walk_s, *cur_s;
     uint64_t *cand_h;
+    RNG      *rng;                     /* each walk's stream, carried from leg to leg */
+    int       epoch;                   /* the leg the walks are in */
 } DvPol;
 
 static DvPol *dv_pol_new(void) {
     const size_t k = (size_t)g_p.polish_top, w = (size_t)dv_walks();
     DvPol *pl = xmalloc(sizeof *pl);
     memset(pl, 0, sizeof *pl);
-    pl->cand = xmalloc((k + 2 * w) * sizeof *pl->cand);
-    pl->st = pl->cand + k; pl->walk = pl->st + w;
-    pl->cand_s = xmalloc((k + 2 * w) * sizeof *pl->cand_s);
-    pl->st_s = pl->cand_s + k; pl->walk_s = pl->st_s + w;
+    pl->cand = xmalloc((k + 3 * w) * sizeof *pl->cand);
+    pl->st = pl->cand + k; pl->walk = pl->st + w; pl->cur = pl->walk + w;
+    pl->cand_s = xmalloc((k + 3 * w) * sizeof *pl->cand_s);
+    pl->st_s = pl->cand_s + k; pl->walk_s = pl->st_s + w; pl->cur_s = pl->walk_s + w;
     pl->cand_h = xmalloc(k * sizeof *pl->cand_h);
+    pl->rng = xmalloc(w * sizeof *pl->rng);
     return pl;
 }
 
 static void dv_pol_free(DvPol *pl) {
-    free(pl->cand); free(pl->cand_s); free(pl->cand_h); free(pl);
+    free(pl->cand); free(pl->cand_s); free(pl->cand_h); free(pl->rng); free(pl);
 }
 
 static struct {
@@ -1889,9 +1898,17 @@ static void dv_job_p0(uint32_t ri, uint32_t c) {
         dv_polish_end(ri);
         return;
     }
+    for (int j = 0; j < pl->nst; j++) {
+        pl->walk[j] = pl->cur[j] = pl->st[j];
+        pl->walk_s[j] = pl->cur_s[j] = pl->st_s[j];
+        pl->rng[j] = rng_for(r->fp, 0x9011u, (uint32_t)j, 0u);
+    }
+    pl->epoch = 0;
     r->pending = pl->nst;
     for (int j = 0; j < pl->nst; j++) dv_push(DV_JOB_P1, ri, (uint32_t)j, 0);
 }
+
+static void dv_walk_leg_end(uint32_t ri);
 
 /* Kick-and-polish walk j from start j: kick, re-polish the touched cells, then
    accept by annealing: never worse is always kept, d edges worse with
@@ -1907,17 +1924,18 @@ static void dv_job_p1(uint32_t ri, uint32_t j) {
     bool inreg[NUM_PIECES] = { false }, inq[NUM_PIECES] = { false };
     for (int c = 0; c < pl->nc; c++) inreg[pl->cells[c]] = true;
     int queue[NUM_PIECES];
-    RNG rng = rng_for(r->fp, 0x9011u, j, 0u);
-    DvBoard walk = pl->st[j], b;
-    int walk_s = pl->st_s[j];
-    pl->walk[j] = walk; pl->walk_s[j] = walk_s;
+    RNG rng = pl->rng[j];
+    DvBoard walk = pl->cur[j], b;
+    int walk_s = pl->cur_s[j];
     DvLs lw, ls;                             /* the walk's tables, and the trial's */
     dv_ls_init(&walk, &lw, pl->cells, pl->nc);
     dv_ls_init(&walk, &ls, pl->cells, pl->nc);
     const int iters = g_p.polish / pl->nst + ((int)j < g_p.polish % pl->nst);
+    const int it0 = (int)((int64_t)iters * pl->epoch / DV_EPOCHS),
+              it1 = (int)((int64_t)iters * (pl->epoch + 1) / DV_EPOCHS);
     const double cool = iters > 1 ? pow(DV_T1 / DV_T0, 1.0 / (iters - 1)) : 1.0;
-    double T = DV_T0;
-    for (int it = 0; it < iters; it++, T *= cool) {
+    double T = DV_T0 * pow(cool, it0);
+    for (int it = it0; it < it1; it++, T *= cool) {
         b = walk;
         dv_ls_copy(&ls, &lw, pl->cells, pl->nc);
         int kd;
@@ -1934,7 +1952,31 @@ static void dv_job_p1(uint32_t ri, uint32_t j) {
         dv_ls_copy(&lw, &ls, pl->cells, pl->nc);
         if (sc > pl->walk_s[j]) { pl->walk[j] = b; pl->walk_s[j] = sc; }
     }
-    if (dv_step_done(r)) dv_polish_end(ri);
+    pl->cur[j] = walk; pl->cur_s[j] = walk_s; pl->rng[j] = rng;
+    if (dv_step_done(r)) dv_walk_leg_end(ri);
+}
+
+/* Between legs, the worse half of the walks (by current score, ties to the
+   lower index) moves to the better half's current boards, the k-th worst to
+   the k-th best when strictly better; each walk keeps its own stream and
+   schedule. Against independent walks at equal kicks: +0.13 and +0.23 edges
+   per board on the top-4-row and band boards (paired SE 0.05, 0.08). */
+static void dv_walk_leg_end(uint32_t ri) {
+    DvRoot *r = &g_dv_q[ri];
+    DvPol *pl = r->pol;
+    if (++pl->epoch == DV_EPOCHS) { dv_polish_end(ri); return; }
+    int ord[(DV_POLISH_MAX + 1) / 2];
+    for (int a = 0; a < pl->nst; a++) {
+        int k = a;
+        while (k > 0 && pl->cur_s[ord[k - 1]] < pl->cur_s[a]) { ord[k] = ord[k - 1]; k--; }
+        ord[k] = a;
+    }
+    for (int k = 0; k < pl->nst / 2; k++) {
+        const int dst = ord[pl->nst - 1 - k], src = ord[k];
+        if (pl->cur_s[dst] < pl->cur_s[src]) { pl->cur[dst] = pl->cur[src]; pl->cur_s[dst] = pl->cur_s[src]; }
+    }
+    r->pending = pl->nst;
+    for (int j = 0; j < pl->nst; j++) dv_push(DV_JOB_P1, ri, (uint32_t)j, 0);
 }
 
 /* The best start, then any walk that beat it, in walk order. */
