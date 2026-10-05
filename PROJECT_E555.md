@@ -1782,7 +1782,7 @@ node rate).
 | `--break_mode`, `--breaks K` | stuck, 0 | engine; break ceiling |
 | `--restarts N`, `--no_lcv` | 50000, off | dives; value ordering off |
 | `--order`, `--reverse`, `--jump` | mrv, off, off | cell order |
-| `--hall MODE`, `--hall_stride N`, `--hall_min N` | adaptive, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
+| `--hall MODE`, `--hall_stride N`, `--hall_min N` | root, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record |
 | `--max_emitted N` | 1 | completions per record (0 = all) |

@@ -38,8 +38,8 @@
  *   - Classic mode (--jump off, except 2sides/4sides) applies three sound
  *     completion prunes: a global empty-domain lower bound, incremental
  *     color/type accounting, and a Hall/deficiency bipartite-matching bound.
- *     Hall is always checked at the root and, by default, adaptively below it;
- *     --hall controls the policy.  With --jump on, or with an exact side-growth
+ *     Hall is checked at the root by default (--hall adaptive or always adds
+ *     checks below it).  --hall controls the policy.  With --jump on, or with an exact side-growth
  *     order, an impossible cell is deferred so independent gaps can keep
  *     growing and completion-only prunes are disabled.
  *   - --clue_center / --clue_corners force the published Eternity II hint
@@ -394,11 +394,16 @@ static const char *break_mode_name(BreakMode m) {
     }
 }
 
-/* Hall is exact but relatively expensive.  E555 always computes the root
- * deficiency unless disabled; below the root the default adaptive policy runs
- * it periodically and near the leaves instead of at almost every child. */
+/* Hall is exact but relatively expensive.  The default runs it once, at the
+ * record root, where it can prove a whole record infeasible or raise the first
+ * budget level.  Below the root it is opt-in (adaptive: periodically and near the
+ * leaves).  Measured on exact spiral tails of real boards, Hall below the root
+ * rejected 0.03-0.1% of placements yet cost about a quarter of the run time, and
+ * every node it cuts is one whose open cells cannot close with zero breaks --
+ * which rules out partials that a later, break-tolerant stage could still turn
+ * into a high-scoring board. */
 typedef enum { HALL_OFF = 0, HALL_ROOT, HALL_ADAPTIVE, HALL_ALWAYS } HallMode;
-static HallMode g_hall_mode = HALL_ADAPTIVE;
+static HallMode g_hall_mode = HALL_ROOT;
 static int      g_hall_stride = 8;       /* adaptive: every N placed tail cells */
 static int      g_hall_small  = 32;      /* adaptive: always when <= this many cells remain */
 #define HALL_TIGHT_DOMAIN 4
@@ -5789,7 +5794,7 @@ static void usage(const char *prog) {
         "                         a column-major tie-break instead of row-major.  No\n"
         "                         effect on 2sides/4sides.\n"
         "  --jump                 Best-partial mode: skip a dead cell and continue.\n"
-        "  --hall MODE            off, root, adaptive (default), or always.\n"
+        "  --hall MODE            off, root (default), adaptive, or always.\n"
         "  --no_hall              Alias for --hall off.\n"
         "  --hall_stride N        Adaptive Hall period in placements (default 8; 0=off).\n"
         "  --hall_min N           Adaptive Hall always-on threshold (default 32 cells).\n\n",
