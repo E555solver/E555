@@ -728,6 +728,10 @@ typedef struct {
 /* Immutable orientation cache.  v9 reconstructed these six bytes in every
  * break-candidate scan and placement; E555 builds the 1024 entries once. */
 static Oriented g_oriented[NUM_PIECES][4];
+/* Colours on any side of each piece: a frontier cell (FcState) whose placed neighbours
+ * demand a colour the piece lacks cannot hold it in any orientation. */
+static uint32_t g_piece_cols[NUM_PIECES];
+_Static_assert(NUM_COLORS <= 32, "need_cols stores one bit per colour");
 
 typedef struct Board {
     Oriented cell[PUZZLE_SIDE][PUZZLE_SIDE];
@@ -865,6 +869,9 @@ static void build_oriented_cache(void) {
             }
         }
         g_piece_spin_mask[pid] = mask;
+        const Oriented *o = &g_oriented[pid][0];
+        g_piece_cols[pid] = (1u << o->top) | (1u << o->right) |
+                            (1u << o->bottom) | (1u << o->left);
     }
     printf("[seed] distinct oriented pieces=%d/%d (rotational duplicates removed)\n",
            distinct_total, NUM_PIECES * 4);
@@ -1570,6 +1577,7 @@ static int piece_break_count(const Board *b, int row, int col, const Oriented *o
  */
 
 #define OMASK_WORDS ((NUM_PIECES * 4 + 63) / 64)
+#define CELL_WORDS  ((NUM_PIECES + 63) / 64)   /* one bit per board cell */
 
 typedef struct { uint64_t w[OMASK_WORDS]; } OMask;
 
@@ -1585,6 +1593,7 @@ static OMask g_fit_side[4][NUM_COLORS];
  */
 #define CELL_CLASSES 9
 static OMask g_cellbase_cls[CELL_CLASSES];
+
 
 static inline int cell_class(int row, int col) {
     return ((row == 0) ? 1 : (row == PUZZLE_SIDE-1) ? 2 : 0) * 3
@@ -1641,6 +1650,7 @@ static void build_fit_index(void) {
                 }
         }
     }
+
 }
 
 /* Per-search forward-checking state.  In addition to exact-fit masks, E555
@@ -1672,6 +1682,23 @@ typedef struct {
     uint8_t empty_list[NUM_PIECES];
     uint8_t empty_pos[NUM_PIECES];
     int16_t n_empty;
+    /*
+     * The frontier: empty cells with at least one placed neighbour, kept the
+     * same way.  An empty cell with none has the domain "every unused piece of
+     * its type", whose size is base_avail[class] and is never zero (type counts
+     * balance), so only frontier cells need dom_count moved on every place and
+     * unplace; fc_exact_count() answers for the rest.  On a spiral tail half the
+     * empty cells or more are off the frontier, and that loop was two thirds of
+     * the exact search's instructions.  need_cols[cell] is the set of colours the
+     * placed neighbours demand, and col_bits[x] the frontier cells demanding x:
+     * a piece can only sit in a cell that demands one of its own (at most four)
+     * colours, so fc_adjust_piece_support() walks the union of four sets rather
+     * than the frontier, then drops cells demanding a colour the piece lacks.
+     * fc_compute_cell() keeps all of it current.
+     */
+    uint64_t fr_bits[CELL_WORDS];                 /* the frontier, one bit per cell */
+    uint64_t col_bits[NUM_COLORS][CELL_WORDS];    /* frontier cells demanding colour x */
+    uint32_t need_cols[NUM_PIECES];
     int16_t zero_domains;       /* empty cells with no exact-fit orientation */
     int16_t required_color[NUM_COLORS];
     int16_t need_type[3];
@@ -1694,6 +1721,26 @@ static inline void fc_empty_remove(FcState *fc, int r, int c) {
     fc->empty_list[at]  = (uint8_t)last;
     fc->empty_pos[last] = (uint8_t)at;
 }
+
+static inline bool fc_fr_in(const FcState *fc, int cell) {
+    return (fc->fr_bits[cell >> 6] >> (cell & 63)) & 1ULL;
+}
+
+/* Set a frontier cell's demanded colours, moving its bit between col_bits
+ * sets; need 0 with in == false takes it off the frontier. */
+static inline void fc_fr_set(FcState *fc, int cell, bool in, uint32_t need) {
+    const int w = cell >> 6;
+    const uint64_t bit = 1ULL << (cell & 63);
+    uint32_t old = fc_fr_in(fc, cell) ? fc->need_cols[cell] : 0;
+    if (in) fc->fr_bits[w] |= bit; else fc->fr_bits[w] &= ~bit;
+    if (!in) need = 0;
+    fc->need_cols[cell] = need;
+    for (uint32_t gone = old & ~need; gone; gone &= gone - 1)
+        fc->col_bits[__builtin_ctz(gone)][w] &= ~bit;
+    for (uint32_t added = need & ~old; added; added &= added - 1)
+        fc->col_bits[__builtin_ctz(added)][w] |= bit;
+}
+
 
 static const int g_dr[4] = { 1, 0,-1, 0 };
 static const int g_dc[4] = { 0, 1, 0,-1 };
@@ -1731,27 +1778,50 @@ static void fc_compute_cell(const Board *b, FcState *fc, int r, int c) {
     uint16_t old = fc->dom_count[r][c];
     if (old != DOM_PLACED && old == 0) fc->zero_domains--;
 
+    /* Whole-mask operations on purpose: 16 words are two AVX-512 registers, and
+     * a word-by-word loop over the words the class can use measured slower. */
     OMask m = *cellbase(r, c);
+    uint32_t need = 0;
+    bool placed_nb = false;
     if (r+1 < PUZZLE_SIDE) {
         const Oriented *nb = &b->cell[r+1][c];
-        if (nb->piece_id != EMPTY_PIECE) omask_and(&m, &g_fit_side[0][nb->bottom]);
+        if (nb->piece_id != EMPTY_PIECE) {
+            omask_and(&m, &g_fit_side[0][nb->bottom]);
+            need |= 1u << nb->bottom;
+            placed_nb = true;
+        }
     }
     if (c+1 < PUZZLE_SIDE) {
         const Oriented *nb = &b->cell[r][c+1];
-        if (nb->piece_id != EMPTY_PIECE) omask_and(&m, &g_fit_side[1][nb->left]);
+        if (nb->piece_id != EMPTY_PIECE) {
+            omask_and(&m, &g_fit_side[1][nb->left]);
+            need |= 1u << nb->left;
+            placed_nb = true;
+        }
     }
     if (r > 0) {
         const Oriented *nb = &b->cell[r-1][c];
-        if (nb->piece_id != EMPTY_PIECE) omask_and(&m, &g_fit_side[2][nb->top]);
+        if (nb->piece_id != EMPTY_PIECE) {
+            omask_and(&m, &g_fit_side[2][nb->top]);
+            need |= 1u << nb->top;
+            placed_nb = true;
+        }
     }
     if (c > 0) {
         const Oriented *nb = &b->cell[r][c-1];
-        if (nb->piece_id != EMPTY_PIECE) omask_and(&m, &g_fit_side[3][nb->right]);
+        if (nb->piece_id != EMPTY_PIECE) {
+            omask_and(&m, &g_fit_side[3][nb->right]);
+            need |= 1u << nb->right;
+            placed_nb = true;
+        }
     }
     fc->nbmask[r][c] = m;
     int n = omask_intersection_count(&m, &fc->unused4);
     fc->dom_count[r][c] = (uint16_t)n;
     if (n == 0) fc->zero_domains++;
+
+    /* Frontier membership and demanded colours follow the placed neighbours. */
+    fc_fr_set(fc, r * PUZZLE_SIDE + c, placed_nb, need);
 }
 
 #if defined(VERIFY_INDEX) || defined(VERIFY_AVAIL)
@@ -1810,11 +1880,22 @@ static inline void fc_adjust_piece_support(FcState *fc, int pid, int sign) {
     for (int k = 0; k < CELL_CLASSES; k++)
         fc->base_avail[k] += sign * __builtin_popcountll(g_cellbase_cls[k].w[wi] & bits);
 
-    for (int i = 0; i < fc->n_empty; i++) {
-        int cell = fc->empty_list[i];
+    /* Only frontier cells: off it a domain is base_avail[class], moved above.
+     * And only those demanding one of the piece's colours -- any other demands
+     * a colour it lacks.  The frontier holds empty cells only, so none reads
+     * DOM_PLACED; the cell dfs_unplace() restores joins it in fc_compute_cell(). */
+    const uint32_t lacks = ~g_piece_cols[pid];
+    uint64_t cand[CELL_WORDS] = {0};
+    for (uint32_t pc = g_piece_cols[pid]; pc; pc &= pc - 1) {
+        const uint64_t *cb = fc->col_bits[__builtin_ctz(pc)];
+        for (int w = 0; w < CELL_WORDS; w++) cand[w] |= cb[w];
+    }
+    for (int w = 0; w < CELL_WORDS; w++)
+    for (uint64_t m = cand[w]; m; m &= m - 1) {
+        int cell = w * 64 + __builtin_ctzll(m);
+        if (fc->need_cols[cell] & lacks) continue;  /* piece lacks a demanded colour */
         int r = cell / PUZZLE_SIDE, c = cell % PUZZLE_SIDE;
         uint16_t old = fc->dom_count[r][c];
-        if (old == DOM_PLACED) continue; /* emptied by unplace, not recomputed yet */
         int delta = __builtin_popcountll(fc->nbmask[r][c].w[wi] & bits);
         if (delta == 0) continue;
         int next = (int)old + sign * delta;
@@ -1839,9 +1920,31 @@ static void fc_verify_state(const Board *b, const FcState *fc, const char *where
                 continue;
             }
             int n = omask_intersection_count(&fc->nbmask[r][c], &fc->unused4);
-            if (n != (int)fc->dom_count[r][c])
-                fatal("%s: domain count (%d,%d) cached=%u actual=%d", where, r, c,
-                      (unsigned)fc->dom_count[r][c], n);
+            int cell = r * PUZZLE_SIDE + c;
+            bool placed_nb = false;
+            uint32_t need = 0;
+            for (int dir = 0; dir < 4; dir++) {
+                int nr = r + g_dr[dir], nc = c + g_dc[dir];
+                if (nr < 0 || nr >= PUZZLE_SIDE || nc < 0 || nc >= PUZZLE_SIDE) continue;
+                const Oriented *nb = &b->cell[nr][nc];
+                if (nb->piece_id == EMPTY_PIECE) continue;
+                placed_nb = true;
+                need |= 1u << nb_edge_toward(nb, dir);
+            }
+            const bool in = fc_fr_in(fc, cell);
+            if (placed_nb != in)
+                fatal("%s: (%d,%d) frontier flag %d but placed neighbours %d", where,
+                      r, c, (int)in, (int)placed_nb);
+            if (in && need != fc->need_cols[cell])
+                fatal("%s: (%d,%d) need_cols cached=%#x actual=%#x", where, r, c,
+                      (unsigned)fc->need_cols[cell], (unsigned)need);
+            /* Off the frontier dom_count is left stale on purpose and the domain
+             * is base_avail[class]; what a reader sees is fc_exact_count(). */
+            int cached = in ? (int)fc->dom_count[r][c]
+                                         : fc->base_avail[cell_class(r, c)];
+            if (n != cached)
+                fatal("%s: domain count (%d,%d) cached=%d actual=%d (frontier %d)",
+                      where, r, c, cached, n, (int)in);
             if (n == 0) zeros++;
         }
     }
@@ -1883,6 +1986,22 @@ static void fc_verify_state(const Board *b, const FcState *fc, const char *where
             fatal("%s: empty list holds %d cells, board has %d", where,
                   (int)fc->n_empty, n_empty);
     }
+
+    /* Placed cells are off the frontier, and every colour set holds exactly the
+     * frontier cells demanding that colour, or a cell silently stops receiving
+     * domain updates for the pieces that carry it. */
+    for (int cell = 0; cell < NUM_PIECES; cell++) {
+        const bool in = fc_fr_in(fc, cell);
+        if (in && b->cell[cell / PUZZLE_SIDE][cell % PUZZLE_SIDE].piece_id != EMPTY_PIECE)
+            fatal("%s: placed cell %d is on the frontier", where, cell);
+        for (int x = 0; x < NUM_COLORS; x++) {
+            bool want = in && ((fc->need_cols[cell] >> x) & 1u);
+            bool have = (fc->col_bits[x][cell >> 6] >> (cell & 63)) & 1ULL;
+            if (want != have)
+                fatal("%s: col_bits[%d] has cell %d = %d, expected %d", where, x,
+                      cell, (int)have, (int)want);
+        }
+    }
 }
 #endif
 
@@ -1901,6 +2020,7 @@ static inline void dfs_place(Board *b, FcState *fc, int r, int c, int pid, int s
     if (fc->dom_count[r][c] == 0) fc->zero_domains--;
     fc->dom_count[r][c] = DOM_PLACED;
     fc_empty_remove(fc, r, c);
+    fc_fr_set(fc, r * PUZZLE_SIDE + c, false, 0);
 
     fc->need_type[cell_frame_degree(r, c)]--;
     for (int dir = 0; dir < 4; dir++) {
@@ -1965,11 +2085,14 @@ static inline void dfs_unplace(Board *b, FcState *fc, int r, int c) {
 
 /* Number of exact fits (0-break placements of unused pieces) at empty (r,c). */
 static inline int fc_exact_count(const FcState *fc, int r, int c) {
-    return (int)fc->dom_count[r][c];
+    /* Off the frontier dom_count is not maintained: the domain is every unused
+     * piece of the cell's type, which base_avail counts exactly. */
+    return fc_fr_in(fc, r * PUZZLE_SIDE + c) ? (int)fc->dom_count[r][c]
+                                          : (int)fc->base_avail[cell_class(r, c)];
 }
 
 static inline bool fc_dom_nonzero(const FcState *fc, int r, int c) {
-    return fc->dom_count[r][c] != 0;
+    return fc_exact_count(fc, r, c) != 0;
 }
 
 
@@ -3483,7 +3606,7 @@ static int count_break_candidates_scan(const Board *b, const FcState *fc,
 
     int n;
     if (budget >= d) {
-        n = fc->base_avail[cell_class(row, col)] - (int)fc->dom_count[row][col];
+        n = fc->base_avail[cell_class(row, col)] - fc_exact_count(fc, row, col);
     } else {
         OMask base = *cellbase(row, col);
         omask_and(&base, &fc->unused4);
@@ -3621,10 +3744,9 @@ static int collect_candidates(const Board *b, const FcState *fc,
 #ifdef VERIFY_BREAKCOUNT
         {   /* out[0] must be the exact-fit domain, and the admissible break
              * candidates must be exactly what the old scan produced. */
-            if (omask_popcount(&cls[0]) != (int)fc->dom_count[row][col])
-                fatal("VERIFY_BREAKCOUNT: (r=%d,c=%d) class 0 has %d bits, dom_count %u",
-                      row, col, omask_popcount(&cls[0]),
-                      (unsigned)fc->dom_count[row][col]);
+            if (omask_popcount(&cls[0]) != fc_exact_count(fc, row, col))
+                fatal("VERIFY_BREAKCOUNT: (r=%d,c=%d) class 0 has %d bits, exact count %d",
+                      row, col, omask_popcount(&cls[0]), fc_exact_count(fc, row, col));
             int chk = break_count_reference(b, fc, row, col, remaining_budget);
             if (chk != n - exact)
                 fatal("VERIFY_BREAKCOUNT: (r=%d,c=%d) emitted %d break candidates, scan %d",
@@ -3804,7 +3926,7 @@ static int lcv_pick(Board *b, FcState *fc, int row, int col,
             int nr = row + g_dr[dir], nc = col + g_dc[dir];
             if (nr >= 0 && nr < PUZZLE_SIDE && nc >= 0 && nc < PUZZLE_SIDE &&
                 b->cell[nr][nc].piece_id == EMPTY_PIECE)
-                nb += (int)fc->dom_count[nr][nc];
+                nb += fc_exact_count(fc, nr, nc);
         }
         const int brk = (int)cand[ci].breaks, zd = (int)fc->zero_domains;
         dfs_unplace(b, fc, row, col);
