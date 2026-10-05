@@ -33,6 +33,7 @@ bash tests/run_tests.sh 6 8-11 roundhouse_cache         # by number, range or na
 ```
 
 - After a change, run the core set plus the tags of the tools you touched: `tools` (Python tools), `annealer`, `finalizer`, `roundhouse`, `backtracker`, `diver`, `beamer`, `cpsat`, `scripts`, `pipeline`. Shared sources: `E555_database.c` -> `beamer finalizer roundhouse diver`; `E555_dive.c` -> `beamer finalizer diver`. Run `--all` only before a release or when asked.
+- Selection pitfalls: `core` is not a tag (the no-argument run is the core set), so run it as a separate invocation from a tag run. A word that is both a check name and a tag selects only the check: `diver` and `annealer` run one check each, not their tags. For those tags, pass the numbers that `--list` shows.
 - The `ALL_STEPS` array at the top of `run_tests.sh` is the only list of checks. Each entry `name|tier|tags|label` has a matching `step_name` function. To add a check, add both; make it `core` only if it is fast and guards something no core check does.
 - Each check runs on its own and never depends on an earlier check's artifacts. If check 1 (`compile`) isn't selected, the checks use whatever is already in `bin/`.
 - The `beamer` checks and `pipeline_full` need the real 6.4 GB chain database (~8 GB RAM). Set `SKIP_BEAMER=1` to skip them, `DB_FILE=path` to keep a persistent DB cache, or `DB_IN_MEMORY=1` to avoid writing it to disk.
@@ -70,4 +71,12 @@ tools/   viewer, rank (--rescore), rotate (--sink), distiller (dive screen -> fi
 - **Top-corner supply (`--lambda_corners`)**, beamer and finalizer: the exact catalog of legal top-corner blocks, alive counting and the stop-row report are shared `tc_*` code in `E555_database.c/.h`; each tool only wires the score, the column filter and the CLI.
 - **Script/runner convention** (`examples/`, `pipeline/`): each script opens with a block of plain settings, overridden by `NAME=value` **arguments** (not environment variables). Stages hand off through the `outputs.txt` each tool writes and pass `--print_cmd` so the log records the exact commands. `examples/` is for learning single tools. `pipeline/` holds long unattended runs, plus `slurm_wrapper.sh` for clusters.
 - Run products (`beam_out/`, `final_out/`, `tests/out/`, `*.db_cache`, `rotations.csv`, …) are gitignored. Don't commit them.
+- **End-dive engine** (`E555_dive.c`): its tuning constants are the `DV_*` defines at the top of the file (measured; PROJECT_E555.md 5.11). To expose one in a single tool, add a `DvParams` field whose 0 means the built-in default; tools that don't set it keep byte-identical output (example: the diver's `--polish_top`).
 - `agent/` holds an experimental, untested autonomous `/goal` kit. It is not part of the toolchain.
+
+## Working conventions
+
+- **Git:** other sessions also push to `main`. Before pushing to it, `git fetch origin main` and rebase your branch onto it. Push `main` only as a fast-forward, never with force.
+- **Docs:** PROJECT_E555.md documents behaviour and flags concisely. Small internal details stay in code comments.
+- **Output:** every stdout line must be useful to the user running the tool. Diagnostics go behind `--verbose` or a test-only environment variable.
+- **Before blaming a change for a failing check,** run that check against a binary built from the base commit.
