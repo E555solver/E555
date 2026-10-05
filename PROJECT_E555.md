@@ -745,7 +745,8 @@ side under `--free_edges`/`--random_edges`.
    `w += 0.3 log((votes + 1/2) / (expected + 1/2))`, clipped to +-2.
 3. **Polish** (`--end_polish R`) improves dives that are already finished; it
    does not dive again. Stages 1 and 2 keep each board's 16 best distinct
-   dives, not just the best one. A board whose best dive is within 6 of `S` is
+   dives, not just the best one (`E555_diver --polish_top K`: K, with K/2
+   walks). A board whose best dive is within 6 of `S` is
    polished; a board further below rarely reaches `S`. Only pieces placed by
    the dives move.
    - **Climb:** each of the 16 dives is hill-climbed: turn one piece or swap
@@ -1564,6 +1565,7 @@ The breaks a dive leaves in the top rows of a Stage B board are forced by the pi
 | `--cap_top [N]` | 1 | as the beamer's: of the longest extensions keep the one whose top-left border closes over the most whole columns, and place that closure (0 = off) |
 | `--end_dive M` | 10000 | dives per board; 0 = write the prepared boards |
 | `--end_polish R` | off | polish plus R kick rounds |
+| `--polish_top K` | 16 | dives polished per board, K/2 walks (1..256) |
 | `--emit_score S` | 450 | write boards whose best is >= S |
 | `--rotations FILE` | free edges | hold edge pieces to their dealt sides |
 | `--corner_seeds N` | 0 | corner-seeded copies (needs `--rotations`) |

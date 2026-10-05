@@ -120,6 +120,7 @@ static int         g_nspec = 0;
 static const char *g_rot_path     = NULL;    /* --rotations FILE */
 static uint32_t    g_dives        = DR_M_DEFAULT;
 static int         g_polish       = -1;      /* --end_polish R; -1 = off */
+static int         g_polish_top   = 16;      /* --polish_top K */
 static int         g_emit         = DR_S_DEFAULT;
 static int         g_seeds        = 0;       /* --corner_seeds N; 0 = off */
 static uint64_t    g_rng          = DR_SEED_DEFAULT;
@@ -1049,6 +1050,7 @@ static void usage(const char *prog) {
         "Options:\n"
         "  --end_dive M        dives per board (default %d)\n"
         "  --end_polish R      polish the winners with R kick-and-polish rounds (default off)\n"
+        "  --polish_top K      polish each board's K best dives, with K/2 walks (default 16)\n"
         "  --emit_score S      write a board when its best finish is >= S (default %d)\n"
         "  --rotations FILE    Stage A rotations: a beamer id \"r<N>b...\" holds edge pieces to\n"
         "                      the sides row N deals them (default: any edge on any border cell)\n"
@@ -1109,6 +1111,7 @@ static void usage(const char *prog) {
 static void print_cmd(const char *a0, const char *seed, const char *in, const char *out) {
     printf("[cmd] %s %s %s %s --end_dive %u --emit_score %d", a0, seed, in, out, g_dives, g_emit);
     if (g_polish >= 0)                printf(" --end_polish %d", g_polish);
+    if (g_polish_top != 16)           printf(" --polish_top %d", g_polish_top);
     if (g_rot_path)                   printf(" --rotations %s", g_rot_path);
     if (g_seeds)                      printf(" --corner_seeds %d", g_seeds);
     if (g_clue_mask & CLUE_CORNERS)   printf(" --clue_corners");
@@ -1151,6 +1154,10 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--end_polish") && i + 1 < argc) {
             g_polish = atoi(argv[++i]);
             if (g_polish < 0) fatal("--end_polish must be >= 0");
+        }
+        else if (!strcmp(argv[i], "--polish_top") && i + 1 < argc) {
+            g_polish_top = atoi(argv[++i]);
+            if (g_polish_top < 1 || g_polish_top > 256) fatal("--polish_top must be in 1..256");
         }
         else if (!strcmp(argv[i], "--emit_score")  && i + 1 < argc) g_emit = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rotations")   && i + 1 < argc) g_rot_path = argv[++i];
@@ -1286,8 +1293,9 @@ int main(int argc, char **argv) {
         g_clue_orients = (uint8_t)(1u << g_orient);
     }
     if (g_print_cmd) print_cmd(argv[0], seed_path, in_path, out_path);
-    printf("[cfg] dives=%u polish=%d emit_score=%d frame=%s corner_seeds=%d%s threads=%d rng_seed=%" PRIu64 "\n",
-           g_dives, g_polish, g_emit, g_rot_path ? g_rot_path : "(free edges)", g_seeds,
+    printf("[cfg] dives=%u polish=%d polish_top=%d emit_score=%d frame=%s corner_seeds=%d%s threads=%d "
+           "rng_seed=%" PRIu64 "\n", g_dives, g_polish, g_polish_top, g_emit,
+           g_rot_path ? g_rot_path : "(free edges)", g_seeds,
            (g_clue_mask & CLUE_CORNERS) ? " (clue 2x3)" : "", g_nthreads, g_rng);
     if (g_holes_arg || g_pin || g_backtrack || g_rec_start || g_rec_count) {
         printf("[cfg] records=%" PRIu64 "..", g_rec_start);
@@ -1324,7 +1332,7 @@ int main(int argc, char **argv) {
     g_deadline = deadline;
     DvParams dp = {
         .dives = g_dives, .emit_score = g_emit, .polish = g_polish,
-        .corner_seeds = g_seeds, .seed_corners = g_seeds > 0,
+        .polish_top = g_polish_top, .corner_seeds = g_seeds, .seed_corners = g_seeds > 0,
         .master_seed = g_rng, .max_written = g_max_written,
         .deadline = deadline, .threads = g_nthreads, .stop = &g_stop,
         .prior = g_prior, .nogo = g_nogo, .order_weight = g_order_weight,

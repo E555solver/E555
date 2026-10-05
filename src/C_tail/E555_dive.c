@@ -34,9 +34,9 @@
 #define DV_S2_MARGIN     4      /* stage 2 for stage-1 best >= S - this... */
 #define DV_S2_MIN_SHARE  0.20   /* ...and if that promotes under this share, */
 #define DV_S2_TOP_SHARE  0.10   /* also this top share by stage-1 best */
-#define DV_POLISH_TOP    16     /* dives polished per board */
+#define DV_POLISH_TOP    16     /* K: dives polished per board; K/2 walks (rounded up) */
+#define DV_POLISH_MAX    256    /* largest K (diver --polish_top) */
 #define DV_POLISH_MARGIN 6      /* on boards whose best is >= S - this */
-#define DV_WALKS         8      /* kick-and-polish walks per board */
 #define DV_KICK          3      /* random swaps per kick */
 
 #define DV_WORDS      ((NUM_PIECES * 4) / 64)
@@ -739,11 +739,23 @@ static int dv_kick(DvBoard *b, const uint8_t *cells, int nc, const bool *inreg,
    the same however the dives were split into jobs and merged: the top K of a
    union is the top K of the union of the parts' top K. */
 typedef struct {
-    int      n;
-    int      s[DV_POLISH_TOP];
-    uint64_t idx[DV_POLISH_TOP], fp[DV_POLISH_TOP];
-    uint8_t  brd[DV_POLISH_TOP][2 * NUM_PIECES];   /* pid[256] then rot[256], per cell */
+    int       n;
+    uint64_t *idx, *fp;
+    int      *s;
+    uint8_t (*brd)[2 * NUM_PIECES];   /* pid[256] then rot[256], per cell */
 } DvTop;
+
+static inline int dv_walks(void) { return (g_p.polish_top + 1) / 2; }
+
+static DvTop *dv_top_new(void) {
+    const size_t k = (size_t)g_p.polish_top;
+    DvTop *t = xmalloc(sizeof *t + k * (2 * sizeof(uint64_t) + sizeof(int) + 2 * NUM_PIECES));
+    t->n = 0;
+    t->idx = (uint64_t *)(t + 1); t->fp = t->idx + k;
+    t->s = (int *)(t->fp + k);
+    t->brd = (uint8_t (*)[2 * NUM_PIECES])(t->s + k);
+    return t;
+}
 
 struct DvS2;
 struct DvPol;
@@ -824,6 +836,8 @@ static struct {
 
 void dv_init(const DvParams *p) {
     g_p = *p;
+    if (g_p.polish_top <= 0) g_p.polish_top = DV_POLISH_TOP;
+    if (g_p.polish_top > DV_POLISH_MAX) fatal("polish_top must be in 1..%d", DV_POLISH_MAX);
     dv_build_static();
 }
 
@@ -1119,7 +1133,7 @@ typedef struct {
     int16_t pslot[NUM_PIECES], xslot[NUM_PIECES];
     float   tpos[NUM_PIECES];        /* the root's fill-order key, per cell */
     bool    ordered;                 /* tpos is live: the root's order is not MRV */
-    DvTop   top;                     /* the job's own polish candidates */
+    DvTop  *top;                     /* the job's own polish candidates */
 } DvWork;
 
 /* A fill order's key per open cell: order_weight x a place in [0, 1] of the
@@ -1193,7 +1207,7 @@ static void dv_top_offer(DvTop *t, int s, uint64_t idx, uint64_t fp, const uint8
             return;
         }
     int at;
-    if (t->n < DV_POLISH_TOP) at = t->n++;
+    if (t->n < g_p.polish_top) at = t->n++;
     else {
         at = 0;                               /* the last in key order */
         for (int i = 1; i < t->n; i++)
@@ -1224,7 +1238,7 @@ static void dv_local_take(DvLocal *l, DvWork *k, const DvBoard *b, int s, uint64
     const bool better = l->best < 0 || dv_key_before(s, idx, l->best, l->best_idx);
     if (better || polish) dv_board_bytes(b, brd);
     if (better) { l->best = s; l->best_idx = idx; memcpy(l->brd, brd, sizeof brd); }
-    if (polish) dv_top_offer(&k->top, s, idx, dv_board_fp(b), brd);
+    if (polish) dv_top_offer(k->top, s, idx, dv_board_fp(b), brd);
 }
 
 /* ============================================================================
@@ -1268,12 +1282,26 @@ typedef struct DvS2 {
 typedef struct DvPol {
     uint8_t  cells[NUM_PIECES];
     int      nc, ncand, nst, before;
-    DvBoard  cand[DV_POLISH_TOP];
-    int      cand_s[DV_POLISH_TOP];
-    uint64_t cand_h[DV_POLISH_TOP];
-    DvBoard  st[DV_WALKS], walk[DV_WALKS];
-    int      st_s[DV_WALKS], walk_s[DV_WALKS];
+    DvBoard  *cand, *st, *walk;      /* K candidates; walk starts and ends */
+    int      *cand_s, *st_s, *walk_s;
+    uint64_t *cand_h;
 } DvPol;
+
+static DvPol *dv_pol_new(void) {
+    const size_t k = (size_t)g_p.polish_top, w = (size_t)dv_walks();
+    DvPol *pl = xmalloc(sizeof *pl);
+    memset(pl, 0, sizeof *pl);
+    pl->cand = xmalloc((k + 2 * w) * sizeof *pl->cand);
+    pl->st = pl->cand + k; pl->walk = pl->st + w;
+    pl->cand_s = xmalloc((k + 2 * w) * sizeof *pl->cand_s);
+    pl->st_s = pl->cand_s + k; pl->walk_s = pl->st_s + w;
+    pl->cand_h = xmalloc(k * sizeof *pl->cand_h);
+    return pl;
+}
+
+static void dv_pol_free(DvPol *pl) {
+    free(pl->cand); free(pl->cand_s); free(pl->cand_h); free(pl);
+}
 
 static struct {
     DvJob     *q;
@@ -1377,7 +1405,7 @@ static void dv_job_s1(DvWork *k, uint32_t ri, uint32_t a, uint32_t cnt) {
     DvRoot *r = &g_dv_q[ri];
     const bool polish = r->top != NULL;
     dv_work_root(k, r);
-    k->top.n = 0;
+    k->top->n = 0;
     /* Plain dives, or with an incumbent's prior dives pulled by it. */
     const DvPolicy prior = { r->w0, k->pslot, k->xslot, k->ncell, DV_S2_BETA };
     const DvPolicy *pol = r->w0 ? &prior : NULL;
@@ -1391,7 +1419,7 @@ static void dv_job_s1(DvWork *k, uint32_t ri, uint32_t a, uint32_t cnt) {
         dv_dive(&k->b, &k->f, k->cells, k->ncell, &rng, pol, tpos);
         dv_local_take(&l, k, &k->b, dv_score(&k->b), i, polish);
     }
-    dv_merge(ri, &l, polish ? &k->top : NULL, stopped);
+    dv_merge(ri, &l, polish ? k->top : NULL, stopped);
 }
 
 /* -- Stage 2: learning rounds -------------------------------------------------- */
@@ -1494,7 +1522,7 @@ static void dv_job_s2(DvWork *k, uint32_t ri, uint32_t a, uint32_t cnt) {
     DvS2 *s = r->s2;
     const bool polish = r->top != NULL;
     dv_work_root(k, r);
-    k->top.n = 0;
+    k->top->n = 0;
     const DvPolicy pol = { s->w, k->pslot, k->xslot, k->ncell, DV_S2_BETA };
     DvLocal l = { .best = -1 };
     bool stopped = false;
@@ -1509,7 +1537,7 @@ static void dv_job_s2(DvWork *k, uint32_t ri, uint32_t a, uint32_t cnt) {
         for (int j = 0; j < k->ncell; j++) pl[j] = (uint8_t)k->b.c[k->cells[j]].piece_id;
         dv_local_take(&l, k, &k->b, sc, s->idx0 + i, polish);
     }
-    dv_merge(ri, &l, polish ? &k->top : NULL, stopped);
+    dv_merge(ri, &l, polish ? k->top : NULL, stopped);
     if (!dv_step_done(r)) return;
     /* The round's last job: learn from it and release the next. */
     if (!r->stopped && s->rd < DV_ROUNDS - 1) dv_cem(s, (int)s->nd);
@@ -1536,8 +1564,7 @@ static void dv_polish_begin(uint32_t ri) {
             memcpy(tmp, t->brd[b], sizeof tmp); memcpy(t->brd[b], t->brd[b-1], sizeof tmp);
             memcpy(t->brd[b-1], tmp, sizeof tmp);
         }
-    DvPol *pl = xmalloc(sizeof *pl);
-    memset(pl, 0, sizeof *pl);
+    DvPol *pl = dv_pol_new();
     for (int x = 0; x < NUM_PIECES; x++)
         if (r->base_pid[x] == DV_EMPTY) pl->cells[pl->nc++] = (uint8_t)x;
     pl->ncand = t->n;
@@ -1567,17 +1594,17 @@ static void dv_job_p0(uint32_t ri, uint32_t c) {
     }
     pl->cand_s[c] = sc; pl->cand_h[c] = h;
     if (!dv_step_done(r)) return;
-    /* The last candidate: keep the best DV_WALKS distinct polished boards as the
-       walks' starts, in candidate order, then release the walks. */
-    int st_t[DV_WALKS];
-    uint64_t st_h[DV_WALKS];
+    /* The last candidate: keep the best K/2 (rounded up) distinct polished
+       boards as the walks' starts, in candidate order, then release the walks. */
+    int st_t[(DV_POLISH_MAX + 1) / 2];
+    uint64_t st_h[(DV_POLISH_MAX + 1) / 2];
     pl->nst = 0;
     for (int t = 0; t < pl->ncand; t++) {
         bool dup = false;
         for (int j = 0; j < pl->nst; j++) if (st_h[j] == pl->cand_h[t]) dup = true;
         if (dup) continue;
         int at = -1;
-        if (pl->nst < DV_WALKS) at = pl->nst++;
+        if (pl->nst < dv_walks()) at = pl->nst++;
         else {
             int lo = 0;
             for (int j = 1; j < pl->nst; j++) if (pl->st_s[j] < pl->st_s[lo]) lo = j;
@@ -1648,7 +1675,7 @@ static void dv_polish_end(uint32_t ri) {
         r->best = cur_s;
     }
     omp_unset_lock(&g_dv_lock[ri]);
-    free(pl);
+    dv_pol_free(pl);
     r->pol = NULL;
 }
 
@@ -1789,7 +1816,10 @@ void dv_run(const char *id) {
     if (!g_js.cap) omp_init_lock(&g_js.lock);
     if (g_dv_nwork < nt) {
         g_dv_work = xrealloc(g_dv_work, (size_t)nt * sizeof *g_dv_work);
-        for (int t = g_dv_nwork; t < nt; t++) g_dv_work[t] = xmalloc(sizeof(DvWork));
+        for (int t = g_dv_nwork; t < nt; t++) {
+            g_dv_work[t] = xmalloc(sizeof(DvWork));
+            g_dv_work[t]->top = dv_top_new();
+        }
         g_dv_nwork = nt;
     }
     if (g_dv_lock_n < n) {
@@ -1804,7 +1834,7 @@ void dv_run(const char *id) {
         q[i].top = NULL; q[i].s2 = NULL; q[i].pol = NULL; q[i].w0 = NULL;
         q[i].pending = 0; q[i].stopped = false; q[i].best = -1; q[i].best_idx = 0;
         q[i].dives = 0; q[i].own = -1; q[i].moved = false;
-        if (polish) { q[i].top = xmalloc(sizeof(DvTop)); q[i].top->n = 0; }
+        if (polish) q[i].top = dv_top_new();
         if (q[i].inc_score >= 0) {
             /* The incumbent is the best so far; a dive must beat it (index 0
                wins every tie), so the board kept is never worse. On the
