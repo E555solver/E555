@@ -2085,12 +2085,12 @@ EOF
     cmp -s "$OUT/er_off0.csv" "$OUT/er_off.csv" || fail "--early_release 0 changed the output"
 
     # Anything that would make "N cells before the end" mean something else is refused.
-    for extra in "--breaks 5" "--jump" "--order 2sides" "--stop_row 3"; do
+    for extra in "--breaks 5" "--jump" "--order 2sides" "--stop_row 3" "--max_emitted 2"; do
         "${bt[@]}" "$OUT/er_bad.csv" --early_release 10 $extra > "$OUT/er_bad.log" 2>&1 \
             && fail "--early_release accepted $extra"
         grep -q -- "--early_release" "$OUT/er_bad.log" || fail "no --early_release refusal for $extra"
     done
-    echo "ok: N=0 is the plain run; --breaks, --jump, 2sides and --stop_row refused"
+    echo "ok: N=0 is the plain run; --breaks, --jump, 2sides, --stop_row and --max_emitted 2 refused"
 }
 
 # The mismatch engines no longer test candidates one at a time: a placement's

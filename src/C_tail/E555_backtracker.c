@@ -5706,7 +5706,7 @@ static void usage(const char *prog) {
         "                         N=60 the border ring, centerout a disc (not a ring);\n"
         "                         mrv leaves whichever N cells remain.  The search above\n"
         "                         is unchanged: the open cells still count in every\n"
-        "                         completion prune.  --max_emitted counts releases.\n"
+        "                         completion prune.  One board per record.\n"
         "                         Requires --breaks 0; refused with 2sides/4sides,\n"
         "                         --jump and --stop_row/--stop_column.  Exact search\n"
         "                         has no default time limit: set --time_limit for big\n"
@@ -6050,6 +6050,11 @@ int main(int argc, char **argv) {
         if (g_stop_active)
             fatal("--early_release cannot be combined with --stop_%s: a band is "
                   "already its own end point", g_stop_isrow ? "row" : "column");
+        /* output.csv holds one board per record, so searching on for more
+         * releases would only count boards that are never written. */
+        if (g_solution_limit != 1)
+            fatal("--early_release writes one board per record: --max_emitted must "
+                  "be 1, got %" PRIu64, g_solution_limit);
     }
     if (g_lds_max >= 0 && g_break_mode != BREAK_LDS)
         fprintf(stderr, "[warn] --lds_max has no effect unless --break_mode lds is selected.\n");
