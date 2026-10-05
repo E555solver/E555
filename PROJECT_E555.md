@@ -756,7 +756,8 @@ side under `--free_edges`/`--random_edges`.
    - **Walks:** up to 16 of the best distinct climbed boards each start a walk,
      and the walks share `R` rounds. A round swaps 3 random pairs (each pair
      has one piece at a broken edge), climbs again around the swapped cells,
-     and keeps the result if it is not worse.
+     and accepts a board d edges worse with probability `exp(-d/T)`, T cooling
+     2 -> 0.2 over the walk; each walk returns the best board it met.
    - The best board found replaces the board's best dive. `R = 0` runs the
      climb only.
 

@@ -5139,7 +5139,7 @@ static void usage(const char *a0) {
 "  --end_polish R         with --end_dive: on boards whose best dive is within 6 of S,\n"
 "                         hill-climb the 32 best distinct dives (best swap or\n"
 "                         re-rotation, repeated), then run R kick-and-polish rounds\n"
-"                         (3 random swaps, re-polish, keep if not worse) over 16\n"
+"                         (3 random swaps, re-polish, annealed accept) over 16\n"
 "                         walks. 0 = polish only; absent = off\n"
 "  --emit_score S         connected edges (of 480) a finished board needs to be\n"
 "                         written (default 450)\n"

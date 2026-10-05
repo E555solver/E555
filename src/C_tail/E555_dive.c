@@ -39,6 +39,8 @@
 #define DV_POLISH_MAX    256    /* largest K (diver --polish_top) */
 #define DV_POLISH_MARGIN 6      /* on boards whose best is >= S - this */
 #define DV_KICK          3      /* random swaps per kick */
+#define DV_T0            2.0    /* walk temperature at the first kick... */
+#define DV_T1            0.2    /* ...cooling geometrically to this at the last */
 
 #define DV_WORDS      ((NUM_PIECES * 4) / 64)
 #define DV_CLASSES    9
@@ -1814,8 +1816,12 @@ static void dv_job_p0(uint32_t ri, uint32_t c) {
     for (int j = 0; j < pl->nst; j++) dv_push(DV_JOB_P1, ri, (uint32_t)j, 0);
 }
 
-/* Kick-and-polish walk j from start j: kick, re-polish the touched cells, keep
-   the result when it is not worse. */
+/* Kick-and-polish walk j from start j: kick, re-polish the touched cells, then
+   accept by annealing: never worse is always kept, d edges worse with
+   probability exp(-d/T), T cooling from DV_T0 to DV_T1 over the walk. The walk
+   reports the best board it met. Against keeping only "not worse", at equal
+   kicks on 16 row-12 and 7 band boards x 10-20 seeds: +0.50 and +0.26 edges
+   per board (paired SE 0.06 and 0.10), +0.12 on a 250-kick walk. */
 static void dv_job_p1(uint32_t ri, uint32_t j) {
     DvRoot *r = &g_dv_q[ri];
     DvPol *pl = r->pol;
@@ -1825,15 +1831,22 @@ static void dv_job_p1(uint32_t ri, uint32_t j) {
     RNG rng = rng_for(r->fp, 0x9011u, j, 0u);
     DvBoard walk = pl->st[j], b;
     int walk_s = pl->st_s[j];
+    pl->walk[j] = walk; pl->walk_s[j] = walk_s;
     const int iters = g_p.polish / pl->nst + ((int)j < g_p.polish % pl->nst);
-    for (int it = 0; it < iters; it++) {
+    const double cool = iters > 1 ? pow(DV_T1 / DV_T0, 1.0 / (iters - 1)) : 1.0;
+    double T = DV_T0;
+    for (int it = 0; it < iters; it++, T *= cool) {
         b = walk;
         const int qn = dv_kick(&b, pl->cells, pl->nc, inreg, &rng, queue, inq);
         dv_polish_q(&b, pl->cells, pl->nc, inreg, queue, qn, inq);
         const int sc = dv_score(&b);
-        if (sc >= walk_s) { walk_s = sc; walk = b; }
+        if (sc < walk_s) {
+            const double u = ((double)(rng_next(&rng) >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+            if (u >= exp((sc - walk_s) / T)) continue;
+        }
+        walk_s = sc; walk = b;
+        if (sc > pl->walk_s[j]) { pl->walk[j] = b; pl->walk_s[j] = sc; }
     }
-    pl->walk[j] = walk; pl->walk_s[j] = walk_s;
     if (dv_step_done(r)) dv_polish_end(ri);
 }
 
