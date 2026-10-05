@@ -1549,11 +1549,10 @@ bin/E555_diver data/seed_Edge5.txt old_boards.csv redone.csv \
 
   Given n times, round r uses the (r mod n)-th spec.
 - `--reopen` does not combine with `--holes`, which makes every board a partial with no incumbent, nor with `--backtrack`/`--stop_row`.
-- **Measured** on 15 dived-and-polished boards (459-463), with `--reopen auto`, 15 s per board and 2 seeds:
-  - `--copies 8 --end_dive 3000 --end_polish 1000 --prior 1 --nogo 1` gained on 8 of 30 runs (5 of 15 boards), the best of eight settings tried;
-  - one copy of 50000/50000 gained on 5 of 30.
-
-  The same few boards gain under every setting.
+- **Measured** on 24 dived-and-polished boards (459-461: `data/E565_lowB_baseline.csv` finished with 3000/10000), with `--reopen auto --copies 8` on 4 threads (`examples/11_diver_reopen.sh` runs the best):
+  - 15 s per board: `--end_dive 1000 --end_polish 10000` gained +1.03 edges per board (81% of 72 runs). 500/7000, 4 copies of 2000/20000, `auto` and `auto+1` in turn, `--plateau`, and `--prior 1 --nogo 1` all came within 0.1 of it. 10000/10000 gained +0.88; 3000/1000 with `--prior 1 --nogo 1`, the best setting on the previous engine, +0.58.
+  - 120 s per board, 12 of the boards: 1000/10000 +1.33 (11 improved), 10000/10000 +0.92, 3000/1000 +0.58.
+  - The seven 463s of `data/best_463.csv`, 120 s each: the first gains 2 under both settings, the other six none.
 
 A finished board turned 180 degrees, with its top K rows lifted so that a perfect refill exists, is refilled perfectly on:
 - 15 of 15 boards at K = 3-4;

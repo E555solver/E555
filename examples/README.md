@@ -257,19 +257,34 @@ Placed cells never move. The output does not depend on `THREADS`.
 
 ## 11 -- diver: improve complete boards
 
+```bash
+bash examples/11_diver_reopen.sh                                   # the seven 463s, a minute each
+bash examples/11_diver_reopen.sh BOARDS=best.csv SECONDS_PER_BOARD=600 THREADS=32
+```
+
+Each board gets its own wall clock, spent in rounds: lift the damaged band,
+refill it in `COPIES` copies (dives, then kick-and-polish), keep the best copy
+if it beats the board, and start the next round from the better of the two.
+
 | setting | default | meaning |
 |---|---|---|
-| `REOPEN` | `auto` | cells to re-dive: `auto` (the damaged band, at most 5 rows), `auto+E`, `top:K`, `box:R0-R1,C0-C1`, or a mask file |
-| `SECONDS_PER_BOARD` | 60 | wall clock per board; rounds run until it is spent |
-| `COPIES` | 8 | copies per round, each on its own random streams |
-| `END_DIVE`, `END_POLISH` | 3000, 1000 | per copy |
-| `PRIOR`, `NOGO` | 1, 1 | start the dives pulled toward the board's clean placements and off its broken ones |
-| `PLATEAU` | 0 | 1: a round may move to a different board of equal score |
+| `BOARDS`, `OUT` | `data/best_463.csv`, `reopened.csv` | complete boards in; the same boards out, one row each, in order |
+| `SECONDS_PER_BOARD` | 60 | wall clock per board |
+| `THREADS`, `RNG_SEED` | 8, 1 | another seed is a fresh run on the same boards |
+| `REOPEN` | `auto` | the band: `auto` (the damaged side's outer rows, at most 5), `auto+E`, `top:K`, `box:R0-R1,C0-C1`, or a mask file |
+| `COPIES` | 8 | refills per round |
+| `END_DIVE`, `END_POLISH` | 1000, 10000 | dives and kick-and-polish rounds per copy |
 
-- **Guarantee.** Every board comes back as one row, never worse; the run ends
-  with a before → after table.
-- **Defaults.** They are the best setting measured (PROJECT_E555.md,
-  E555_diver). This is the ender's redive without OR-Tools.
+- **Guarantee.** No board comes back worse. The run prints one line per board
+  and ends with a before → after table; the diver's own output goes to
+  `OUT`'s `.diver.log`.
+- **Time is the knob.** The defaults were the best setting measured at 15 s and
+  120 s per board, and the gain grew with the budget (+1.03 to +1.33 edges per
+  board; PROJECT_E555.md, E555_diver). Some boards do not move at any setting
+  tried (six of the seven 463s in 120 s): those need another attack, such as
+  04c.
+- **Clue pieces.** A clue inside the band may move. Boards that must keep
+  their clues go through 04c (the ender, `CLUES=1`) instead.
 
 ---
 

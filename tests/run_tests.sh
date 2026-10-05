@@ -134,7 +134,7 @@ ALL_STEPS=(
     "example_cpsat|extra|cpsat,scripts|examples/04a, scout -> promote -> polish -> close"
     "example_backtracker|extra|backtracker,scripts|examples/05 dives on the example board"
     "example_diver|extra|diver,scripts|examples/10 finishes the row-12 partial into a complete board"
-    "example_diver_reopen|extra|diver,scripts|examples/11 re-dives the seven 463s: one row each, none worse"
+    "example_diver_reopen|extra|diver,scripts|examples/11 re-dives the seven 463s: one row each, none worse; unknown settings refused"
     "pipeline_topper_sweep|extra|cpsat,scripts|pipeline/topper_sweep.sh through a two-pass plan"
     "example_beamer|extra|beamer,annealer,scripts|examples/01 both ways, random and annealed borders"
     "pipeline_full|extra|pipeline,scripts|pipeline/run_pipeline.sh, all seven stages"
@@ -3545,7 +3545,12 @@ step_example_diver_reopen() {
     worse=$(awk -F, 'NR>1 && $4<463' "$OUT/ex11_rank.csv" | head -1)
     [ -z "$worse" ] || fail "examples/11 returned a board below 463: $worse"
     grep -q " -> " "$OUT/ex11.log" || fail "examples/11 printed no before -> after table"
-    echo "ok: examples/11 re-dived the seven 463s, one row each, none worse"
+    [ -s "$OUT/ex11.diver.log" ] || fail "examples/11 wrote no diver log"
+    if bash examples/11_diver_reopen.sh OUT="$OUT/ex11_bad.csv" PRIOR=1 > "$OUT/ex11_bad.log" 2>&1; then
+        fail "examples/11 accepted an unknown setting"
+    fi
+    grep -q "unknown setting PRIOR" "$OUT/ex11_bad.log" || fail "examples/11 did not name the unknown setting"
+    echo "ok: examples/11 re-dived the seven 463s, one row each, none worse; unknown settings refused"
 }
 
 # Two passes: one that unsets the outer rows, one that fills them back in. That
