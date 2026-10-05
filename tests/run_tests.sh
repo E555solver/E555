@@ -2471,7 +2471,10 @@ EOF
     bin/E555_diver data/synth_seed.txt "$OUT/dvp_in.csv" "$OUT/dvp_s13.csv" --num_rows 1 \
         --holes top:4 --stop_row 13 --end_dive 0 > "$OUT/dvp_s13.log" \
         || fail "--holes top:4 --stop_row 13 failed"
-    python3 - data/synth_seed.txt "$OUT/dvp_in.csv" "$OUT/dvp_s13.csv" <<'EOF' || exit 1
+    bin/E555_diver data/synth_seed.txt "$OUT/dvp_in.csv" "$OUT/dvp_s13c0.csv" --num_rows 1 \
+        --holes top:4 --stop_row 13 --end_dive 0 --cap_top 0 > "$OUT/dvp_s13c0.log" \
+        || fail "--holes top:4 --stop_row 13 --cap_top 0 failed"
+    python3 - data/synth_seed.txt "$OUT/dvp_in.csv" "$OUT/dvp_s13.csv" "$OUT/dvp_s13c0.csv" <<'EOF' || exit 1
 import sys
 seed = [list(map(int, l.split())) for l in open(sys.argv[1]) if l.strip()]
 def cells(line):
@@ -2479,22 +2482,32 @@ def cells(line):
     pos, rot = list(map(int, v[-512:-256])), list(map(int, v[-256:]))
     return v[0], int(v[1]), {pos[p]: (p, rot[p]) for p in range(256) if pos[p] != 999}
 _, _, src = cells(open(sys.argv[2]).readline())
-out = [cells(l) for l in open(sys.argv[3]) if l.strip()]
-assert len(out) == 1, f"one record in, {len(out)} rows out"
-name, score, c = out[0]
-side = lambda x, d: seed[c[x][0]][(d + c[x][1]) % 4]
-m = 0
-for x in c:
-    r, col = divmod(x, 16)
-    if col < 15 and x + 1 in c:
-        assert side(x, 1) == side(x + 1, 3), f"break at cell {x}"; m += 1
-    if r < 15 and x + 16 in c:
-        assert side(x, 0) == side(x + 16, 2), f"break at cell {x}"; m += 1
-assert m == score, f"score {score} is not the {m} matched edges"
-assert all(c[x] == src[x] for x in range(12 * 16)), "a kept row changed"
+def check(path):
+    out = [cells(l) for l in open(path) if l.strip()]
+    assert len(out) == 1, f"one record in, {len(out)} rows out"
+    name, score, c = out[0]
+    side = lambda x, d: seed[c[x][0]][(d + c[x][1]) % 4]
+    m = 0
+    for x in c:
+        r, col = divmod(x, 16)
+        if col < 15 and x + 1 in c:
+            assert side(x, 1) == side(x + 1, 3), f"break at cell {x}"; m += 1
+        if r < 15 and x + 16 in c:
+            assert side(x, 0) == side(x + 16, 2), f"break at cell {x}"; m += 1
+    assert m == score, f"score {score} is not the {m} matched edges"
+    assert all(c[x] == src[x] for x in range(12 * 16)), "a kept row changed"
+    return c, m
+# --cap_top (on by default) closes row 15 over the 14 whole columns, from the
+# top-left corner; --cap_top 0 leaves row 15 to the dives.
+c, m = check(sys.argv[3])
+c0, _ = check(sys.argv[4])
 want = set(range(14 * 16)) | {14 * 16 + k for k in range(15)}
-assert set(c) == want, f"rows 12-13 plus row 14 cols 0-14 expected, got {len(c)} cells"
-print(f"ok: top:4 lifted, rows 12-13 rebuilt and row 14 extended to column 14, zero breaks ({m} edges)")
+assert set(c0) == want, f"--cap_top 0: rows 12-13 plus row 14 cols 0-14 expected, got {len(c0)} cells"
+assert set(c) == want | {15 * 16 + k for k in range(15)}, \
+    f"rows 12-13 plus rows 14-15 cols 0-14 expected, got {len(c)} cells"
+assert all(c[x] == c0[x] for x in want), "--cap_top changed a cell below row 15"
+print(f"ok: top:4 lifted, rows 12-13 rebuilt, row 14 extended to column 14 and capped on row 15, "
+      f"zero breaks ({m} edges); --cap_top 0 leaves row 15 empty")
 EOF
     for t in 1 4; do
         bin/E555_diver data/synth_seed.txt "$OUT/dvp_in.csv" "$OUT/dvp_t$t.csv" --holes top:5 \
