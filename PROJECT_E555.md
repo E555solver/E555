@@ -1091,6 +1091,8 @@ with itself and with the beamer.
 - **`--frac_rand` defaults to 0.30** and the first searched row always uses the
   full random band: the tool is meant to be re-run over the same partial
   (`--finalize_repeats N`), and the random band is what makes repeats differ.
+  **`--accept_best F`** (default 1) also varies the score band: it takes each
+  candidate with probability F and otherwise passes to the next.
 - **`--beam_expand_row` defaults to 8** (the search starts at `finalize_from+1`).
 - **The Mahalanobis spread** is taken from this row's own earlier measurement,
   then the row below, then the nearest measured row, since the rows below the
@@ -1234,6 +1236,7 @@ enumeration grows explosively as rows are freed; 7 is a practical value.
 | `--lambda_J`, `--lambda_Mahalanobis` | 1.0, 1.0 | scoring (5.5) |
 | `--lambda_corners [F]` | off; bare 0.5 | top-corner supply; needs known sides |
 | `--frac_rand F`, `--parent_cap N`, `--pool_factor N` | 0.30, 4, 8 | selection |
+| `--accept_best F` | 1 | probability of taking each score-band candidate, else the next |
 | `--end_dive [M]`, `--end_polish R`, `--emit_score S`, `--corner_seeds N` | off, off, 450, 4 | end dives (5.11) |
 | `--no_free_demand` | -- | as the beamer |
 | `--top_columns N` | 12 | sampled columns per repeat; <= 0 enumerates all |
