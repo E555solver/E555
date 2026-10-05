@@ -754,10 +754,11 @@ side under `--free_edges`/`--random_edges`.
    - **Climb:** each of the 32 dives is hill-climbed: turn one piece or swap
      two, with frame-legal spins, while any such move adds an edge.
    - **Walks:** up to 16 of the best distinct climbed boards each start a walk,
-     and the walks share `R` rounds. A round swaps 3 random pairs (each pair
-     has one piece at a broken edge), climbs again around the swapped cells,
-     and accepts a board d edges worse with probability `exp(-d/T)`, T cooling
-     2 -> 0.2 over the walk; each walk returns the best board it met.
+     and the walks share `R` rounds. A round makes 4 swaps, each the least
+     damaging of 16 random pairs with one piece at a broken edge, climbs again
+     around the swapped cells, and accepts a board d edges worse with
+     probability `exp(-d/T)`, T cooling 3 -> 0.3 over the walk; each walk
+     returns the best board it met.
    - The best board found replaces the board's best dive. `R = 0` runs the
      climb only.
 

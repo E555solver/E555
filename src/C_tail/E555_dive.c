@@ -38,9 +38,10 @@
 #define DV_POLISH_TOP    32     /* K: dives polished per board; K/2 walks (rounded up) */
 #define DV_POLISH_MAX    256    /* largest K (diver --polish_top) */
 #define DV_POLISH_MARGIN 6      /* on boards whose best is >= S - this */
-#define DV_KICK          3      /* random swaps per kick */
-#define DV_T0            2.0    /* walk temperature at the first kick... */
-#define DV_T1            0.2    /* ...cooling geometrically to this at the last */
+#define DV_KICK          4      /* swaps per kick... */
+#define DV_KICK_SAMPLES  16     /* ...each the least damaging of this many random ones */
+#define DV_T0            3.0    /* walk temperature at the first kick... */
+#define DV_T1            0.3    /* ...cooling geometrically to this at the last */
 
 #define DV_WORDS      ((NUM_PIECES * 4) / 64)
 #define DV_CLASSES    9
@@ -885,12 +886,16 @@ static int dv_polish_q(DvBoard *b, const uint8_t *cells, int n, const bool *inre
     return gained;
 }
 
-/* Kick: DV_KICK random frame-legal swaps; the touched cells and their
-   neighbours are queued for the re-polish. Returns the queue length. The first
-   cell of each swap is drawn from the open cells with a broken edge (any open
-   cell once none is left), the second from all open cells: a swap that moves
-   a broken piece is the one a re-polish can turn into a gain. Measured on 177
-   stop-row boards: +0.08 edges per board over uniform kicks, no extra time. */
+/* Kick: DV_KICK swaps, each the least damaging (by the two cells' matched
+   edges) of DV_KICK_SAMPLES random frame-legal swaps with random legal spins;
+   the touched cells and their neighbours are queued for the re-polish. Returns
+   the queue length. The first cell of each sampled swap is drawn from the open
+   cells with a broken edge (any open cell once none is left), the second from
+   all open cells: a swap that moves a broken piece is the one a re-polish can
+   turn into a gain. A uniform kick was undone by the re-polish 70% of the
+   time; against 3 such kicks at equal time, 4 sampled ones gain +0.25, +0.60
+   and +0.66 edges per board on 16 row-12, 7 band and 7 top-4-row boards
+   (paired SE 0.05-0.11; 210 wins, 50 losses). */
 static int dv_kick(DvBoard *b, const uint8_t *cells, int nc, const bool *inreg,
                    RNG *rng, int *queue, bool *inq) {
     int qn = 0;
@@ -901,26 +906,36 @@ static int dv_kick(DvBoard *b, const uint8_t *cells, int nc, const bool *inreg,
         if (dv_local(b, x) < g_dv_nnb[x]) brk[nb++] = (uint8_t)x;
     }
     for (int kk = 0; kk < DV_KICK; kk++) {
-        for (int tries = 0; tries < 32; tries++) {
-            const int x = nb ? brk[rng_uniform(rng, (uint32_t)nb)]
-                             : cells[rng_uniform(rng, (uint32_t)nc)];
-            const int y = cells[rng_uniform(rng, (uint32_t)nc)];
-            if (x == y) continue;
-            const int p = b->c[x].piece_id, q = b->c[y].piece_id;
-            if (!(g_dv_pclass[p] >> dv_cls(y) & 1u) || !(g_dv_pclass[q] >> dv_cls(x) & 1u)) continue;
-            int sp, sq;
-            do sp = (int)rng_uniform(rng, 4); while (!dv_legal(p, sp, dv_cls(y)));
-            do sq = (int)rng_uniform(rng, 4); while (!dv_legal(q, sq, dv_cls(x)));
-            b->c[y] = g_dv_or[p][sp]; b->c[x] = g_dv_or[q][sq];
-            const int kicked[2] = { x, y };
-            for (int t = 0; t < 2; t++)
-                for (int d = -1; d < 4; d++) {
-                    const int w = d < 0 ? kicked[t] : g_dv_nbr[kicked[t]][d];
-                    if (w < 0 || !inreg[w] || inq[w]) continue;
-                    inq[w] = true; queue[qn++] = w;
-                }
-            break;
-        }
+        int bx = -1, by = -1, bsp = 0, bsq = 0, bd = INT_MIN;
+        for (int smp = 0; smp < DV_KICK_SAMPLES; smp++)
+            for (int tries = 0; tries < 32; tries++) {
+                const int x = nb ? brk[rng_uniform(rng, (uint32_t)nb)]
+                                 : cells[rng_uniform(rng, (uint32_t)nc)];
+                const int y = cells[rng_uniform(rng, (uint32_t)nc)];
+                if (x == y) continue;
+                const int p = b->c[x].piece_id, q = b->c[y].piece_id;
+                if (!(g_dv_pclass[p] >> dv_cls(y) & 1u) || !(g_dv_pclass[q] >> dv_cls(x) & 1u)) continue;
+                int sp, sq;
+                do sp = (int)rng_uniform(rng, 4); while (!dv_legal(p, sp, dv_cls(y)));
+                do sq = (int)rng_uniform(rng, 4); while (!dv_legal(q, sq, dv_cls(x)));
+                const Oriented ox = b->c[x], oy = b->c[y];
+                const int before = dv_local(b, x) + dv_local(b, y);
+                b->c[y] = g_dv_or[p][sp]; b->c[x] = g_dv_or[q][sq];
+                const int d = dv_local(b, x) + dv_local(b, y) - before;
+                b->c[x] = ox; b->c[y] = oy;
+                if (d > bd) { bd = d; bx = x; by = y; bsp = sp; bsq = sq; }
+                break;
+            }
+        if (bx < 0) continue;
+        const int p = b->c[bx].piece_id, q = b->c[by].piece_id;
+        b->c[by] = g_dv_or[p][bsp]; b->c[bx] = g_dv_or[q][bsq];
+        const int kicked[2] = { bx, by };
+        for (int t = 0; t < 2; t++)
+            for (int d = -1; d < 4; d++) {
+                const int w = d < 0 ? kicked[t] : g_dv_nbr[kicked[t]][d];
+                if (w < 0 || !inreg[w] || inq[w]) continue;
+                inq[w] = true; queue[qn++] = w;
+            }
     }
     return qn;
 }
@@ -1821,7 +1836,9 @@ static void dv_job_p0(uint32_t ri, uint32_t c) {
    probability exp(-d/T), T cooling from DV_T0 to DV_T1 over the walk. The walk
    reports the best board it met. Against keeping only "not worse", at equal
    kicks on 16 row-12 and 7 band boards x 10-20 seeds: +0.50 and +0.26 edges
-   per board (paired SE 0.06 and 0.10), +0.12 on a 250-kick walk. */
+   per board (paired SE 0.06 and 0.10), +0.12 on a 250-kick walk (measured
+   with 3 uniform swaps per kick and T 2 -> 0.2; the sampled kick prefers the
+   hotter 3 -> 0.3: +0.26 on the top-4-row boards, SE 0.07). */
 static void dv_job_p1(uint32_t ri, uint32_t j) {
     DvRoot *r = &g_dv_q[ri];
     DvPol *pl = r->pol;
