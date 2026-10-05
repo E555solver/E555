@@ -743,11 +743,19 @@ side under `--free_edges`/`--random_edges`.
    steers only choices that would otherwise be random or ranked by room; after
    each round the top 5% of dives vote and
    `w += 0.3 log((votes + 1/2) / (expected + 1/2))`, clipped to +-2.
-3. **Polish** (`--end_polish R`): for boards within 6 of `S`, the 16 best
-   distinct dives are hill-climbed (best single re-rotation or pair swap, with
-   frame-legal spins, until no move gains), then 8 walks share R kick-and-polish
-   rounds (3 random swaps, the first at a broken edge; re-polish the affected
-   cells; keep if not worse). `R = 0` polishes only.
+3. **Polish** (`--end_polish R`) improves dives that are already finished; it
+   does not dive again. Stages 1 and 2 keep each board's 16 best distinct
+   dives, not just the best one. A board whose best dive is within 6 of `S` is
+   polished; a board further below rarely reaches `S`. Only pieces placed by
+   the dives move.
+   - **Climb:** each of the 16 dives is hill-climbed: turn one piece or swap
+     two, with frame-legal spins, while any such move adds an edge.
+   - **Walks:** up to 8 of the best distinct climbed boards each start a walk,
+     and the walks share `R` rounds. A round swaps 3 random pairs (each pair
+     has one piece at a broken edge), climbs again around the swapped cells,
+     and keeps the result if it is not worse.
+   - The best board found replaces the board's best dive. `R = 0` runs the
+     climb only.
 
 Boards reaching `S` are written after each configuration, best first, duplicates
 dropped, with the matched-edge count in field 2; `--max_emitted` then caps
