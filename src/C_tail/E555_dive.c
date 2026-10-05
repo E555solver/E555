@@ -93,6 +93,7 @@ static int16_t  g_dv_nbr[NUM_PIECES][4];               /* neighbour toward d; -1
 static uint8_t  g_dv_nnb[NUM_PIECES];                  /* neighbours on the board */
 static uint32_t g_dv_or32[NUM_PIECES][4];              /* packed sides per orientation */
 static uint8_t  g_dv_legal4[NUM_PIECES][DV_CLASSES];   /* frame-legal spins, one bit each */
+static uint64_t g_dv_pm[NUM_PIECES][2];                /* each piece's colours (dv_cmask) */
 _Static_assert(offsetof(Oriented, right) == offsetof(Oriented, top) + 1 &&
                offsetof(Oriented, bottom) == offsetof(Oriented, top) + 2 &&
                offsetof(Oriented, left) == offsetof(Oriented, top) + 3,
@@ -108,6 +109,27 @@ static inline int dv_byte(uint32_t v, int d) { return (int)((v >> (8 * d)) & 0xF
 static inline int dv_zc(uint32_t v) {
     const uint32_t t = ((v & 0x7F7F7F7Fu) + 0x7F7F7F7Fu) | v | 0x7F7F7F7Fu;
     return __builtin_popcount(~t);
+}
+/* The colour multiset of a packed side word (0xFF bytes skipped): bit c of
+   level k (k = 0..3; levels 0,1 in m[0], 2,3 in m[1], 32 bits each) is set when
+   colour c shows more than k times. Two words share at most
+   dv_cbound(a, b) = sum over colours of min(count in a, count in b) colours,
+   so a piece matches at most that many of a cell's neighbours, at any spin. */
+_Static_assert(NUM_COLORS_TOTAL <= 32, "a colour multiset level is one 32-bit word");
+static inline void dv_cmask(uint32_t v, uint64_t m[2]) {
+    uint32_t lv[4] = { 0, 0, 0, 0 };
+    for (int d = 0; d < 4; d++) {
+        const unsigned c = v >> (8 * d) & 0xFFu;
+        if (c == 0xFFu) continue;
+        int k = 0;
+        while (lv[k] >> c & 1u) k++;
+        lv[k] |= 1u << c;
+    }
+    m[0] = lv[0] | (uint64_t)lv[1] << 32;
+    m[1] = lv[2] | (uint64_t)lv[3] << 32;
+}
+static inline int dv_cbound(const uint64_t a[2], const uint64_t b[2]) {
+    return __builtin_popcountll(a[0] & b[0]) + __builtin_popcountll(a[1] & b[1]);
 }
 /* Neighbour of x toward d (0 up, 1 right, 2 down, 3 left), or -1. */
 static inline int dv_nb(int x, int d) {
@@ -213,6 +235,7 @@ void dv_frame(bool by_side) {
                     m |= (uint8_t)(1u << s);
             g_dv_legal4[p][k] = m;
         }
+    for (int p = 0; p < NUM_PIECES; p++) dv_cmask(g_dv_or32[p][0], g_dv_pm[p]);
 }
 
 /* Connected edges of a full board, out of 480. */
@@ -772,6 +795,7 @@ static int dv_polish(DvBoard *b, const uint8_t *cells, int n) {
    unread, and on a good board most cells have no deficit at all. */
 typedef struct {
     uint32_t need[NUM_PIECES];
+    uint64_t nm[NUM_PIECES][2];      /* dv_cmask of need */
     uint8_t  def[NUM_PIECES];
     /* The region's cells by frame class, in region order: a piece only ever
        moves to the classes it is legal in, so an inner cell's partners are the
@@ -782,6 +806,7 @@ typedef struct {
 
 static inline void dv_ls_cell(const DvBoard *b, DvLs *c, int x) {
     c->need[x] = dv_need(b, x);
+    dv_cmask(c->need[x], c->nm[x]);
     c->def[x] = (uint8_t)(g_dv_nnb[x] - dv_zc(dv_s32(&b->c[x]) ^ c->need[x]));
 }
 /* x's piece changed: x and its neighbours in the region see it. */
@@ -823,12 +848,16 @@ static int dv_best_move_at(DvBoard *b, const DvLs *ls, int x, int *gain) {
         const int d = y == n0 ? 0 : y == n1 ? 1 : y == n2 ? 2 : y == n3 ? 3 : -1;
         if (d < 0) {
             /* q's side first (x's neighbours are fixed for the whole scan): p at
-               y gains at most def[y], so most partners stop here. */
+               y gains at most def[y], so most partners stop here, most of them
+               on q's colours alone. */
+            const int before = lx + g_dv_nnb[y] - ls->def[y];
+            const int ubq = dv_cbound(g_dv_pm[q], ls->nm[x]);
+            if (ubq - lx + ls->def[y] <= best_g ||
+                ubq + dv_cbound(g_dv_pm[p], ls->nm[y]) - before <= best_g) continue;
             int va, vb;
             const int sq = dv_best_spin(nx, q, cx, &vb);
             if (sq < 0 || vb - lx + ls->def[y] <= best_g) continue;
             const int sp = dv_best_spin(ny, p, cy, &va);
-            const int before = lx + g_dv_nnb[y] - ls->def[y];
             if (sp >= 0 && va + vb - before > best_g) {
                 best_g = va + vb - before; by = y; bsp = sp; bsq = sq;
             }
@@ -837,6 +866,10 @@ static int dv_best_move_at(DvBoard *b, const DvLs *ls, int x, int *gain) {
         const int e = (d + 2) & 3;
         const int before = dv_pair_now(ox, nx, oy, ny, d);
         const int thr = before + best_g;
+        /* Each piece's colour bound covers its three outer sides (it is taken
+           over a superset), the edge between them is one more. */
+        if (dv_cbound(g_dv_pm[q], ls->nm[x]) + dv_cbound(g_dv_pm[p], ls->nm[y]) + 1 <= thr)
+            continue;
         int sp = -1, sq = -1;
         const int v = dv_touching_swap(nx | (0xFFu << (8 * d)), ny | (0xFFu << (8 * e)),
                                        d, p, q, cx, cy, &sp, &sq, thr);
@@ -853,26 +886,39 @@ static int dv_best_move_at(DvBoard *b, const DvLs *ls, int x, int *gain) {
 /* Polish driven by a work queue: only cells whose surroundings changed are
    re-examined (a move's gain depends only on the two cells and their
    neighbours). Seeds with queue[0..qn); returns the edges gained. */
-static int dv_polish_q(DvBoard *b, const uint8_t *cells, int n, const bool *inreg,
+/* The region's tables for board b. */
+static void dv_ls_init(const DvBoard *b, DvLs *ls, const uint8_t *cells, int n) {
+    memset(ls->nbycls, 0, sizeof ls->nbycls);
+    for (int i = 0; i < n; i++) {
+        const int x = cells[i], k = dv_cls(x);
+        dv_ls_cell(b, ls, x);
+        ls->bycls[k][ls->nbycls[k]++] = (uint8_t)x;
+    }
+}
+/* The per-cell entries of the region's cells (bycls never changes). */
+static inline void dv_ls_copy(DvLs *dst, const DvLs *src, const uint8_t *cells, int n) {
+    for (int i = 0; i < n; i++) {
+        const int x = cells[i];
+        dst->need[x] = src->need[x];
+        dst->nm[x][0] = src->nm[x][0]; dst->nm[x][1] = src->nm[x][1];
+        dst->def[x] = src->def[x];
+    }
+}
+
+/* Hill-climb from the queued cells; ls must be current for b and is kept so. */
+static int dv_polish_q(DvBoard *b, DvLs *ls, const bool *inreg,
                        int *queue, int qn, bool *inq) {
     int gained = 0, head = 0, tail = qn;   /* ring of NUM_PIECES slots */
     int cnt = qn;
-    DvLs ls;
-    memset(ls.nbycls, 0, sizeof ls.nbycls);
-    for (int i = 0; i < n; i++) {
-        const int x = cells[i], k = dv_cls(x);
-        dv_ls_cell(b, &ls, x);
-        ls.bycls[k][ls.nbycls[k]++] = (uint8_t)x;
-    }
     while (cnt > 0) {
         const int x = queue[head]; head = (head + 1) % NUM_PIECES; cnt--;
         inq[x] = false;
         int g = 0;
-        const int y = dv_best_move_at(b, &ls, x, &g);
+        const int y = dv_best_move_at(b, ls, x, &g);
         if (y < 0) continue;
         gained += g;
-        dv_ls_touch(b, &ls, inreg, x);
-        if (y != x) dv_ls_touch(b, &ls, inreg, y);
+        dv_ls_touch(b, ls, inreg, x);
+        if (y != x) dv_ls_touch(b, ls, inreg, y);
         const int touched[2] = { x, y };
         for (int t = 0; t < 2; t++) {
             const int z = touched[t];
@@ -895,16 +941,16 @@ static int dv_polish_q(DvBoard *b, const uint8_t *cells, int n, const bool *inre
    turn into a gain. A uniform kick was undone by the re-polish 70% of the
    time; against 3 such kicks at equal time, 4 sampled ones gain +0.25, +0.60
    and +0.66 edges per board on 16 row-12, 7 band and 7 top-4-row boards
-   (paired SE 0.05-0.11; 210 wins, 50 losses). */
-static int dv_kick(DvBoard *b, const uint8_t *cells, int nc, const bool *inreg,
-                   RNG *rng, int *queue, bool *inq) {
+   (paired SE 0.05-0.11; 210 wins, 50 losses). ls must be current for b and
+   is kept so; *delta gets the kick's change in matched edges. */
+static int dv_kick(DvBoard *b, DvLs *ls, const uint8_t *cells, int nc, const bool *inreg,
+                   RNG *rng, int *queue, bool *inq, int *delta) {
     int qn = 0;
     uint8_t brk[NUM_PIECES];
     int nb = 0;
-    for (int i = 0; i < nc; i++) {
-        const int x = cells[i];
-        if (dv_local(b, x) < g_dv_nnb[x]) brk[nb++] = (uint8_t)x;
-    }
+    *delta = 0;
+    for (int i = 0; i < nc; i++)
+        if (ls->def[cells[i]] > 0) brk[nb++] = cells[i];
     for (int kk = 0; kk < DV_KICK; kk++) {
         int bx = -1, by = -1, bsp = 0, bsq = 0, bd = INT_MIN;
         for (int smp = 0; smp < DV_KICK_SAMPLES; smp++)
@@ -918,17 +964,33 @@ static int dv_kick(DvBoard *b, const uint8_t *cells, int nc, const bool *inreg,
                 int sp, sq;
                 do sp = (int)rng_uniform(rng, 4); while (!dv_legal(p, sp, dv_cls(y)));
                 do sq = (int)rng_uniform(rng, 4); while (!dv_legal(q, sq, dv_cls(x)));
-                const Oriented ox = b->c[x], oy = b->c[y];
-                const int before = dv_local(b, x) + dv_local(b, y);
-                b->c[y] = g_dv_or[p][sp]; b->c[x] = g_dv_or[q][sq];
-                const int d = dv_local(b, x) + dv_local(b, y) - before;
-                b->c[x] = ox; b->c[y] = oy;
+                const int before = g_dv_nnb[x] - ls->def[x] + g_dv_nnb[y] - ls->def[y];
+                int d;
+                if (dv_dir(x, y) < 0) {     /* apart: the swap leaves both needs */
+                    d = dv_zc(g_dv_or32[q][sq] ^ ls->need[x])
+                      + dv_zc(g_dv_or32[p][sp] ^ ls->need[y]) - before;
+                } else {
+                    const Oriented ox = b->c[x], oy = b->c[y];
+                    b->c[y] = g_dv_or[p][sp]; b->c[x] = g_dv_or[q][sq];
+                    d = dv_local(b, x) + dv_local(b, y) - before;
+                    b->c[x] = ox; b->c[y] = oy;
+                }
                 if (d > bd) { bd = d; bx = x; by = y; bsp = sp; bsq = sq; }
                 break;
             }
         if (bx < 0) continue;
+        /* The edges at bx and by, the one between them (if any) counted once. */
+        const int dd = dv_dir(bx, by);
+        int at = g_dv_nnb[bx] - ls->def[bx] + g_dv_nnb[by] - ls->def[by]
+               - (dd >= 0 && dv_byte(dv_s32(&b->c[bx]), dd) == dv_byte(dv_s32(&b->c[by]), (dd + 2) & 3));
+        *delta -= at;
         const int p = b->c[bx].piece_id, q = b->c[by].piece_id;
         b->c[by] = g_dv_or[p][bsp]; b->c[bx] = g_dv_or[q][bsq];
+        dv_ls_touch(b, ls, inreg, bx);
+        dv_ls_touch(b, ls, inreg, by);
+        at = g_dv_nnb[bx] - ls->def[bx] + g_dv_nnb[by] - ls->def[by]
+           - (dd >= 0 && dv_byte(dv_s32(&b->c[bx]), dd) == dv_byte(dv_s32(&b->c[by]), (dd + 2) & 3));
+        *delta += at;
         const int kicked[2] = { bx, by };
         for (int t = 0; t < 2; t++)
             for (int d = -1; d < 4; d++) {
@@ -1849,19 +1911,27 @@ static void dv_job_p1(uint32_t ri, uint32_t j) {
     DvBoard walk = pl->st[j], b;
     int walk_s = pl->st_s[j];
     pl->walk[j] = walk; pl->walk_s[j] = walk_s;
+    DvLs lw, ls;                             /* the walk's tables, and the trial's */
+    dv_ls_init(&walk, &lw, pl->cells, pl->nc);
+    dv_ls_init(&walk, &ls, pl->cells, pl->nc);
     const int iters = g_p.polish / pl->nst + ((int)j < g_p.polish % pl->nst);
     const double cool = iters > 1 ? pow(DV_T1 / DV_T0, 1.0 / (iters - 1)) : 1.0;
     double T = DV_T0;
     for (int it = 0; it < iters; it++, T *= cool) {
         b = walk;
-        const int qn = dv_kick(&b, pl->cells, pl->nc, inreg, &rng, queue, inq);
-        dv_polish_q(&b, pl->cells, pl->nc, inreg, queue, qn, inq);
-        const int sc = dv_score(&b);
+        dv_ls_copy(&ls, &lw, pl->cells, pl->nc);
+        int kd;
+        const int qn = dv_kick(&b, &ls, pl->cells, pl->nc, inreg, &rng, queue, inq, &kd);
+        const int sc = walk_s + kd + dv_polish_q(&b, &ls, inreg, queue, qn, inq);
+#ifdef DV_VERIFY_SCORE
+        if (sc != dv_score(&b)) fatal("internal error: walk score %d, board %d", sc, dv_score(&b));
+#endif
         if (sc < walk_s) {
             const double u = ((double)(rng_next(&rng) >> 11) + 0.5) * (1.0 / 9007199254740992.0);
             if (u >= exp((sc - walk_s) / T)) continue;
         }
         walk_s = sc; walk = b;
+        dv_ls_copy(&lw, &ls, pl->cells, pl->nc);
         if (sc > pl->walk_s[j]) { pl->walk[j] = b; pl->walk_s[j] = sc; }
     }
     if (dv_step_done(r)) dv_polish_end(ri);
