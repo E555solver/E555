@@ -47,6 +47,15 @@
 
 static DvParams g_p;
 
+/* Gumbel noise in single precision for the dive engine's tie-breaks and
+   policies: the same distribution to float resolution (24-bit uniform, tail cut
+   past 17, probability 3e-8) at a fraction of two double logs.  The beam keeps
+   its own double gumbel_noise() in E555_database.h. */
+static inline double dv_gumbel(RNG *r) {
+    const float u = ((float)(rng_next(r) >> 40) + 0.5f) * (1.0f / 16777216.0f);
+    return (double)(-logf(-logf(u)));
+}
+
 static inline bool dv_time_up(void) {
     return (g_p.stop && *g_p.stop) || (g_p.deadline > 0.0 && omp_get_wtime() >= g_p.deadline);
 }
@@ -68,11 +77,8 @@ static inline int dv_piece_kind(int p) {       /* grey sides: 0 inner, 1 edge, 2
     return (g_seed_top[p] == 0) + (g_seed_right[p] == 0)
          + (g_seed_bottom[p] == 0) + (g_seed_left[p] == 0);
 }
-static inline int dv_cls(int x) {
-    int r = x / PUZZLE_SIDE, c = x % PUZZLE_SIDE;
-    return ((r == 0) ? 1 : (r == PUZZLE_SIDE - 1) ? 2 : 0) * 3
-         + ((c == 0) ? 1 : (c == PUZZLE_SIDE - 1) ? 2 : 0);
-}
+static uint8_t g_dv_clsof[NUM_PIECES];
+static inline int dv_cls(int x) { return g_dv_clsof[x]; }
 /* Neighbour of x toward d (0 up, 1 right, 2 down, 3 left), or -1. */
 static inline int dv_nb(int x, int d) {
     int r = x / PUZZLE_SIDE, c = x % PUZZLE_SIDE;
@@ -102,6 +108,11 @@ static inline bool dv_legal(int p, int s, int cls) {
 }
 
 static void dv_build_static(void) {
+    for (int x = 0; x < NUM_PIECES; x++) {
+        const int r = x / PUZZLE_SIDE, c = x % PUZZLE_SIDE;
+        g_dv_clsof[x] = (uint8_t)(((r == 0) ? 1 : (r == PUZZLE_SIDE - 1) ? 2 : 0) * 3
+                                + ((c == 0) ? 1 : (c == PUZZLE_SIDE - 1) ? 2 : 0));
+    }
     memset(g_dv_fit, 0, sizeof g_dv_fit);
     for (int p = 0; p < NUM_PIECES; p++) {
         const int e[4] = { g_seed_top[p], g_seed_right[p], g_seed_bottom[p], g_seed_left[p] };
@@ -193,6 +204,20 @@ typedef struct {
     int16_t  n_empty, zero;
 } DvFc;
 
+/* A dive's starting state: the prototype's, copying only what a dive reads --
+   the masks of the open cells (a third of the 32 kB mask array on a typical
+   board), not those of placed cells, which no dive touches. */
+static inline void dv_fc_reset(DvFc *f, const DvFc *proto, const uint8_t *cells, int n) {
+    f->unused4 = proto->unused4;
+    memcpy(f->dom, proto->dom, sizeof f->dom);
+    memcpy(f->avail, proto->avail, sizeof f->avail);
+    memcpy(f->elist, proto->elist, sizeof f->elist);
+    memcpy(f->epos, proto->epos, sizeof f->epos);
+    f->n_empty = proto->n_empty;
+    f->zero = proto->zero;
+    for (int i = 0; i < n; i++) f->nb[cells[i]] = proto->nb[cells[i]];
+}
+
 static inline void dv_empty_add(DvFc *f, int x) {
     f->epos[x] = (uint8_t)f->n_empty;
     f->elist[f->n_empty++] = (uint8_t)x;
@@ -236,17 +261,18 @@ static inline void dv_adjust(DvFc *f, int p, int sign) {
     const uint64_t bits = (uint64_t)g_dv_spins[p] << ((p * 4) & 63);
     for (int k = 0; k < DV_CLASSES; k++)
         f->avail[k] += sign * __builtin_popcountll(g_dv_base[k].w[wi] & bits);
+    /* Branch-free: most cells do not hold p (delta 0), but which ones is data,
+       and a mispredicted skip costs more than the update it saves.  No cell here
+       is DV_PLACED: dv_unplace() adjusts before its own cell rejoins the list. */
+    int zero = 0;
     for (int i = 0; i < f->n_empty; i++) {
         const int x = f->elist[i];
-        const uint16_t old = f->dom[x];
-        if (old == DV_PLACED) continue;          /* emptied by unplace, recomputed next */
-        const int delta = __builtin_popcountll(f->nb[x].w[wi] & bits);
-        if (!delta) continue;
-        if (old == 0) f->zero--;
-        const int next = (int)old + sign * delta;
+        const int old = f->dom[x];
+        const int next = old + sign * __builtin_popcountll(f->nb[x].w[wi] & bits);
         f->dom[x] = (uint16_t)next;
-        if (next == 0) f->zero++;
+        zero += (next == 0) - (old == 0);
     }
+    f->zero = (int16_t)(f->zero + zero);
 }
 
 static inline void dv_refresh(const DvBoard *b, DvFc *f, int x) {
@@ -269,9 +295,9 @@ static inline void dv_place(DvBoard *b, DvFc *f, int x, int p, int s) {
 static inline void dv_unplace(DvBoard *b, DvFc *f, int x) {
     const int p = b->c[x].piece_id;
     b->c[x].piece_id = DV_EMPTY;
-    dv_empty_add(f, x);
     f->unused4.w[(p * 4) >> 6] |= (uint64_t)g_dv_spins[p] << ((p * 4) & 63);
-    dv_adjust(f, p, +1);
+    dv_adjust(f, p, +1);                     /* before x rejoins: dom[x] is DV_PLACED */
+    dv_empty_add(f, x);
     dv_compute(b, f, x);
     dv_refresh(b, f, x);
 }
@@ -384,8 +410,74 @@ static float dv_maxw(const DvFc *f, int x, const DvPolicy *pol) {
     return m;
 }
 
-/* Least-constraining value among cand[lo..hi): play each candidate, read the
-   forward-checking state back, undo. Lexicographic: fewest breaks, fewest
+/* What dv_place(x, p, s) would leave behind, read off the state without playing
+   it: the zero-domain count and the room (exact fits summed over x's open
+   neighbours).  Placing p removes its orientations from every open cell's
+   domain and narrows x's open neighbours to the new side; so a neighbour's new
+   domain is its mask AND that side's fit mask counted against the pool without
+   p, and any other cell turns zero only if p's orientations were its whole
+   domain -- which needs at most four fits, so only those cells are kept to
+   test.  Exact: the same numbers as playing the move and undoing it, for a
+   fraction of the work (no writes, no per-cell recompute). */
+typedef struct {
+    int     ny, y[4], dir[4];      /* x's open neighbours and the side toward each */
+    int     zero_base;             /* zero count with x and its neighbours left out */
+    int     ncrit;
+    uint8_t crit[NUM_PIECES];      /* other open cells with 1..4 exact fits */
+} DvLcvCtx;
+
+static void dv_lcv_ctx(const DvBoard *b, const DvFc *f, int x, DvLcvCtx *c) {
+    c->ny = 0;
+    c->zero_base = f->zero - (f->dom[x] == 0);
+    for (int d = 0; d < 4; d++) {
+        const int y = dv_nb(x, d);
+        if (y < 0 || b->c[y].piece_id != DV_EMPTY) continue;
+        c->y[c->ny] = y; c->dir[c->ny] = d; c->ny++;
+        c->zero_base -= (f->dom[y] == 0);
+    }
+    c->ncrit = 0;
+    for (int i = 0; i < f->n_empty; i++) {
+        const int y = f->elist[i];
+        const int dy = f->dom[y];
+        if (dy >= 1 && dy <= 4) c->crit[c->ncrit++] = (uint8_t)y;
+    }
+    /* drop x and its neighbours (handled exactly above) from the critical list */
+    int k = 0;
+    for (int i = 0; i < c->ncrit; i++) {
+        const int y = c->crit[i];
+        bool nb = (y == x);
+        for (int d = 0; d < 4 && !nb; d++) nb = (dv_nb(x, d) == y);
+        if (!nb) c->crit[k++] = (uint8_t)y;
+    }
+    c->ncrit = k;
+}
+
+static inline void dv_lcv_eval(const DvFc *f, const DvLcvCtx *c, int p, int s,
+                               int *zd_out, int *room_out) {
+    const Oriented *o = &g_dv_or[p][s & 3];
+    const int wi = (p * 4) >> 6;
+    const uint64_t bits = (uint64_t)g_dv_spins[p] << ((p * 4) & 63);
+    DvMask un = f->unused4;
+    un.w[wi] &= ~(0xFULL << ((p * 4) & 63));
+    int zd = c->zero_base, room = 0;
+    for (int k = 0; k < c->ny; k++) {
+        const int y = c->y[k], d = c->dir[k];
+        DvMask m = f->nb[y];
+        dv_and(&m, &g_dv_fit[(d + 2) & 3][dv_side(o, d)]);
+        const int n = dv_ipop(&m, &un);
+        room += n;
+        zd += (n == 0);
+    }
+    for (int i = 0; i < c->ncrit; i++) {
+        const int y = c->crit[i];
+        zd += (__builtin_popcountll(f->nb[y].w[wi] & bits) == (int)f->dom[y]);
+    }
+    *zd_out = zd; *room_out = room;
+}
+
+/* Least-constraining value among cand[lo..hi): evaluate each candidate's effect
+   on the forward-checking state (dv_lcv_eval, exactly what playing it would
+   leave). Lexicographic: fewest breaks, fewest
    zero-domain cells, then most room left around it (stock: ties uniform;
    guided: log1p(room) + beta*(w + Gumbel)). */
 static int dv_lcv(DvBoard *b, DvFc *f, int x, const DvCand *cand, int lo, int hi,
@@ -401,7 +493,7 @@ static int dv_lcv(DvBoard *b, DvFc *f, int x, const DvCand *cand, int lo, int hi
         double key[DV_LCV_CAP];
         int m = 0;
         for (int i = lo; i < hi; i++) {
-            const double k = pol->beta * dv_w(pol, cand[i].pid, x) + gumbel_noise(rng);
+            const double k = pol->beta * dv_w(pol, cand[i].pid, x) + dv_gumbel(rng);
             if (m < cap) { idx[m] = i; key[m] = k; m++; }
             else {
                 int lo_k = 0;
@@ -413,18 +505,15 @@ static int dv_lcv(DvBoard *b, DvFc *f, int x, const DvCand *cand, int lo, int hi
     int best = -1, b_brk = 0, b_zd = 0;
     double b_key = 0.0;
     uint32_t ties = 0;
+    DvLcvCtx ctx;
+    dv_lcv_ctx(b, f, x, &ctx);
     for (int k = 0; k < cap; k++) {
         const int ci = idx[k];
-        dv_place(b, f, x, cand[ci].pid, cand[ci].spin);
-        int room = 0;
-        for (int d = 0; d < 4; d++) {
-            const int y = dv_nb(x, d);
-            if (y >= 0 && b->c[y].piece_id == DV_EMPTY) room += (int)f->dom[y];
-        }
-        const int brk = cand[ci].breaks, zd = f->zero;
-        dv_unplace(b, f, x);
-        const double key = g ? log1p((double)room)
-                               + pol->beta * ((double)dv_w(pol, cand[ci].pid, x) + gumbel_noise(rng))
+        int zd, room;
+        dv_lcv_eval(f, &ctx, cand[ci].pid, cand[ci].spin, &zd, &room);
+        const int brk = cand[ci].breaks;
+        const double key = g ? (double)log1pf((float)room)
+                               + pol->beta * ((double)dv_w(pol, cand[ci].pid, x) + dv_gumbel(rng))
                              : (double)room;
         const bool better = best < 0 || brk < b_brk ||
                             (brk == b_brk && (zd < b_zd || (zd == b_zd && key > b_key)));
@@ -447,27 +536,34 @@ static void dv_dive(DvBoard *b, DvFc *f, const uint8_t *cells, int n, RNG *rng,
     for (int pos = 0; pos < n; pos++) {
         int sel = -1, best_ex = INT_MAX;
         uint32_t ties = 0;
-        if (!g && !tpos) {
+        /* The most constrained open cell with an exact fit: a branch-free minimum,
+           then the tied cells, then one draw among them -- uniform for a stock
+           dive, Gumbel-max on the policy (and the fill order) for a guided one,
+           which needs no draw at all when a single cell is tied. */
+        for (int j = pos; j < n; j++) {
+            const int ex = f->dom[rem[j]];
+            const int v = ex ? ex : INT_MAX;
+            best_ex = v < best_ex ? v : best_ex;
+        }
+        if (best_ex != INT_MAX) {
+            uint8_t tie[NUM_PIECES];
+            int nt = 0;
             for (int j = pos; j < n; j++) {
-                const int ex = f->dom[rem[j]];
-                if (ex == 0) continue;
-                if (ex < best_ex) { best_ex = ex; sel = j; ties = 1; }
-                else if (ex == best_ex && rng_uniform(rng, ++ties) == 0) sel = j;
+                tie[nt] = (uint8_t)j;
+                nt += (f->dom[rem[j]] == best_ex);
             }
-        } else {
-            for (int j = pos; j < n; j++) {
-                const int ex = f->dom[rem[j]];
-                if (ex > 0 && ex < best_ex) best_ex = ex;
-            }
-            double bk = -INFINITY;
-            if (best_ex != INT_MAX)
-                for (int j = pos; j < n; j++) {
-                    if (f->dom[rem[j]] != best_ex) continue;
-                    double k = gumbel_noise(rng);
+            if (nt == 1) sel = tie[0];
+            else if (!g && !tpos) sel = tie[rng_uniform(rng, (uint32_t)nt)];
+            else {
+                double bk = -INFINITY;
+                for (int t = 0; t < nt; t++) {
+                    const int j = tie[t];
+                    double k = dv_gumbel(rng);
                     if (g) k += pol->beta * (double)dv_maxw(f, rem[j], pol);
                     if (tpos) k += (double)tpos[rem[j]];
                     if (sel < 0 || k > bk) { bk = k; sel = j; }
                 }
+            }
         }
         if (sel < 0) {                 /* every cell is stuck: break where narrowest */
             int best_n = INT_MAX;
@@ -1415,7 +1511,7 @@ static void dv_job_s1(DvWork *k, uint32_t ri, uint32_t a, uint32_t cnt) {
     for (uint32_t i = a; i < a + cnt; i++) {
         if (((i - a) & 15u) == 0 && dv_time_up()) { stopped = true; break; }
         RNG rng = rng_for(r->fp, 1u, i, 0u);
-        k->b = k->base; k->f = k->proto;
+        k->b = k->base; dv_fc_reset(&k->f, &k->proto, k->cells, k->ncell);
         dv_dive(&k->b, &k->f, k->cells, k->ncell, &rng, pol, tpos);
         dv_local_take(&l, k, &k->b, dv_score(&k->b), i, polish);
     }
@@ -1529,7 +1625,7 @@ static void dv_job_s2(DvWork *k, uint32_t ri, uint32_t a, uint32_t cnt) {
     for (uint32_t i = a; i < a + cnt; i++) {
         if (((i - a) & 15u) == 0 && dv_time_up()) { stopped = true; break; }
         RNG rng = rng_for(r->fp, 3u + (uint32_t)s->rd, i, 0u);
-        k->b = k->base; k->f = k->proto;
+        k->b = k->base; dv_fc_reset(&k->f, &k->proto, k->cells, k->ncell);
         dv_dive(&k->b, &k->f, k->cells, k->ncell, &rng, &pol, k->ordered ? k->tpos : NULL);
         const int sc = dv_score(&k->b);
         s->rsc[i] = sc;
