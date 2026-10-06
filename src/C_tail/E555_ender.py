@@ -862,14 +862,18 @@ class EffortProfile:
 
 # The redive steps run 8 copies (16 in superdeep's first) of 1000 dives and
 # 10000 kick-and-polish rounds.  On 24 dived-and-polished boards (459-461), the
-# whole overnight plan at 30 s a board gained +0.96 edges per board (21 of 24
-# improved) against +0.50 (12) with the earlier 3000/1000 and --prior 1
-# --nogo 1: 11 boards better, none worse.
+# whole overnight plan at 30 s a board gained +0.96 edges per board (18 of 24
+# improved) against +0.50 (10) with the earlier 3000/1000 and --prior 1
+# --nogo 1: 9 boards better, none worse.  In those runs every gain came from
+# the redive and none from 566 CP-SAT calls, and a re-dived band kept gaining
+# with time (E555_diver --reopen: +1.03 edges per board at 15 s, +1.33 at
+# 120 s), so a redive call gets a long wall: half the board budget in
+# overnight, a fifth in deep (twice a pass), 600 s in superdeep (twice).
 EFFORT_PROFILES = {
     "overnight": EffortProfile(
         board_seconds=180.0, workers=4,
         plan=(Step("swap", sets=24),
-              Step("redive", 0, 5, 45.0, sets=8, dives=1000, polish=10000),
+              Step("redive", 0, 5, 90.0, sets=8, dives=1000, polish=10000),
               Step("window", 3, 5, 4.0),
               Step("window", 4, 5, 8.0),
               Step("window", 4, 7, 15.0),
@@ -879,12 +883,12 @@ EFFORT_PROFILES = {
     "deep": EffortProfile(
         board_seconds=900.0, workers=8,
         plan=(Step("swap", sets=48),
-              Step("redive", 0, 5, 90.0, sets=8, dives=1000, polish=10000),
+              Step("redive", 0, 5, 180.0, sets=8, dives=1000, polish=10000),
               Step("window", 4, 4, 5.0),
               Step("window", 4, 6, 12.0),
               Step("window", 5, 6, 20.0),
               Step("corner", 5, 0, 45.0),
-              Step("redive", 0, 5, 90.0, sets=8, dives=1000, polish=10000),
+              Step("redive", 0, 5, 180.0, sets=8, dives=1000, polish=10000),
               Step("window", 5, 8, 40.0),
               Step("band", 4, 0, 120.0),
               Step("frame", 0, 0, 90.0),
@@ -898,7 +902,7 @@ EFFORT_PROFILES = {
               Step("window", 4, 6, 20.0),
               Step("window", 5, 6, 40.0),
               Step("corner", 6, 0, 120.0),
-              Step("redive", 1, 6, 300.0, sets=8, dives=1000, polish=10000),
+              Step("redive", 1, 6, 600.0, sets=8, dives=1000, polish=10000),
               Step("window", 5, 8, 90.0),
               Step("window", 6, 8, 180.0),
               Step("band", 5, 0, 600.0),

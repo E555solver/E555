@@ -1626,9 +1626,9 @@ infeasible are cached until a cell in or around them changes.
 
 | profile | budget / board | threads | plan (cheapest first, restarting after every gain) |
 |---|---|---|---|
-| `overnight` | 180 s | 4 | swap, redive 45 s, windows 3x5 4x5 4x7, band 3 |
-| `deep` | 900 s | 8 | swap, redive 90 s, windows 4x4 4x6 5x6, corner 5, redive 90 s, window 5x8, band 4, frame, corral 5x6 |
-| `superdeep` | 7200 s | 12 | swap, redive 600 s (16 copies), windows 4x4 4x6 5x6, corner 6, redive 300 s one row deeper, windows 5x8 6x8, band 5, frame, corral 5x8 |
+| `overnight` | 180 s | 4 | swap, redive 90 s, windows 3x5 4x5 4x7, band 3 |
+| `deep` | 900 s | 8 | swap, redive 180 s, windows 4x4 4x6 5x6, corner 5, redive 180 s, window 5x8, band 4, frame, corral 5x6 |
+| `superdeep` | 7200 s | 12 | swap, redive 600 s (16 copies), windows 4x4 4x6 5x6, corner 6, redive 600 s one row deeper, windows 5x8 6x8, band 5, frame, corral 5x8 |
 
 Step caps scale with `--board_time_limit`. On dived-and-polished Stage B boards
 (457-463) every 4x4 window touching a break was already optimal (78/78), and no
@@ -1637,7 +1637,9 @@ clean row under them gained +1 on 2 of 8 boards and turned a 463 into
 `data/best_465.csv`. The CP-SAT steps matter on unpolished boards. With the
 redive at 1000/10000 instead of 3000/1000 `--prior 1 --nogo 1`, the overnight
 plan at 30 s a board gained +0.96 edges per board on 24 such boards (459-461)
-instead of +0.50: 11 boards better, none worse.
+instead of +0.50: 9 boards better, none worse. Every gain there came from the
+redive (none from 566 CP-SAT calls), and a re-dived band keeps gaining with
+time (9.2, `--reopen`), so the redive calls get long walls.
 
 **Output.** First the files, the number of boards, the threads, each plan step
 with its real cap at this budget, and the latest finishing time; then per board
