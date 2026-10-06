@@ -22,7 +22,7 @@ CSVs), **borders** (Stage A output), and **holes** (movable-cell masks).
 | `holes_open_border_TBLR.csv` | Opens the whole border (Top, Bottom, Left, Right) and its adjacent ring. |
 | `holes_open_border_TRL.csv` | Opens the Top, Right and Left borders plus adjacent corners. |
 | `holes_open_border_TR.csv` | Opens the Top and Right borders plus adjacent corners. |
-| `holes_open_TR3_frontier.csv` | Opens the top 3 rows, the right 3 columns and the box rows 8-15 x cols 10-15, for `E555_backtracker --order frontier`; the header gives the layers and the commands. |
+| `holes_open_TR3_frontier.csv` | Opens the top 3 rows, the right 3 columns and the box rows 10-15 x cols 8-15, for `E555_backtracker --order frontier`; the header gives the layers and the commands. |
 
 ## Board CSV convention (used across the whole toolkit)
 
