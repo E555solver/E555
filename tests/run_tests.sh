@@ -2125,6 +2125,26 @@ EOF
     grep -q "release cell (r=0,c=0) is not open" "$OUT/er_closed.log" || fail "a closed release cell was not reported"
     [ "$(grep -vc '^#' "$OUT/er_closed.csv")" = 0 ] || fail "a board with a closed release cell was written"
     echo "ok: R,C gives the K of its place in the order; mrv refused; a closed cell is reported, not written"
+
+    # --order frontier fills the layers around the placed pieces one by one: on
+    # holes_top3 those are rows 13, 14, 15, so 13,5 releases after row 13 = K 32.
+    local fr=(--order frontier --threads 1)
+    "${bt[@]}" "$OUT/fr_cell.csv" "${open[@]}" "${fr[@]}" --early_release 13,5 > "$OUT/fr_cell.log" \
+        || fail "frontier --early_release 13,5 failed"
+    "${bt[@]}" "$OUT/fr_k.csv" "${open[@]}" "${fr[@]}" --early_release 32 > "$OUT/fr_k.log" \
+        || fail "frontier --early_release 32 failed"
+    "${bt[@]}" "$OUT/fr_t4.csv" "${open[@]}" --order frontier --threads 4 --early_release 32 \
+        --no_hall --no_colour_count > "$OUT/fr_t4.log" || fail "frontier at 4 threads failed"
+    grep -q "colour_count=off" "$OUT/fr_t4.log" || fail "--no_colour_count not in the header"
+    cmp -s "$OUT/fr_cell.csv" "$OUT/fr_k.csv" || fail "frontier 13,5 differs from 32"
+    cmp -s "$OUT/fr_k.csv" "$OUT/fr_t4.csv" || fail "frontier differs at 4 threads"
+    python3 - "$OUT/fr_cell.csv" <<'PY' || fail "frontier did not release after a complete row 13"
+import sys
+f = [l for l in open(sys.argv[1]) if not l.startswith("#")][0].split(",")[-512:]
+cells = {int(x) for x in f[:256] if int(x) != 999}
+assert all(208 + c in cells for c in range(16)) and not any(x >= 224 for x in cells)
+PY
+    echo "ok: frontier releases after whole layers (13,5 == 32), the same at 4 threads"
 }
 
 # --resume cuts one exact search into sessions.  The proof that nothing is
@@ -2147,7 +2167,8 @@ step_backtracker_resume() {
     # 1. Stops at the time limit: the sessions are one run, node for node.
     for spec in "rm 4096 --order rowmajor --holes $d/ge9.csv" \
                 "mrv 65536 --order mrv --holes $d/ge9.csv" \
-                "rot 16384 --order centerout --rotate 2 --holes $d/le6.csv"; do
+                "rot 16384 --order centerout --rotate 2 --holes $d/le6.csv" \
+                "fr 4096 --order frontier --holes $d/ge9.csv"; do
         set -- $spec; tag=$1; budget=$2; shift 2
         "$bt" "$seed" "$part" "$d/$tag.ref.csv" "$@" --threads 1 --verbose \
             > "$d/$tag.ref.log" || fail "$tag: the straight run failed"

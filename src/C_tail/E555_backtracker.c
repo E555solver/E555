@@ -344,6 +344,11 @@ static void release_text(int code, char *buf, size_t n) {
  * written carries one (format: "Resume identifier" below).  --resume_score S:
  * rows whose board scores below S are skipped and not written; -1 = off. */
 static bool        g_resume             = false;
+/* --no_colour_count: skip the colour/type accounting (remaining_feasibility_ex)
+ * at the record root and after every placement.  The no-exact-fit cut stays.
+ * For runs whose last cells are meant to take breaks; not recorded in the
+ * resume identifier, like --hall, so it may change between runs. */
+static bool        g_colour_count       = true;
 static int         g_resume_score       = -1;
 /* Test hook, from the environment variable E555_BT_NODE_BUDGET: a record's
  * search stops as if its --time_limit had run out once it has visited this
@@ -469,6 +474,8 @@ typedef enum {
     ORD_SPIRAL,        /* outside-in (border rings first) */
     ORD_CENTEROUT,     /* inside-out (center first) */
     ORD_SPIRALOUT,     /* inside-out ring path ending at the top-left corner */
+    ORD_FRONTIER,      /* dynamic, layered: the most-constrained cell of the innermost
+                        * unfinished layer around the placed pieces (see frontier_layers) */
     ORD_MRV,           /* dynamic: most-constrained cell; row-major tie break,
                         * or column-major when --reverse is given */
     ORD_2SIDES,        /* exact side-growth: left/right layers, one cell per row */
@@ -538,6 +545,7 @@ static const char *order_name(OrderMode m) {
         case ORD_CENTEROUT: return "centerout";
         case ORD_SPIRALOUT:  return "spiralout";
         case ORD_MRV:        return "mrv";
+        case ORD_FRONTIER:   return "frontier";
         case ORD_2SIDES:     return "2sides";
         case ORD_4SIDES:    return "4sides";
         default:            return "?";
@@ -590,6 +598,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_resume_score >= 0) printf(" --resume_score %d", g_resume_score);
     printf(" --restarts %lld", (long long)g_stuck_restarts);
     if (!g_lcv) printf(" --no_lcv");
+    if (!g_colour_count) printf(" --no_colour_count");
     if (g_hall_mode == HALL_OFF) printf(" --no_hall");
     else                         printf(" --hall %s", hall_mode_name(g_hall_mode));
     printf(" --hall_stride %d --hall_min %d", g_hall_stride, g_hall_small);
@@ -906,6 +915,7 @@ typedef struct {
     double       deadline;       /* wall-clock deadline; 0 = none */
     bool         collect;        /* gather complete boards in MismatchResult */
     int          release;        /* --early_release K of this record (0 = off) */
+    const int8_t (*layer)[PUZZLE_SIDE]; /* --order frontier: this record's layers */
     ResumeCursor *resume;        /* --resume: this record's cursor; else NULL.
                                   * Mutated by the (serial) DFS that owns it. */
 } SearchCtx;
@@ -1568,8 +1578,9 @@ static bool board_cells_equal(const Board *a, const Board *b) {
  *       for --early_release R,C -- a dot, as the field holds no commas).  A resuming run must be
  *       given the same values; any difference is fatal at load and names the
  *       setting.  Settings that do not change the tree (--threads,
- *       --time_limit, --hall, --best_n, ...) are not recorded and may change
- *       from run to run.  --hall only ever prunes subtrees holding no
+ *       --time_limit, --hall, --no_colour_count, --best_n, ...) are not
+ *       recorded and may change from run to run; the region before the
+ *       position keeps the cuts that were in force when it was searched.  --hall only ever prunes subtrees holding no
  *       completion, so it cannot change what lies before a point.
  *   open=H
  *       The cells this record's search fills: 64 hex digits, digit i (counting
@@ -4271,9 +4282,73 @@ static int collect_candidates(const Board *b, const FcState *fc,
  * as written. */
 
 /* Choose which remaining cell (index in rem[pos..n_rem-1]) to process next. */
+static inline int placed_neighbor_count(const Board *b, int r, int c);
+
+/*
+ * --order frontier: each empty cell's layer is its distance to the nearest
+ * placed piece of the START board, diagonal steps counting one (so the layers
+ * around a square block are square rings).  The search fills the innermost
+ * unfinished layer first, and within it the cell with the fewest fits, so it
+ * grows from the placed pieces outward and a layer is complete before the next
+ * opens -- which is what lets --early_release R,C mean "after that cell's
+ * layer".  A pure function of the start board: --resume rebuilds it exactly.
+ * With no placed piece every cell is layer 1, i.e. plain fail-first.
+ */
+static void frontier_layers(const Board *b, int8_t layer[PUZZLE_SIDE][PUZZLE_SIDE]) {
+    int q[NUM_PIECES], h = 0, t = 0;
+    for (int r = 0; r < PUZZLE_SIDE; r++)
+        for (int c = 0; c < PUZZLE_SIDE; c++) {
+            bool placed = b->cell[r][c].piece_id != EMPTY_PIECE;
+            layer[r][c] = placed ? 0 : -1;
+            if (placed) q[t++] = r * PUZZLE_SIDE + c;
+        }
+    if (t == 0) {
+        for (int r = 0; r < PUZZLE_SIDE; r++)
+            for (int c = 0; c < PUZZLE_SIDE; c++) layer[r][c] = 1;
+        return;
+    }
+    while (h < t) {
+        int r = q[h] / PUZZLE_SIDE, c = q[h] % PUZZLE_SIDE; h++;
+        for (int dr = -1; dr <= 1; dr++)
+            for (int dc = -1; dc <= 1; dc++) {
+                int nr = r + dr, nc = c + dc;
+                if (nr < 0 || nr >= PUZZLE_SIDE || nc < 0 || nc >= PUZZLE_SIDE) continue;
+                if (layer[nr][nc] >= 0) continue;
+                layer[nr][nc] = (int8_t)(layer[r][c] + 1);
+                q[t++] = nr * PUZZLE_SIDE + nc;
+            }
+    }
+}
+
 static int pick_next_cell(const Board *b, const FcState *fc,
                           const Cell *rem, int n_rem, int pos,
-                          OrderMode mode, int remaining_budget) {
+                          OrderMode mode, int remaining_budget,
+                          const int8_t (*layer)[PUZZLE_SIDE]) {
+    if (mode == ORD_FRONTIER) {
+        /* The innermost unfinished layer only; in it, fewest fits, then more
+         * placed neighbours (the board edge does not count), then row-major
+         * (column-major with --reverse). */
+        int lo = INT_MAX;
+        for (int j = pos; j < n_rem; j++) {
+            int l = layer[(int)rem[j].row][(int)rem[j].col];
+            if (l < lo) lo = l;
+        }
+        int best = pos, best_eff = INT_MAX, best_nb = -1;
+        long best_key = LONG_MAX;
+        for (int j = pos; j < n_rem; j++) {
+            int r = (int)rem[j].row, c = (int)rem[j].col;
+            if (layer[r][c] != lo) continue;
+            int eff = mrv_cell_count(b, fc, r, c, remaining_budget);
+            int nb = placed_neighbor_count(b, r, c);
+            long key = g_reverse ? (long)c * PUZZLE_SIDE + r : (long)r * PUZZLE_SIDE + c;
+            if (eff < best_eff || (eff == best_eff && nb > best_nb) ||
+                (eff == best_eff && nb == best_nb && key < best_key)) {
+                best = j; best_eff = eff; best_nb = nb; best_key = key;
+                if (best_eff == 0) break;
+            }
+        }
+        return best;
+    }
     if (mode != ORD_MRV) return pos;
 
     int best = pos;
@@ -4814,7 +4889,8 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
     int remaining_budget = cx->k_budget - breaks_so_far;
     if (remaining_budget < 0) return;
 
-    int sel = pick_next_cell(b, fc, rem, n_rem, pos, cx->mode, remaining_budget);
+    int sel = pick_next_cell(b, fc, rem, n_rem, pos, cx->mode, remaining_budget,
+                             cx->layer);
     if (sel < 0) {
         stats_note_dead(st, depth, -1, -1);
         return;
@@ -4906,7 +4982,7 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
                 st->fc_rejects[depth]++;
                 viable = false;
             }
-            if (viable) {
+            if (viable && g_colour_count) {
                 FeasIssue issue;
                 if (!remaining_feasibility_ex(b, fc, &issue,
                                               cx->k_budget - new_breaks)) {
@@ -5173,7 +5249,8 @@ static void afo_build_frontier(Board *b, FcState *fc, Cell *rem, int n_rem, int 
     int remaining_budget = cx->k_budget - breaks_so_far;
     if (remaining_budget < 0) return;
 
-    int sel = pick_next_cell(b, fc, rem, n_rem, pos, cx->mode, remaining_budget);
+    int sel = pick_next_cell(b, fc, rem, n_rem, pos, cx->mode, remaining_budget,
+                             cx->layer);
     if (sel < 0) {
         stats_note_dead(st, depth, -1, -1);
         return;
@@ -5229,7 +5306,7 @@ static void afo_build_frontier(Board *b, FcState *fc, Cell *rem, int n_rem, int 
                 st->fc_rejects[depth]++;
                 viable = false;
             }
-            if (viable) {
+            if (viable && g_colour_count) {
                 FeasIssue issue;
                 if (!remaining_feasibility_ex(b, fc, &issue,
                                               cx->k_budget - new_breaks)) {
@@ -5794,6 +5871,8 @@ static void process_line(const char *config_id_str, long long sol_id,
     /* -- --early_release: this record's K.  For a named cell, the number of
      *    searched cells after it in the (static) order; the cell is turned
      *    into the search frame first, as apply_rotation_k() turns a board. -- */
+    int8_t layer[PUZZLE_SIDE][PUZZLE_SIDE];
+    if (g_order_mode == ORD_FRONTIER) frontier_layers(&base, layer);
     int release_k = g_early_release;
     if (g_release_row >= 0) {
         int rr = g_release_row, rc = g_release_col;
@@ -5819,6 +5898,11 @@ static void process_line(const char *config_id_str, long long sol_id,
             return;
         }
         release_k = n_seq - at - 1;
+        if (g_order_mode == ORD_FRONTIER) {     /* after the cell's whole layer */
+            release_k = 0;
+            for (int i = 0; i < n_seq; i++)
+                if (layer[(int)seq[i].row][(int)seq[i].col] > layer[rr][rc]) release_k++;
+        }
     }
     const bool soft_completion = order_uses_soft_completion(g_order_mode);
 
@@ -5852,7 +5936,8 @@ static void process_line(const char *config_id_str, long long sol_id,
     FcState root_fc;
     fc_init(&root_fc, &base);
     FeasIssue init_issue; memset(&init_issue,0,sizeof(init_issue)); init_issue.code=FEAS_OK;
-    bool initial_feasible = remaining_feasibility_ex(&base, &root_fc, &init_issue,
+    bool initial_feasible = !g_colour_count ||
+                            remaining_feasibility_ex(&base, &root_fc, &init_issue,
                                                      total_budget - input_breaks);
     if (initial_feasible && root_fc.zero_domains > total_budget - input_breaks) {
         memset(&init_issue, 0, sizeof(init_issue));
@@ -6055,6 +6140,7 @@ static void process_line(const char *config_id_str, long long sol_id,
             cx.collect          = collect;
             cx.resume           = g_resume ? &rcur : NULL;
             cx.release          = release_k;
+            cx.layer            = (const int8_t (*)[PUZZLE_SIDE])layer;
 
             run_search_at_k(&base, &cx, &lsol, &stats, &mres);
 
@@ -6477,7 +6563,11 @@ static void usage(const char *prog) {
     fputs(
         "Search order and pruning:\n"
         "  --order MODE           mrv (default), rowmajor, colmajor, snake, spiral,\n"
-        "                         centerout, spiralout, 2sides, 4sides.\n"
+        "                         centerout, spiralout, frontier, 2sides, 4sides.\n"
+        "                         frontier: layers by distance to the placed pieces;\n"
+        "                         fewest fits within the innermost unfinished layer, so\n"
+        "                         it grows outward from them (--early_release R,C: after\n"
+        "                         that cell's layer).\n"
         "                         mrv picks the most-constrained cell (fail-first);\n"
         "                         static orders land on cells with no exact fit far\n"
         "                         more often once breaks are allowed.\n"
@@ -6494,6 +6584,9 @@ static void usage(const char *prog) {
         "  --jump                 Best-partial mode: skip a dead cell and continue.\n"
         "  --hall MODE            off, root (default), adaptive, or always.\n"
         "  --no_hall              Alias for --hall off.\n"
+        "  --no_colour_count      Skip the colour/type count at the root and after each\n"
+        "                         placement (the no-exact-fit cut stays): for regions\n"
+        "                         whose last cells will take breaks anyway.\n"
         "  --hall_stride N        Adaptive Hall period in placements (default 8; 0=off).\n"
         "  --hall_min N           Adaptive Hall always-on threshold (default 32 cells).\n\n",
         stderr);
@@ -6807,7 +6900,7 @@ int main(int argc, char **argv) {
             const char *m = argv[++i];
             int o = order_from_name(m);
             if (o < 0)
-                fatal("--order expects mrv|rowmajor|colmajor|snake|spiral|centerout|spiralout|2sides|4sides, got '%s'", m);
+                fatal("--order expects mrv|rowmajor|colmajor|snake|spiral|centerout|spiralout|frontier|2sides|4sides, got '%s'", m);
             g_order_mode = (OrderMode)o;
         } else if (strcmp(argv[i], "--break_mode") == 0 && i+1 < argc) {
             const char *m = argv[++i];
@@ -6828,6 +6921,8 @@ int main(int argc, char **argv) {
             else if (!strcmp(m, "adaptive")) g_hall_mode = HALL_ADAPTIVE;
             else if (!strcmp(m, "always"))   g_hall_mode = HALL_ALWAYS;
             else fatal("--hall expects off|root|adaptive|always, got '%s'", m);
+        } else if (strcmp(argv[i], "--no_colour_count") == 0) {
+            g_colour_count = false;
         } else if (strcmp(argv[i], "--no_hall") == 0) {
             g_hall_mode = HALL_OFF;
         } else if (strcmp(argv[i], "--hall_stride") == 0 && i+1 < argc) {
@@ -7048,7 +7143,7 @@ int main(int argc, char **argv) {
         printf("  side_sweep=left/right/bottom/top ring layers; the exterior ring is processed first\n");
         printf("  side_policy=exact-only; FC/color/Hall completion prunes are bypassed by invariant\n");
     }
-    printf("  hall=%s", effective_hall_name());
+    printf("  hall=%s%s", effective_hall_name(), g_colour_count ? "" : "  colour_count=off");
     if (!order_uses_soft_completion(g_order_mode) && g_hall_mode == HALL_ADAPTIVE)
         printf("  stride=%d  small=%d", g_hall_stride, g_hall_small);
     printf("\n");

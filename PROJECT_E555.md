@@ -1788,6 +1788,12 @@ instead: each record's N is the number of its searched cells after it in
 `--order` (static orders only), so `--order spiralout --reverse
 --early_release 14,14` leaves the border ring. A board on which the cell is
 not open is reported and not written.
+`--order frontier` puts every open cell in a layer, its distance (diagonal
+steps count one) to the nearest placed piece, and fills the innermost
+unfinished layer first, fewest fits first: it grows outward from the placed
+pieces, and `--early_release R,C` then releases after that cell's whole layer.
+`--no_colour_count` (like `--no_hall`) drops a start-of-record check that sees
+the cells to be released too; neither is recorded by `--resume`.
 
 **Resume.** `--resume` splits one exact search over many short runs. Every
 output row carries a resume identifier as field 3 (515 fields): where the
@@ -1830,6 +1836,7 @@ node rate).
 | `--break_mode`, `--breaks K` | stuck, 0 | engine; break ceiling |
 | `--restarts N`, `--no_lcv` | 50000, off | dives; value ordering off |
 | `--order`, `--reverse`, `--jump` | mrv, off, off | cell order |
+| `--no_colour_count` | off | skip the colour/type count (root and per placement); the no-fit cut stays |
 | `--hall MODE`, `--hall_stride N`, `--hall_min N` | root, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record |
