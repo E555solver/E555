@@ -1599,7 +1599,7 @@ The breaks a dive leaves in the top rows of a Stage B board are forced by the pi
 ### 9.3 `E555_ender.py` -- the closer
 
 ```bash
-python3 src/C_tail/E555_ender.py seed.txt boards.csv out.csv --profile deep [--threads N]
+src/C_tail/E555_ender.py seed.txt boards.csv out.csv --profile deep [--threads N]   # python3 in front optional
 ```
 
 Re-solves regions of a complete board exactly (the region's pieces may permute
@@ -1618,7 +1618,7 @@ infeasible are cached until a cell in or around them changes.
 | step | region | method |
 |---|---|---|
 | `swap` | a maximal set of pairwise non-adjacent cells, damaged first | linear assignment: every exchange cycle over the set |
-| `redive` | the band holding 90% of the damage | `E555_diver --reopen` with the band as a mask, 8 copies of 3000/1000 dives, `--prior 1 --nogo 1` |
+| `redive` | the band holding 90% of the damage | `E555_diver --reopen` with the band as a mask, 8 copies of 1000 dives + 10000 polish rounds |
 | `window h x w` | every h x w and w x h rectangle touching a break | CP-SAT |
 | `corner d` | a d x d corner block plus the frame arms beside it | CP-SAT |
 | `band k` | the k rows or columns with the most damage | CP-SAT |
@@ -1634,7 +1634,16 @@ Step caps scale with `--board_time_limit`. On dived-and-polished Stage B boards
 (457-463) every 4x4 window touching a break was already optimal (78/78), and no
 exact region of 48-102 cells gained; the redive of the damaged rows plus the
 clean row under them gained +1 on 2 of 8 boards and turned a 463 into
-`data/best_465.csv`. The CP-SAT steps matter on unpolished boards.
+`data/best_465.csv`. The CP-SAT steps matter on unpolished boards. With the
+redive at 1000/10000 instead of 3000/1000 `--prior 1 --nogo 1`, the overnight
+plan at 30 s a board gained +0.96 edges per board on 24 such boards (459-461)
+instead of +0.50: 11 boards better, none worse.
+
+**Output.** First the files, the number of boards, the threads, each plan step
+with its real cap at this budget, and the latest finishing time; then per board
+its score, every gain as it lands (the time into the board and the step that
+found it), a progress line after two quiet minutes, and a closing line (calls,
+proofs, redives, why it stopped); last, the scores before and after.
 
 | option | default | meaning |
 |---|---|---|
@@ -1646,7 +1655,8 @@ clean row under them gained +1 on 2 of 8 boards and turned a 463 into
 | `--search_mode` | `improve` | `optimize` spends each call's cap |
 | `--clue_center`, `--clue_corners`, `--clue_orient` | off, off, auto | pin clues in place; repair a displaced clue first |
 | `--start_row`, `--num_rows`, `--shard_count`, `--shard_index`, `--resume` | 0, 0, 1, 0, off | input window and sharding |
-| `--rng_seed S`, `--verbose` | 0 = random, off | |
+| `--rng_seed S` | 0 = random (printed) | |
+| `-v`, `--verbose` | off | also every CP-SAT call and redive; `-vv` draws each accepted region |
 
 Advanced controls (`--show_advanced --help`):
 

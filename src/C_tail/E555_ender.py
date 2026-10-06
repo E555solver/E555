@@ -3,17 +3,24 @@
 """
 E555_ender.py -- Stage C CP-SAT closer for complete E555 boards.
 
-NORMAL USE
+NORMAL USE (from the repository root; the script is executable, so the
+leading python3 is optional)
 
-    python3 E555_ender.py seed.txt boards.csv output.csv
-    python3 E555_ender.py seed.txt elites.csv output.csv --profile deep --threads 20
-    python3 E555_ender.py seed.txt elites.csv output.csv --profile superdeep
+    src/C_tail/E555_ender.py data/seed_Edge5.txt boards.csv output.csv
+    src/C_tail/E555_ender.py data/seed_Edge5.txt elites.csv output.csv --profile deep --threads 20
+    src/C_tail/E555_ender.py data/seed_Edge5.txt elites.csv output.csv --profile superdeep
+
+It prints the files, the plan and an estimate of the run time first, then
+one block per board: every gain as it is found (with the time into the
+board), a progress line every few minutes on long boards, and a closing
+line; the run ends with the scores before and after.  --verbose adds every
+CP-SAT call and redive.
 
 WHAT A BOARD LOOKS LIKE WHEN IT GETS HERE
 
 A board from the beamer's --end_dive/--end_polish (or E555_diver) has been
 hill-climbed over every re-rotation and every swap of two dived cells, and
-kicked 50 000 times with three random swaps.  Measured on such boards: every
+kicked and re-polished tens of thousands of times.  Measured on such boards: every
 4x4 window touching a break is already OPTIMAL (CP-SAT proves it), nearly
 every 4x6 window is, no exchange cycle over non-adjacent cells anywhere on the
 board gains an edge, and no larger exact region tried (up to the dived rows
@@ -301,6 +308,24 @@ def _h(cell):
     return min(c, SIDE - 1 - c)
 
 MIN_CALL_SECONDS = 2.0                      # floor under a scaled-down call cap
+HEARTBEAT_SECONDS = 120.0                   # progress line on a long, quiet board
+
+
+def clock(seconds):
+    """Elapsed time as m:ss, or h:mm:ss from an hour on."""
+    s = int(round(seconds))
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def duration(seconds):
+    """A budget in the unit a person would use."""
+    if seconds < 90:
+        return f"{seconds:.0f} s"
+    if seconds < 5400:
+        return f"{seconds / 60:.1f} min"
+    return f"{seconds / 3600:.1f} h"
 
 CORRAL_MAX = 2 * (SIDE // 2 - 1)            # 14: both cells on the centre line
 CORRAL_ROW_W = CORRAL_MAX + 1               # a row step outweighs any sideways sum
@@ -813,6 +838,18 @@ class Step:
     nogo: float = 0.0          # redive: --nogo (push off its broken ones)
 
 
+def step_name(step):
+    """A step's short label: swap, redive, redive+1, window4x6, corner5,
+    band4, frame, corral-window5x6."""
+    if step.kind == "window":
+        name = f"window{step.h}x{step.w}"
+    elif step.kind == "redive":
+        name = "redive" + (f"+{step.h}" if step.h else "")
+    else:
+        name = f"{step.kind}{step.h or ''}"
+    return ("corral-" if step.corral else "") + name
+
+
 @dataclass(frozen=True)
 class EffortProfile:
     board_seconds: float
@@ -823,11 +860,16 @@ class EffortProfile:
     duplicate_policy: str
 
 
+# The redive steps run 8 copies (16 in superdeep's first) of 1000 dives and
+# 10000 kick-and-polish rounds.  On 24 dived-and-polished boards (459-461), the
+# whole overnight plan at 30 s a board gained +0.96 edges per board (21 of 24
+# improved) against +0.50 (12) with the earlier 3000/1000 and --prior 1
+# --nogo 1: 11 boards better, none worse.
 EFFORT_PROFILES = {
     "overnight": EffortProfile(
         board_seconds=180.0, workers=4,
         plan=(Step("swap", sets=24),
-              Step("redive", 0, 5, 45.0, sets=8, dives=3000, polish=1000, prior=1.0, nogo=1.0),
+              Step("redive", 0, 5, 45.0, sets=8, dives=1000, polish=10000),
               Step("window", 3, 5, 4.0),
               Step("window", 4, 5, 8.0),
               Step("window", 4, 7, 15.0),
@@ -837,12 +879,12 @@ EFFORT_PROFILES = {
     "deep": EffortProfile(
         board_seconds=900.0, workers=8,
         plan=(Step("swap", sets=48),
-              Step("redive", 0, 5, 90.0, sets=8, dives=3000, polish=1000, prior=1.0, nogo=1.0),
+              Step("redive", 0, 5, 90.0, sets=8, dives=1000, polish=10000),
               Step("window", 4, 4, 5.0),
               Step("window", 4, 6, 12.0),
               Step("window", 5, 6, 20.0),
               Step("corner", 5, 0, 45.0),
-              Step("redive", 0, 5, 90.0, sets=8, dives=3000, polish=1000, prior=1.0, nogo=1.0),
+              Step("redive", 0, 5, 90.0, sets=8, dives=1000, polish=10000),
               Step("window", 5, 8, 40.0),
               Step("band", 4, 0, 120.0),
               Step("frame", 0, 0, 90.0),
@@ -851,12 +893,12 @@ EFFORT_PROFILES = {
     "superdeep": EffortProfile(
         board_seconds=7200.0, workers=12,
         plan=(Step("swap", sets=96),
-              Step("redive", 0, 5, 600.0, sets=16, dives=3000, polish=1000, prior=1.0, nogo=1.0),
+              Step("redive", 0, 5, 600.0, sets=16, dives=1000, polish=10000),
               Step("window", 4, 4, 8.0),
               Step("window", 4, 6, 20.0),
               Step("window", 5, 6, 40.0),
               Step("corner", 6, 0, 120.0),
-              Step("redive", 1, 6, 300.0, sets=8, dives=3000, polish=1000, prior=1.0, nogo=1.0),
+              Step("redive", 1, 6, 300.0, sets=8, dives=1000, polish=10000),
               Step("window", 5, 8, 90.0),
               Step("window", 6, 8, 180.0),
               Step("band", 5, 0, 600.0),
@@ -912,6 +954,14 @@ def solve_board(partial, tiles, policy, workers, base_seed, verbose, *,
     def remaining():
         return float("inf") if deadline is None else deadline - time.monotonic()
 
+    last_note = [t_start]
+
+    def note(text):
+        """One progress line, stamped with the time into this board."""
+        now = time.monotonic()
+        print(f"      {clock(now - t_start):>7}  {text}", flush=True)
+        last_note[0] = now
+
     # ---- the clean-foundation guard, as hard model constraints -------------
     q0, info0 = board_quality(pos, rot, tiles)
     baseline_broken = set(broken_junctions(pos, rot, tiles))
@@ -949,8 +999,8 @@ def solve_board(partial, tiles, policy, workers, base_seed, verbose, *,
         return max(info["clean"]) >= max(clean0) - policy["max_clean_loss"]
 
     if verbose and requirements:
-        print("      [guard] clean foundation kept: "
-              + ", ".join(f"{s}>={d}" for s, d in requirements), flush=True)
+        note("guard: clean foundation kept: "
+             + ", ".join(f"{s}>={d}" for s, d in requirements))
 
     clues_on = bool(clue_mask and orient is not None)
 
@@ -1001,10 +1051,10 @@ def solve_board(partial, tiles, policy, workers, base_seed, verbose, *,
             kind = "plateau"
         else:
             return None
-        if verbose:
-            print(f"      [{tag}] {breaks} -> {nb} breaks"
-                  + (f", pull {phi} -> {nphi}" if kind == "plateau" else "")
-                  + (f", clues {hits} -> {nh}" if nh != hits else ""), flush=True)
+        note(f"{tag:<16} {NUM_EDGES - breaks} -> {NUM_EDGES - nb}"
+             + (f"  (same score, breaks pulled together: {phi} -> {nphi})"
+                if kind == "plateau" else "")
+             + (f"  (clues in place {hits} -> {nh})" if nh != hits else ""))
         at, breaks, phi, hits = new, nb, nphi, nh
         stage_tag = tag
         stats[kind] += 1
@@ -1088,9 +1138,13 @@ def solve_board(partial, tiles, policy, workers, base_seed, verbose, *,
             for (cells, pins, key), out, st, wall in results:
                 stats["calls"] += 1
                 stats[st.lower()] += 1
-                if verbose > 1:
-                    print(f"        [{label}] {len(cells):3d} cells {st:<10} "
-                          f"{wall:5.1f}s", flush=True)
+                if verbose:
+                    said = {"OPTIMAL": "proved optimal", "INFEASIBLE": "proved: no better",
+                            "FEASIBLE": "no gain by the cap", "UNKNOWN": "no answer by the cap"}
+                    if out is not None and len(broken_of(tiles, out)) < breaks:
+                        said = {st: "better board"}
+                    note(f"  {label:<14} {len(cells):3d} cells  {said.get(st, st.lower()):<20}"
+                         f" {wall:5.1f} s")
                 if out is None:
                     if st == "INFEASIBLE":
                         proven.add(key)          # a proof as well: nothing that good
@@ -1150,13 +1204,14 @@ def solve_board(partial, tiles, policy, workers, base_seed, verbose, *,
                 break
             if step.corral and not corral_on:
                 continue
+            if time.monotonic() - last_note[0] >= HEARTBEAT_SECONDS:
+                note(f"still {NUM_EDGES - breaks}; pass {passes}, next {step_name(step)}; "
+                     f"{stats['calls']} CP-SAT call(s) ({stats['optimal']} proved optimal), "
+                     f"{stats['redives']} redive(s) so far")
             bc = frozenset(c for pr in broken_of(tiles, at) for c in pr)
             if not bc and hits == n_clues:
                 break
-            label = (f"{step.kind}{step.h}x{step.w}" if step.kind == "window"
-                     else f"{step.kind}{step.h or ''}")
-            if step.corral:
-                label = "corral-" + label
+            label = step_name(step)
             if step.kind == "swap":
                 gained = False
                 for _i in range(step.sets):
@@ -1190,6 +1245,11 @@ def solve_board(partial, tiles, policy, workers, base_seed, verbose, *,
                              wall=min(max(MIN_CALL_SECONDS, step.seconds * scale),
                                       remaining()))
                 stats["redives"] += 1
+                if verbose:
+                    nb_new = None if new is None else len(broken_of(tiles, new))
+                    note(f"  {label:<14} {len(band & allowed):3d} cells  "
+                         + ("no board back" if nb_new is None else
+                            f"best copy {NUM_EDGES - nb_new}"))
                 if new is not None and accept(new, label, False) == "strict":
                     progress = True
                     break
@@ -1285,8 +1345,9 @@ def main():
                          "optimize spends each call's cap on the best one"))
     g.add_argument("--rng_seed", type=int, default=0,
                    help="base seed; 0 chooses and reports a random seed")
-    g.add_argument("--verbose", action="count", default=0,
-                   help="print every accepted move (twice: every call and the open region)")
+    g.add_argument("-v", "--verbose", action="count", default=0,
+                   help=("also print every CP-SAT call and redive (twice: draw each "
+                         "accepted region too); gains are always printed"))
     g.add_argument("--show_advanced", action="store_true",
                    help="with --help, display all low-level controls")
 
@@ -1425,29 +1486,32 @@ def main():
               "step is skipped", flush=True)
         policy["seed_file"] = None
 
-    def step_text(s):
-        if s.kind == "swap":
-            return f"swap{s.sets}"
-        if s.kind == "redive":
-            return (f"redive+{s.h}(x{s.sets},{s.dives}/{s.polish}"
-                    + (f",prior{s.prior:g}" if s.prior else "")
-                    + (f",nogo{s.nogo:g}" if s.nogo else "")
-                    + (",plateau" if s.plateau else "") + f")/{s.seconds:g}s")
-        head = (f"window{s.h}x{s.w}" if s.kind == "window" else f"{s.kind}{s.h or ''}")
-        return head + ("(corral)" if s.corral else "") + f"/{s.seconds:g}s"
+    def step_text(st):
+        """What a plan step does, with its real per-call cap at this budget."""
+        cap = (args.attempt_time if args.attempt_time is not None
+               else max(MIN_CALL_SECONDS, st.seconds * scale))
+        if st.kind == "swap":
+            return f"exchange cycles over {st.sets} sets of non-adjacent cells (exact, instant)"
+        if st.kind == "redive":
+            return (f"re-dive the damaged rows" + (f" + {st.h} more" if st.h else "")
+                    + f" (at most {st.w or 5} deep): {st.sets} copies of {st.dives} dives"
+                    f" + {st.polish} polish rounds, up to {duration(cap)}"
+                    + (f", prior {st.prior:g}" if st.prior else "")
+                    + (f", nogo {st.nogo:g}" if st.nogo else "")
+                    + (", plateau" if st.plateau else ""))
+        what = {"window": (f"every {st.h}x{st.w} square" if st.h == st.w else
+                           f"every {st.h}x{st.w} and {st.w}x{st.h} rectangle") + " touching a break",
+                "corner": f"each damaged {st.h}x{st.h} corner block with its frame arms",
+                "band": f"the {st.h} most damaged rows or columns",
+                "frame": "the 60 frame cells and the damaged cells beside them"}[st.kind]
+        return what + (", breaks pulled together" if st.corral else "") + \
+            f", CP-SAT up to {duration(cap)} a call"
 
-    plan_text = ", ".join(step_text(s) for s in prof.plan
-                          if (s.kind != "redive" or policy["seed_file"])
-                          and (not s.corral or policy["corral"]))
-    print("\n=== E555 ender ===")
-    print(f"[cfg] profile={args.profile} search={args.search_mode} board_time={board_time:g}s "
-          f"threads={workers} jobs={jobs}x{max(1, workers // jobs)} corral={policy['corral']} "
-          f"duplicates={policy['duplicate_policy']} rng_seed={args.rng_seed}")
-    print(f"[cfg] plan: {plan_text}")
-    print(f"[cfg] clean guard={args.preserve_clean}/{args.preserve_side} loss<={max_clean_loss}"
-          f" max_new_breaks={'none' if max_new is None else max_new}"
-          f" max_changes={'none' if args.max_changes is None else args.max_changes}"
-          + (f" holes={len(holes)} cells" if holes else ""))
+    scale = (board_time / prof.board_seconds
+             if board_time > 0 and prof.board_seconds > 0 else 1.0)
+    plan_steps = [st for st in prof.plan
+                  if (st.kind != "redive" or policy["seed_file"])
+                  and (not st.corral or policy["corral"])]
 
     def selected_rows():
         data_idx = 0
@@ -1471,14 +1535,72 @@ def main():
     if args.resume and out_path.exists():
         resume_rows = _count_data_rows(out_path)
         out_mode = "a"
-        print(f"[resume] {resume_rows} completed row(s) already in {out_path}")
     else:
         out_mode = "w"
-    rows = itertools.islice(selected_rows(), resume_rows, None)
+    n_selected = sum(1 for _ in selected_rows())
+    n_todo = max(0, n_selected - resume_rows)
 
+    try:
+        import ortools
+        ortools_version = ortools.__version__
+    except (ImportError, AttributeError):
+        ortools_version = "?"
+    print("\n=== E555 ender ===")
+    window = ""
+    if args.start_row or args.num_rows:
+        last = args.start_row + args.num_rows if args.num_rows else None
+        window = (f", input rows {args.start_row + 1}-{last}" if last
+                  else f", input rows {args.start_row + 1} on")
+    if args.shard_count > 1:
+        window += f", shard {args.shard_index + 1} of {args.shard_count}"
+    print(f"[in]  boards  {args.partials}: {n_todo} board(s) to do{window}"
+          + (f" ({resume_rows} already in the output)" if resume_rows else ""))
+    print(f"[in]  seed    {args.seed}")
+    print(f"[out] boards  {args.output}: one row per board, never worse"
+          + (" (appending: --resume)" if out_mode == "a" else ""))
+    if board_time > 0:
+        total = n_todo * board_time
+        finish = time.strftime("%a %H:%M" if total > 20 * 3600 else "%H:%M",
+                               time.localtime(time.time() + total))
+        budget = (f"up to {duration(board_time)} per board, at most {duration(total)} "
+                  f"in all (by {finish}; boards that run out of moves finish sooner)")
+    else:
+        budget = "no time limit per board (each runs until nothing is left to try)"
+    print(f"[cfg] profile {args.profile}: {budget}")
+    print(f"[cfg] threads {workers} ({jobs} region model(s) at a time, "
+          f"{max(1, workers // jobs)} CP-SAT workers each)")
+    print("[cfg] plan, cheapest first, back to the top after every gain:")
+    for st in plan_steps:
+        print(f"[cfg]   {step_name(st):<18} {step_text(st)}")
+    guard = "off"
+    if args.preserve_clean:
+        guard = {"auto": "the cleanest side's", "any": "any side's",
+                 "all": "every side's"}.get(args.preserve_side, f"side {args.preserve_side}'s")
+        guard += f" clean rows kept (at most {max_clean_loss} lost)"
+    extras = [f"only the {len(holes)} cells of --holes move"] if holes else []
+    if max_new is not None:
+        extras.append(f"at most {max_new} new break(s) a move")
+    if args.max_changes is not None:
+        extras.append(f"at most {args.max_changes} cell(s) changed a move")
+    print(f"[cfg] guard   {guard}" + "".join("; " + e for e in extras))
+    if clue_mask:
+        which = " + ".join(n for n, on in (("centre", args.clue_center),
+                                           ("corners", args.clue_corners)) if on)
+        print(f"[cfg] clues   {which} pinned (orientation {args.clue_orient})")
+    print(f"[cfg] tools   OR-Tools {ortools_version}; diver "
+          + (str(diver_path()) if policy["seed_file"] else "off (no redive)"))
+    print(f"[cfg] rng     --rng_seed {args.rng_seed} (pass it again to repeat this run)",
+          flush=True)
+
+    rows = itertools.islice(selected_rows(), resume_rows, None)
     run_start = time.time()
-    done = gained = reused = 0
+    done = gained = reused = improved = 0
+    before_hist, after_hist = collections.Counter(), collections.Counter()
+    best_seen = None                        # (score, id, input row)
     duplicate_cache = {}
+    reason_text = {"board-time": "time up", "exhausted": "nothing left to try",
+                   "solved": "solved", "input-solved": "already solved",
+                   "passes": "--max_passes reached", "interrupted": "interrupted"}
     with open(args.output, out_mode, newline="") as out:
         writer = csv.writer(out, lineterminator="\n")
         for input_idx, row in rows:
@@ -1487,52 +1609,64 @@ def main():
             partial = parse_partial_line(row)
             bin_ = len(broken_junctions(partial.pos, partial.rot, tiles))
             fp = board_fingerprint(partial.pos, partial.rot)
+            tag = f"[{done + 1}/{n_todo}]"
+            head = f"{tag} {partial.config_id} (input row {input_idx + 1})"
             if policy["duplicate_policy"] == "reuse" and fp in duplicate_cache:
-                pos, rot, breaks = duplicate_cache[fp]
-                writer.writerow([partial.config_id, str(NUM_EDGES - breaks)]
-                                + [str(x) for x in pos] + [str(x) for x in rot])
-                out.flush()
-                done += 1
+                pos, rot, breaks, first = duplicate_cache[fp]
                 reused += 1
-                gained += bin_ - breaks
-                print(f"[{input_idx + 1}] {partial.config_id} | {bin_:>2}->{breaks:>2} "
-                      f"| reused exact duplicate | profile={args.profile}", flush=True)
-                continue
-            orient = None
-            if clue_mask:
-                if args.clue_orient == "auto":
-                    orient, _n = CL.clue_orient(partial.pos, partial.rot, clue_mask)
-                else:
-                    orient = int(args.clue_orient)
-                if orient is None:
-                    print(f"[{input_idx + 1}] [WARN] no enabled clue identifies "
-                          "an orientation; solving unpinned", flush=True)
-            if args.verbose:
-                print(f"\n[{input_idx + 1}] {partial.config_id} | input breaks {bin_}",
-                      flush=True)
-            pos, rot, breaks, reason, stage, sec, bstats = solve_board(
-                partial, tiles, policy, workers, args.rng_seed + 104729 * input_idx,
-                args.verbose, holes=holes, CL=CL, clue_mask=clue_mask, orient=orient)
+                print(f"{head}: same board as input row {first + 1}, its result reused: "
+                      f"{NUM_EDGES - bin_} -> {NUM_EDGES - breaks}", flush=True)
+            else:
+                print(f"{head}: {NUM_EDGES - bin_} ({bin_} breaks)", flush=True)
+                orient = None
+                if clue_mask:
+                    if args.clue_orient == "auto":
+                        orient, _n = CL.clue_orient(partial.pos, partial.rot, clue_mask)
+                    else:
+                        orient = int(args.clue_orient)
+                    if orient is None:
+                        print("      [warn] no enabled clue identifies an orientation; "
+                              "solving unpinned", flush=True)
+                pos, rot, breaks, reason, stage, sec, bstats = solve_board(
+                    partial, tiles, policy, workers, args.rng_seed + 104729 * input_idx,
+                    args.verbose, holes=holes, CL=CL, clue_mask=clue_mask, orient=orient)
+                if policy["duplicate_policy"] == "reuse":
+                    duplicate_cache[fp] = (list(pos), list(rot), breaks, input_idx)
+                skipped = (f", {bstats['cached']} skipped as already proved"
+                           if bstats["cached"] else "")
+                print(f"      {clock(sec):>7}  done: {NUM_EDGES - bin_} -> {NUM_EDGES - breaks}"
+                      + (f" (+{bin_ - breaks})" if breaks < bin_ else "")
+                      + f"; {bstats['calls']} CP-SAT call(s) ({bstats['optimal']} proved"
+                      f" optimal{skipped}), {bstats['redives']} redive(s); stopped: "
+                      + reason_text.get(reason, reason), flush=True)
             writer.writerow([partial.config_id, str(NUM_EDGES - breaks)]
                             + [str(x) for x in pos] + [str(x) for x in rot])
             out.flush()
             done += 1
             gained += bin_ - breaks
-            if policy["duplicate_policy"] == "reuse":
-                duplicate_cache[fp] = (list(pos), list(rot), breaks)
-            print(f"[{input_idx + 1}] {partial.config_id} | {bin_:>2}->{breaks:>2} "
-                  f"| gain={bin_ - breaks:+d} time={sec:6.1f}s calls={bstats['calls']:3d} "
-                  f"proved={bstats['optimal']:3d} cached={bstats['cached']:3d} "
-                  f"redives={bstats['redives']} moves={bstats['strict']}+{bstats['plateau']}p "
-                  f"last={stage} end={reason}", flush=True)
+            improved += breaks < bin_
+            before_hist[NUM_EDGES - bin_] += 1
+            after_hist[NUM_EDGES - breaks] += 1
+            if best_seen is None or NUM_EDGES - breaks > best_seen[0]:
+                best_seen = (NUM_EDGES - breaks, partial.config_id, input_idx + 1)
+
+    def hist(h):
+        return ", ".join(f"{k} x{h[k]}" for k in sorted(h, reverse=True)) or "none"
 
     elapsed = time.time() - run_start
-    print("\n=== run summary ===")
-    print(f"[sum] {done} board(s) in {elapsed:.1f}s, {gained:+d} break(s) net"
-          + (f", {reused} exact duplicate(s) reused" if reused else "")
-          + f" -> {args.output}")
+    print("\n=== summary ===")
+    print(f"[sum] {done} of {n_todo} board(s) in {clock(elapsed)}: {improved} improved, "
+          f"+{gained} edge(s) in all"
+          + (f"; {reused} exact duplicate(s) reused" if reused else ""))
+    print(f"[sum] scores before: {hist(before_hist)}")
+    print(f"[sum] scores after:  {hist(after_hist)}")
+    if best_seen:
+        print(f"[sum] best: {best_seen[0]} {best_seen[1]} (input row {best_seen[2]})")
+    print(f"[sum] written: {args.output}"
+          + (f" ({resume_rows} earlier row(s) kept)" if resume_rows else ""))
     if _STOP:
-        print("[sum] stopped cleanly; every row already written is complete")
+        print("[sum] stopped cleanly; every row already written is complete; "
+              "--resume continues from the next board")
 
 
 if __name__ == "__main__":

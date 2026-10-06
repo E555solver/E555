@@ -2851,7 +2851,7 @@ EOF
         "$OUT/ender_462.csv" --profile overnight --board_time_limit 30 \
         --threads 4 --rng_seed 5 > "$OUT/ender_462.log" \
         || { tail -5 "$OUT/ender_462.log"; fail "the ender exited non-zero on the 462 board"; }
-    grep -Eq "redives=[1-9]" "$OUT/ender_462.log" \
+    grep -Eq " [1-9][0-9]* redive\(s\); stopped" "$OUT/ender_462.log" \
         || { tail -3 "$OUT/ender_462.log"; fail "no redive ran on the 462 board"; }
     ! grep -q "redive: .* failed" "$OUT/ender_462.log" \
         || { grep "redive:" "$OUT/ender_462.log"; fail "the redive's E555_diver call failed"; }
