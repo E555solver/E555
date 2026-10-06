@@ -46,10 +46,11 @@
 #                   instead of under tests/out, so it survives the wipe and
 #                   every later run loads it rather than building it. The
 #                   real-seed checks share one cache either way.
-#   DB_IN_MEMORY=1  never write the database to disk: each database check
-#                   builds it in RAM and drops it (full-disk machines): one
-#                   build per check instead of one in all, each needing 8 GB
-#                   free. Overrides DB_FILE.
+#   DB_IN_MEMORY=1  never write the database to disk: every beamer run builds
+#                   it in RAM and drops it (full-disk machines). That is one
+#                   build per run instead of one in all -- about a minute each
+#                   on 4 cores, so the database checks take many minutes --
+#                   each needing 8 GB free. Overrides DB_FILE.
 #
 # This gate proves the tools find the RIGHT answer.
 #
@@ -76,6 +77,7 @@ OUT=tests/out
 # so a drive with no room for 6.5 GB can still run every check.
 if [ "${DB_IN_MEMORY:-0}" = "1" ]; then GATE_DB=""
 else GATE_DB="${DB_FILE:-$OUT/chain.db}"; fi
+DB_BUILD_S=0        # seconds gate_db spent building it, kept out of the check times
 
 # -----------------------------------------------------------------------------
 # The checks, in order: "name|tier|tags|one-line label".
@@ -192,6 +194,21 @@ index_of() {
 # trying to detect ("the roundhouse must emit nothing here"). An unmatched glob
 # stays literal in bash, so `-e` is the test that works. Always returns 0.
 first_match() { local f; for f in "$@"; do [ -e "$f" ] && { printf '%s\n' "$f"; return 0; }; done; return 0; }
+
+# The database checks share one cache (GATE_DB). The first of them builds it
+# here, once and on every core: left to the check's own command it would be
+# built at that command's --threads, often 1 -- minutes instead of seconds.
+gate_db() {
+    [ -n "$GATE_DB" ] && [ ! -s "$GATE_DB" ] || return 0
+    local t0=$SECONDS
+    echo "[gate] building the 6.4 GB chain database on $(nproc) threads, once for this run" \
+         "(DB_FILE=path keeps it for later runs)"
+    bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv --num_rows 1 \
+        --top_bottoms 1 --top_columns 1 --beam_width 1 --stop_row 1 --threads "$(nproc)" \
+        --db_file "$GATE_DB" --out_dir "$OUT/db_build" > "$OUT/db_build.log" \
+        || { tail -5 "$OUT/db_build.log"; fail "building the chain database failed"; }
+    DB_BUILD_S=$((DB_BUILD_S + SECONDS - t0))
+}
 
 # has_step N -- is check N in this run's selection?
 has_step() { local i; for i in "${SEL[@]}"; do [ "$i" = "$1" ] && return 0; done; return 1; }
@@ -2864,6 +2881,7 @@ EOF
 
 step_beamer_micro() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    gate_db
     # No --lambda_Mahalanobis: it used to pass 8, a value in the raw-d2n units
     # the term had before it was normalised by the live per-row spread. In
     # score-SD, 8 is enormous and drowns the colour objective. The same stale
@@ -2894,7 +2912,9 @@ step_beamer_micro() {
     DD=(bin/E555_beamer data/seed_Edge5.txt --random_edges --exhaust_border_color --pin_clue 1
         --samples 2 --top_columns 40 --stop_row 8 --beam_width 1 --pool_factor 1
         --rng_seed 3 --threads 4 --out_dir "$OUT/beam_dd")
-    if [ -n "$GATE_DB" ]; then DD+=(--db_file "$GATE_DB"); fi
+    # No --db_file: --pin_clue takes the clue piece out of the database, so on
+    # the shared cache this run would rewrite it for its clue set and the next
+    # database check would have to build it back. It builds its own in RAM.
     E555_BORDER_KEYS=1 "${DD[@]}" > "$OUT/beam_dd.log" 2> "$OUT/beam_dd.err" \
         || { tail -5 "$OUT/beam_dd.log" "$OUT/beam_dd.err"; fail "the border-dedup run exited non-zero"; }
     grep "^\[bkey\]" "$OUT/beam_dd.err" > "$OUT/beam_dd.keys" || true
@@ -2913,6 +2933,7 @@ step_beamer_micro() {
 # the two runs together must write exactly the uninterrupted sweep's boards.
 step_beamer_resume() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    gate_db
     CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv
          --start_row 1 --num_rows 2 --top_bottoms 2 --top_columns 3 --beam_width 2000
          --stop_row 6 --rng_seed 5 --threads 1 --verbose)
@@ -2944,12 +2965,13 @@ step_beamer_resume() {
 # through the same checks, their extra fixed corner cells above the stop row.
 step_beamer_backtrack_dive() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    gate_db
     # --no_top_dedup: the near-duplicate filter compares top rows under the
     # run's --backtrack_min_col, so a K=1 run would drop other twins than the
     # K=0 run its boards are checked against; beamer_min_col covers it.
     CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv
          --num_rows 1 --top_bottoms 1 --top_columns 1 --beam_width 2000
-         --backtrack_row 8 --stop_row 10 --lambda_corners --rng_seed 7 --threads 1
+         --backtrack_row 8 --stop_row 10 --lambda_corners --rng_seed 7 --threads 4
          --no_top_dedup)
     if [ -n "$GATE_DB" ]; then CMD+=(--db_file "$GATE_DB"); fi
     "${CMD[@]}" --out_dir "$OUT/btd_plain" > "$OUT/btd_plain.log" \
@@ -2983,7 +3005,7 @@ EOF
     for lam in 0 2; do
         RSV=(bin/E555_beamer data/seed_Edge5.txt "$OUT/btd_rsv.csv"
              --num_rows 2 --top_bottoms 1 --top_columns 1 --beam_width 2000
-             --stop_row 9 --lambda_corners --lambda_reserve "$lam" --rng_seed 7 --threads 2)
+             --stop_row 9 --lambda_corners --lambda_reserve "$lam" --rng_seed 7 --threads 4)
         if [ -n "$GATE_DB" ]; then RSV+=(--db_file "$GATE_DB"); fi
         "${RSV[@]}" --out_dir "$OUT/btd_rsv$lam" > "$OUT/btd_rsv$lam.log" \
             || { tail -5 "$OUT/btd_rsv$lam.log"; fail "--lambda_reserve $lam run exited non-zero"; }
@@ -3067,14 +3089,14 @@ EOF
     # from column 1, and its --cap_top closure a run on row 15 from column 1
     # over the whole columns (checked by the legality pass above: no break
     # anywhere).
-    # 4 threads write the same file as 1; --backtrack_min_col 1 writes the
+    # 1 thread writes the same file as 4; --backtrack_min_col 1 writes the
     # subset whose extension fills column 1; --prefix names the boards.
     grep -q "^\[sum\] extension: " "$OUT/btd_plain.log" \
         || fail "no extension summary"
     "${CMD[@]}" --extend_nodes 0 --out_dir "$OUT/btd_noext" > "$OUT/btd_noext.log" \
         || { tail -5 "$OUT/btd_noext.log"; fail "--extend_nodes 0 run exited non-zero"; }
-    "${CMD[@]}" --threads 4 --out_dir "$OUT/btd_t4" --prefix gate1 > "$OUT/btd_t4.log" \
-        || { tail -5 "$OUT/btd_t4.log"; fail "--prefix run exited non-zero"; }
+    "${CMD[@]}" --threads 1 --out_dir "$OUT/btd_t1" --prefix gate1 > "$OUT/btd_t1.log" \
+        || { tail -5 "$OUT/btd_t1.log"; fail "--prefix run exited non-zero"; }
     "${CMD[@]}" --backtrack_min_col 1 --out_dir "$OUT/btd_min1" --prefix > "$OUT/btd_min1.log" \
         || { tail -5 "$OUT/btd_min1.log"; fail "--backtrack_min_col 1 run exited non-zero"; }
     local code
@@ -3086,7 +3108,7 @@ EOF
         fi
     done
     python3 - "$OUT/btd_plain/beam_completions_0_10.csv" "$OUT/btd_noext/beam_completions_0_10.csv" \
-              "$OUT/btd_t4/beam_completions_0_10.csv" "$OUT/btd_min1/beam_completions_0_10.csv" \
+              "$OUT/btd_t1/beam_completions_0_10.csv" "$OUT/btd_min1/beam_completions_0_10.csv" \
               "$code" <<'EOF' || exit 1
 import sys
 STOP, H = 10, 4
@@ -3112,15 +3134,15 @@ for name, pos, rot in ext_rows:
 plain = [split(p, r)[0] for _, p, r in rows(sys.argv[2])]
 assert all(not split(p, r)[1] for _, p, r in rows(sys.argv[2])), "--extend_nodes 0 placed cells above the stop row"
 assert cores == plain, "the extension changed the stop-row boards or their order"
-t4 = list(rows(sys.argv[3]))
-assert [(p, r) for _, p, r in t4] == [(p, r) for _, p, r in ext_rows], "4 threads wrote other boards than 1"
-assert all(n.startswith("gate1_") for n, _, _ in t4), "--prefix gate1 did not name the boards"
+t1 = list(rows(sys.argv[3]))
+assert [(p, r) for _, p, r in t1] == [(p, r) for _, p, r in ext_rows], "1 thread wrote other boards than 4"
+assert all(n.startswith("gate1_") for n, _, _ in t1), "--prefix gate1 did not name the boards"
 m1 = list(rows(sys.argv[4]))
 assert all(n.startswith(sys.argv[5] + "_") for n, _, _ in m1), "the bare --prefix code does not name the boards"
 full1 = [(p, r) for _, p, r in ext_rows if len(split(p, r)[1]) >= H]
 assert [(p, r) for _, p, r in m1] == full1, "--backtrack_min_col 1 did not write exactly the boards filling column 1"
 print(f"ok: extension on {len(ext_rows)} boards ({n_ext} cells, column-major, stop-row boards unchanged); "
-      f"same at 4 threads; --backtrack_min_col 1 keeps {len(m1)}; --prefix names the rows")
+      f"same at 1 thread; --backtrack_min_col 1 keeps {len(m1)}; --prefix names the rows")
 EOF
 
     # E555_diver --stop_row runs the same extension on the same candidate order:
@@ -3167,6 +3189,7 @@ EOF
 #    as a recount of their matched edges does;
 step_beamer_min_col() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    gate_db
     CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv
          --num_rows 1 --top_bottoms 1 --top_columns 2 --beam_width 2000
          --backtrack_row 7 --stop_row 10 --rng_seed 7 --threads 1)
@@ -3585,6 +3608,7 @@ step_pipeline_topper_sweep() {
 # "no board survived" and exits 0), so depth costs the check nothing.
 step_example_beamer() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    gate_db
     bash examples/01_beamer_quickstart.sh OUT_DIR="$OUT/ex01" BEAM_WIDTH=2000 \
         STOP_ROW=10 N_BOTTOMS=1 N_COLUMNS=1 THREADS=4 DB_FILE="$GATE_DB" \
         > "$OUT/ex01.log" \
@@ -3615,6 +3639,7 @@ step_example_beamer() {
 # really operates.
 step_pipeline_full() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    gate_db
     if ! python3 -c "import ortools" 2>/dev/null; then
         echo "SKIPPED: OR-Tools not installed (stages 5 and 6 would be skipped)"
         return 0
@@ -3811,13 +3836,14 @@ for idx in "${SEL[@]}"; do
     echo ""
     echo "=== [test $idx/$TOTAL] $name -- $STEP ==="
     t0=$SECONDS
+    b0=$DB_BUILD_S
     # Called bare, on purpose. Putting this in an `if`, a `&&` or a `|| fail`
     # would disable `set -e` for everything inside the function body, so a
     # failing tool would stop aborting and only the body's last command would
     # decide the result -- a gate that is green because it stopped checking.
     # Every check signals failure with an explicit `fail`, or by dying under -e.
     "step_$name"
-    TIMES+=("$(printf '%3d  %-22s %4ds' "$idx" "$name" $((SECONDS - t0)))")
+    TIMES+=("$(printf '%3d  %-22s %4ds' "$idx" "$name" $((SECONDS - t0 - (DB_BUILD_S - b0))))")
     PASS=$((PASS + 1))
 done
 
@@ -3825,6 +3851,10 @@ echo ""
 echo "=== run summary ==="
 if [ "${#TIMES[@]}" -gt 0 ]; then
     for t in "${TIMES[@]}"; do echo "[sum] $t"; done
+fi
+if [ "$DB_BUILD_S" -gt 0 ]; then
+    printf '[sum]      %-22s %4ds (once per run, not counted above; DB_FILE=path keeps it)\n' \
+        "chain database build" "$DB_BUILD_S"
 fi
 if [ "$PASS" -eq "$TOTAL" ]; then
     echo "[sum] all $TOTAL checks passed in ${SECONDS}s"
