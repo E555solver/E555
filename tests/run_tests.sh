@@ -3022,6 +3022,8 @@ step_ender_repair() {
     # exchanged along the frame. Every break is repairable by construction --
     # the solution is still there to be found -- so anything short of 480 is a
     # regression in the engine, the exchange move or the frame handling.
+    # With --rng_seed 8 the exchange move alone restores it, in about 2 s at
+    # any thread count; the 8 s cap only bounds a regression.
     python3 - "$OUT/ender_scrambled.csv" <<'EOF' || fail "could not scramble the synthetic solution"
 import csv, random, sys
 row = next(csv.reader(open("data/synth_solution_480.csv")))
@@ -3053,8 +3055,8 @@ EOF
              --seed_file data/synth_seed.txt --csv | awk -F, 'NR==2{print $4}')
     [ "${before:-480}" -lt 480 ] || fail "the scramble left the board intact"
     python3 src/C_tail/E555_ender.py data/synth_seed.txt "$OUT/ender_scrambled.csv" \
-        "$OUT/ender_repaired.csv" --profile overnight --board_time_limit 120 \
-        --threads 4 --rng_seed 5 > "$OUT/ender_repair.log" \
+        "$OUT/ender_repaired.csv" --profile overnight --board_time_limit 8 \
+        --threads 4 --rng_seed 8 > "$OUT/ender_repair.log" \
         || { tail -5 "$OUT/ender_repair.log"; fail "the ender exited non-zero"; }
     nf=$(awk -F, '{print NF; exit}' "$OUT/ender_repaired.csv")
     [ "$nf" = "514" ] || fail "the repaired board has $nf fields (want 514)"
@@ -3065,9 +3067,11 @@ EOF
 
     # The redive step hands a board to bin/E555_diver and reads the result
     # back; the synthetic repair above never reaches it (the exchange move
-    # finishes first), so run a real board long enough for one redive.
+    # finishes first), so run a real board long enough for one redive.  The
+    # ender starts a redive only with 5 s of the board's budget left, so 10 s
+    # leaves room for one (it starts within a second and runs 4-5 s).
     python3 src/C_tail/E555_ender.py data/seed_Edge5.txt data/board_example_462.csv \
-        "$OUT/ender_462.csv" --profile overnight --board_time_limit 30 \
+        "$OUT/ender_462.csv" --profile overnight --board_time_limit 10 \
         --threads 4 --rng_seed 5 > "$OUT/ender_462.log" \
         || { tail -5 "$OUT/ender_462.log"; fail "the ender exited non-zero on the 462 board"; }
     grep -Eq " [1-9][0-9]* redive\(s\); stopped" "$OUT/ender_462.log" \
