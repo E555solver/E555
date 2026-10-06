@@ -319,6 +319,26 @@ static uint64_t    g_solution_limit     = 1;    /* per record; 0 = enumerate all
  * are the last N of the sequence order_key() builds, which is how --reverse
  * moves the gate; under mrv they are whichever N cells are still empty. */
 static int         g_early_release      = 0;
+/* --early_release R,C: the gate falls right after the search places cell (R,C),
+ * CSV frame, row first.  Each record's K is then the number of its searched
+ * cells that come after that cell in --order (static orders only).  -1 = off. */
+static int         g_release_row        = -1;
+static int         g_release_col        = -1;
+static inline bool release_on(void) { return g_early_release > 0 || g_release_row >= 0; }
+/* The --early_release setting as one int (the resume identifier compares it):
+ * K, or RELEASE_CELL_CODE + R*16 + C for a cell; release_text() prints it. */
+#define RELEASE_CELL_CODE 1000
+static inline int release_code(void) {
+    return g_release_row >= 0 ? RELEASE_CELL_CODE + g_release_row * PUZZLE_SIDE + g_release_col
+                              : g_early_release;
+}
+static void release_text(int code, char *buf, size_t n) {
+    if (code >= RELEASE_CELL_CODE)
+        snprintf(buf, n, "%d,%d", (code - RELEASE_CELL_CODE) / PUZZLE_SIDE,
+                 (code - RELEASE_CELL_CODE) % PUZZLE_SIDE);
+    else
+        snprintf(buf, n, "%d", code);
+}
 
 /* --resume: rows carrying a resume identifier continue their search, every row
  * written carries one (format: "Resume identifier" below).  --resume_score S:
@@ -333,8 +353,8 @@ static int         g_resume_score       = -1;
 static unsigned long long g_test_node_budget = 0;
 
 /* Sequence position of the DFS leaf for a search over n_rem cells. */
-static inline int search_gate(int n_rem) {
-    int g = n_rem - g_early_release;
+static inline int search_gate(int n_rem, int k) {
+    int g = n_rem - k;
     return g > 0 ? g : 0;
 }
 
@@ -564,7 +584,8 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     printf(" --breaks %d", g_max_mismatch);
     if (g_lds_max >= 0) printf(" --lds_max %d", g_lds_max);
     printf(" --max_emitted %" PRIu64, g_solution_limit);
-    if (g_early_release > 0) printf(" --early_release %d", g_early_release);
+    if (g_release_row >= 0) printf(" --early_release %d,%d", g_release_row, g_release_col);
+    else if (g_early_release > 0) printf(" --early_release %d", g_early_release);
     if (g_resume) printf(" --resume");
     if (g_resume_score >= 0) printf(" --resume_score %d", g_resume_score);
     printf(" --restarts %lld", (long long)g_stuck_restarts);
@@ -608,6 +629,7 @@ static uint64_t g_cnt_solution       = 0;
 static uint64_t g_cnt_solution_cutoff= 0;
 static uint64_t g_cnt_no_solution    = 0;
 static uint64_t g_cnt_cutoff         = 0;
+static uint64_t g_cnt_release_closed = 0;   /* --early_release R,C: cell not open */
 static uint64_t g_feas_code_cnt[5]   = {0};
 
 /* -- Best-partial-board tracking ---------------------------------------------- */
@@ -883,6 +905,7 @@ typedef struct {
     double       record_start;   /* absolute omp_get_wtime at record entry */
     double       deadline;       /* wall-clock deadline; 0 = none */
     bool         collect;        /* gather complete boards in MismatchResult */
+    int          release;        /* --early_release K of this record (0 = off) */
     ResumeCursor *resume;        /* --resume: this record's cursor; else NULL.
                                   * Mutated by the (serial) DFS that owns it. */
 } SearchCtx;
@@ -1541,7 +1564,8 @@ static bool board_cells_equal(const Board *a, const Board *b) {
  *
  *   order, reverse, rotate, early_release
  *       The run settings that shape the search tree, named and valued like
- *       their command-line flags (reverse is 0 or 1).  A resuming run must be
+ *       their command-line flags (reverse is 0 or 1; early_release is K, or R.C
+ *       for --early_release R,C -- a dot, as the field holds no commas).  A resuming run must be
  *       given the same values; any difference is fatal at load and names the
  *       setting.  Settings that do not change the tree (--threads,
  *       --time_limit, --hall, --best_n, ...) are not recorded and may change
@@ -1682,7 +1706,21 @@ static bool resume_parse(const char *s, ResumeId *id, char *why, size_t why_sz) 
             id->order = order_from_name(val);
             if (id->order < 0) { snprintf(why, why_sz, "resume identifier: unknown order '%s'", val); return false; }
             break;
-        case K_REVERSE: case K_ROTATE: case K_EARLY:
+        case K_EARLY:
+            if (strchr(val, '.')) {                     /* R.C: a cell */
+                long rr, cc = -1; char *e2 = NULL;
+                errno = 0; rr = strtol(val, &end, 10);
+                if (!errno && end != val && *end == '.') cc = strtol(end + 1, &e2, 10);
+                if (errno || end == val || *end != '.' || e2 == end + 1 || *e2 ||
+                    rr < 0 || rr >= PUZZLE_SIDE || cc < 0 || cc >= PUZZLE_SIDE) {
+                    snprintf(why, why_sz, "resume identifier: bad early_release value '%s'", val);
+                    return false;
+                }
+                id->early_release = RELEASE_CELL_CODE + (int)rr * PUZZLE_SIDE + (int)cc;
+                break;
+            }
+            /* fall through */
+        case K_REVERSE: case K_ROTATE:
             errno = 0; v = strtol(val, &end, 10);
             if (errno || end == val || *end ||
                 v < 0 || v > (k == K_REVERSE ? 1 : k == K_ROTATE ? 3 : NUM_PIECES)) {
@@ -1765,9 +1803,13 @@ static bool resume_settings_match(const ResumeId *id, char *why, size_t why_sz) 
     else if (id->rotate != g_rotation)
         snprintf(why, why_sz, "it was searched with --rotate %d, this run has --rotate %d",
                  id->rotate, g_rotation);
-    else if (id->early_release != g_early_release)
-        snprintf(why, why_sz, "it was searched with --early_release %d, this run has "
-                 "--early_release %d", id->early_release, g_early_release);
+    else if (id->early_release != release_code()) {
+        char a[16], b[16];
+        release_text(id->early_release, a, sizeof(a));
+        release_text(release_code(), b, sizeof(b));
+        snprintf(why, why_sz, "it was searched with --early_release %s, this run has "
+                 "--early_release %s", a, b);
+    }
     else
         return true;
     return false;
@@ -1779,9 +1821,12 @@ static void resume_format(char *out, size_t cap, const uint8_t open[NUM_PIECES],
                           uint32_t start, bool done, const uint16_t *path,
                           int n_path, bool after) {
     size_t off = 0;
-    appendf(out, cap, &off, "%s;order=%s;reverse=%d;rotate=%d;early_release=%d;open=",
+    char rel[16];
+    release_text(release_code(), rel, sizeof(rel));
+    for (char *q = rel; *q; q++) if (*q == ',') *q = '.';    /* no commas in a CSV field */
+    appendf(out, cap, &off, "%s;order=%s;reverse=%d;rotate=%d;early_release=%s;open=",
             RESUME_VERSION, order_name(g_order_mode), g_reverse ? 1 : 0,
-            g_rotation, g_early_release);
+            g_rotation, rel);
     for (int i = 0; i < NUM_PIECES / 4; i++) {
         int d = 0;
         for (int j = 0; j < 4; j++) d |= open[4 * i + j] << j;
@@ -3312,7 +3357,7 @@ static uint64_t write_solution(const Board *b,
      * validator below cannot run.  It is an exact search (--early_release
      * requires --breaks 0), so a broken edge or a frame violation here is an
      * internal error, never a result. */
-    if (g_early_release > 0) {
+    if (release_on()) {
         int placed = board_count_placed(out_b);
         if (!validate_partial_board_ex(out_b, placed, 0, why, sizeof(why)))
             fatal("internal error: invalid released board from sol_id=%lld: %s",
@@ -4745,9 +4790,9 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
     /* The leaf: the end of the sequence, or the --early_release gate before it.
      * A released board needs no completeness test -- --jump is refused with the
      * option, so every position before the gate holds a placed piece. */
-    if (pos == search_gate(n_rem)) {
+    if (pos == search_gate(n_rem, cx->release)) {
         if (rc) rc->following = false;          /* the input path ends here */
-        if (g_early_release > 0 ||
+        if (release_on() ||
             (g_stop_active ? band_is_complete(b)
                            : board_count_placed(b) == NUM_PIECES)) {
             if (!claim_complete_solution(cx->live)) return;
@@ -5108,8 +5153,8 @@ static void afo_build_frontier(Board *b, FcState *fc, Cell *rem, int n_rem, int 
     /* The leaf: the end of the sequence, or the --early_release gate before it.
      * A released board needs no completeness test -- --jump is refused with the
      * option, so every position before the gate holds a placed piece. */
-    if (pos == search_gate(n_rem)) {
-        if (g_early_release > 0 ||
+    if (pos == search_gate(n_rem, cx->release)) {
+        if (release_on() ||
             (g_stop_active ? band_is_complete(b)
                            : board_count_placed(b) == NUM_PIECES)) {
             if (!claim_complete_solution(cx->live)) return;
@@ -5297,7 +5342,7 @@ static void run_search_at_k_search_parallel(Board *base, const SearchCtx *cx,
     {
         /* Never refine past the leaf, which --early_release moves before the
          * end of the sequence; an item already at the gate is a leaf. */
-        int depth_cap = search_gate(n_rem) - 1;
+        int depth_cap = search_gate(n_rem, cx->release) - 1;
         long long max_exp_ll = 16LL * (long long)fr.target;
         int max_expansions = (max_exp_ll > INT_MAX) ? INT_MAX : (int)max_exp_ll;
         int expansions = 0;
@@ -5306,7 +5351,7 @@ static void run_search_at_k_search_parallel(Board *base, const SearchCtx *cx,
             int pick = -1;
             for (int i = 0; i < fr.count; i++) {
                 const AfoWorkItem *it = &fr.items[i];
-                if (it->pos >= search_gate(it->n_rem) || it->pos >= depth_cap) continue;
+                if (it->pos >= search_gate(it->n_rem, cx->release) || it->pos >= depth_cap) continue;
                 if (pick < 0 || it->pos < fr.items[pick].pos) pick = i;
             }
             if (pick < 0) break;                      /* nothing refinable left */
@@ -5745,6 +5790,36 @@ static void process_line(const char *config_id_str, long long sol_id,
     Cell seq[MAX_SEQ_LEN];
     int  n_seq = 0;
     build_search_sequence_ordered(&base, seq, &n_seq, g_order_mode);
+
+    /* -- --early_release: this record's K.  For a named cell, the number of
+     *    searched cells after it in the (static) order; the cell is turned
+     *    into the search frame first, as apply_rotation_k() turns a board. -- */
+    int release_k = g_early_release;
+    if (g_release_row >= 0) {
+        int rr = g_release_row, rc = g_release_col;
+        for (int q = 0; q < g_rotation; q++) { int t = rc; rc = PUZZLE_SIDE - 1 - rr; rr = t; }
+        int at = -1;
+        for (int i = 0; i < n_seq; i++)
+            if (seq[i].row == rr && seq[i].col == rc) { at = i; break; }
+        if (at < 0) {
+            #pragma omp atomic
+            g_cnt_release_closed++;
+            appendf(rec_buf, sizeof(rec_buf), &rec_off,
+                    "[cfg=%s sol=%lld] release cell (r=%d,c=%d) is not open on this "
+                    "board; not searched, not written.\n",
+                    config_id_str, sol_id, g_release_row, g_release_col);
+            #pragma omp critical(stdout_print)
+            { fputs(rec_buf, stdout); fflush(stdout); }
+            DfsStats st0; stats_init(&st0);
+            FeasIssue fi0; memset(&fi0,0,sizeof(fi0)); fi0.code=FEAS_OK;
+            write_status_csv(config_id_str, sol_id, true, "release_cell_closed",
+                             n_placed, n_seq, holes_applied, omp_get_wtime()-t0, 0,
+                             &fi0, &st0, NULL, 0, n_placed, input_connected, input_breaks,
+                             -1, -1, 0);
+            return;
+        }
+        release_k = n_seq - at - 1;
+    }
     const bool soft_completion = order_uses_soft_completion(g_order_mode);
 
     if (g_verbose && order_is_side_growth(g_order_mode)) {
@@ -5979,6 +6054,7 @@ static void process_line(const char *config_id_str, long long sol_id,
             cx.deadline         = level_deadline;
             cx.collect          = collect;
             cx.resume           = g_resume ? &rcur : NULL;
+            cx.release          = release_k;
 
             run_search_at_k(&base, &cx, &lsol, &stats, &mres);
 
@@ -6131,15 +6207,15 @@ static void process_line(const char *config_id_str, long long sol_id,
         int sconnected = total_internal - sbroken;  /* complete board: all 480 edges exist */
         /* A released board is not complete: its edges are counted, not assumed.
          * The streamed board is the record's best, which is a released one. */
-        if (g_early_release > 0) sconnected = rstat.best_connected;
+        if (release_on()) sconnected = rstat.best_connected;
         char brk[128];
         int boff = snprintf(brk, sizeof(brk),
                             " connected_edges=%d broken_edges=%d pieces_with_breaks=%d kept=%d",
                             sconnected, sbroken, collect && mres.found ? mres.items[0].pieces : 0,
                             collect ? mres.count : 0);
-        if (g_early_release > 0 && boff > 0 && (size_t)boff < sizeof(brk))
+        if (release_on() && boff > 0 && (size_t)boff < sizeof(brk))
             snprintf(brk + boff, sizeof(brk) - (size_t)boff, " released=%d",
-                     n_seq - search_gate(n_seq));
+                     n_seq - search_gate(n_seq, release_k));
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
                 "[cfg=%s sol=%lld] %s found=%" PRIu64
                 " placed=%d/%d empty=%d holes=%d"
@@ -6456,6 +6532,13 @@ static void usage(const char *prog) {
         "                         mrv leaves whichever N cells remain.  The search above\n"
         "                         is unchanged: the open cells still count in every\n"
         "                         completion prune.  One board per record.\n"
+        "  --early_release R,C    The same, released right after the search places the\n"
+        "                         cell at row R, column C (0-based, CSV frame): each\n"
+        "                         record's N is the number of its searched cells after\n"
+        "                         that cell in --order.  spiralout --reverse 14,14 (or\n"
+        "                         spiralout 14,1) leaves the border ring.  Needs a static\n"
+        "                         order (not mrv); a board where the cell is not open is\n"
+        "                         reported and not written.\n"
         "                         Requires --breaks 0; refused with 2sides/4sides,\n"
         "                         --jump and --stop_row/--stop_column.  Exact search\n"
         "                         has no default time limit: set --time_limit for big\n"
@@ -6695,11 +6778,22 @@ int main(int argc, char **argv) {
             g_solution_limit = (uint64_t)v;
         } else if (strcmp(argv[i], "--early_release") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
-            long v = strtol(argv[++i], &end, 10);
-            if (errno || end == argv[i] || *end || v < 0 || v > NUM_PIECES)
-                fatal("--early_release expects an integer in [0,%d], got '%s'",
-                      NUM_PIECES, argv[i]);
-            g_early_release = (int)v;
+            const char *a = argv[++i];
+            long v = strtol(a, &end, 10);
+            if (!errno && end != a && *end == ',') {        /* R,C: a cell */
+                char *e2 = NULL;
+                long c = strtol(end + 1, &e2, 10);
+                if (errno || e2 == end + 1 || *e2 || v < 0 || v >= PUZZLE_SIDE ||
+                    c < 0 || c >= PUZZLE_SIDE)
+                    fatal("--early_release R,C expects a row and a column in [0,%d], "
+                          "got '%s'", PUZZLE_SIDE - 1, a);
+                g_release_row = (int)v; g_release_col = (int)c; g_early_release = 0;
+            } else {
+                if (errno || end == a || *end || v < 0 || v > NUM_PIECES)
+                    fatal("--early_release expects an integer in [0,%d] or a cell R,C, "
+                          "got '%s'", NUM_PIECES, a);
+                g_early_release = (int)v; g_release_row = g_release_col = -1;
+            }
         } else if (strcmp(argv[i], "--resume") == 0) {
             g_resume = true;
         } else if (strcmp(argv[i], "--resume_score") == 0 && i+1 < argc) {
@@ -6806,7 +6900,7 @@ int main(int argc, char **argv) {
     /* A released board is the exact search's state N cells before the end, so
      * everything that makes "N cells before the end" mean something else is
      * refused rather than reinterpreted. */
-    if (g_early_release > 0) {
+    if (release_on()) {
         if (order_is_side_growth(g_order_mode))
             fatal("--early_release does not apply to --order %s: side growth defers "
                   "dead cells and has no fixed end to count back from",
@@ -6825,6 +6919,11 @@ int main(int argc, char **argv) {
         if (g_solution_limit != 1)
             fatal("--early_release writes one board per record: --max_emitted must "
                   "be 1, got %" PRIu64, g_solution_limit);
+        /* mrv picks its next cell from the board as it stands, so a named cell
+         * has no fixed place in the order to count back from. */
+        if (g_release_row >= 0 && g_order_mode == ORD_MRV)
+            fatal("--early_release R,C needs a static --order: under mrv the cell "
+                  "order changes as the search runs, so the cell has no fixed place");
     }
     /* --resume continues ONE serial exact DFS per record from a recorded path.
      * Everything that would make that path mean something else, or would split
@@ -6979,7 +7078,11 @@ int main(int argc, char **argv) {
     printf("  max_emitted=");
     if (g_solution_limit > 0) printf("%" PRIu64 " per record\n", g_solution_limit);
     else                      printf("all\n");
-    if (g_early_release > 0)
+    if (g_release_row >= 0)
+        printf("  early_release=%d,%d (emit right after placing cell (r=%d,c=%d); each "
+               "record's K follows from --order; each release counts as a solution)\n",
+               g_release_row, g_release_col, g_release_row, g_release_col);
+    else if (release_on())
         printf("  early_release=%d (emit when %d searched cells remain; each release "
                "counts as a solution)\n", g_early_release, g_early_release);
     if (g_resume) {
@@ -7319,7 +7422,10 @@ int main(int argc, char **argv) {
     printf("    solution_cutoff      = %" PRIu64 "\n", g_cnt_solution_cutoff);
     printf("    no_solution          = %" PRIu64 "\n", g_cnt_no_solution);
     printf("    cutoff               = %" PRIu64 "\n", g_cnt_cutoff);
-    if (g_early_release > 0)
+    if (g_release_row >= 0)
+        printf("    release_cell_closed  = %" PRIu64 "  (not searched, not written)\n",
+               g_cnt_release_closed);
+    if (release_on())
         printf("    released_boards      = %" PRIu64 "\n", g_total_solutions);
     else
         printf("    full_solutions       = %" PRIu64 "\n", g_total_solutions);

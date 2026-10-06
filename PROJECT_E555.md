@@ -1783,6 +1783,11 @@ break-free board with only N of its searched cells still empty, the last N of
 frame and the rings to re-grow, leaves the border ring for the CP-SAT tools.
 The search above the gate is unchanged. Requires `--breaks 0`; the usage text
 (run without arguments) lists where the gate falls per order.
+`--early_release R,C` (row, column, 0-based) names the last cell to place
+instead: each record's N is the number of its searched cells after it in
+`--order` (static orders only), so `--order spiralout --reverse
+--early_release 14,14` leaves the border ring. A board on which the cell is
+not open is reported and not written.
 
 **Resume.** `--resume` splits one exact search over many short runs. Every
 output row carries a resume identifier as field 3 (515 fields): where the
@@ -1830,7 +1835,7 @@ node rate).
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record |
 | `--max_emitted N` | 1 | completions per record (0 = all) |
 | `--stop_row N`, `--stop_column N`, `--with_frame` | -- | band enumeration |
-| `--early_release N` | 0 | emit the break-free board N searched cells before the end |
+| `--early_release N` or `R,C` | 0 | emit the break-free board N searched cells before the end, or right after cell (R,C) |
 | `--resume` | off | continue each row's search from its identifier; write one on every row |
 | `--resume_score S` | -- | with `--resume`: skip the rows scoring below S |
 | `--clue_center`, `--clue_corners`, `--clue_orient N` | off | clues |

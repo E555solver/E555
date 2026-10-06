@@ -2109,6 +2109,22 @@ EOF
         grep -q -- "--early_release" "$OUT/er_bad.log" || fail "no --early_release refusal for $extra"
     done
     echo "ok: N=0 is the plain run; --breaks, --jump, 2sides, --stop_row and --max_emitted 2 refused"
+
+    # --early_release R,C releases right after the named cell: K is the number of
+    # searched cells after it in --order, so the 4th cell placed gives K=44.
+    "${bt[@]}" "$OUT/er_cell.csv" "${open[@]}" --order rowmajor --early_release 13,3 \
+        --threads 1 > "$OUT/er_cell.log" || fail "--early_release 13,3 failed"
+    cmp -s "$OUT/er_cell.csv" "$OUT/er_rowmajor.csv" || fail "rowmajor 13,3 differs from 44"
+    "${bt[@]}" "$OUT/er_cell_rev.csv" "${open[@]}" --order spiralout --reverse \
+        --early_release 13,5 --threads 1 > "$OUT/er_cell_rev.log" || fail "--early_release 13,5 failed"
+    cmp -s "$OUT/er_cell_rev.csv" "$OUT/er_spiralout--reverse.csv" || fail "spiralout --reverse 13,5 differs from 44"
+    "${bt[@]}" "$OUT/er_bad.csv" "${open[@]}" --order mrv --early_release 13,3 > "$OUT/er_bad.log" 2>&1 \
+        && fail "--early_release R,C accepted with mrv"
+    "${bt[@]}" "$OUT/er_closed.csv" "${open[@]}" --order rowmajor --early_release 0,0 \
+        > "$OUT/er_closed.log" || fail "--early_release 0,0 failed"
+    grep -q "release cell (r=0,c=0) is not open" "$OUT/er_closed.log" || fail "a closed release cell was not reported"
+    [ "$(grep -vc '^#' "$OUT/er_closed.csv")" = 0 ] || fail "a board with a closed release cell was written"
+    echo "ok: R,C gives the K of its place in the order; mrv refused; a closed cell is reported, not written"
 }
 
 # --resume cuts one exact search into sessions.  The proof that nothing is
