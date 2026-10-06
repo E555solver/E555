@@ -53,7 +53,8 @@ corner clues always occupy (2,2), (2,13), (13,2), (13,13), with different pieces
   `pos[p]` is the cell of piece `p` (999 = unplaced), `rot[p]` its spin.
   Readers take the **last 512 fields** as `pos, rot` and treat anything before
   them as metadata, so every producer's rows parse everywhere (Stage B writes a
-  solution index in field 2, or the matched-edge count under `--end_dive`).
+  solution index in field 2, or the matched-edge count under `--end_dive`;
+  the backtracker's `--resume` rows put a resume identifier third, 515 fields).
   Lines starting with `#` or `%` are comments. `tools/E555_rank.py --out F
   --rescore` rewrites any file canonically with field 2 = matched edges.
 - Scores are matched interior junctions, 0..480. A partial board's score counts
@@ -1783,6 +1784,34 @@ frame and the rings to re-grow, leaves the border ring for the CP-SAT tools.
 The search above the gate is unchanged. Requires `--breaks 0`; the usage text
 (run without arguments) lists where the gate falls per order.
 
+**Resume.** `--resume` splits one exact search over many short runs. Every
+output row carries a resume identifier as field 3 (515 fields): where the
+record's search stopped, or `done`. Fed back with `--resume`, a row goes on
+from there, so the runs together search exactly the tree of one long run.
+After a released board, the next run releases the next one. The row's board is
+the best over all runs, never worse.
+- Rows without an identifier start fresh. `--holes` and the clue flags apply to
+  them only, and dedup skips those identical after `--holes`; under `--resume`
+  a skipped duplicate is not written.
+- Each record runs on one thread; records still run in parallel.
+- `--order`, `--reverse`, `--rotate` and `--early_release` must match the
+  identifier; `--threads`, `--time_limit` and `--hall` may change between runs.
+- Requires `--breaks 0` and `--max_emitted 1`. Refused with 2sides/4sides,
+  `--jump`, a stop band and `--all_for_one`.
+- `--resume_score S` skips, and does not write, the rows scoring below S.
+- Every run ends with `output scores: ... median=M (K boards >= M)`: M as the
+  next `--resume_score` keeps about half the rows.
+- Without `--resume`, an identifier row is a plain board. Use that to finish
+  the best boards with every thread.
+- `rank.py --top/--out` keeps identifiers; `--rescore` drops them. The format
+  is documented in `E555_backtracker.c` ("Resume identifier").
+
+```bash
+E555_backtracker seed beams.csv s1.csv --holes H --order spiralout --early_release 60 --resume --time_limit 120
+E555_backtracker seed s1.csv s2.csv --order spiralout --early_release 60 --resume --resume_score M --time_limit 600
+E555_backtracker seed elite.csv done.csv --breaks 0          # no --resume: all threads per board
+```
+
 **Parallelism.** One record per thread, or all threads on one record when there
 are no more records than threads (`--all_for_one` forces it). The search is
 memory-bandwidth bound (four independent single-thread runs reach 2.44x
@@ -1802,12 +1831,15 @@ node rate).
 | `--max_emitted N` | 1 | completions per record (0 = all) |
 | `--stop_row N`, `--stop_column N`, `--with_frame` | -- | band enumeration |
 | `--early_release N` | 0 | emit the break-free board N searched cells before the end |
+| `--resume` | off | continue each row's search from its identifier; write one on every row |
+| `--resume_score S` | -- | with `--resume`: skip the rows scoring below S |
 | `--clue_center`, `--clue_corners`, `--clue_orient N` | off | clues |
 | `--start_row`, `--num_rows`, `--dedup`/`--no_dedup` | 0, all, dedup | input |
 | `--best_n N`, `--status` | --, off | side files |
 | `--threads N`, `--all_for_one`, `--verbose`, `--version`, `--print_cmd` | all | |
 
-Output: one best-board row per input record in `output.csv`, plus
+Output: one best-board row per input record in `output.csv` (with `--resume`,
+the identifier third; the run ends with the min/max/mean/std/median score), plus
 `output.csv.checkpoint.csv` (crash recovery), `.status.csv`, `.best_pure.csv`,
 `.best_mismatch.csv` and the stop-band files. The gate rebuilds the solver with
 `-DVERIFY_BREAKCOUNT` to check the break counters against a full scan.
@@ -1894,7 +1926,7 @@ Output: one best-board row per input record in `output.csv`, plus
 | finalizer | `beam_completions_finalized_<stop>.csv` | as the beamer; ids `p<line>r<repeat>l<column>` |
 | roundhouse | the output CSV (third positional) | canonical; ids `<input>_<line><tag><n>`, tags `s d j f` |
 | diver | the output CSV, `<out>.outputs.txt` | canonical, matched edges in field 2 |
-| backtracker | output CSV, `.checkpoint.csv`, `.status.csv`, `.best_*.csv`, `.stop_row<N>.csv` / `.stop_col<N>.csv` (`_rev`) | canonical |
+| backtracker | output CSV, `.checkpoint.csv`, `.status.csv`, `.best_*.csv`, `.stop_row<N>.csv` / `.stop_col<N>.csv` (`_rev`) | canonical; with `--resume`, `config_id, score, identifier, pos, rot` |
 | topper, ender, distiller | output CSV | canonical |
 
 ## 12. Build and test

@@ -71,6 +71,13 @@
  *     still count in every completion prune -- so a released board is a state
  *     the full search passes through.  Where the gate falls follows --order and
  *     --reverse (rowmajor N=16: the top row; spiralout N=60: the border ring).
+ *   - --resume makes the exact search resumable: every output row carries an
+ *     identifier of where that record's search stopped (the pieces placed
+ *     along the current DFS path), and a later run given the file with
+ *     --resume re-places that path and carries on, so a search split into many
+ *     short runs visits exactly the tree of one long run.  One thread per
+ *     record.  --resume_score S keeps only the rows scoring S or more.  The
+ *     identifier format is documented at "Resume identifier" below.
  *
  * OUTPUT
  *   - The mandatory output.csv gets ONE line per processed record: the best
@@ -78,7 +85,9 @@
  *     partial), streamed at end-of-record, thread-safe.  Layout is the
  *     canonical E555 board row config_id,score,pos[256],rot[256] (514 fields;
  *     score = matched internal edges) so the file can be fed straight back in
- *     as input for an improvement loop.
+ *     as input for an improvement loop.  Under --resume the row has 515 fields,
+ *     the resume identifier third; the run ends with the min/max/mean/std/
+ *     median of the scores written either way.
  *   - <output>.checkpoint.csv: append-only crash-recovery file in the same
  *     re-feedable layout; a record's best board is appended when it improves
  *     (>=10 s throttle per record).  Removed on clean completion.
@@ -116,11 +125,12 @@
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 
-#define E555_BUILD_TAG "backtracker-20261005"
+#define E555_BUILD_TAG "backtracker-20261006"
 
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <math.h>
 #include <omp.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -309,6 +319,18 @@ static uint64_t    g_solution_limit     = 1;    /* per record; 0 = enumerate all
  * are the last N of the sequence order_key() builds, which is how --reverse
  * moves the gate; under mrv they are whichever N cells are still empty. */
 static int         g_early_release      = 0;
+
+/* --resume: rows carrying a resume identifier continue their search, every row
+ * written carries one (format: "Resume identifier" below).  --resume_score S:
+ * rows whose board scores below S are skipped and not written; -1 = off. */
+static bool        g_resume             = false;
+static int         g_resume_score       = -1;
+/* Test hook, from the environment variable E555_BT_NODE_BUDGET: a record's
+ * search stops as if its --time_limit had run out once it has visited this
+ * many nodes (0 = off).  The node counter advances in NODE_TICK_BATCH steps on
+ * one thread, so the stop lands on the same node every run -- which is what a
+ * check needs to cut one search into sessions repeatably.  Not a user option. */
+static unsigned long long g_test_node_budget = 0;
 
 /* Sequence position of the DFS leaf for a search over n_rem cells. */
 static inline int search_gate(int n_rem) {
@@ -502,6 +524,13 @@ static const char *order_name(OrderMode m) {
     }
 }
 
+/* The inverse of order_name(): the OrderMode a --order value names, or -1. */
+static int order_from_name(const char *m) {
+    for (int o = ORD_ROWMAJOR; o <= ORD_4SIDES; o++)
+        if (strcmp(m, order_name((OrderMode)o)) == 0) return o;
+    return -1;
+}
+
 /* -- --print_cmd ----------------------------------------------------------
  * The whole invocation with every flag carrying the value the run will really
  * use, from the command line or from a default. Copy the line and you have the
@@ -536,6 +565,8 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_lds_max >= 0) printf(" --lds_max %d", g_lds_max);
     printf(" --max_emitted %" PRIu64, g_solution_limit);
     if (g_early_release > 0) printf(" --early_release %d", g_early_release);
+    if (g_resume) printf(" --resume");
+    if (g_resume_score >= 0) printf(" --resume_score %d", g_resume_score);
     printf(" --restarts %lld", (long long)g_stuck_restarts);
     if (!g_lcv) printf(" --no_lcv");
     if (g_hall_mode == HALL_OFF) printf(" --no_hall");
@@ -763,7 +794,8 @@ typedef struct {
  * active), an approximate node counter (each thread adds its batch when its
  * local counter wraps), and the next-heartbeat timestamp for the periodic
  * progress line (CAS-claimed so exactly one thread prints per interval). */
-enum { STOP_NONE = 0, STOP_SOLUTION_LIMIT = 1, STOP_TIMEOUT = 2 };
+enum { STOP_NONE = 0, STOP_SOLUTION_LIMIT = 1, STOP_TIMEOUT = 2,
+       STOP_RESUME_MISMATCH = 4 /* a resume path left the candidate lists */ };
 typedef struct {
     atomic_int    requested;   /* bitmask of STOP_* reasons */
     atomic_llong  hb_next_ms;  /* next heartbeat, ms since g_t_start_wall */
@@ -812,6 +844,25 @@ static inline bool claim_complete_solution(SearchLive *s) {
     }
 }
 
+/* --resume: where one record's serial DFS starts and where it stopped.  The
+ * input path is the identifier's at=PATH, turned into search-frame keys
+ * (pid*4+spin); while `following`, the DFS re-places it and skips the siblings
+ * before it.  The output path is captured once, at the first stop, in CSV keys
+ * (P*4+S with S the CSV rotation), ready to be written as the next at=.  See
+ * "Resume identifier" for the format. */
+typedef struct ResumeCursor {
+    int      n_in;                  /* input path length (0 = the root) */
+    uint16_t in[MAX_SEQ_LEN];       /* search-frame keys */
+    bool     in_after;              /* at=PATH+: PATH's last subtree is done */
+    bool     following;             /* still re-placing the input path */
+    bool     mismatch;              /* the input path left the candidate lists */
+    int      mismatch_depth;
+    bool     captured;              /* the output path below is set */
+    int      n_out;
+    uint16_t out[MAX_SEQ_LEN];      /* CSV keys */
+    bool     out_after;
+} ResumeCursor;
+
 /* E555: read-only per-search context.  Bundles the invariants that v8 threaded
  * through tail_dfs()'s parameter list, one instance per (record, budget level,
  * lds allowance).  rstat and live point at shared per-record state (lock- and
@@ -832,6 +883,8 @@ typedef struct {
     double       record_start;   /* absolute omp_get_wtime at record entry */
     double       deadline;       /* wall-clock deadline; 0 = none */
     bool         collect;        /* gather complete boards in MismatchResult */
+    ResumeCursor *resume;        /* --resume: this record's cursor; else NULL.
+                                  * Mutated by the (serial) DFS that owns it. */
 } SearchCtx;
 static inline uint64_t piece_bit(int pid) { return 1ULL << (pid & 63); }
 static inline bool used_test(const uint64_t u[], int pid) { return (u[pid>>6] & piece_bit(pid)) != 0; }
@@ -1268,20 +1321,24 @@ static bool parse_board_fields(char *const fields[], int n_fields, int first_pos
 }
 
 /*
- * Parse one of the two documented, exact CSV layouts:
+ * Parse one of the documented, exact CSV layouts:
  *   canonical / Stage-B : config_id,meta,pos[256],rot[256]       (514 fields)
  *                         (meta is the score of a canonical row, or the
  *                          sol_id of a Stage-B beamer/finalizer row)
  *   legacy tailsolver   : config_id,sol_id,rank,pos[256],rot[256] (515 fields)
+ *   --resume output     : config_id,score,identifier,pos[256],rot[256]
+ *                         (515 fields; field 3 begins "bt", see "Resume
+ *                          identifier"; *resume_out gets a copy of it)
  *
  * v9 guessed the layout from a single field-count special case and then allowed
  * arbitrary trailing fields.  A one-column shift silently corrupts every piece
- * position, so E555 accepts only these two unambiguous schemas.
+ * position, so E555 accepts only these unambiguous schemas.
  */
 static bool parse_csv_line(const char *line,
                            char config_id_out[CONFIG_ID_LEN], long long *sol_id,
                            int pos[NUM_PIECES], int rot[NUM_PIECES],
-                           char *why, size_t why_sz) {
+                           char **resume_out, char *why, size_t why_sz) {
+    *resume_out = NULL;
     const int beam_fields = 2 + 2 * NUM_PIECES;
     const int tail_fields = 3 + 2 * NUM_PIECES;
     int n_fields = count_csv_fields(line);
@@ -1331,8 +1388,14 @@ static bool parse_csv_line(const char *line,
 
     int first_pos = 2;
     if (n_fields == tail_fields) {
+        char *f3 = fields[2];
+        while (*f3 == ' ' || *f3 == '\t') f3++;
         long long rank = 0;
-        if (!parse_ll_token(fields[2], &rank)) {
+        if (strncmp(f3, "bt", 2) == 0) {
+            char *e = f3 + strlen(f3);
+            while (e > f3 && (e[-1] == ' ' || e[-1] == '\t')) *--e = '\0';
+            *resume_out = xstrdup(f3);
+        } else if (!parse_ll_token(f3, &rank)) {
             snprintf(why, why_sz, "bad rank/meta field");
             free(fields); free(buf); return false;
         }
@@ -1343,6 +1406,7 @@ static bool parse_csv_line(const char *line,
                                  pos, rot, why, why_sz);
     free(fields);
     free(buf);
+    if (!ok) { free(*resume_out); *resume_out = NULL; }
     return ok;
 }
 
@@ -1454,6 +1518,315 @@ static bool board_cells_equal(const Board *a, const Board *b) {
         }
     }
     return true;
+}
+
+/* -- Resume identifier (--resume) ---------------------------------------------- *
+ *
+ * Under --resume every output.csv row is
+ *
+ *     config_id, score, IDENTIFIER, pos[256], rot[256]          (515 fields)
+ *
+ * and IDENTIFIER says where that record's exact search stood when the run
+ * stopped, so a later run fed the file with --resume continues it from there.
+ * Readers that take the last 512 fields (rank, viewer, diver, ender, finalizer,
+ * ...) see an ordinary board with one more metadata field; rank --rescore
+ * rewrites the row canonically and drops it.
+ *
+ * FORMAT bt1.  One CSV field without commas or spaces, for example
+ *
+ *     bt1;order=spiralout;reverse=0;rotate=0;early_release=60;open=<64 hex>;start=<8 hex>;at=812.33.1020.7+
+ *
+ * "bt1", then ';'-separated items in any order, each key=value or the bare word
+ * "done":
+ *
+ *   order, reverse, rotate, early_release
+ *       The run settings that shape the search tree, named and valued like
+ *       their command-line flags (reverse is 0 or 1).  A resuming run must be
+ *       given the same values; any difference is fatal at load and names the
+ *       setting.  Settings that do not change the tree (--threads,
+ *       --time_limit, --hall, --best_n, ...) are not recorded and may change
+ *       from run to run.  --hall only ever prunes subtrees holding no
+ *       completion, so it cannot change what lies before a point.
+ *   open=H
+ *       The cells this record's search fills: 64 hex digits, digit i (counting
+ *       from the left, from 0) covering cells 4i..4i+3, bit j (value 1<<j) for
+ *       cell 4i+j.  Cells are numbered row*16+col in the CSV frame: row 0 at the
+ *       bottom, before --rotate.  The START BOARD is the row's board with these
+ *       cells emptied.  --holes and the clue flags are not applied to it again.
+ *   start=X
+ *       Checksum of the start board, 8 hex digits: 32-bit FNV-1a over cells
+ *       0..255 in order, each cell's value -- piece*4 + its CSV rotation, or
+ *       1024 when empty -- fed as two bytes, low byte first.  A row whose board
+ *       was changed by another tool fails it and is copied through unsearched.
+ *   at=PATH  or  at=PATH+
+ *       Everything before PATH in the search order has been searched.  PATH is
+ *       the pieces the search had placed on the start board, in the order it
+ *       placed them, as '.'-separated decimals P*4+S (P the piece id, S its
+ *       rotation as the CSV rot[] field writes it).  An empty PATH is the root.
+ *       Without '+' the next run re-enters the node PATH leads to (where a
+ *       --time_limit stop left it).  With '+' the subtree under PATH's last
+ *       piece is finished as well (the stop after a released board or a
+ *       solution), so the next run goes on with the candidate after it.
+ *   done
+ *       Instead of at=: the whole tree has been searched.  A done row is
+ *       copied through unsearched.
+ *
+ * The row's board is the best board over all runs, not the board at PATH: where
+ * the search stands and what it has found are different things.
+ *
+ * WHAT THE FORMAT RELIES ON.  PATH only means something because the search tree
+ * is a pure function of the start board and the settings above:
+ *   - the next cell is pick_next_cell() over the sequence order_key() builds;
+ *   - the candidates at a cell are its exact fits in ascending search-frame
+ *     pid*4+spin (collect_candidates(); --resume requires --breaks 0, so no
+ *     break candidate ever appears);
+ *   - every prune is sound: it never cuts a completion, or a released board.
+ * Changing any of these changes the tree, and old identifiers would point at
+ * the wrong place: bump the version to bt2 and keep refusing other versions.
+ *
+ * COMPATIBILITY.  Writers always write every key.  A key added later must be
+ * optional when read, its absence meaning the behaviour from before the key
+ * existed, so that bt1 rows stay valid.  Unknown keys and versions are fatal:
+ * an identifier this build cannot honour must not be resumed as if it could.
+ */
+#define RESUME_VERSION  "bt1"
+#define RESUME_ID_MAX   4096   /* a full 256-entry path needs about 1.5 KB */
+#define RESUME_EMPTY    1024   /* start= value of an empty cell */
+
+typedef struct {
+    int      order, reverse, rotate, early_release;
+    uint8_t  open[NUM_PIECES];      /* 1 = cell the search fills, CSV frame */
+    uint32_t start;                 /* resume_start_sum() of the start board */
+    bool     done;
+    bool     after;                 /* at=PATH+ */
+    int      n_path;
+    uint16_t path[MAX_SEQ_LEN];     /* P*4+S, S the CSV rotation */
+} ResumeId;
+
+/* The start= checksum of a board given as CSV pos[]/rot[] arrays. */
+static uint32_t resume_start_sum(const int pos[NUM_PIECES], const int rot[NUM_PIECES]) {
+    int cell[NUM_PIECES];
+    for (int i = 0; i < NUM_PIECES; i++) cell[i] = RESUME_EMPTY;
+    for (int p = 0; p < NUM_PIECES; p++)
+        if (pos[p] >= 0 && pos[p] < NUM_PIECES) cell[pos[p]] = p * 4 + (rot[p] & 3);
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < NUM_PIECES; i++) {
+        h ^= (uint32_t)(cell[i] & 0xFF);        h *= 16777619u;
+        h ^= (uint32_t)((cell[i] >> 8) & 0xFF); h *= 16777619u;
+    }
+    return h;
+}
+
+static int hex_digit(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+/* Parse an identifier.  Checks the syntax and the value ranges only; whether
+ * its settings match this run is resume_settings_match()'s job. */
+static bool resume_parse(const char *s, ResumeId *id, char *why, size_t why_sz) {
+    memset(id, 0, sizeof(*id));
+    size_t len = strlen(s);
+    if (len >= RESUME_ID_MAX) {
+        snprintf(why, why_sz, "resume identifier is %zu characters long", len);
+        return false;
+    }
+    size_t vlen = strcspn(s, ";");
+    if (vlen != strlen(RESUME_VERSION) || strncmp(s, RESUME_VERSION, vlen) != 0) {
+        snprintf(why, why_sz, "resume identifier version '%.*s' is unknown; this build "
+                 "reads %s", (int)(vlen < 16 ? vlen : 16), s, RESUME_VERSION);
+        return false;
+    }
+    char buf[RESUME_ID_MAX];
+    memcpy(buf, s, len + 1);
+    enum { K_ORDER, K_REVERSE, K_ROTATE, K_EARLY, K_OPEN, K_START, K_STATE, K_N };
+    static const char *const kname[K_N] = { "order", "reverse", "rotate",
+                                            "early_release", "open", "start", "at|done" };
+    bool seen[K_N] = { false };
+    char *save = NULL;
+    strtok_r(buf, ";", &save);                          /* the version */
+    for (char *it = strtok_r(NULL, ";", &save); it; it = strtok_r(NULL, ";", &save)) {
+        int k;
+        char *val = strchr(it, '=');
+        if (!val) {
+            if (strcmp(it, "done") != 0) {
+                snprintf(why, why_sz, "resume identifier item '%s' is not key=value", it);
+                return false;
+            }
+            k = K_STATE; id->done = true;
+        } else {
+            *val++ = '\0';
+            if      (!strcmp(it, "order"))         k = K_ORDER;
+            else if (!strcmp(it, "reverse"))       k = K_REVERSE;
+            else if (!strcmp(it, "rotate"))        k = K_ROTATE;
+            else if (!strcmp(it, "early_release")) k = K_EARLY;
+            else if (!strcmp(it, "open"))          k = K_OPEN;
+            else if (!strcmp(it, "start"))         k = K_START;
+            else if (!strcmp(it, "at"))            k = K_STATE;
+            else {
+                snprintf(why, why_sz, "resume identifier key '%s' is unknown to this build", it);
+                return false;
+            }
+        }
+        if (seen[k]) {
+            snprintf(why, why_sz, "resume identifier repeats %s", kname[k]);
+            return false;
+        }
+        seen[k] = true;
+        char *end = NULL;
+        long v;
+        switch (k) {
+        case K_ORDER:
+            id->order = order_from_name(val);
+            if (id->order < 0) { snprintf(why, why_sz, "resume identifier: unknown order '%s'", val); return false; }
+            break;
+        case K_REVERSE: case K_ROTATE: case K_EARLY:
+            errno = 0; v = strtol(val, &end, 10);
+            if (errno || end == val || *end ||
+                v < 0 || v > (k == K_REVERSE ? 1 : k == K_ROTATE ? 3 : NUM_PIECES)) {
+                snprintf(why, why_sz, "resume identifier: bad %s value '%s'", kname[k], val);
+                return false;
+            }
+            if (k == K_REVERSE) id->reverse = (int)v;
+            else if (k == K_ROTATE) id->rotate = (int)v;
+            else id->early_release = (int)v;
+            break;
+        case K_OPEN:
+            if (strlen(val) != NUM_PIECES / 4) {
+                snprintf(why, why_sz, "resume identifier: open= needs %d hex digits", NUM_PIECES / 4);
+                return false;
+            }
+            for (int i = 0; i < NUM_PIECES / 4; i++) {
+                int d = hex_digit(val[i]);
+                if (d < 0) { snprintf(why, why_sz, "resume identifier: open= is not hex"); return false; }
+                for (int j = 0; j < 4; j++) id->open[4 * i + j] = (uint8_t)((d >> j) & 1);
+            }
+            break;
+        case K_START: {
+            if (strlen(val) != 8) { snprintf(why, why_sz, "resume identifier: start= needs 8 hex digits"); return false; }
+            uint32_t h = 0;
+            for (int i = 0; i < 8; i++) {
+                int d = hex_digit(val[i]);
+                if (d < 0) { snprintf(why, why_sz, "resume identifier: start= is not hex"); return false; }
+                h = (h << 4) | (uint32_t)d;
+            }
+            id->start = h;
+            break;
+        }
+        case K_STATE:
+            if (id->done) break;
+            {
+                size_t n = strlen(val);
+                if (n > 0 && val[n - 1] == '+') { id->after = true; val[--n] = '\0'; }
+                if (id->after && n == 0) {
+                    snprintf(why, why_sz, "resume identifier: at=+ has no path");
+                    return false;
+                }
+                for (char *p = val; *p; ) {
+                    if (id->n_path >= MAX_SEQ_LEN) { snprintf(why, why_sz, "resume identifier: path too long"); return false; }
+                    errno = 0; v = strtol(p, &end, 10);
+                    if (errno || end == p || v < 0 || v >= 4 * NUM_PIECES || (*end && *end != '.') ||
+                        (*end == '.' && end[1] == '\0')) {
+                        snprintf(why, why_sz, "resume identifier: bad path entry at '%.12s'", p);
+                        return false;
+                    }
+                    id->path[id->n_path++] = (uint16_t)v;
+                    p = *end ? end + 1 : end;
+                }
+            }
+            break;
+        }
+    }
+    for (int k = 0; k < K_N; k++)
+        if (!seen[k]) {
+            snprintf(why, why_sz, "resume identifier lacks %s", kname[k]);
+            return false;
+        }
+    int n_open = 0;
+    for (int i = 0; i < NUM_PIECES; i++) n_open += id->open[i];
+    if (id->n_path > n_open) {
+        snprintf(why, why_sz, "resume identifier: a %d-piece path for %d open cells",
+                 id->n_path, n_open);
+        return false;
+    }
+    return true;
+}
+
+/* Does an identifier's tree match this run's?  On a mismatch, says which flag. */
+static bool resume_settings_match(const ResumeId *id, char *why, size_t why_sz) {
+    if (id->order != (int)g_order_mode)
+        snprintf(why, why_sz, "it was searched with --order %s, this run has --order %s",
+                 order_name((OrderMode)id->order), order_name(g_order_mode));
+    else if (id->reverse != (int)g_reverse)
+        snprintf(why, why_sz, "it was searched %s --reverse, this run %s",
+                 id->reverse ? "with" : "without", g_reverse ? "has it" : "does not");
+    else if (id->rotate != g_rotation)
+        snprintf(why, why_sz, "it was searched with --rotate %d, this run has --rotate %d",
+                 id->rotate, g_rotation);
+    else if (id->early_release != g_early_release)
+        snprintf(why, why_sz, "it was searched with --early_release %d, this run has "
+                 "--early_release %d", id->early_release, g_early_release);
+    else
+        return true;
+    return false;
+}
+
+/* Write an identifier for this run's settings.  `path` holds CSV keys; NULL
+ * (or done) writes "done". */
+static void resume_format(char *out, size_t cap, const uint8_t open[NUM_PIECES],
+                          uint32_t start, bool done, const uint16_t *path,
+                          int n_path, bool after) {
+    size_t off = 0;
+    appendf(out, cap, &off, "%s;order=%s;reverse=%d;rotate=%d;early_release=%d;open=",
+            RESUME_VERSION, order_name(g_order_mode), g_reverse ? 1 : 0,
+            g_rotation, g_early_release);
+    for (int i = 0; i < NUM_PIECES / 4; i++) {
+        int d = 0;
+        for (int j = 0; j < 4; j++) d |= open[4 * i + j] << j;
+        appendf(out, cap, &off, "%x", d);
+    }
+    appendf(out, cap, &off, ";start=%08x;", start);
+    if (done || !path) { appendf(out, cap, &off, "done"); return; }
+    appendf(out, cap, &off, "at=");
+    for (int j = 0; j < n_path; j++)
+        appendf(out, cap, &off, j ? ".%u" : "%u", (unsigned)path[j]);
+    if (after) appendf(out, cap, &off, "+");
+}
+
+/* Set a cursor up from an identifier (NULL: a fresh search from the root). */
+static void resume_cursor_init(ResumeCursor *rc, const ResumeId *id) {
+    memset(rc, 0, sizeof(*rc));
+    if (!id) return;
+    rc->n_in = id->n_path;
+    for (int j = 0; j < id->n_path; j++)
+        rc->in[j] = (uint16_t)((id->path[j] & ~3u) | ((id->path[j] + g_rotation) & 3u));
+    rc->in_after = id->after;
+    rc->following = id->n_path > 0;
+}
+
+/* Record where the search stopped, once: the pieces on the current DFS path
+ * rem[0..pos), and whether the subtree under the last one is finished.  A stop
+ * that comes while the input path is still being re-placed leaves the input
+ * position as it was, so a run that ends that early loses nothing. */
+static void resume_capture(ResumeCursor *rc, const Board *b, const Cell *rem,
+                           int pos, bool after) {
+    if (!rc || rc->captured) return;
+    rc->captured = true;
+    if (rc->following) {
+        rc->n_out = rc->n_in;
+        for (int j = 0; j < rc->n_in; j++)
+            rc->out[j] = (uint16_t)((rc->in[j] & ~3u) | ((rc->in[j] - g_rotation) & 3u));
+        rc->out_after = rc->in_after;
+        return;
+    }
+    rc->n_out = pos;
+    for (int j = 0; j < pos; j++) {
+        const Oriented *o = &b->cell[(int)rem[j].row][(int)rem[j].col];
+        rc->out[j] = (uint16_t)((int)o->piece_id * 4 + (((int)o->rotation - g_rotation) & 3));
+    }
+    rc->out_after = after;
 }
 
 /* -- Board printing ----------------------------------------------------------- */
@@ -2996,32 +3369,105 @@ static uint64_t write_solution(const Board *b,
     return solnum;
 }
 
+/* Scores of the rows written to output.csv, for the end-of-run summary
+ * (min/max/mean/std/median).  A score is 0..480, so a histogram holds them
+ * all; updated under critical(stream_csv) with the row itself. */
+#define MAX_SCORE (2 * PUZZLE_SIDE * (PUZZLE_SIDE - 1))
+static uint64_t g_score_hist[MAX_SCORE + 1];
+
+/* Append one row to output.csv: id, field2[, identifier], pos[256], rot[256],
+ * the arrays in the CSV frame.  `score` is the board's matched-edge count,
+ * which is what the summary counts.  Thread-safe. */
+static void emit_output_row(const char *id, long long field2, const char *ident,
+                            const int pos[NUM_PIECES], const int rot[NUM_PIECES],
+                            int score) {
+    if (!g_stream_csv) return;
+    char buf[CSV_BUF_BYTES]; size_t off = 0;
+    appendf(buf, sizeof(buf), &off, "%s,%lld", id, field2);
+    if (ident) appendf(buf, sizeof(buf), &off, ",%s", ident);
+    for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", pos[i]);
+    for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", rot[i]);
+    appendf(buf, sizeof(buf), &off, "\n");
+    #pragma omp critical(stream_csv)
+    { checked_fwrite(buf, 1, off, g_stream_csv, "output.csv");
+      checked_fflush(g_stream_csv, "output.csv");
+      if (score >= 0 && score <= MAX_SCORE) g_score_hist[score]++; }
+}
+
+/* A search-frame board as CSV-frame pos[]/rot[], with its matched-edge count. */
+static int board_to_csv_arrays(const Board *b, int pos[NUM_PIECES], int rot[NUM_PIECES]) {
+    Board orig;
+    const Board *out_b = b;
+    if (g_rotation > 0) { inverse_rotation_k(&orig, b, g_rotation); out_b = &orig; }
+    int conn = 0, brk = 0;
+    board_edge_counts(out_b, &conn, &brk);
+    board_to_pos_rot(out_b, pos, rot);
+    return conn;
+}
+
 /*
  * Stream the single best board for a processed record to output.csv.  Layout
  * is the canonical E555 board row config_id_solid,score,pos[256],rot[256]
  * (514 fields; score = matched internal edges) in the original frame, and the
  * file can be fed straight back in as input.  One line per non-rejected
- * record; thread-safe.
+ * record; thread-safe.  --resume rows go through resume_emit() instead.
  */
 static void write_stream_best(const Board *b,
                               const char *config_id_str, long long sol_id) {
     if (!g_stream_csv) return;
-    Board orig;
-    const Board *out_b = b;
-    if (g_rotation > 0) { inverse_rotation_k(&orig, b, g_rotation); out_b = &orig; }
-
-    int conn = 0, brk = 0;
-    board_edge_counts(out_b, &conn, &brk);
     int pos[NUM_PIECES], rot_arr[NUM_PIECES];
-    board_to_pos_rot(out_b, pos, rot_arr);
-    char buf[CSV_BUF_BYTES]; size_t off = 0;
-    appendf(buf, sizeof(buf), &off, "%s_%lld,%d", config_id_str, sol_id, conn);
-    for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", pos[i]);
-    for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", rot_arr[i]);
-    appendf(buf, sizeof(buf), &off, "\n");
-    #pragma omp critical(stream_csv)
-    { checked_fwrite(buf, 1, off, g_stream_csv, "output.csv");
-      checked_fflush(g_stream_csv, "output.csv"); }
+    int conn = board_to_csv_arrays(b, pos, rot_arr);
+    char id[CONFIG_ID_LEN + 32];
+    snprintf(id, sizeof(id), "%s_%lld", config_id_str, sol_id);
+    emit_output_row(id, conn, NULL, pos, rot_arr, conn);
+}
+
+/* --resume counters for the end-of-run summary: what came in ... */
+static uint64_t g_cnt_resume_fresh     = 0;   /* rows without an identifier, searched */
+static uint64_t g_cnt_resume_continued = 0;   /* rows with one, searched on */
+static uint64_t g_cnt_resume_below     = 0;   /* skipped by --resume_score, not written */
+static uint64_t g_cnt_resume_done_in   = 0;   /* already done, copied through */
+static uint64_t g_cnt_resume_mismatch  = 0;   /* identifier does not fit its board */
+/* ... and how the searched rows ended. */
+static uint64_t g_cnt_end_done    = 0;
+static uint64_t g_cnt_end_stopped = 0;
+static uint64_t g_cnt_end_after   = 0;
+
+/*
+ * Write one --resume row: `out_b` (search frame) is the board, `start_b` (search
+ * frame) the start board its identifier describes, and `rc` where the search
+ * stopped -- NULL, or a cursor that captured nothing, means the tree is done.
+ * Resumed rows keep the id they were read with (keep_id); fresh ones are named
+ * <id>_<sol> as every other row this tool writes.
+ */
+static void resume_emit(const char *config_id_str, long long sol_id, bool keep_id,
+                        const Board *out_b, const Board *start_b,
+                        const ResumeCursor *rc) {
+    int spos[NUM_PIECES], srot[NUM_PIECES];
+    board_to_csv_arrays(start_b, spos, srot);
+    uint8_t open[NUM_PIECES];
+    for (int i = 0; i < NUM_PIECES; i++) open[i] = 1;
+    for (int p = 0; p < NUM_PIECES; p++)
+        if (spos[p] != CSV_UNPLACED) open[spos[p]] = 0;
+
+    bool done = !rc || !rc->captured || (rc->out_after && rc->n_out == 0);
+    char ident[RESUME_ID_MAX];
+    resume_format(ident, sizeof(ident), open, resume_start_sum(spos, srot), done,
+                  done ? NULL : rc->out, done ? 0 : rc->n_out, !done && rc->out_after);
+    uint64_t *cnt = done ? &g_cnt_end_done
+                         : (rc->out_after ? &g_cnt_end_after : &g_cnt_end_stopped);
+    #pragma omp atomic
+    (*cnt)++;
+    uint64_t *kind = keep_id ? &g_cnt_resume_continued : &g_cnt_resume_fresh;
+    #pragma omp atomic
+    (*kind)++;
+
+    int pos[NUM_PIECES], rot_arr[NUM_PIECES];
+    int conn = board_to_csv_arrays(out_b, pos, rot_arr);
+    char id[CONFIG_ID_LEN + 32];
+    if (keep_id) snprintf(id, sizeof(id), "%s", config_id_str);
+    else         snprintf(id, sizeof(id), "%s_%lld", config_id_str, sol_id);
+    emit_output_row(id, conn, ident, pos, rot_arr, conn);
 }
 
 /*
@@ -3184,7 +3630,13 @@ static void ckpt_flush_maybe(const SearchCtx *cx, double now) {
  * flush, heartbeat. */
 #define NODE_TICK_BATCH 4096ULL
 static void search_node_tick(const SearchCtx *cx) {
-    atomic_fetch_add_explicit(&cx->live->nodes, NODE_TICK_BATCH, memory_order_relaxed);
+    unsigned long long seen =
+        atomic_fetch_add_explicit(&cx->live->nodes, NODE_TICK_BATCH, memory_order_relaxed)
+        + NODE_TICK_BATCH;
+    if (g_test_node_budget && seen >= g_test_node_budget) {
+        search_request_stop(cx->live, STOP_TIMEOUT);
+        return;
+    }
     double now = omp_get_wtime();
     if (cx->deadline > 0.0 && now > cx->deadline) {
         search_request_stop(cx->live, STOP_TIMEOUT);
@@ -4269,10 +4721,13 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
     if (order_is_side_growth(cx->mode))
         fatal("internal error: side-growth order entered generic DFS");
     const bool soft_completion = g_jump;
-    if (search_stop_requested(cx->live)) return;
+    /* --resume: a stop seen on entry leaves this node unsearched, so the next
+     * run re-enters it; resume_capture() records the path that leads here. */
+    ResumeCursor *rc = cx->resume;
+    if (search_stop_requested(cx->live)) { resume_capture(rc, b, rem, pos, false); return; }
     if (((++g_tls_nodes) & (NODE_TICK_BATCH - 1ULL)) == 0) {
         search_node_tick(cx);
-        if (search_stop_requested(cx->live)) return;
+        if (search_stop_requested(cx->live)) { resume_capture(rc, b, rem, pos, false); return; }
     }
 
     int depth = base_depth + pos;
@@ -4291,6 +4746,7 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
      * A released board needs no completeness test -- --jump is refused with the
      * option, so every position before the gate holds a placed piece. */
     if (pos == search_gate(n_rem)) {
+        if (rc) rc->following = false;          /* the input path ends here */
         if (g_early_release > 0 ||
             (g_stop_active ? band_is_complete(b)
                            : board_count_placed(b) == NUM_PIECES)) {
@@ -4303,6 +4759,9 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
                 board_break_stats(b, &br, &pcs);
                 mres_add(mres, b, br, pcs);
             }
+            /* This leaf was the --max_emitted'th board: the next run goes on
+             * from the leaf after it. */
+            if (search_stop_requested(cx->live)) resume_capture(rc, b, rem, pos, true);
         }
         return;
     }
@@ -4339,8 +4798,40 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
         }
     }
 
+    /* --resume: while the input path is being re-placed, start this node's loop
+     * at the path's candidate (or just after it, for the last entry of an
+     * at=PATH+), skipping the siblings an earlier run already searched.  The
+     * candidate order is the one the earlier run used -- that is what the
+     * identifier format relies on -- so a piece missing from the list means the
+     * identifier does not belong to this board, and the record stops. */
+    int i_start = 0;
+    bool follow_here = false;
+    if (rc && rc->following) {
+        if (pos >= rc->n_in) {
+            rc->following = false;
+        } else {
+            int at = -1;
+            for (int i = 0; i < n_cand; i++)
+                if ((int)cand[i].pid * 4 + (int)cand[i].spin == (int)rc->in[pos]) { at = i; break; }
+            if (at < 0) {
+                rc->mismatch = true;
+                rc->mismatch_depth = pos;
+                rc->captured = true;            /* no position to write */
+                rc->following = false;
+                search_request_stop(cx->live, STOP_RESUME_MISMATCH);
+            } else if (pos == rc->n_in - 1 && rc->in_after) {
+                rc->following = false;
+                i_start = at + 1;
+            } else {
+                i_start = at;
+                follow_here = true;
+            }
+        }
+    }
+
     uint64_t children = 0;
-    for (int i = 0; i < n_cand && !search_stop_requested(cx->live); i++) {
+    for (int i = i_start; i < n_cand && !search_stop_requested(cx->live); i++) {
+        if (follow_here && i > i_start) { rc->following = false; follow_here = false; }
         if ((int)cand[i].breaks > remaining_budget) continue;
         int new_disc = disc_used;
         if (g_break_mode == BREAK_STUCK) {
@@ -4924,6 +5415,10 @@ static void run_search_at_k(Board *base, const SearchCtx *cx,
                   order_name(cx->mode));
     }
 
+    /* A resume cursor follows ONE serial DFS; main() refuses everything else. */
+    if (cx->resume && (g_search_parallel || order_is_side_growth(cx->mode)))
+        fatal("internal error: --resume reached a search-parallel or side-growth search");
+
     if (g_search_parallel) {
         run_search_at_k_search_parallel(base, cx, local_solutions, stats, mres);
         return;
@@ -5041,8 +5536,31 @@ static ClueApplyResult clue_apply(Board *b, int *n_placed, int *orient_out,
     return CLUE_APPLY_OK;
 }
 
+/* Matched internal edges of a CSV-frame board; -1 when the arrays are not a board. */
+static int csv_board_score(const int pos[NUM_PIECES], const int rot[NUM_PIECES]) {
+    Board b; int n = 0; char why[160];
+    if (!board_from_csv(&b, pos, rot, &n, why, sizeof(why))) return -1;
+    int conn = 0, brk = 0;
+    board_edge_counts(&b, &conn, &brk);
+    return conn;
+}
+
+/* Copy a --resume input row to output.csv as it was read (done, or mismatched),
+ * with a status row under --status. */
+static void resume_copy_row(const char *config_id_str, long long sol_id,
+                            const char *ident, const int pos[NUM_PIECES],
+                            const int rot[NUM_PIECES], const char *status) {
+    emit_output_row(config_id_str, sol_id, ident, pos, rot, csv_board_score(pos, rot));
+    DfsStats st0; stats_init(&st0);
+    FeasIssue fi0; memset(&fi0, 0, sizeof(fi0)); fi0.code = FEAS_OK;
+    write_status_csv(config_id_str, sol_id, true, status, 0, 0, 0, 0.0, 0,
+                     &fi0, &st0, NULL, 0, 0, 0, 0, -1, -1, 0);
+}
+
+/* `resume_id` is the row's resume identifier under --resume, else NULL. */
 static void process_line(const char *config_id_str, long long sol_id,
-                         const int pos[NUM_PIECES], const int rot[NUM_PIECES]) {
+                         const int pos[NUM_PIECES], const int rot[NUM_PIECES],
+                         const char *resume_id) {
     double t0 = omp_get_wtime();
 
     uint64_t line_num;
@@ -5059,7 +5577,47 @@ static void process_line(const char *config_id_str, long long sol_id,
     int holes_applied = 0;
     char why[512]; why[0] = '\0';
 
-    if (!build_initial_board(pos, rot, &base, &n_placed, &holes_applied, why, sizeof(why))) {
+    /* -- --resume: a row with an identifier continues an earlier search.  Its
+     * start board is the row's board with the identifier's open cells lifted;
+     * --holes and the clues are not applied again (they were, when the search
+     * began).  The row's own board is the best over the earlier runs and is
+     * carried, so the row written below is never worse. -- */
+    ResumeId rid;
+    Board carried;
+    bool resumed = false;
+    if (resume_id) {
+        if (!resume_parse(resume_id, &rid, why, sizeof(why)))
+            fatal("internal error: the identifier of cfg=%s was accepted at load but not "
+                  "now: %s", config_id_str, why);
+        if (rid.done) {
+            #pragma omp atomic
+            g_cnt_resume_done_in++;
+            resume_copy_row(config_id_str, sol_id, resume_id, pos, rot, "resume_done");
+            return;
+        }
+        int spos[NUM_PIECES], srot[NUM_PIECES], n_carried = 0;
+        for (int p = 0; p < NUM_PIECES; p++) {
+            bool lift = pos[p] >= 0 && pos[p] < NUM_PIECES && rid.open[pos[p]];
+            spos[p] = lift ? CSV_UNPLACED : pos[p];
+            srot[p] = lift ? 0 : rot[p];
+        }
+        if (resume_start_sum(spos, srot) != rid.start ||
+            !board_from_csv(&base, spos, srot, &n_placed, why, sizeof(why)) ||
+            !board_from_csv(&carried, pos, rot, &n_carried, why, sizeof(why))) {
+            #pragma omp atomic
+            g_cnt_resume_mismatch++;
+            #pragma omp critical(stdout_print)
+            {
+                printf("[cfg=%s sol=%lld] RESUME MISMATCH: the board is not the one its "
+                       "identifier was written for (start= differs); copied unsearched.\n",
+                       config_id_str, sol_id);
+                fflush(stdout);
+            }
+            resume_copy_row(config_id_str, sol_id, resume_id, pos, rot, "resume_mismatch");
+            return;
+        }
+        resumed = true;
+    } else if (!build_initial_board(pos, rot, &base, &n_placed, &holes_applied, why, sizeof(why))) {
         #pragma omp atomic
         g_cnt_invalid++;
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
@@ -5086,7 +5644,7 @@ static void process_line(const char *config_id_str, long long sol_id,
      * warning, same budget, same drop -- and what turns the clue cells into
      * constraints on the DFS rather than cells it has to fill. */
     int clue_orient_used = -1, clues_added = 0, clues_already = 0;
-    if (g_clue_mask) {
+    if (g_clue_mask && !resumed) {
         ClueApplyResult cr = clue_apply(&base, &n_placed, &clue_orient_used,
                                         &clues_added, &clues_already, why, sizeof(why));
         if (cr != CLUE_APPLY_OK) {
@@ -5160,7 +5718,9 @@ static void process_line(const char *config_id_str, long long sol_id,
                 config_id_str, sol_id, input_breaks, g_max_mismatch);
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); }
-        write_stream_best(&base, config_id_str, sol_id);
+        if (g_resume) resume_emit(config_id_str, sol_id, resumed,
+                                  resumed ? &carried : &base, &base, NULL);
+        else          write_stream_best(&base, config_id_str, sol_id);
         DfsStats st0; stats_init(&st0);
         FeasIssue fi0; memset(&fi0,0,sizeof(fi0)); fi0.code=FEAS_OK;
         write_status_csv(config_id_str, sol_id, true, "dropped",
@@ -5310,7 +5870,9 @@ static void process_line(const char *config_id_str, long long sol_id,
         }
         #pragma omp atomic
         g_cnt_no_solution++;
-        write_stream_best(&base, config_id_str, sol_id);
+        if (g_resume) resume_emit(config_id_str, sol_id, resumed,
+                                  resumed ? &carried : &base, &base, NULL);
+        else          write_stream_best(&base, config_id_str, sol_id);
         double elapsed0 = omp_get_wtime() - t0;
         DfsStats st0; stats_init(&st0);
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
@@ -5336,6 +5898,10 @@ static void process_line(const char *config_id_str, long long sol_id,
     MismatchResult mres = {0}; mres_init(&mres);
     int  solved_k = -1;
     bool timed_out = false;
+    /* --resume: --breaks 0 is required, so the loop below runs one level and
+     * one lds pass, and this one cursor follows the whole record. */
+    ResumeCursor rcur;
+    resume_cursor_init(&rcur, resumed ? &rid : NULL);
 
     /* -- stuck mode: greedy dives instead of the deepening ladder -------------- *
      * Every dive completes, so there is no budget to deepen through and no proof
@@ -5412,6 +5978,7 @@ static void process_line(const char *config_id_str, long long sol_id,
             cx.record_start     = t0;
             cx.deadline         = level_deadline;
             cx.collect          = collect;
+            cx.resume           = g_resume ? &rcur : NULL;
 
             run_search_at_k(&base, &cx, &lsol, &stats, &mres);
 
@@ -5461,9 +6028,54 @@ static void process_line(const char *config_id_str, long long sol_id,
 
     double elapsed = omp_get_wtime() - t0;
 
+    /* --resume: the identifier's path is not this board's -- the row was
+     * edited, or written by a build whose search order differs.  Nothing it
+     * says can be trusted, so the row goes out exactly as it came in. */
+    if (rcur.mismatch) {
+        #pragma omp atomic
+        g_cnt_resume_mismatch++;
+        #pragma omp critical(stdout_print)
+        {
+            printf("[cfg=%s sol=%lld] RESUME MISMATCH: piece %d of the identifier's path "
+                   "is not a candidate on this board; copied unsearched.\n",
+                   config_id_str, sol_id, rcur.mismatch_depth + 1);
+            fflush(stdout);
+        }
+        resume_copy_row(config_id_str, sol_id, resume_id, pos, rot, "resume_mismatch");
+        mres_free(&mres);
+        return;
+    }
+
     /* Stream this record's best board (a completion when found, else the deepest
-     * partial) as one re-feedable line to output.csv. */
-    write_stream_best(rstat.best_board, config_id_str, sol_id);
+     * partial) as one re-feedable line to output.csv.  A resumed record writes
+     * this run's best unless the board it carried in is strictly better: on a
+     * tie the new board wins, which is how each --early_release run hands out
+     * the NEXT released board rather than the first one again. */
+    char rsfx[48] = "";
+    if (g_resume) {
+        const Board *out_b = rstat.best_board;
+        if (resumed) {
+            int c_conn = 0, c_brk = 0, c_pcs = 0;
+            board_edge_counts(&carried, &c_conn, &c_brk);
+            if (c_brk > 0) board_break_stats(&carried, NULL, &c_pcs);
+            if (partial_better(board_count_placed(&carried), c_conn, c_brk, c_pcs,
+                               atomic_load_explicit(&rstat.best_total, memory_order_relaxed),
+                               rstat.best_connected, rstat.best_broken,
+                               rstat.best_break_pieces))
+                out_b = &carried;
+        }
+        resume_emit(config_id_str, sol_id, resumed, out_b, &initial_board, &rcur);
+        char from[16], to[16];
+        if (resumed) snprintf(from, sizeof(from), "%d%s", rid.n_path, rid.after ? "+" : "");
+        else         snprintf(from, sizeof(from), "start");
+        if (!rcur.captured || (rcur.out_after && rcur.n_out == 0))
+            snprintf(to, sizeof(to), "done");
+        else
+            snprintf(to, sizeof(to), "%d%s", rcur.n_out, rcur.out_after ? "+" : "");
+        snprintf(rsfx, sizeof(rsfx), " resume=%s->%s", from, to);
+    } else {
+        write_stream_best(rstat.best_board, config_id_str, sol_id);
+    }
 
     /* -- Determine status.  In collect mode success is mres.found; the broken-
      * edge count of the reported board is solved_k. -- */
@@ -5531,18 +6143,18 @@ static void process_line(const char *config_id_str, long long sol_id,
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
                 "[cfg=%s sol=%lld] %s found=%" PRIu64
                 " placed=%d/%d empty=%d holes=%d"
-                " deepest=(r=%d,c=%d) added=%d%s t=%.3fs\n",
+                " deepest=(r=%d,c=%d) added=%d%s t=%.3fs%s\n",
                 config_id_str, sol_id, status, local_solutions,
                 n_placed, NUM_PIECES, n_seq, holes_applied,
-                deep_row, deep_col, n_added_dfs, brk, elapsed);
+                deep_row, deep_col, n_added_dfs, brk, elapsed, rsfx);
     } else {
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
                 "[cfg=%s sol=%lld] placed=%d/%d empty=%d holes=%d"
                 " best=%d connected_edges=%d broken_edges=%d"
-                " deepest=(r=%d,c=%d) added=%d %s t=%.3fs  %s\n",
+                " deepest=(r=%d,c=%d) added=%d %s t=%.3fs  %s%s\n",
                 config_id_str, sol_id, n_placed, NUM_PIECES, n_seq, holes_applied,
                 rstat_best_total, rstat.best_connected, rstat.best_broken,
-                deep_row, deep_col, n_added_dfs, stuck_str, elapsed, status);
+                deep_row, deep_col, n_added_dfs, stuck_str, elapsed, status, rsfx);
     }
 
     if (order_is_side_growth(g_order_mode)) {
@@ -5609,6 +6221,7 @@ typedef struct {
     long long sol_id;
     int       pos[NUM_PIECES];
     int       rot[NUM_PIECES];
+    char     *resume_id;     /* --resume: the row's identifier, else NULL */
 } CsvRecord;
 
 /* -- E555: post-holes duplicate detection ---------------------------------------- */
@@ -5636,12 +6249,16 @@ static int rechash_cmp(const void *pa, const void *pb) {
 
 /* Fills dup_of[i] with the earliest row index whose post-holes board equals
  * row i's (or -1).  Rows [0, n_hash) are hashed; duplicates are only marked
- * for rows >= proc_start (earlier rows are other blocks' work). */
+ * for rows >= proc_start (earlier rows are other blocks' work).  Rows with
+ * exclude[i] set (NULL: none) take no part at all: under --resume those are
+ * the rows carrying an identifier, each its own search state, and the rows
+ * --resume_score skips, so a row is never lost as the twin of a skipped one. */
 static void build_duplicate_map(const CsvRecord *records, int n_hash,
-                                int proc_start, int *dup_of) {
+                                int proc_start, int *dup_of, const bool *exclude) {
     RecHash *rh = xmalloc((size_t)(n_hash > 0 ? n_hash : 1) * sizeof(RecHash));
     int n_valid = 0;
     for (int i = 0; i < n_hash; i++) {
+        if (exclude && exclude[i]) continue;
         Board b; int npl = 0, ha = 0; char why[256];
         if (!build_initial_board(records[i].pos, records[i].rot,
                                  &b, &npl, &ha, why, sizeof(why)))
@@ -5686,13 +6303,16 @@ static void build_duplicate_map(const CsvRecord *records, int n_hash,
         s = e;
     }
     free(rh);
-    printf("[dedup] hashed %d record(s) post-holes (rows 0..%d): "
-           "%d duplicate(s) in the processing window will be skipped\n",
-           n_valid, n_hash - 1, n_dups_in_window);
+    printf("[dedup] hashed %d record(s) post-holes (rows 0..%d%s): "
+           "%d duplicate(s) in the processing window will be skipped%s\n",
+           n_valid, n_hash - 1, exclude ? ", those without a resume identifier" : "",
+           n_dups_in_window, g_resume ? " and not written" : "");
     fflush(stdout);
 }
 
-/* Report and account one skipped duplicate (thread-safe). */
+/* Report and account one skipped duplicate (thread-safe).  Under --resume it
+ * writes no output row: a row written without an identifier would come back as
+ * a fresh search next run, which is the work the duplicate pass exists to save. */
 static void report_duplicate(const CsvRecord *rec, int row,
                              const CsvRecord *orig, int orig_row) {
     #pragma omp atomic
@@ -5702,8 +6322,9 @@ static void report_duplicate(const CsvRecord *rec, int row,
     #pragma omp critical(stdout_print)
     {
         printf("[cfg=%s sol=%lld] DUPLICATE: initial board after holes is identical "
-               "to row %d (cfg=%s sol=%lld); skipped.\n",
-               rec->config_id, rec->sol_id, orig_row, orig->config_id, orig->sol_id);
+               "to row %d (cfg=%s sol=%lld); skipped%s.\n",
+               rec->config_id, rec->sol_id, orig_row, orig->config_id, orig->sol_id,
+               g_resume ? ", not written" : "");
         fflush(stdout);
     }
     Board b;
@@ -5714,7 +6335,7 @@ static void report_duplicate(const CsvRecord *rec, int row,
                                      &holes_applied, why, sizeof(why));
     if (valid) {
         board_edge_counts(&b, &connected, &broken);
-        write_stream_best(&b, rec->config_id, rec->sol_id);
+        if (!g_resume) write_stream_best(&b, rec->config_id, rec->sol_id);
     }
     (void)row;
     DfsStats st0; stats_init(&st0);
@@ -5733,7 +6354,8 @@ static void usage(const char *prog) {
             "\nUsage: %s seed.txt completions.csv output.csv [options]\n\n"
             "Arguments:\n"
             "  seed.txt         %d rows of: top right bottom left.\n"
-            "  completions.csv  Canonical/Stage-B (514-field) or legacy (515-field) CSV.\n"
+            "  completions.csv  Canonical/Stage-B (514-field) or legacy (515-field) CSV;\n"
+            "                   --resume rows are 515-field, field 3 the identifier.\n"
             "  output.csv       One re-feedable best-board row per processed record.\n\n",
             prog, NUM_PIECES);
     fputs(
@@ -5838,6 +6460,24 @@ static void usage(const char *prog) {
         "                         --jump and --stop_row/--stop_column.  Exact search\n"
         "                         has no default time limit: set --time_limit for big\n"
         "                         batches.\n\n"
+        "Resume (split one exact search over many short runs):\n"
+        "  --resume               Every output row carries a resume identifier (field 3)\n"
+        "                         saying where its search stopped, or that it finished.\n"
+        "                         Feed the file back with --resume and the same --order,\n"
+        "                         --reverse, --rotate and --early_release, and each\n"
+        "                         search goes on from there: after a released board, the\n"
+        "                         next run releases the next one.  Rows without an\n"
+        "                         identifier start fresh; --holes and the clues apply to\n"
+        "                         them only, and those identical after --holes to an\n"
+        "                         earlier row are skipped and not written.  One thread\n"
+        "                         per record.  Needs --breaks 0 and --max_emitted 1;\n"
+        "                         refused with 2sides/4sides, --jump, --stop_row/\n"
+        "                         --stop_column and --all_for_one.  Without --resume an\n"
+        "                         identifier row is searched as a plain board.\n"
+        "  --resume_score S       With --resume: skip every row whose board scores below\n"
+        "                         S (matched edges); it is not written.  Each run ends\n"
+        "                         with the median score written, which as S keeps about\n"
+        "                         half the rows.\n\n"
         "Stop band (emit partials for the finalizer):\n"
         "  --stop_row N           Search ONLY rows 0..N and emit every way to fill\n"
         "                         them, as the beamer's --stop_row does.  Cells above\n"
@@ -6060,18 +6700,21 @@ int main(int argc, char **argv) {
                 fatal("--early_release expects an integer in [0,%d], got '%s'",
                       NUM_PIECES, argv[i]);
             g_early_release = (int)v;
+        } else if (strcmp(argv[i], "--resume") == 0) {
+            g_resume = true;
+        } else if (strcmp(argv[i], "--resume_score") == 0 && i+1 < argc) {
+            char *end = NULL; errno = 0;
+            long v = strtol(argv[++i], &end, 10);
+            if (errno || end == argv[i] || *end || v < 0 || v > MAX_SCORE)
+                fatal("--resume_score expects an integer in [0,%d], got '%s'",
+                      MAX_SCORE, argv[i]);
+            g_resume_score = (int)v;
         } else if (strcmp(argv[i], "--order") == 0 && i+1 < argc) {
             const char *m = argv[++i];
-            if      (!strcmp(m, "rowmajor"))  g_order_mode = ORD_ROWMAJOR;
-            else if (!strcmp(m, "colmajor"))  g_order_mode = ORD_COLMAJOR;
-            else if (!strcmp(m, "snake"))     g_order_mode = ORD_SNAKE;
-            else if (!strcmp(m, "spiral"))    g_order_mode = ORD_SPIRAL;
-            else if (!strcmp(m, "centerout")) g_order_mode = ORD_CENTEROUT;
-            else if (!strcmp(m, "spiralout")) g_order_mode = ORD_SPIRALOUT;
-            else if (!strcmp(m, "mrv"))       g_order_mode = ORD_MRV;
-            else if (!strcmp(m, "2sides"))    g_order_mode = ORD_2SIDES;
-            else if (!strcmp(m, "4sides"))    g_order_mode = ORD_4SIDES;
-            else fatal("--order expects mrv|rowmajor|colmajor|snake|spiral|centerout|spiralout|2sides|4sides, got '%s'", m);
+            int o = order_from_name(m);
+            if (o < 0)
+                fatal("--order expects mrv|rowmajor|colmajor|snake|spiral|centerout|spiralout|2sides|4sides, got '%s'", m);
+            g_order_mode = (OrderMode)o;
         } else if (strcmp(argv[i], "--break_mode") == 0 && i+1 < argc) {
             const char *m = argv[++i];
             if      (!strcmp(m, "stuck")) g_break_mode = BREAK_STUCK;
@@ -6182,6 +6825,49 @@ int main(int argc, char **argv) {
         if (g_solution_limit != 1)
             fatal("--early_release writes one board per record: --max_emitted must "
                   "be 1, got %" PRIu64, g_solution_limit);
+    }
+    /* --resume continues ONE serial exact DFS per record from a recorded path.
+     * Everything that would make that path mean something else, or would split
+     * the record across threads, is refused rather than reinterpreted. */
+    if (g_resume_score >= 0 && !g_resume)
+        fatal("--resume_score selects which rows --resume continues: add --resume");
+    if (g_resume) {
+        if (g_solution_limit != 1)
+            fatal("--resume needs --max_emitted 1, got %" PRIu64 ": a run stops at its "
+                  "first board so the next one can start right after it, and other "
+                  "boards would never be written", g_solution_limit);
+        if (g_max_mismatch != 0)
+            fatal("--resume needs --breaks 0: it continues the exact search, whose "
+                  "candidates are the exact fits only");
+        if (g_jump)
+            fatal("--resume needs --jump off: a jumped cell is not on the recorded path");
+        if (order_is_side_growth(g_order_mode))
+            fatal("--resume does not apply to --order %s: side growth has its own "
+                  "search engine", order_name(g_order_mode));
+        if (g_stop_active)
+            fatal("--resume cannot be combined with --stop_%s: a band enumeration "
+                  "writes its bands elsewhere", g_stop_isrow ? "row" : "column");
+        if (g_parallel_mode == PAR_SEARCH)
+            fatal("--resume searches each record on one thread, so --all_for_one "
+                  "cannot be honoured");
+    }
+    {
+        const char *nb = getenv("E555_BT_NODE_BUDGET");
+        if (nb && *nb) {
+            char *end = NULL; errno = 0;
+            g_test_node_budget = strtoull(nb, &end, 10);
+            if (errno || end == nb || *end)
+                fatal("E555_BT_NODE_BUDGET expects a node count, got '%s'", nb);
+        }
+    }
+    /* The output is truncated before the input is read, so the same file would
+     * be emptied first.  A resume loop invites exactly that mistake. */
+    if (strcmp(csv_path, "-") != 0) {
+        struct stat si, so;
+        if (stat(csv_path, &si) == 0 && stat(out_path, &so) == 0 &&
+            si.st_dev == so.st_dev && si.st_ino == so.st_ino)
+            fatal("the input CSV and the output are the same file (%s): the output is "
+                  "emptied before the input is read; write to another file", out_path);
     }
     if (g_lds_max >= 0 && g_break_mode != BREAK_LDS)
         fprintf(stderr, "[warn] --lds_max has no effect unless --break_mode lds is selected.\n");
@@ -6296,6 +6982,16 @@ int main(int argc, char **argv) {
     if (g_early_release > 0)
         printf("  early_release=%d (emit when %d searched cells remain; each release "
                "counts as a solution)\n", g_early_release, g_early_release);
+    if (g_resume) {
+        printf("  resume=on (rows with an identifier continue their search, the others "
+               "start fresh; every row written carries one; one thread per record)\n");
+        if (g_resume_score >= 0)
+            printf("  resume_score=%d (rows scoring less are skipped and not written)\n",
+                   g_resume_score);
+    }
+    if (g_test_node_budget)
+        printf("  test node budget=%llu per record (E555_BT_NODE_BUDGET)\n",
+               g_test_node_budget);
     printf("  dedup=%s  status_report=%s\n",
            g_dedup ? "on (default)" : "off",
            g_write_status ? "on" : "off (use --status)");
@@ -6346,8 +7042,11 @@ int main(int argc, char **argv) {
                  out_path, g_stop_isrow ? "row" : "col", g_stop_n,
                  g_reverse ? "_rev" : "");
 
-    const char *stream_hdr =
-        "# E555 backtracker -- best board per record (original frame)\n"
+    const char *stream_hdr = g_resume
+      ? "# E555 backtracker -- best board per record (original frame) + where its "
+        "search stopped\n"
+        "# fields: config_id,score,resume_id,pos_0,...,pos_255,rot_0,...,rot_255\n"
+      : "# E555 backtracker -- best board per record (original frame)\n"
         "# fields: config_id,score,pos_0,...,pos_255,rot_0,...,rot_255\n";
     const char *status_hdr =
         "config_id,sol_id,valid,status,order,parallel_mode,hall_mode,"
@@ -6415,6 +7114,7 @@ int main(int argc, char **argv) {
     CsvRecord *records = NULL;
     int n_records = 0, cap = 0;
     long long n_comment = 0, n_unparseable = 0, n_filtered = 0, physical_line = 0;
+    int n_ident = 0;   /* rows carrying a resume identifier */
 
     char *csvline = NULL; size_t csvline_cap = 0; ssize_t csvlen;
     while ((csvlen = getline(&csvline, &csvline_cap, csv_f)) >= 0) {
@@ -6428,11 +7128,29 @@ int main(int argc, char **argv) {
         char cid[CONFIG_ID_LEN] = {0};
         long long sid = 0;
         int pos[NUM_PIECES], rot[NUM_PIECES];
+        char *ident = NULL;
         char why[256];
 
-        if (!parse_csv_line(csvline, cid, &sid, pos, rot, why, sizeof(why))) {
+        if (!parse_csv_line(csvline, cid, &sid, pos, rot, &ident, why, sizeof(why))) {
             fprintf(stderr, "[warn] line %lld skipped: %s\n", physical_line, why);
             n_unparseable++; continue;
+        }
+        /* An identifier this run cannot honour stops the run here, before any
+         * search: resuming it anyway would search the wrong tree. */
+        if (ident) {
+            n_ident++;
+            if (g_resume) {
+                ResumeId rid;
+                if (!resume_parse(ident, &rid, why, sizeof(why)))
+                    fatal("%s line %lld: %s", csv_path, physical_line, why);
+                if (!resume_settings_match(&rid, why, sizeof(why)))
+                    fatal("%s line %lld: the resume identifier does not fit this run: %s. "
+                          "Rerun with the settings it was written with",
+                          csv_path, physical_line, why);
+            } else {
+                free(ident);
+                ident = NULL;
+            }
         }
         if (n_records == cap) {
             cap = cap ? cap * 2 : 1024;
@@ -6442,6 +7160,7 @@ int main(int argc, char **argv) {
         records[n_records].sol_id = sid;
         memcpy(records[n_records].pos, pos, sizeof(pos));
         memcpy(records[n_records].rot, rot, sizeof(rot));
+        records[n_records].resume_id = ident;
         n_records++;
     }
     free(csvline);
@@ -6449,6 +7168,16 @@ int main(int argc, char **argv) {
 
     printf("[csv] loaded=%d  comment_or_blank=%lld  unparseable=%lld  filtered=%lld\n",
            n_records, n_comment, n_unparseable, n_filtered);
+    if (n_ident > 0 && !g_resume)
+        printf("[csv] %d row(s) carry a resume identifier; without --resume each is "
+               "searched as a plain board, from the board it holds\n", n_ident);
+    if (n_ident > 0 && g_resume) {
+        printf("[resume] %d row(s) continue an earlier search, %d start fresh\n",
+               n_ident, n_records - n_ident);
+        if (holes_path || g_clue_mask)
+            printf("[resume] --holes and the clue flags apply to the %d fresh row(s) only\n",
+                   n_records - n_ident);
+    }
     fflush(stdout);
 
     if (n_records == 0) {
@@ -6490,20 +7219,49 @@ int main(int argc, char **argv) {
      * mode where early-dead records release workers while the remaining hard
      * records continue serially. */
     ParallelMode requested_parallel = g_parallel_mode;
-    if (g_parallel_mode == PAR_AUTO)
+    if (g_resume)                       /* one cursor follows one serial DFS */
+        g_parallel_mode = PAR_RECORDS;
+    else if (g_parallel_mode == PAR_AUTO)
         g_parallel_mode = (proc_count <= nt) ? PAR_SEARCH : PAR_RECORDS;
     g_search_parallel = (g_parallel_mode == PAR_SEARCH);
-    printf("[parallel] requested=%s resolved=%s (records=%d workers=%d)\n",
+    printf("[parallel] requested=%s resolved=%s (records=%d workers=%d)",
            parallel_mode_name(requested_parallel), parallel_mode_name(g_parallel_mode),
            proc_count, nt);
+    if (g_resume)
+        printf(" -- --resume: one thread per record%s",
+               proc_count < nt ? ", so some workers stay idle" : "");
+    printf("\n");
+
+    /* -- --resume_score: rows whose board scores below S are skipped and not
+     *    written.  Applied before the duplicate pass, so a row is never dropped
+     *    as the duplicate of a twin that this filter then removes. -- */
+    bool *skip_below = NULL;
+    if (g_resume_score >= 0) {
+        skip_below = xmalloc((size_t)n_records * sizeof(bool));
+        int n_skip = 0;
+        for (int i = 0; i < n_records; i++) {
+            int s = csv_board_score(records[i].pos, records[i].rot);
+            skip_below[i] = (s >= 0 && s < g_resume_score);
+            if (skip_below[i] && i >= proc_start && i < proc_end) n_skip++;
+        }
+        printf("[resume] --resume_score %d: %d of %d row(s) score less and are skipped\n",
+               g_resume_score, n_skip, proc_count);
+    }
 
     /* -- E555: mark records whose post-holes initial board repeats an earlier
      *    row (processed here or skipped below --start_row); they would exactly
-     *    repeat that row's search. -- */
+     *    repeat that row's search.  Under --resume only the fresh rows take
+     *    part: a row with an identifier is its own search state. -- */
     int *dup_of = xmalloc((size_t)n_records * sizeof(int));
     for (int i = 0; i < n_records; i++) dup_of[i] = -1;
+    bool *dedup_exclude = NULL;
+    if (g_resume) {
+        dedup_exclude = xmalloc((size_t)n_records * sizeof(bool));
+        for (int i = 0; i < n_records; i++)
+            dedup_exclude[i] = records[i].resume_id != NULL || (skip_below && skip_below[i]);
+    }
     if (g_dedup)
-        build_duplicate_map(records, proc_end, proc_start, dup_of);
+        build_duplicate_map(records, proc_end, proc_start, dup_of, dedup_exclude);
     else
         printf("[dedup] off by --no_dedup; every selected input row will be searched\n");
 
@@ -6524,17 +7282,22 @@ int main(int argc, char **argv) {
                 continue;
             }
             process_line(records[i].config_id, records[i].sol_id,
-                         records[i].pos, records[i].rot);
+                         records[i].pos, records[i].rot, NULL);
         }
     } else {
         #pragma omp parallel for schedule(dynamic,1) num_threads(nt)
         for (int i = proc_start; i < proc_end; i++) {
+            if (skip_below && skip_below[i]) {
+                #pragma omp atomic
+                g_cnt_resume_below++;
+                continue;
+            }
             if (dup_of[i] >= 0) {
                 report_duplicate(&records[i], i, &records[dup_of[i]], dup_of[i]);
                 continue;
             }
             process_line(records[i].config_id, records[i].sol_id,
-                         records[i].pos, records[i].rot);
+                         records[i].pos, records[i].rot, records[i].resume_id);
         }
     }
 
@@ -6572,6 +7335,58 @@ int main(int argc, char **argv) {
         if (seen)
             printf("    band_accept_rate     = %.1f%%\n",
                    100.0 * (double)g_band_emitted / (double)seen);
+    }
+    if (g_resume) {
+        printf("\n  Resume:\n");
+        printf("    fresh                = %" PRIu64 "  (no identifier: searched from the start)\n",
+               g_cnt_resume_fresh);
+        printf("    continued            = %" PRIu64 "  (searched on from their identifier)\n",
+               g_cnt_resume_continued);
+        if (g_resume_score >= 0)
+            printf("    skipped(below %3d)   = %" PRIu64 "  (not written)\n",
+                   g_resume_score, g_cnt_resume_below);
+        printf("    skipped(duplicate)   = %" PRIu64 "  (not written)\n", g_cnt_duplicate);
+        printf("    copied(done)         = %" PRIu64 "  (searched to the end before)\n",
+               g_cnt_resume_done_in);
+        if (g_cnt_resume_mismatch)
+            printf("    copied(mismatch)     = %" PRIu64 "  (identifier does not fit its "
+                   "board; see RESUME MISMATCH above)\n", g_cnt_resume_mismatch);
+        printf("    ended: done=%" PRIu64 "  stopped=%" PRIu64 " (time limit)  "
+               "after_board=%" PRIu64 " (next run starts after the board written)\n",
+               g_cnt_end_done, g_cnt_end_stopped, g_cnt_end_after);
+    }
+
+    /* The scores of the rows just written.  The median is printed as an
+     * integer that --resume_score accepts: the value at index n/2 of the
+     * ascending scores, with the count it keeps beside it (ties can make that
+     * more than half). */
+    {
+        uint64_t n = 0, ge = 0;
+        double sum = 0.0, sumsq = 0.0;
+        int smin = -1, smax = -1, median = -1;
+        for (int s = 0; s <= MAX_SCORE; s++) {
+            if (!g_score_hist[s]) continue;
+            if (smin < 0) smin = s;
+            smax = s;
+            n += g_score_hist[s];
+            sum += (double)s * (double)g_score_hist[s];
+            sumsq += (double)s * (double)s * (double)g_score_hist[s];
+        }
+        if (n == 0) {
+            printf("\n  output scores: no boards written\n");
+        } else {
+            uint64_t seen_n = 0;
+            for (int s = 0; s <= MAX_SCORE && median < 0; s++) {
+                seen_n += g_score_hist[s];
+                if (seen_n > n / 2) median = s;
+            }
+            for (int s = median; s <= MAX_SCORE; s++) ge += g_score_hist[s];
+            double mean = sum / (double)n;
+            double var = sumsq / (double)n - mean * mean;
+            printf("\n  output scores: boards=%" PRIu64 " min=%d max=%d mean=%.2f std=%.2f "
+                   "median=%d (%" PRIu64 " boards >= %d)\n",
+                   n, smin, smax, mean, var > 0.0 ? sqrt(var) : 0.0, median, ge, median);
+        }
     }
 
     if (g_cnt_infeasible > 0) {
@@ -6657,6 +7472,9 @@ int main(int argc, char **argv) {
     free(g_best_pure);
     free(g_best_mm);
     free(dup_of);
+    free(dedup_exclude);
+    free(skip_below);
+    for (int i = 0; i < n_records; i++) free(records[i].resume_id);
     free(records);
     omp_destroy_lock(&g_best_lock);
     return EXIT_SUCCESS;

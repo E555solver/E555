@@ -2923,20 +2923,28 @@ static void beam_ctx_alloc(BeamCtx *ctx) {
 
 /* -- Partial input ------------------------------------------------------------ */
 
-/* Tokenize one data line in place: config_id, sol_idx, pos[256], rot[256].
-   id_out may be NULL when only the placements are needed. */
+/* Tokenize one data line in place: config_id, then metadata, then pos[256],
+   rot[256] as the LAST 512 fields -- the toolkit's CSV rule, so a row with more
+   than one metadata field (the backtracker's --resume rows carry an identifier
+   third) is read correctly instead of one column off.  At least one metadata
+   field is required, as in the canonical config_id,score,... row.  id_out may
+   be NULL when only the placements are needed. */
 static bool fin_parse_fields(char *s, char id_out[64],
                              int pos[NUM_PIECES], int rot[NUM_PIECES]) {
-    char *tok = strtok(s, ",\r\n");
-    if (!tok) return false;
-    while (*tok == ' ') tok++;
-    if (id_out) snprintf(id_out, 64, "%s", tok);
-    tok = strtok(NULL, ",\r\n");                 /* sol_idx: not needed here */
-    if (!tok) return false;
+    enum { MAX_FIELDS = 2 * NUM_PIECES + 8 };
+    char *f[MAX_FIELDS];
+    int n = 0;
+    for (char *tok = strtok(s, ",\r\n"); tok; tok = strtok(NULL, ",\r\n")) {
+        if (n == MAX_FIELDS) return false;
+        f[n++] = tok;
+    }
+    if (n < 2 + 2 * NUM_PIECES) return false;
+    char *id = f[0];
+    while (*id == ' ') id++;
+    if (id_out) snprintf(id_out, 64, "%s", id);
+    char **board = f + n - 2 * NUM_PIECES;
     for (int k = 0; k < 2 * NUM_PIECES; k++) {
-        tok = strtok(NULL, ",\r\n");
-        if (!tok) return false;
-        long v = strtol(tok, NULL, 10);
+        long v = strtol(board[k], NULL, 10);
         if (k < NUM_PIECES) pos[k] = (int)v;
         else                rot[k - NUM_PIECES] = (int)v;
     }

@@ -114,6 +114,7 @@ ALL_STEPS=(
     "backtracker_exhaustive|core|backtracker|exhaustive enumeration identical at 1 and 4 threads"
     "backtracker_stop_band|extra|backtracker|--stop_row/--stop_column emit exact, finalizer-shaped bands"
     "backtracker_release|extra|backtracker|--early_release stops N cells early in every order; --reverse moves the gate"
+    "backtracker_resume|extra|backtracker,finalizer|--resume: sessions add up to one run node for node; each run releases the next board; dedup, --resume_score, readers"
     "backtracker_breakcount|extra|backtracker|break classes agree with the per-candidate scan they replaced"
     "backtracker_clues|extra|backtracker|--clue_center/--clue_corners force the hints on, or drop the board"
     "diver|core|diver|E555_diver finishes held boards: identical at 1 and 4 threads, scores recount, placed cells untouched"
@@ -2108,6 +2109,207 @@ EOF
         grep -q -- "--early_release" "$OUT/er_bad.log" || fail "no --early_release refusal for $extra"
     done
     echo "ok: N=0 is the plain run; --breaks, --jump, 2sides, --stop_row and --max_emitted 2 refused"
+}
+
+# --resume cuts one exact search into sessions.  The proof that nothing is
+# skipped and nothing searched twice is a count: the test hook
+# E555_BT_NODE_BUDGET stops every session at a fixed node, and the sessions'
+# DFS visits must add up to one straight run's exactly, plus the nodes each
+# session re-places to get back to where the last one stopped.  The real row-12
+# partial with rows 9-15 open is searched to the end in about a second in each
+# order used (mrv 1.06 M visits, the others under 100 k), on rows and turned.
+step_backtracker_resume() {
+    local bt=bin/E555_backtracker seed=data/seed_Edge5.txt part=data/board_partial_row12.csv
+    local d="$OUT/resume" spec tag budget in n ref sum placed extra
+    mkdir -p "$d"
+    python3 -c "print(','.join('1' if c // 16 >= 9 else '0' for c in range(256)))" > "$d/ge9.csv"
+    python3 -c "print(','.join('1' if c // 16 <= 6 else '0' for c in range(256)))" > "$d/le6.csv"
+    # Length of the at= path of a one-row --resume output (0 for done).
+    local plen='!/^#/ { s = $3; if (s ~ /;done/) { print 0; next }
+                        sub(/.*;at=/, "", s); sub(/\+$/, "", s); print (s == "" ? 0 : split(s, a, ".")) }'
+
+    # 1. Stops at the time limit: the sessions are one run, node for node.
+    for spec in "rm 4096 --order rowmajor --holes $d/ge9.csv" \
+                "mrv 65536 --order mrv --holes $d/ge9.csv" \
+                "rot 16384 --order centerout --rotate 2 --holes $d/le6.csv"; do
+        set -- $spec; tag=$1; budget=$2; shift 2
+        "$bt" "$seed" "$part" "$d/$tag.ref.csv" "$@" --threads 1 --verbose \
+            > "$d/$tag.ref.log" || fail "$tag: the straight run failed"
+        ref=$(sed -n 's/.*DFS visits=\([0-9]*\).*/\1/p' "$d/$tag.ref.log")
+        in=$part; n=0; sum=0; placed=0
+        while :; do
+            n=$((n + 1)); [ "$n" -le 60 ] || fail "$tag: the search did not end in 60 sessions"
+            E555_BT_NODE_BUDGET=$budget "$bt" "$seed" "$in" "$d/$tag.$n.csv" "$@" \
+                --threads 1 --verbose --resume > "$d/$tag.$n.log" || fail "$tag: session $n failed"
+            sum=$((sum + $(sed -n 's/.*DFS visits=\([0-9]*\).*/\1/p' "$d/$tag.$n.log")))
+            in="$d/$tag.$n.csv"
+            grep -q ';done,' "$in" && break
+            placed=$((placed + $(awk -F, "$plen" "$in")))
+        done
+        [ "$n" -ge 3 ] || fail "$tag: $n session(s): the node budget did not cut the search"
+        [ "$sum" -eq $((ref + placed)) ] \
+            || fail "$tag: the sessions visited $sum nodes; one run visits $ref, plus $placed re-placed"
+        [ "$(grep -v '^#' "$in" | cut -d, -f2)" = "$(grep -v '^#' "$d/$tag.ref.csv" | cut -d, -f2)" ] \
+            || fail "$tag: the sessions end on another score than the straight run"
+        echo "ok: $tag: $n sessions visit $sum nodes = one run's $ref + $placed re-placed"
+    done
+
+    # 2. Stops after a released board: each run releases the NEXT one, until done.
+    #    Synthetic, turned: the truth's own prefix survives every prune, so it
+    #    must be among them -- whichever region a wrong skip would lose.
+    for spec in "er $seed $part --holes $d/ge9.csv --early_release 108" \
+                "ers data/synth_seed.txt data/synth_solution_480.csv --rotate 1 --early_release 44 --holes tests/fixtures/holes_top3.csv"; do
+        set -- $spec; tag=$1; local s=$2; in=$3; shift 3
+        n=0
+        while :; do
+            n=$((n + 1)); [ "$n" -le 40 ] || fail "$tag: no end in 40 sessions"
+            "$bt" "$s" "$in" "$d/$tag.$n.csv" "$@" --order rowmajor --resume --threads 1 \
+                > "$d/$tag.$n.log" || fail "$tag: session $n failed"
+            in="$d/$tag.$n.csv"
+            grep -q ';done,' "$in" && break
+        done
+    done
+    python3 - "$d" <<'EOF' || exit 1
+import glob, sys
+d = sys.argv[1]
+def rows(path):
+    return [l.strip().split(",") for l in open(path) if l.strip() and not l.startswith("#")]
+for tag, seedf, rot, n_open, want in (("er", "data/seed_Edge5.txt", 0, 108, 5),
+                                      ("ers", "data/synth_seed.txt", 1, 44, 1)):
+    seed = [list(map(int, l.split())) for l in open(seedf) if l.strip()]
+    face = lambda p, s, k: seed[p][(k + s) % 4]
+    files = sorted(glob.glob("%s/%s.*.csv" % (d, tag)), key=lambda f: int(f.split(".")[-2]))
+    boards, paths = [], []
+    for f in files[:-1]:
+        (r,) = rows(f)
+        ident = r[2]
+        assert ";at=" in ident and ident.endswith("+"), "%s: not stopped after a board: %s" % (f, ident[-40:])
+        pos, sp = r[-512:-256], r[-256:]
+        cell = {int(x): (p, int(sp[p])) for p, x in enumerate(pos) if int(x) != 999}
+        assert 256 - len(cell) == n_open, "%s: %d cells open, expected %d" % (f, 256 - len(cell), n_open)
+        for x, (p, s) in cell.items():
+            rr, c = divmod(x, 16)
+            if c < 15 and x + 1 in cell: assert face(p, s, 1) == face(*cell[x + 1], 3), "%s: break" % f
+            if rr < 15 and x + 16 in cell: assert face(p, s, 0) == face(*cell[x + 16], 2), "%s: break" % f
+        boards.append(tuple(sorted(cell.items())))
+        keys = [int(k) for k in ident.split(";at=")[1].rstrip("+").split(".")]
+        paths.append([(k & ~3) | ((k + rot) & 3) for k in keys])    # search-frame keys
+    assert len(boards) >= want, "%s: %d released boards, expected at least %d" % (tag, len(boards), want)
+    assert len(set(boards)) == len(boards), "%s: a released board came twice" % tag
+    assert all(a < b for a, b in zip(paths, paths[1:])), "%s: a run went back in search order" % tag
+    (last,) = rows(files[-1])
+    assert last[2].endswith(";done"), "%s: the last run is not done" % tag
+    assert last[-512:] == rows(files[-2])[0][-512:], "%s: done lost the last released board" % tag
+    if tag == "ers":
+        t = rows("data/synth_solution_480.csv")[0]
+        truth = {int(t[-512 + p]): (p, int(t[-256 + p])) for p in range(256)}
+        assert any(all(truth[x] == v for x, v in b) for b in boards), "ers: the truth's prefix was skipped"
+    print("ok: %s: %d runs release %d distinct boards in search order, then done" % (tag, len(files), len(boards)))
+EOF
+
+    # 3. Many records: thread-independent, --resume_score, the score summary.
+    python3 - "$d" <<'EOF' || exit 1
+import sys
+d = sys.argv[1]
+seed = [list(map(int, l.split())) for l in open("data/synth_seed.txt") if l.strip()]
+t = [l.strip().split(",") for l in open("data/synth_solution_480.csv") if l.strip() and not l.startswith("#")][0]
+pos, rot = [int(x) for x in t[-512:-256]], t[-256:]
+def score(p):
+    cell = {x: (i, int(rot[i])) for i, x in enumerate(p) if x != 999}
+    f = lambda q, s, k: seed[q][(k + s) % 4]
+    return sum((x % 16 < 15 and x + 1 in cell and f(*cell[x], 1) == f(*cell[x + 1], 3)) +
+               (x < 240 and x + 16 in cell and f(*cell[x], 0) == f(*cell[x + 16], 2)) for x in cell)
+with open(d + "/multi.csv", "w") as out:            # the truth, its top 1..3 rows emptied
+    for k in (1, 2, 3):
+        p = [x if x < 256 - 16 * k else 999 for x in pos]
+        out.write(",".join(["top%d" % k, "0"] + [str(x) for x in p] + rot) + "\n")
+open(d + "/score_top2", "w").write(str(score([x if x < 224 else 999 for x in pos])))
+cells = {c: i for i, c in enumerate(pos)}
+with open(d + "/dup.csv", "w") as out:              # identical once rows 13-15 are holes
+    for k in range(3):
+        q = pos[:]
+        a, b = cells[208 + k], cells[240 + k]
+        q[a], q[b] = q[b], q[a]
+        out.write(",".join(["d%d" % k, "0"] + [str(x) for x in q] + rot) + "\n")
+EOF
+    local sbt=("$bt" data/synth_seed.txt)
+    for n in 1 4; do
+        "${sbt[@]}" "$d/multi.csv" "$d/m$n.csv" --order rowmajor --early_release 20 --resume \
+            --threads "$n" > "$d/m$n.log" || fail "the three-row run at $n thread(s) failed"
+    done
+    cmp -s <(grep -v '^#' "$d/m1.csv" | sort) <(grep -v '^#' "$d/m4.csv" | sort) \
+        || fail "--resume wrote other rows at 4 threads than at 1"
+    python3 - "$d/m1.csv" "$d/m1.log" <<'EOF' || exit 1
+import re, statistics, sys
+s = sorted(int(l.split(",")[1]) for l in open(sys.argv[1]) if l.strip() and not l.startswith("#"))
+m = re.search(r"output scores: boards=(\d+) min=(\d+) max=(\d+) mean=([\d.]+) std=([\d.]+) "
+              r"median=(\d+) \((\d+) boards >= (\d+)\)", open(sys.argv[2]).read())
+assert m, "no output scores line"
+med = s[len(s) // 2]
+want = (len(s), s[0], s[-1], "%.2f" % statistics.fmean(s), "%.2f" % statistics.pstdev(s),
+        med, sum(x >= med for x in s), med)
+got = (int(m[1]), int(m[2]), int(m[3]), m[4], m[5], int(m[6]), int(m[7]), int(m[8]))
+assert got == want, "summary %s, the rows say %s" % (got, want)
+print("ok: output scores line agrees with the rows: %s" % m[0])
+EOF
+    "${sbt[@]}" "$d/multi.csv" "$d/ms.csv" --resume --resume_score "$(cat "$d/score_top2")" \
+        --threads 2 > "$d/ms.log" || fail "--resume_score run failed"
+    [ "$(grep -v '^#' "$d/ms.csv" | cut -d, -f1 | sort | tr '\n' ' ')" = "top1_0 top2_0 " ] \
+        || fail "--resume_score should keep top1 and top2 and drop top3"
+    grep -q "skipped(below" "$d/ms.log" || fail "no --resume_score count in the summary"
+
+    # 4. Dedup: fresh rows identical after --holes are skipped and not written;
+    #    rows carrying an identifier are each their own search state.
+    "${sbt[@]}" "$d/dup.csv" "$d/dd.csv" --resume --holes tests/fixtures/holes_top3.csv \
+        --threads 2 > "$d/dd.log" || fail "dedup run failed"
+    [ "$(grep -vc '^#' "$d/dd.csv")" = 1 ] || fail "duplicates after --holes were written"
+    [ "$(grep -c 'DUPLICATE.*not written' "$d/dd.log")" = 2 ] || fail "two duplicates not reported"
+    grep -hv '^#' "$d/er.1.csv" "$d/er.5.csv" > "$d/two.csv"
+    "$bt" "$seed" "$d/two.csv" "$d/two_out.csv" --order rowmajor --early_release 108 --resume \
+        --threads 2 > "$d/two.log" || fail "two identifier rows failed"
+    [ "$(grep -vc '^#' "$d/two_out.csv")" = 2 ] || fail "identifier rows were deduplicated"
+    echo "ok: thread-independent; --resume_score drops the low row; duplicates skip only fresh rows"
+
+    # 5. Readers: rank keeps the identifier, the viewer and the finalizer read
+    #    the row, and without --resume it is a plain board.
+    python3 tools/E555_rank.py "$d/er.1.csv" --seed_file "$seed" --sort score --top 1 \
+        --out "$d/rank.csv" > /dev/null || fail "rank failed on a --resume row"
+    cmp -s <(grep -v '^#' "$d/er.1.csv") "$d/rank.csv" || fail "rank --out changed a --resume row"
+    python3 tools/E555_viewer.py "$d/er.1.csv" --seed_file "$seed" > "$d/view.txt" \
+        || fail "viewer failed on a --resume row"
+    "$bt" "$seed" "$d/er.1.csv" "$d/plain.csv" --threads 4 > "$d/plain.log" \
+        || fail "a plain run on a --resume row failed"
+    grep -q "carry a resume identifier" "$d/plain.log" || fail "no note on identifier rows"
+    [ "$(grep -v '^#' "$d/plain.csv" | awk -F, '{print NF}')" = 514 ] || fail "a plain run wrote no 514-field row"
+    grep -v '^#' data/synth_solution_480.csv \
+        | awk -F, 'BEGIN { OFS = "," } { $2 = $2 ",bt1;done"; print }' > "$d/truth515.csv"
+    for n in 514 515; do
+        in=data/synth_solution_480.csv; [ "$n" = 515 ] && in="$d/truth515.csv"
+        bin/E555_finalizer data/synth_seed.txt "$in" --finalize_from 10 --stop_row 14 \
+            --beam_width 2000 --frac_rand 0 --rng_seed 1 --out_dir "$d/fin$n" > "$d/fin$n.log" \
+            || fail "finalizer on a $n-field row failed"
+    done
+    [ -s "$d/fin514/beam_completions_finalized_14.csv" ] || fail "the finalizer emitted nothing"
+    cmp -s "$d/fin514/beam_completions_finalized_14.csv" "$d/fin515/beam_completions_finalized_14.csv" \
+        || fail "the finalizer reads a 515-field row differently"
+    echo "ok: rank, viewer and the finalizer read --resume rows; without --resume they are plain boards"
+
+    # 6. Refused: anything that would make the recorded path mean something else.
+    for extra in "--max_emitted 2" "--max_emitted 0" "--breaks 1" "--jump" "--order 2sides" \
+                 "--stop_row 3" "--all_for_one"; do
+        "${sbt[@]}" "$d/multi.csv" "$d/bad.csv" --resume $extra > "$d/bad.log" 2>&1 \
+            && fail "--resume accepted $extra"
+        grep -q -- "--resume" "$d/bad.log" || fail "no --resume refusal for $extra"
+    done
+    "${sbt[@]}" "$d/multi.csv" "$d/bad.csv" --resume_score 400 > "$d/bad.log" 2>&1 \
+        && fail "--resume_score accepted without --resume"
+    "$bt" "$seed" "$d/er.1.csv" "$d/bad.csv" --order spiralout --early_release 108 --resume \
+        > "$d/bad.log" 2>&1 && fail "an identifier was resumed with another --order"
+    grep -q "order rowmajor, this run has --order spiralout" "$d/bad.log" || fail "the mismatch does not name --order"
+    cp "$d/multi.csv" "$d/same.csv"
+    "${sbt[@]}" "$d/same.csv" "$d/same.csv" > "$d/bad.log" 2>&1 && fail "input == output accepted"
+    [ "$(grep -vc '^#' "$d/same.csv")" = 3 ] || fail "input == output emptied the input"
+    echo "ok: --max_emitted, --breaks, --jump, 2sides, bands, --all_for_one, other settings and input == output refused"
 }
 
 # The mismatch engines no longer test candidates one at a time: a placement's
