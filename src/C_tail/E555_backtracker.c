@@ -84,13 +84,18 @@
  *     board reached for that record (a completion when found, else the deepest
  *     partial), streamed at end-of-record, thread-safe.  Layout is the
  *     canonical E555 board row config_id,score,pos[256],rot[256] (514 fields;
- *     score = matched internal edges) so the file can be fed straight back in
+ *     config_id as read, score = matched internal edges) so the file can be fed straight back in
  *     as input for an improvement loop.  Under --resume the row has 515 fields,
  *     the resume identifier third; the run ends with the min/max/mean/std/
  *     median of the scores written either way.
  *   - <output>.checkpoint.csv: append-only crash-recovery file in the same
  *     re-feedable layout; a record's best board is appended when it improves
  *     (>=10 s throttle per record).  Removed on clean completion.
+ *   - stdout names each row "row N/T id" (N counts the input's data rows) and
+ *     ends it with one line: the outcome, the score read -> written, the depth.
+ *     --verbose adds statistics and draws one example row, before and after.
+ *   - SIGINT/SIGTERM stop the running searches as their time limit would; see
+ *     handle_stop().
  *   - ~30 s heartbeat progress lines per in-flight record (k, D, nodes, best).
  *   - --status optionally writes <output>.status.csv with one diagnostic row
  *     per parsed input record.  --best_n N additionally writes global
@@ -132,6 +137,7 @@
 #include <limits.h>
 #include <math.h>
 #include <omp.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -307,6 +313,14 @@ static const char *parallel_mode_name(ParallelMode m) {
  * requiring the user-facing --jump option to remain off. */
 static bool        g_jump              = false;
 static int         g_total_records      = 0;
+
+
+/* How the log names an input row: "row N/T id", N counting the data rows of
+ * the input file from 1 (comments and blank lines not counted), T of them. */
+static const char *row_tag(char *buf, size_t sz, long long row, const char *id) {
+    snprintf(buf, sz, "row %lld/%d %s", row, g_total_records, id);
+    return buf;
+}
 static double      g_t_start_wall       = 0.0;
 static int         g_rotation           = 0;    /* --rotate K */
 static uint64_t    g_solution_limit     = 1;    /* per record; 0 = enumerate all */
@@ -356,6 +370,24 @@ static int         g_resume_score       = -1;
  * one thread, so the stop lands on the same node every run -- which is what a
  * check needs to cut one search into sessions repeatably.  Not a user option. */
 static unsigned long long g_test_node_budget = 0;
+
+/* SIGINT/SIGTERM: the running searches stop as at their time limit and are
+ * written (under --resume their identifier is the exact place to go on from);
+ * rows not started yet are copied unchanged under --resume, else not written.
+ * A second signal kills at once. */
+static volatile sig_atomic_t g_stop = 0;
+static void handle_stop(int sig) { g_stop = 1; signal(sig, SIG_DFL); }
+static atomic_int g_stop_announced  = 0;
+static atomic_int g_example_claimed = 0;  /* the row --verbose draws, see process_line */
+static uint64_t   g_cnt_not_started = 0;
+static void stop_announce(void) {
+    if (atomic_exchange(&g_stop_announced, 1)) return;
+    #pragma omp critical(stdout_print)
+    { printf("\n[stop] signal: the running searches stop now and are written; rows not "
+             "started are %s. A second signal kills.\n",
+             g_resume ? "copied unchanged (--resume)" : "not written");
+      fflush(stdout); }
+}
 
 /* Sequence position of the DFS leaf for a search over n_rem cells. */
 static inline int search_gate(int n_rem, int k) {
@@ -671,7 +703,7 @@ typedef struct {
     int       deepest_row;       /* (row,col) of last DFS-placed piece */
     int       deepest_col;
     char      record_id[CONFIG_ID_LEN];
-    long long sol_id_num;
+    long long row_num;
 } BestPartial;
 
 /*
@@ -901,7 +933,8 @@ typedef struct ResumeCursor {
  * search, so the struct is safe to share across search-parallel workers. */
 typedef struct {
     const char  *config_id;
-    long long    sol_id;
+    long long    row;            /* 1-based input data row */
+    const char  *tag;            /* "row N/T id": the log's name for the row */
     int          initial_n_placed;
     int          initial_connected;
     const Board *initial_board;
@@ -3333,7 +3366,7 @@ static void board_to_pos_rot(const Board *b, int pos[NUM_PIECES], int rot[NUM_PI
 }
 
 static void write_band_partial(const Board *b,
-                               const char *config_id_str, long long sol_id);
+                               const char *config_id_str, long long row);
 
 /*
  * Write a full solution. Board b is in rotated frame.
@@ -3345,10 +3378,10 @@ static void write_band_partial(const Board *b,
  * leaves need no knowledge of which mode they are in.
  */
 static uint64_t write_solution(const Board *b,
-                                const char *config_id_str, long long input_sol_id) {
+                                const char *config_id_str, long long row) {
     char why[256];
     if (g_stop_active) {
-        write_band_partial(b, config_id_str, input_sol_id);
+        write_band_partial(b, config_id_str, row);
         uint64_t n;
         #pragma omp atomic capture
         n = ++g_total_solutions;
@@ -3371,8 +3404,8 @@ static uint64_t write_solution(const Board *b,
     if (release_on()) {
         int placed = board_count_placed(out_b);
         if (!validate_partial_board_ex(out_b, placed, 0, why, sizeof(why)))
-            fatal("internal error: invalid released board from sol_id=%lld: %s",
-                  input_sol_id, why);
+            fatal("internal error: invalid released board from row %lld: %s",
+                  row, why);
         uint64_t n;
         #pragma omp atomic capture
         n = ++g_total_solutions;
@@ -3381,11 +3414,11 @@ static uint64_t write_solution(const Board *b,
             board_edge_counts(out_b, &conn, &brk);
             #pragma omp critical(stdout_print)
             {
-                printf("*** RELEASED %" PRIu64 " from config=%s sol_id=%lld  t=%.3fs"
+                char tg[CONFIG_ID_LEN + 48];
+                printf("*** RELEASED %" PRIu64 " [%s]  t=%.3fs"
                        "  placed=%d/%d  connected_edges=%d ***\n",
-                       n, config_id_str, input_sol_id, elapsed_wall(),
+                       n, row_tag(tg, sizeof(tg), row, config_id_str), elapsed_wall(),
                        placed, NUM_PIECES, conn);
-                print_board_ascii(stdout, b, "=== RELEASED BOARD (rotated frame) ===");
                 fflush(stdout);
             }
         }
@@ -3399,7 +3432,7 @@ static uint64_t write_solution(const Board *b,
     if (!validate_complete_board_lenient(out_b, 2*PUZZLE_SIDE*(PUZZLE_SIDE-1),
                                          &sol_breaks, &sol_break_pieces,
                                          why, sizeof(why)))
-        fatal("internal error: invalid full solution from sol_id=%lld: %s", input_sol_id, why);
+        fatal("internal error: invalid full solution from row %lld: %s", row, why);
     int sol_connected = 2*PUZZLE_SIDE*(PUZZLE_SIDE-1) - sol_breaks;
 
     uint64_t solnum;
@@ -3413,11 +3446,11 @@ static uint64_t write_solution(const Board *b,
     if (g_verbose) {
         #pragma omp critical(stdout_print)
         {
-            printf("*** SOLUTION %" PRIu64 " from config=%s sol_id=%lld  t=%.3fs"
+            char tg[CONFIG_ID_LEN + 48];
+            printf("*** SOLUTION %" PRIu64 " [%s]  t=%.3fs"
                    "  connected_edges=%d  broken_edges=%d  pieces_with_breaks=%d ***\n",
-                   solnum, config_id_str, input_sol_id, elapsed_wall(),
+                   solnum, row_tag(tg, sizeof(tg), row, config_id_str), elapsed_wall(),
                    sol_connected, sol_breaks, sol_break_pieces);
-            print_board_ascii(stdout, b, "=== FULL SOLUTION (rotated frame) ===");
             fflush(stdout);
         }
     }
@@ -3463,26 +3496,23 @@ static int board_to_csv_arrays(const Board *b, int pos[NUM_PIECES], int rot[NUM_
 
 /*
  * Stream the single best board for a processed record to output.csv.  Layout
- * is the canonical E555 board row config_id_solid,score,pos[256],rot[256]
+ * is the canonical E555 board row config_id,score,pos[256],rot[256]
  * (514 fields; score = matched internal edges) in the original frame, and the
  * file can be fed straight back in as input.  One line per non-rejected
  * record; thread-safe.  --resume rows go through resume_emit() instead.
  */
-static void write_stream_best(const Board *b,
-                              const char *config_id_str, long long sol_id) {
+static void write_stream_best(const Board *b, const char *config_id_str) {
     if (!g_stream_csv) return;
     int pos[NUM_PIECES], rot_arr[NUM_PIECES];
     int conn = board_to_csv_arrays(b, pos, rot_arr);
-    char id[CONFIG_ID_LEN + 32];
-    snprintf(id, sizeof(id), "%s_%lld", config_id_str, sol_id);
-    emit_output_row(id, conn, NULL, pos, rot_arr, conn);
+    emit_output_row(config_id_str, conn, NULL, pos, rot_arr, conn);
 }
 
 /* --resume counters for the end-of-run summary: what came in ... */
 static uint64_t g_cnt_resume_fresh     = 0;   /* rows without an identifier, searched */
 static uint64_t g_cnt_resume_continued = 0;   /* rows with one, searched on */
 static uint64_t g_cnt_resume_below     = 0;   /* skipped by --resume_score, not written */
-static uint64_t g_cnt_resume_done_in   = 0;   /* already done, copied through */
+static uint64_t g_cnt_resume_done_in   = 0;   /* already done: not written again */
 static uint64_t g_cnt_resume_mismatch  = 0;   /* identifier does not fit its board */
 /* ... and how the searched rows ended. */
 static uint64_t g_cnt_end_done    = 0;
@@ -3493,10 +3523,10 @@ static uint64_t g_cnt_end_after   = 0;
  * Write one --resume row: `out_b` (search frame) is the board, `start_b` (search
  * frame) the start board its identifier describes, and `rc` where the search
  * stopped -- NULL, or a cursor that captured nothing, means the tree is done.
- * Resumed rows keep the id they were read with (keep_id); fresh ones are named
- * <id>_<sol> as every other row this tool writes.
+ * keep_id says which: a row read with an identifier, or a fresh one.  Every row
+ * keeps the id it was read with.
  */
-static void resume_emit(const char *config_id_str, long long sol_id, bool keep_id,
+static void resume_emit(const char *config_id_str, bool keep_id,
                         const Board *out_b, const Board *start_b,
                         const ResumeCursor *rc) {
     int spos[NUM_PIECES], srot[NUM_PIECES];
@@ -3520,10 +3550,7 @@ static void resume_emit(const char *config_id_str, long long sol_id, bool keep_i
 
     int pos[NUM_PIECES], rot_arr[NUM_PIECES];
     int conn = board_to_csv_arrays(out_b, pos, rot_arr);
-    char id[CONFIG_ID_LEN + 32];
-    if (keep_id) snprintf(id, sizeof(id), "%s", config_id_str);
-    else         snprintf(id, sizeof(id), "%s_%lld", config_id_str, sol_id);
-    emit_output_row(id, conn, ident, pos, rot_arr, conn);
+    emit_output_row(config_id_str, conn, ident, pos, rot_arr, conn);
 }
 
 /*
@@ -3545,7 +3572,7 @@ static void resume_emit(const char *config_id_str, long long sol_id, bool keep_i
  * diagnosable from the summary rather than mysterious.
  */
 static void write_band_partial(const Board *b,
-                               const char *config_id_str, long long sol_id) {
+                               const char *config_id_str, long long row) {
     if (!g_band_csv) return;
     Board orig;
     const Board *out_b = b;
@@ -3557,10 +3584,10 @@ static void write_band_partial(const Board *b,
             const Oriented *o = &out_b->cell[r][c];
             if (o->piece_id == EMPTY_PIECE)
                 fatal("internal error: band cell (r=%d,c=%d) empty at emission "
-                      "from sol_id=%lld", r, c, sol_id);
+                      "from row %lld", r, c, row);
             if (!frame_zero_rule_ok(r, c, o))
                 fatal("internal error: frame-zero violation at (r=%d,c=%d) in band "
-                      "from sol_id=%lld", r, c, sol_id);
+                      "from row %lld", r, c, row);
         }
     }
 
@@ -3575,7 +3602,7 @@ static void write_band_partial(const Board *b,
     int pos[NUM_PIECES], rot_arr[NUM_PIECES];
     board_to_pos_rot(out_b, pos, rot_arr);
     char buf[CSV_BUF_BYTES]; size_t off = 0;
-    appendf(buf, sizeof(buf), &off, "%s_%lld,%d", config_id_str, sol_id, conn);
+    appendf(buf, sizeof(buf), &off, "%s,%d", config_id_str, conn);
     for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", pos[i]);
     for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", rot_arr[i]);
     appendf(buf, sizeof(buf), &off, "\n");
@@ -3598,8 +3625,7 @@ static void write_band_partial(const Board *b,
  * file is removed on clean completion (output.csv then holds something at
  * least as good).
  */
-static void write_checkpoint_line(const Board *b,
-                                  const char *config_id_str, long long sol_id) {
+static void write_checkpoint_line(const Board *b, const char *config_id_str) {
     if (!g_ckpt_csv) return;
     Board orig;
     const Board *out_b = b;
@@ -3610,7 +3636,7 @@ static void write_checkpoint_line(const Board *b,
     int pos[NUM_PIECES], rot_arr[NUM_PIECES];
     board_to_pos_rot(out_b, pos, rot_arr);
     char buf[CSV_BUF_BYTES]; size_t off = 0;
-    appendf(buf, sizeof(buf), &off, "%s_%lld,%d", config_id_str, sol_id, conn);
+    appendf(buf, sizeof(buf), &off, "%s,%d", config_id_str, conn);
     for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", pos[i]);
     for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", rot_arr[i]);
     appendf(buf, sizeof(buf), &off, "\n");
@@ -3651,9 +3677,9 @@ static void heartbeat_maybe(const SearchCtx *cx, double now) {
         snprintf(dstr, sizeof(dstr), " D=%d", cx->lds_D);
     #pragma omp critical(stdout_print)
     {
-        printf("[cfg=%s sol=%lld] progress k=%d%s t=%.0fs nodes=%.1fM "
+        printf("[%s] progress k=%d%s t=%.0fs nodes=%.1fM "
                "best=%d pieces connected=%d broken=%d\n",
-               cx->config_id, cx->sol_id, cx->k_budget, dstr,
+               cx->tag, cx->k_budget, dstr,
                now - cx->record_start, (double)nodes / 1e6, bt, bc, bb);
         fflush(stdout);
     }
@@ -3679,7 +3705,7 @@ static void ckpt_flush_maybe(const SearchCtx *cx, double now) {
         do_ckpt = true;
     }
     omp_unset_lock(&g_best_lock);
-    if (do_ckpt) write_checkpoint_line(&ckpt_copy, cx->config_id, cx->sol_id);
+    if (do_ckpt) write_checkpoint_line(&ckpt_copy, cx->config_id);
 }
 
 /* Batched per-node bookkeeping: node counter, deadline check, checkpoint
@@ -3690,6 +3716,11 @@ static void search_node_tick(const SearchCtx *cx) {
         atomic_fetch_add_explicit(&cx->live->nodes, NODE_TICK_BATCH, memory_order_relaxed)
         + NODE_TICK_BATCH;
     if (g_test_node_budget && seen >= g_test_node_budget) {
+        search_request_stop(cx->live, STOP_TIMEOUT);
+        return;
+    }
+    if (g_stop) {
+        stop_announce();
         search_request_stop(cx->live, STOP_TIMEOUT);
         return;
     }
@@ -3790,7 +3821,7 @@ static void try_update_best(const Board *cur_board,
                             int n_total, int n_added,
                             int connected, int breaks,
                             int last_row, int last_col,
-                            const char *config_id_str, long long sol_id,
+                            const char *config_id_str, long long row,
                             RecStat *rstat, bool pure_track_ok) {
     BestPartial *track = NULL; int *count = NULL; atomic_int *floorp = NULL;
     if (breaks > 0) {
@@ -3842,7 +3873,7 @@ static void try_update_best(const Board *cur_board,
 
     if (g_best_output <= 0 || !track) {
         omp_unset_lock(&g_best_lock);
-        if (do_ckpt) write_checkpoint_line(&ckpt_copy, config_id_str, sol_id);
+        if (do_ckpt) write_checkpoint_line(&ckpt_copy, config_id_str);
         return;
     }
 
@@ -3868,7 +3899,7 @@ static void try_update_best(const Board *cur_board,
         track[ins].deepest_row      = last_row;
         track[ins].deepest_col      = last_col;
         snprintf(track[ins].record_id, CONFIG_ID_LEN, "%s", config_id_str);
-        track[ins].sol_id_num       = sol_id;
+        track[ins].row_num         = row;
         *count = new_count;
 
         int new_floor = (*count < g_best_output) ? 0 : track[g_best_output-1].n_total;
@@ -3876,7 +3907,7 @@ static void try_update_best(const Board *cur_board,
     }
 
     omp_unset_lock(&g_best_lock);
-    if (do_ckpt) write_checkpoint_line(&ckpt_copy, config_id_str, sol_id);
+    if (do_ckpt) write_checkpoint_line(&ckpt_copy, config_id_str);
 }
 
 /* -- v8: mismatch-solution collector ------------------------------------------ */
@@ -4320,6 +4351,49 @@ static void frontier_layers(const Board *b, int8_t layer[PUZZLE_SIDE][PUZZLE_SID
     }
 }
 
+/* The frontier layers of one row, drawn once per run: '#' a placed piece, 1-9
+ * then A-Z the layer of an open cell, '*' the --early_release cell (rr,rc in
+ * the search frame; -1 = none).  Rows run top-down as in print_board_ascii;
+ * the labels are 0-based like every (r=,c=) in the log. */
+static void print_frontier_map(const char *tag, const int8_t (*layer)[PUZZLE_SIDE],
+                               int rr, int rc, int release_k) {
+    char buf[4096]; size_t off = 0;
+    int cnt[PUZZLE_SIDE * PUZZLE_SIDE + 1] = {0}, top = 0;
+    appendf(buf, sizeof(buf), &off,
+            "[%s] frontier layers%s (# placed, 1-9/A-Z layer%s):\n  r\\c ",
+            tag, g_rotation > 0 ? " (rotated frame)" : "",
+            rr >= 0 ? ", * the --early_release cell" : "");
+    for (int c = 0; c < PUZZLE_SIDE; c++) appendf(buf, sizeof(buf), &off, " %d", c % 10);
+    appendf(buf, sizeof(buf), &off, "\n");
+    for (int r = PUZZLE_SIDE - 1; r >= 0; r--) {
+        appendf(buf, sizeof(buf), &off, "  %3d ", r);
+        for (int c = 0; c < PUZZLE_SIDE; c++) {
+            int l = layer[r][c];
+            if (l > 0) { cnt[l]++; if (l > top) top = l; }
+            char ch = l <= 0 ? '#' : l < 10 ? (char)('0' + l) : l < 36 ? (char)('A' + l - 10) : '+';
+            if (r == rr && c == rc) ch = '*';
+            appendf(buf, sizeof(buf), &off, " %c", ch);
+        }
+        appendf(buf, sizeof(buf), &off, "\n");
+    }
+    appendf(buf, sizeof(buf), &off, "  layer cells:");
+    for (int l = 1; l <= top; l++) appendf(buf, sizeof(buf), &off, " %d:%d", l, cnt[l]);
+    if (rr >= 0) {
+        int l = layer[rr][rc];
+        appendf(buf, sizeof(buf), &off, "   --early_release %d,%d is in layer %d: %d cell(s)",
+                g_release_row, g_release_col, l, release_k);
+        if (l + 1 < top)       appendf(buf, sizeof(buf), &off, " (layers %d-%d)", l + 1, top);
+        else if (l + 1 == top) appendf(buf, sizeof(buf), &off, " (layer %d)", top);
+        appendf(buf, sizeof(buf), &off, " left open");
+    } else if (release_k > 0) {
+        appendf(buf, sizeof(buf), &off, "   --early_release %d: the last %d cell(s) stay open",
+                release_k, release_k);
+    }
+    appendf(buf, sizeof(buf), &off, "\n");
+    #pragma omp critical(stdout_print)
+    { fputs(buf, stdout); fflush(stdout); }
+}
+
 static int pick_next_cell(const Board *b, const FcState *fc,
                           const Cell *rem, int n_rem, int pos,
                           OrderMode mode, int remaining_budget,
@@ -4671,7 +4745,7 @@ static void run_greedy_restarts(const Board *base, const Cell *seq, int n_seq,
         for (long long i = 0; i < n_want; i++) {
             /* One shared absolute deadline; a dive is sub-millisecond, so
              * checking once per dive is fine-grained enough. */
-            if (deadline > 0.0 && omp_get_wtime() > deadline) { fp[i] = 0; br[i] = -1; continue; }
+            if (g_stop || (deadline > 0.0 && omp_get_wtime() > deadline)) { fp[i] = 0; br[i] = -1; continue; }
 
             RNG rng = rng_for(g_rng_master, rec_index, (uint64_t)i);
             b = *base;
@@ -4770,7 +4844,7 @@ static void side_dfs(Board *b, FcState *fc, Cell *seq, int n_seq, int pos,
             if (!claim_complete_solution(cx->live)) return;
             st->completed_leaves++;
             (*local_solutions)++;
-            write_solution(b, cx->config_id, cx->sol_id);
+            write_solution(b, cx->config_id, cx->row);
             if (cx->collect) {
                 int br = 0, pcs = 0;
                 board_break_stats(b, &br, &pcs);
@@ -4806,7 +4880,7 @@ static void side_dfs(Board *b, FcState *fc, Cell *seq, int n_seq, int pos,
         const int n_total = cx->initial_n_placed + new_added;
         try_update_best(b, cx->initial_board, cx->initial_n_placed,
                         n_total, new_added, new_connected, 0,
-                        row, col, cx->config_id, cx->sol_id, cx->rstat, true);
+                        row, col, cx->config_id, cx->row, cx->rstat, true);
 
         st->recursed[depth]++;
         children++;
@@ -4873,7 +4947,7 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
             if (!claim_complete_solution(cx->live)) return;
             st->completed_leaves++;
             (*local_solutions)++;
-            write_solution(b, cx->config_id, cx->sol_id);
+            write_solution(b, cx->config_id, cx->row);
             if (cx->collect) {
                 int br = 0, pcs = 0;
                 board_break_stats(b, &br, &pcs);
@@ -5004,7 +5078,7 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
         if (viable || soft_completion) {
             try_update_best(b, cx->initial_board, cx->initial_n_placed,
                             n_total, new_added, new_connected, new_breaks,
-                            row, col, cx->config_id, cx->sol_id, cx->rstat,
+                            row, col, cx->config_id, cx->row, cx->rstat,
                             cx->k_budget == 0);
             st->recursed[depth]++;
             children++;
@@ -5131,7 +5205,7 @@ static void side_build_frontier(Board *b, FcState *fc, Cell *seq, int n_seq,
             if (!claim_complete_solution(cx->live)) return;
             st->completed_leaves++;
             (*local_solutions)++;
-            write_solution(b, cx->config_id, cx->sol_id);
+            write_solution(b, cx->config_id, cx->row);
             if (cx->collect) {
                 int br = 0, pcs = 0;
                 board_break_stats(b, &br, &pcs);
@@ -5167,7 +5241,7 @@ static void side_build_frontier(Board *b, FcState *fc, Cell *seq, int n_seq,
         const int n_total = cx->initial_n_placed + new_added;
         try_update_best(b, cx->initial_board, cx->initial_n_placed,
                         n_total, new_added, new_connected, 0,
-                        row, col, cx->config_id, cx->sol_id, cx->rstat, true);
+                        row, col, cx->config_id, cx->row, cx->rstat, true);
 
         st->recursed[depth]++;
         children++;
@@ -5236,7 +5310,7 @@ static void afo_build_frontier(Board *b, FcState *fc, Cell *rem, int n_rem, int 
             if (!claim_complete_solution(cx->live)) return;
             st->completed_leaves++;
             (*local_solutions)++;
-            write_solution(b, cx->config_id, cx->sol_id);
+            write_solution(b, cx->config_id, cx->row);
             if (cx->collect) {
                 int br = 0, pcs = 0;
                 board_break_stats(b, &br, &pcs);
@@ -5328,7 +5402,7 @@ static void afo_build_frontier(Board *b, FcState *fc, Cell *rem, int n_rem, int 
         if (viable || soft_completion) {
             try_update_best(b, cx->initial_board, cx->initial_n_placed,
                             n_total, new_added, new_connected, new_breaks,
-                            row, col, cx->config_id, cx->sol_id, cx->rstat,
+                            row, col, cx->config_id, cx->row, cx->rstat,
                             cx->k_budget == 0);
             st->recursed[depth]++;
             children++;
@@ -5457,9 +5531,9 @@ static void run_search_at_k_search_parallel(Board *base, const SearchCtx *cx,
     if (g_verbose || fr.count < nt) {
         #pragma omp critical(stdout_print)
         {
-            printf("[cfg=%s sol=%lld] search_parallel k=%d frontier_tasks=%d target=%d "
+            printf("[%s] search_parallel k=%d frontier_tasks=%d target=%d "
                    "split_depth=%d refined_to=%d\n",
-                   cx->config_id, cx->sol_id, cx->k_budget, fr.count, fr.target,
+                   cx->tag, cx->k_budget, fr.count, fr.target,
                    SPLIT_DEPTH, refine_depth);
             fflush(stdout);
         }
@@ -5680,14 +5754,15 @@ static void resume_copy_row(const char *config_id_str, long long sol_id,
 }
 
 /* `resume_id` is the row's resume identifier under --resume, else NULL. */
-static void process_line(const char *config_id_str, long long sol_id,
+static void process_line(const char *config_id_str, long long field2, long long row,
                          const int pos[NUM_PIECES], const int rot[NUM_PIECES],
                          const char *resume_id) {
     double t0 = omp_get_wtime();
 
-    uint64_t line_num;
-    #pragma omp atomic capture
-    line_num = ++g_records_processed;
+    #pragma omp atomic
+    g_records_processed++;
+    char tag[CONFIG_ID_LEN + 48];
+    row_tag(tag, sizeof(tag), row, config_id_str);
 
     char rec_buf[REC_BUF_BYTES];
     size_t rec_off = 0;
@@ -5714,7 +5789,10 @@ static void process_line(const char *config_id_str, long long sol_id,
         if (rid.done) {
             #pragma omp atomic
             g_cnt_resume_done_in++;
-            resume_copy_row(config_id_str, sol_id, resume_id, pos, rot, "resume_done");
+            DfsStats st0; stats_init(&st0);       /* not written: its file keeps it */
+            FeasIssue fi0; memset(&fi0, 0, sizeof(fi0)); fi0.code = FEAS_OK;
+            write_status_csv(config_id_str, field2, true, "resume_done", 0, 0, 0, 0.0, 0,
+                             &fi0, &st0, NULL, 0, 0, 0, 0, -1, -1, 0);
             return;
         }
         int spos[NUM_PIECES], srot[NUM_PIECES], n_carried = 0;
@@ -5730,12 +5808,12 @@ static void process_line(const char *config_id_str, long long sol_id,
             g_cnt_resume_mismatch++;
             #pragma omp critical(stdout_print)
             {
-                printf("[cfg=%s sol=%lld] RESUME MISMATCH: the board is not the one its "
+                printf("[%s] RESUME MISMATCH: the board is not the one its "
                        "identifier was written for (start= differs); copied unsearched.\n",
-                       config_id_str, sol_id);
+                       tag);
                 fflush(stdout);
             }
-            resume_copy_row(config_id_str, sol_id, resume_id, pos, rot, "resume_mismatch");
+            resume_copy_row(config_id_str, field2, resume_id, pos, rot, "resume_mismatch");
             return;
         }
         resumed = true;
@@ -5743,13 +5821,13 @@ static void process_line(const char *config_id_str, long long sol_id,
         #pragma omp atomic
         g_cnt_invalid++;
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[%4" PRIu64 "/%d] cfg=%s sol=%lld  INVALID: %s\n",
-                line_num, g_total_records, config_id_str, sol_id, why);
+                "[%s] INVALID: %s\n",
+                tag, why);
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); }
         DfsStats st0; stats_init(&st0);
         FeasIssue fi0; memset(&fi0,0,sizeof(fi0)); fi0.code=FEAS_OK;
-        write_status_csv(config_id_str, sol_id, false, "invalid",
+        write_status_csv(config_id_str, field2, false, "invalid",
                                 n_placed, 0, 0, omp_get_wtime()-t0, 0,
                                 &fi0, &st0, NULL, 0, n_placed, 0, 0,
                                 -1, -1, 0);
@@ -5773,8 +5851,8 @@ static void process_line(const char *config_id_str, long long sol_id,
             #pragma omp atomic
             g_cnt_clue_conflict++;
             appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                    "[cfg=%s sol=%lld] DROPPED (clues): %s; not searched, not written.\n",
-                    config_id_str, sol_id,
+                    "[%s] DROPPED (clues): %s; not searched, not written.\n",
+                    tag,
                     cr == CLUE_APPLY_NO_ORIENT
                       ? "board carries no clue, so its orientation cannot be read off it"
                         " -- pass --clue_orient 0..3"
@@ -5783,14 +5861,14 @@ static void process_line(const char *config_id_str, long long sol_id,
             { fputs(rec_buf, stdout); fflush(stdout); }
             DfsStats st0; stats_init(&st0);
             FeasIssue fi0; memset(&fi0,0,sizeof(fi0)); fi0.code=FEAS_OK;
-            write_status_csv(config_id_str, sol_id, false, "clue_conflict",
+            write_status_csv(config_id_str, field2, false, "clue_conflict",
                              n_placed, 0, holes_applied, omp_get_wtime()-t0, 0,
                              &fi0, &st0, NULL, 0, n_placed, 0, 0, -1, -1, 0);
             return;
         }
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[cfg=%s sol=%lld] clues: orientation %d, %d placed, %d already in place.\n",
-                config_id_str, sol_id,
+                "[%s] clues: orientation %d, %d placed, %d already in place.\n",
+                tag,
                 (clue_orient_used + g_rotation) % CLUE_ORIENTS, clues_added, clues_already);
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); rec_off = 0; rec_buf[0] = '\0'; }
@@ -5813,13 +5891,13 @@ static void process_line(const char *config_id_str, long long sol_id,
         #pragma omp atomic
         g_cnt_invalid++;
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[%4" PRIu64 "/%d] cfg=%s sol=%lld  INVALID (post-holes): %s\n",
-                line_num, g_total_records, config_id_str, sol_id, why);
+                "[%s] INVALID (post-holes): %s\n",
+                tag, why);
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); }
         DfsStats st0; stats_init(&st0);
         FeasIssue fi0; memset(&fi0,0,sizeof(fi0)); fi0.code=FEAS_OK;
-        write_status_csv(config_id_str, sol_id, false, "invalid",
+        write_status_csv(config_id_str, field2, false, "invalid",
                                 n_placed, 0, holes_applied, omp_get_wtime()-t0, 0,
                                 &fi0, &st0, NULL, 0, n_placed, input_connected, input_breaks,
                                 -1, -1, 0);
@@ -5835,17 +5913,17 @@ static void process_line(const char *config_id_str, long long sol_id,
         #pragma omp atomic
         g_cnt_dropped++;
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[cfg=%s sol=%lld] DROPPED: input has %d broken edge(s) > "
+                "[%s] DROPPED: input has %d broken edge(s) > "
                 "--breaks %d (total budget); not searched.\n",
-                config_id_str, sol_id, input_breaks, g_max_mismatch);
+                tag, input_breaks, g_max_mismatch);
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); }
-        if (g_resume) resume_emit(config_id_str, sol_id, resumed,
+        if (g_resume) resume_emit(config_id_str, resumed,
                                   resumed ? &carried : &base, &base, NULL);
-        else          write_stream_best(&base, config_id_str, sol_id);
+        else          write_stream_best(&base, config_id_str);
         DfsStats st0; stats_init(&st0);
         FeasIssue fi0; memset(&fi0,0,sizeof(fi0)); fi0.code=FEAS_OK;
-        write_status_csv(config_id_str, sol_id, true, "dropped",
+        write_status_csv(config_id_str, field2, true, "dropped",
                                 n_placed, NUM_PIECES - n_placed, holes_applied,
                                 omp_get_wtime()-t0, 0, &fi0, &st0, NULL, 0,
                                 n_placed, input_connected, input_breaks,
@@ -5856,9 +5934,9 @@ static void process_line(const char *config_id_str, long long sol_id,
     /* -- Warn if the input partial already carries broken edges -- */
     if (input_breaks > 0) {
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[cfg=%s sol=%lld] WARNING: input partial has %d broken edge(s) "
+                "[%s] WARNING: input partial has %d broken edge(s) "
                 "(connected=%d); accepted as sunk, counted toward the total budget.\n",
-                config_id_str, sol_id, input_breaks, input_connected);
+                tag, input_breaks, input_connected);
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); rec_off = 0; rec_buf[0] = '\0'; }
     }
@@ -5874,6 +5952,7 @@ static void process_line(const char *config_id_str, long long sol_id,
     int8_t layer[PUZZLE_SIDE][PUZZLE_SIDE];
     if (g_order_mode == ORD_FRONTIER) frontier_layers(&base, layer);
     int release_k = g_early_release;
+    int rel_r = -1, rel_c = -1;             /* the release cell, search frame */
     if (g_release_row >= 0) {
         int rr = g_release_row, rc = g_release_col;
         for (int q = 0; q < g_rotation; q++) { int t = rc; rc = PUZZLE_SIDE - 1 - rr; rr = t; }
@@ -5884,20 +5963,21 @@ static void process_line(const char *config_id_str, long long sol_id,
             #pragma omp atomic
             g_cnt_release_closed++;
             appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                    "[cfg=%s sol=%lld] release cell (r=%d,c=%d) is not open on this "
+                    "[%s] release cell (r=%d,c=%d) is not open on this "
                     "board; not searched, not written.\n",
-                    config_id_str, sol_id, g_release_row, g_release_col);
+                    tag, g_release_row, g_release_col);
             #pragma omp critical(stdout_print)
             { fputs(rec_buf, stdout); fflush(stdout); }
             DfsStats st0; stats_init(&st0);
             FeasIssue fi0; memset(&fi0,0,sizeof(fi0)); fi0.code=FEAS_OK;
-            write_status_csv(config_id_str, sol_id, true, "release_cell_closed",
+            write_status_csv(config_id_str, field2, true, "release_cell_closed",
                              n_placed, n_seq, holes_applied, omp_get_wtime()-t0, 0,
                              &fi0, &st0, NULL, 0, n_placed, input_connected, input_breaks,
                              -1, -1, 0);
             return;
         }
         release_k = n_seq - at - 1;
+        rel_r = rr; rel_c = rc;
         if (g_order_mode == ORD_FRONTIER) {     /* after the cell's whole layer */
             release_k = 0;
             for (int i = 0; i < n_seq; i++)
@@ -5906,18 +5986,23 @@ static void process_line(const char *config_id_str, long long sol_id,
     }
     const bool soft_completion = order_uses_soft_completion(g_order_mode);
 
-    if (g_verbose && order_is_side_growth(g_order_mode)) {
+    /* -- One example row, the first to get here: --verbose draws its board
+     * before the search and the row written after it (a board for every row
+     * made the log unusable on many rows), and --order frontier prints its
+     * layer map, verbose or not. -- */
+    const bool example = (g_verbose || g_order_mode == ORD_FRONTIER) &&
+                         !atomic_exchange(&g_example_claimed, 1);
+    if (example && g_order_mode == ORD_FRONTIER)
+        print_frontier_map(tag, (const int8_t (*)[PUZZLE_SIDE])layer, rel_r, rel_c, release_k);
+    if (example && g_verbose && order_is_side_growth(g_order_mode)) {
         #pragma omp critical(stdout_print)
         { print_side_sequence_preview(seq, n_seq); fflush(stdout); }
     }
-
-    /* -- Initial-board display is explicit: --verbose only.  v9 printed one
-     * large board even in quiet mode, which obscured batch diagnostics. -- */
-    if (g_verbose) {
-        char title[200];
+    if (example && g_verbose) {
+        char title[CONFIG_ID_LEN + 200];
         snprintf(title, sizeof(title),
-                 "=== INITIAL BOARD  cfg=%s sol=%lld  placed=%d/%d  empty=%d  holes=%d%s ===",
-                 config_id_str, sol_id, n_placed, NUM_PIECES, n_seq, holes_applied,
+                 "=== INITIAL BOARD [%s]  placed=%d/%d  empty=%d  holes=%d%s ===",
+                 tag, n_placed, NUM_PIECES, n_seq, holes_applied,
                  g_rotation > 0 ? " (rotated frame)" : "");
         #pragma omp critical(stdout_print)
         { print_board_ascii(stdout, &initial_board, title); fflush(stdout); }
@@ -5956,9 +6041,9 @@ static void process_line(const char *config_id_str, long long sol_id,
         { if (init_issue.code < 5) g_feas_code_cnt[(int)init_issue.code]++; }
 
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[cfg=%s sol=%lld] completion-infeasible within the requested budget%s: "
+                "[%s] completion-infeasible within the requested budget%s: "
                 "placed=%d/%d empty=%d holes=%d reason=%s\n",
-                config_id_str, sol_id,
+                tag,
                 soft_completion ? ", continuing exact best-partial growth" : "",
                 n_placed, NUM_PIECES, n_seq, holes_applied, desc);
         #pragma omp critical(stdout_print)
@@ -6012,9 +6097,9 @@ static void process_line(const char *config_id_str, long long sol_id,
     bool hall_impossible = (!soft_completion && k_start > total_budget);
     if (root_deficiency > 0) {
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[cfg=%s sol=%lld] root Hall deficiency=%d: any completion needs "
+                "[%s] root Hall deficiency=%d: any completion needs "
                 ">= %d additional broken edge(s); first admissible total k=%d%s.\n",
-                config_id_str, sol_id, root_deficiency, root_deficiency, k_start,
+                tag, root_deficiency, root_deficiency, k_start,
                 hall_impossible ? " (outside the requested budget)" : "");
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); rec_off = 0; rec_buf[0] = '\0'; }
@@ -6030,19 +6115,19 @@ static void process_line(const char *config_id_str, long long sol_id,
         }
         #pragma omp atomic
         g_cnt_no_solution++;
-        if (g_resume) resume_emit(config_id_str, sol_id, resumed,
+        if (g_resume) resume_emit(config_id_str, resumed,
                                   resumed ? &carried : &base, &base, NULL);
-        else          write_stream_best(&base, config_id_str, sol_id);
+        else          write_stream_best(&base, config_id_str);
         double elapsed0 = omp_get_wtime() - t0;
         DfsStats st0; stats_init(&st0);
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[cfg=%s sol=%lld] ROOT-INFEASIBLE: no DFS run; best remains %d/%d "
+                "[%s] ROOT-INFEASIBLE: no DFS run; best remains %d/%d "
                 "connected=%d broken=%d t=%.6fs  no_solution\n",
-                config_id_str, sol_id, n_placed, NUM_PIECES,
+                tag, n_placed, NUM_PIECES,
                 input_connected, input_breaks, elapsed0);
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); }
-        write_status_csv(config_id_str, sol_id, true, "no_solution",
+        write_status_csv(config_id_str, field2, true, "no_solution",
                                 n_placed, n_seq, holes_applied, elapsed0, 0,
                                 &init_issue, &st0, seq, n_seq,
                                 n_placed, input_connected, input_breaks,
@@ -6056,7 +6141,6 @@ static void process_line(const char *config_id_str, long long sol_id,
     stats_init(&total_stats);
     SearchLive live; search_live_init(&live);
     MismatchResult mres = {0}; mres_init(&mres);
-    int  solved_k = -1;
     bool timed_out = false;
     /* --resume: --breaks 0 is required, so the loop below runs one level and
      * one lds pass, and this one cursor follows the whole record. */
@@ -6071,10 +6155,9 @@ static void process_line(const char *config_id_str, long long sol_id,
     if (greedy_mode) {
         DiveStats ds;
         memset(&ds, 0, sizeof(ds));
-        run_greedy_restarts(&base, seq, n_seq, line_num,
+        run_greedy_restarts(&base, seq, n_seq, (uint64_t)row,
                             record_deadline, &mres, &ds);
         local_solutions = (uint64_t)ds.dives;
-        solved_k = mres.found ? mres.items[0].breaks : -1;
         #pragma omp atomic
         g_total_solutions += (uint64_t)ds.dives;   /* every dive is a completion */
 
@@ -6087,19 +6170,19 @@ static void process_line(const char *config_id_str, long long sol_id,
             try_update_best(w, &initial_board, initial_n_placed,
                             NUM_PIECES, NUM_PIECES - initial_n_placed,
                             conn, brk, -1, -1,
-                            config_id_str, sol_id, &rstat, false);
+                            config_id_str, row, &rstat, false);
         }
 
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[cfg=%s sol=%lld] [dive] %lld dives in %.2fs (%.0f/s)  "
+                "[%s] [dive] %lld dives in %.2fs (%.0f/s)  "
                 "breaks best=%d median=%d worst=%d  distinct_boards=%lld\n",
-                config_id_str, sol_id, ds.dives, ds.seconds,
+                tag, ds.dives, ds.seconds,
                 ds.seconds > 0.0 ? (double)ds.dives / ds.seconds : 0.0,
                 ds.best_breaks, ds.median_breaks, ds.worst_breaks, ds.distinct);
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); rec_off = 0; rec_buf[0] = '\0'; }
 
-        if (record_deadline > 0.0 && omp_get_wtime() > record_deadline)
+        if (g_stop || (record_deadline > 0.0 && omp_get_wtime() > record_deadline))
             search_request_stop(&live, STOP_TIMEOUT);
     }
 
@@ -6125,7 +6208,8 @@ static void process_line(const char *config_id_str, long long sol_id,
             SearchCtx cx;
             memset(&cx, 0, sizeof(cx));
             cx.config_id        = config_id_str;
-            cx.sol_id           = sol_id;
+            cx.row              = row;
+            cx.tag              = tag;
             cx.initial_n_placed = initial_n_placed;
             cx.initial_connected= input_connected;
             cx.initial_board    = &initial_board;
@@ -6151,9 +6235,9 @@ static void process_line(const char *config_id_str, long long sol_id,
                     atomic_load_explicit(&live.nodes, memory_order_relaxed);
                 #pragma omp critical(stdout_print)
                 {
-                    printf("[cfg=%s sol=%lld] lds k=%d: D=%d exhausted, widening to "
+                    printf("[%s] lds k=%d: D=%d exhausted, widening to "
                            "D=%d  t=%.1fs nodes=%.1fM best=%d pieces broken=%d\n",
-                           config_id_str, sol_id, k, D, D + 1,
+                           tag, k, D, D + 1,
                            omp_get_wtime() - t0, (double)nds / 1e6,
                            atomic_load_explicit(&rstat.best_total, memory_order_relaxed),
                            rstat.best_broken);
@@ -6164,7 +6248,7 @@ static void process_line(const char *config_id_str, long long sol_id,
         local_solutions = lsol;
         stats_merge(&total_stats, &stats);
 
-        if (found) { solved_k = k; timed_out = false; break; }
+        if (found) { timed_out = false; break; }
 
         /* All mismatch levels share one record deadline.  Once it expires there
          * is no fresh window to spend at a wider k. */
@@ -6174,9 +6258,9 @@ static void process_line(const char *config_id_str, long long sol_id,
         if (k < total_budget) {
             #pragma omp critical(stdout_print)
             {
-                printf("[cfg=%s sol=%lld] level k=%d %s  t=%.1fs best=%d pieces "
+                printf("[%s] level k=%d %s  t=%.1fs best=%d pieces "
                        "connected=%d broken=%d -> deepening to k=%d\n",
-                       config_id_str, sol_id, k,
+                       tag, k,
                        timed_out ? "timed out" : "exhausted (no completion)",
                        omp_get_wtime() - t0,
                        atomic_load_explicit(&rstat.best_total, memory_order_relaxed),
@@ -6198,12 +6282,12 @@ static void process_line(const char *config_id_str, long long sol_id,
         g_cnt_resume_mismatch++;
         #pragma omp critical(stdout_print)
         {
-            printf("[cfg=%s sol=%lld] RESUME MISMATCH: piece %d of the identifier's path "
+            printf("[%s] RESUME MISMATCH: piece %d of the identifier's path "
                    "is not a candidate on this board; copied unsearched.\n",
-                   config_id_str, sol_id, rcur.mismatch_depth + 1);
+                   tag, rcur.mismatch_depth + 1);
             fflush(stdout);
         }
-        resume_copy_row(config_id_str, sol_id, resume_id, pos, rot, "resume_mismatch");
+        resume_copy_row(config_id_str, field2, resume_id, pos, rot, "resume_mismatch");
         mres_free(&mres);
         return;
     }
@@ -6214,8 +6298,8 @@ static void process_line(const char *config_id_str, long long sol_id,
      * tie the new board wins, which is how each --early_release run hands out
      * the NEXT released board rather than the first one again. */
     char rsfx[48] = "";
+    const Board *written = rstat.best_board;
     if (g_resume) {
-        const Board *out_b = rstat.best_board;
         if (resumed) {
             int c_conn = 0, c_brk = 0, c_pcs = 0;
             board_edge_counts(&carried, &c_conn, &c_brk);
@@ -6224,9 +6308,9 @@ static void process_line(const char *config_id_str, long long sol_id,
                                atomic_load_explicit(&rstat.best_total, memory_order_relaxed),
                                rstat.best_connected, rstat.best_broken,
                                rstat.best_break_pieces))
-                out_b = &carried;
+                written = &carried;
         }
-        resume_emit(config_id_str, sol_id, resumed, out_b, &initial_board, &rcur);
+        resume_emit(config_id_str, resumed, written, &initial_board, &rcur);
         char from[16], to[16];
         if (resumed) snprintf(from, sizeof(from), "%d%s", rid.n_path, rid.after ? "+" : "");
         else         snprintf(from, sizeof(from), "start");
@@ -6234,13 +6318,12 @@ static void process_line(const char *config_id_str, long long sol_id,
             snprintf(to, sizeof(to), "done");
         else
             snprintf(to, sizeof(to), "%d%s", rcur.n_out, rcur.out_after ? "+" : "");
-        snprintf(rsfx, sizeof(rsfx), " resume=%s->%s", from, to);
+        snprintf(rsfx, sizeof(rsfx), "  resume %s->%s", from, to);
     } else {
-        write_stream_best(rstat.best_board, config_id_str, sol_id);
+        write_stream_best(written, config_id_str);
     }
 
-    /* -- Determine status.  In collect mode success is mres.found; the broken-
-     * edge count of the reported board is solved_k. -- */
+    /* -- Determine status.  In collect mode success is mres.found. -- */
     bool any_solution = collect ? mres.found : (local_solutions > 0);
     int stop_reason = search_stop_reason(&live);
     bool limit_reached = (stop_reason & STOP_SOLUTION_LIMIT) != 0;
@@ -6266,58 +6349,33 @@ static void process_line(const char *config_id_str, long long sol_id,
         g_cnt_no_solution++;
     }
 
-    /* -- Depth info: report the record's BEST board (rstat), which persists
-     *    across all k-levels (stats.max_depth_entered is reset each level). -- */
+    /* -- The row's line: the outcome first, then the scores of the row as read
+     *    and as written, then where the search got to. -- */
     int fd = first_dead_depth(&stats, n_seq);
-    char stuck_str[64];
-    int deep_row     = rstat.deepest_row;
-    int deep_col     = rstat.deepest_col;
     int rstat_best_total = atomic_load_explicit(&rstat.best_total, memory_order_relaxed);
     int n_added_dfs  = rstat_best_total - initial_n_placed;
-
-    if (any_solution)
-        snprintf(stuck_str, sizeof(stuck_str), "solved");
-    else if (timed_out)
-        snprintf(stuck_str, sizeof(stuck_str), "timed_out@%.0fs(best+%d)",
-                 eff_limit, n_added_dfs);
-    else if (fd >= 0)
-        snprintf(stuck_str, sizeof(stuck_str), "stuck@(r=%d,c=%d)",
-                 stats.first_dead_row, stats.first_dead_col);
-    else
-        snprintf(stuck_str, sizeof(stuck_str), "no_dead_recorded");
-
-    /* -- Compact per-record line (with connected/broken edge counts) -- */
-    const int total_internal = 2 * PUZZLE_SIDE * (PUZZLE_SIDE - 1);  /* 480 */
-    if (strcmp(status, "solution") == 0 || strcmp(status, "solution_cutoff") == 0) {
-        int sbroken    = collect ? (mres.found ? mres.items[0].breaks : solved_k) : 0;
-        int sconnected = total_internal - sbroken;  /* complete board: all 480 edges exist */
-        /* A released board is not complete: its edges are counted, not assumed.
-         * The streamed board is the record's best, which is a released one. */
-        if (release_on()) sconnected = rstat.best_connected;
-        char brk[128];
-        int boff = snprintf(brk, sizeof(brk),
-                            " connected_edges=%d broken_edges=%d pieces_with_breaks=%d kept=%d",
-                            sconnected, sbroken, collect && mres.found ? mres.items[0].pieces : 0,
-                            collect ? mres.count : 0);
-        if (release_on() && boff > 0 && (size_t)boff < sizeof(brk))
-            snprintf(brk + boff, sizeof(brk) - (size_t)boff, " released=%d",
-                     n_seq - search_gate(n_seq, release_k));
-        appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[cfg=%s sol=%lld] %s found=%" PRIu64
-                " placed=%d/%d empty=%d holes=%d"
-                " deepest=(r=%d,c=%d) added=%d%s t=%.3fs%s\n",
-                config_id_str, sol_id, status, local_solutions,
-                n_placed, NUM_PIECES, n_seq, holes_applied,
-                deep_row, deep_col, n_added_dfs, brk, elapsed, rsfx);
-    } else {
-        appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[cfg=%s sol=%lld] placed=%d/%d empty=%d holes=%d"
-                " best=%d connected_edges=%d broken_edges=%d"
-                " deepest=(r=%d,c=%d) added=%d %s t=%.3fs  %s%s\n",
-                config_id_str, sol_id, n_placed, NUM_PIECES, n_seq, holes_applied,
-                rstat_best_total, rstat.best_connected, rstat.best_broken,
-                deep_row, deep_col, n_added_dfs, stuck_str, elapsed, status, rsfx);
-    }
+    int w_conn = 0, w_brk = 0;
+    board_edge_counts(written, &w_conn, &w_brk);
+    const bool stopped = timed_out && !limit_reached;
+    const char *outcome = any_solution ? (release_on() ? "released" : "solved")
+                        : !stopped     ? "no_solution"
+                        : g_stop       ? "stopped" : "time_limit";
+    char extra[160]; size_t xoff = 0; extra[0] = '\0';
+    if (any_solution && local_solutions > 1)
+        appendf(extra, sizeof(extra), &xoff, "  found=%" PRIu64, local_solutions);
+    if (any_solution && release_on())
+        appendf(extra, sizeof(extra), &xoff, "  left_open=%d",
+                n_seq - search_gate(n_seq, release_k));
+    if (!any_solution && !stopped && fd >= 0)
+        appendf(extra, sizeof(extra), &xoff, "  stuck=(r=%d,c=%d)",
+                stats.first_dead_row, stats.first_dead_col);
+    appendf(rec_buf, sizeof(rec_buf), &rec_off,
+            "[%s] %s%s  t=%.3fs  score %d -> %d%s  pieces %d+%d/%d  open=%d holes=%d  "
+            "broken=%d  deepest=(r=%d,c=%d)%s%s\n",
+            tag, outcome, any_solution && stopped ? " (time limit)" : "", elapsed,
+            csv_board_score(pos, rot), w_conn, stopped && !any_solution ? " (best so far)" : "",
+            initial_n_placed, n_added_dfs, NUM_PIECES, n_seq, holes_applied,
+            w_brk, rstat.deepest_row, rstat.deepest_col, extra, rsfx);
 
     if (order_is_side_growth(g_order_mode)) {
         int border = 0, left = 0, right = 0, bottom = 0, top = 0;
@@ -6355,9 +6413,8 @@ static void process_line(const char *config_id_str, long long sol_id,
                 TOTAL(reject_top,    &stats, n_seq),
                 TOTAL(reject_right,  &stats, n_seq));
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "  max_depth_seq=%d/%d  first_dead=%s  deepest=(r=%d,c=%d)  n_added=%d",
-                stats.max_depth_entered, n_seq, stuck_str,
-                deep_row, deep_col, n_added_dfs);
+                "  max_depth_seq=%d/%d  n_added=%d",
+                stats.max_depth_entered, n_seq, n_added_dfs);
         if (order_is_side_growth(g_order_mode))
             appendf(rec_buf, sizeof(rec_buf), &rec_off,
                     "  defer_events=%" PRIu64,
@@ -6367,12 +6424,19 @@ static void process_line(const char *config_id_str, long long sol_id,
 
     #pragma omp critical(stdout_print)
     { fputs(rec_buf, stdout); fflush(stdout); }
+    if (example && g_verbose) {
+        char title[CONFIG_ID_LEN + 120];
+        snprintf(title, sizeof(title), "=== FINAL BOARD [%s]  (the row written: score %d)%s ===",
+                 tag, w_conn, g_rotation > 0 ? " (rotated frame)" : "");
+        #pragma omp critical(stdout_print)
+        { print_board_ascii(stdout, written, title); fflush(stdout); }
+    }
 
-    write_status_csv(config_id_str, sol_id, true, status,
+    write_status_csv(config_id_str, field2, true, status,
                             n_placed, n_seq, holes_applied, elapsed,
                             local_solutions, &init_issue, &stats, seq, n_seq,
                             rstat_best_total, rstat.best_connected, rstat.best_broken,
-                            deep_row, deep_col, root_deficiency);
+                            rstat.deepest_row, rstat.deepest_col, root_deficiency);
     mres_free(&mres);
 }
 
@@ -6472,6 +6536,18 @@ static void build_duplicate_map(const CsvRecord *records, int n_hash,
     fflush(stdout);
 }
 
+/* A row reached after a stop signal: under --resume it is copied unchanged
+ * (with its identifier, or none), so the output stays a complete input for
+ * the next run; otherwise it is not written. */
+static void not_started(const CsvRecord *rec) {
+    stop_announce();
+    #pragma omp atomic
+    g_cnt_not_started++;
+    if (g_resume)
+        resume_copy_row(rec->config_id, rec->sol_id, rec->resume_id, rec->pos, rec->rot,
+                        "not_started");
+}
+
 /* Report and account one skipped duplicate (thread-safe).  Under --resume it
  * writes no output row: a row written without an identifier would come back as
  * a fresh search next run, which is the work the duplicate pass exists to save. */
@@ -6481,11 +6557,13 @@ static void report_duplicate(const CsvRecord *rec, int row,
     g_records_processed++;
     #pragma omp atomic
     g_cnt_duplicate++;
+    char rtag[CONFIG_ID_LEN + 48];
+    row_tag(rtag, sizeof(rtag), row + 1, rec->config_id);
     #pragma omp critical(stdout_print)
     {
-        printf("[cfg=%s sol=%lld] DUPLICATE: initial board after holes is identical "
-               "to row %d (cfg=%s sol=%lld); skipped%s.\n",
-               rec->config_id, rec->sol_id, orig_row, orig->config_id, orig->sol_id,
+        printf("[%s] DUPLICATE: initial board after holes is identical "
+               "to row %d (%s); skipped%s.\n",
+               rtag, orig_row + 1, orig->config_id,
                g_resume ? ", not written" : "");
         fflush(stdout);
     }
@@ -6497,9 +6575,8 @@ static void report_duplicate(const CsvRecord *rec, int row,
                                      &holes_applied, why, sizeof(why));
     if (valid) {
         board_edge_counts(&b, &connected, &broken);
-        if (!g_resume) write_stream_best(&b, rec->config_id, rec->sol_id);
+        if (!g_resume) write_stream_best(&b, rec->config_id);
     }
-    (void)row;
     DfsStats st0; stats_init(&st0);
     FeasIssue fi0; memset(&fi0, 0, sizeof(fi0)); fi0.code = FEAS_OK;
     write_status_csv(rec->config_id, rec->sol_id, valid, "duplicate_unsearched",
@@ -6533,7 +6610,8 @@ static void usage(const char *prog) {
         "                         remaining record from --start_row).\n"
         "  --holes PATH           256 position-indexed 0/1 entries; matrix CSV accepted.\n"
         "  --rotate K             Rotate K quarter turns CCW before search (0..3).\n"
-        "  --verbose              Print every initial board and detailed statistics.\n"
+        "  --verbose              Detailed statistics per row; draws one example row's\n"
+        "                         board before and after its search.\n"
         "  --best_n N             Also retain global top-N pure/mismatch partials.\n"
         "  --status               Write output.csv.status.csv (off by default).\n"
         "  --dedup                Enable exact post-hole duplicate skipping (default).\n"
@@ -6652,8 +6730,12 @@ static void usage(const char *prog) {
         "                         identifier row is searched as a plain board.\n"
         "  --resume_score S       With --resume: skip every row whose board scores below\n"
         "                         S (matched edges); it is not written.  Each run ends\n"
-        "                         with the median score written, which as S keeps about\n"
-        "                         half the rows.\n\n"
+        "                         with the median score written and the S that keeps\n"
+        "                         the rows at or above it (about half).  Rows already\n"
+        "                         done are not written again: their file keeps them.\n"
+        "  SIGINT/SIGTERM         The running searches stop and are written (resumable\n"
+        "                         under --resume); rows not started are copied unchanged\n"
+        "                         under --resume, else not written.  A second signal kills.\n\n"
         "Stop band (emit partials for the finalizer):\n"
         "  --stop_row N           Search ONLY rows 0..N and emit every way to fill\n"
         "                         them, as the beamer's --stop_row does.  Cells above\n"
@@ -6710,7 +6792,7 @@ static void write_partials_track(const char *path, const char *kind,
 
     printf("\n  Best %s partial boards -> %s\n", kind, path);
     printf("  %-5s  %-22s  %-10s  %-14s  %-10s  %-8s  %-12s  %s\n",
-           "rank", "config_id", "sol_id", "pieces(tot/add)", "connected", "broken", "break_pieces", "deepest");
+           "rank", "config_id", "row", "pieces(tot/add)", "connected", "broken", "break_pieces", "deepest");
 
     for (int k = 0; k < count; k++) {
         const BestPartial *bp = &track[k];
@@ -6728,15 +6810,14 @@ static void write_partials_track(const char *path, const char *kind,
         board_to_pos_rot(out_b, pos, rot_arr);
 
         char buf[CSV_BUF_BYTES]; size_t off = 0;
-        appendf(buf, sizeof(buf), &off, "%s_%lld,%d",
-                bp->record_id, bp->sol_id_num, bp->n_connected);
+        appendf(buf, sizeof(buf), &off, "%s,%d", bp->record_id, bp->n_connected);
         for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", pos[i]);
         for (int i = 0; i < NUM_PIECES; i++) appendf(buf, sizeof(buf), &off, ",%d", rot_arr[i]);
         appendf(buf, sizeof(buf), &off, "\n");
         checked_fwrite(buf, 1, off, f, path);
 
         printf("  %-5d  %-22s  %-10lld  %5d/%-8d  %-10d  %-8d  %-12d  (r=%d,c=%d)\n",
-               k + 1, bp->record_id, bp->sol_id_num,
+               k + 1, bp->record_id, bp->row_num,
                bp->n_total, bp->n_added, bp->n_connected, bp->n_broken,
                bp->n_break_pieces, bp->deepest_row, bp->deepest_col);
     }
@@ -7464,6 +7545,8 @@ int main(int argc, char **argv) {
         printf("[dedup] off by --no_dedup; every selected input row will be searched\n");
 
     /* [5/5] Search */
+    signal(SIGINT, handle_stop);
+    signal(SIGTERM, handle_stop);
     printf("\n[5/5] Searching %d of %d record(s) (window [%d,%d))...\n",
            proc_count, n_records, proc_start, proc_end);
     if (g_search_parallel) {
@@ -7479,7 +7562,8 @@ int main(int argc, char **argv) {
                 report_duplicate(&records[i], i, &records[dup_of[i]], dup_of[i]);
                 continue;
             }
-            process_line(records[i].config_id, records[i].sol_id,
+            if (g_stop) { not_started(&records[i]); continue; }
+            process_line(records[i].config_id, records[i].sol_id, i + 1,
                          records[i].pos, records[i].rot, NULL);
         }
     } else {
@@ -7494,7 +7578,8 @@ int main(int argc, char **argv) {
                 report_duplicate(&records[i], i, &records[dup_of[i]], dup_of[i]);
                 continue;
             }
-            process_line(records[i].config_id, records[i].sol_id,
+            if (g_stop) { not_started(&records[i]); continue; }
+            process_line(records[i].config_id, records[i].sol_id, i + 1,
                          records[i].pos, records[i].rot, records[i].resume_id);
         }
     }
@@ -7503,6 +7588,9 @@ int main(int argc, char **argv) {
 
     /* -- End-of-run summary -- */
     printf("\n=== E555 backtracker complete ===\n");
+    if (g_stop)
+        printf("  stopped by signal: yes  not_started=%" PRIu64 "  (%s)\n", g_cnt_not_started,
+               g_resume ? "copied unchanged" : "not written");
     printf("  wall_time_sec          = %.3f\n", wall);
     printf("  records_loaded         = %d\n",   n_records);
     printf("  records_processed      = %" PRIu64 "\n", g_records_processed);
@@ -7547,24 +7635,25 @@ int main(int argc, char **argv) {
             printf("    skipped(below %3d)   = %" PRIu64 "  (not written)\n",
                    g_resume_score, g_cnt_resume_below);
         printf("    skipped(duplicate)   = %" PRIu64 "  (not written)\n", g_cnt_duplicate);
-        printf("    copied(done)         = %" PRIu64 "  (searched to the end before)\n",
-               g_cnt_resume_done_in);
+        printf("    skipped(done)        = %" PRIu64 "  (finished before: their file keeps "
+               "them, not written)\n", g_cnt_resume_done_in);
         if (g_cnt_resume_mismatch)
             printf("    copied(mismatch)     = %" PRIu64 "  (identifier does not fit its "
                    "board; see RESUME MISMATCH above)\n", g_cnt_resume_mismatch);
-        printf("    ended: done=%" PRIu64 "  stopped=%" PRIu64 " (time limit)  "
+        printf("    ended: done=%" PRIu64 "  stopped=%" PRIu64 " (time limit or signal)  "
                "after_board=%" PRIu64 " (next run starts after the board written)\n",
                g_cnt_end_done, g_cnt_end_stopped, g_cnt_end_after);
     }
 
-    /* The scores of the rows just written.  The median is printed as an
-     * integer that --resume_score accepts: the value at index n/2 of the
-     * ascending scores, with the count it keeps beside it (ties can make that
-     * more than half). */
+    /* The scores of the rows just written; std is the population one (over n).
+     * The median is the middle score, or the mean of the two middle ones for an
+     * even count.  --resume_score takes an integer, so the line also gives the
+     * one that keeps the rows at or above the median, with their count (ties
+     * can make that more than half). */
     {
         uint64_t n = 0, ge = 0;
         double sum = 0.0, sumsq = 0.0;
-        int smin = -1, smax = -1, median = -1;
+        int smin = -1, smax = -1;
         for (int s = 0; s <= MAX_SCORE; s++) {
             if (!g_score_hist[s]) continue;
             if (smin < 0) smin = s;
@@ -7576,17 +7665,21 @@ int main(int argc, char **argv) {
         if (n == 0) {
             printf("\n  output scores: no boards written\n");
         } else {
-            uint64_t seen_n = 0;
-            for (int s = 0; s <= MAX_SCORE && median < 0; s++) {
+            int mid[2] = { -1, -1 };              /* scores at ranks (n-1)/2 and n/2 */
+            uint64_t want[2] = { (n - 1) / 2, n / 2 }, seen_n = 0;
+            for (int s = 0; s <= MAX_SCORE; s++) {
                 seen_n += g_score_hist[s];
-                if (seen_n > n / 2) median = s;
+                for (int k = 0; k < 2; k++)
+                    if (mid[k] < 0 && seen_n > want[k]) mid[k] = s;
             }
-            for (int s = median; s <= MAX_SCORE; s++) ge += g_score_hist[s];
+            double median = 0.5 * (mid[0] + mid[1]);
+            int keep_at = (mid[0] + mid[1] + 1) / 2;   /* ceil(median) */
+            for (int s = keep_at; s <= MAX_SCORE; s++) ge += g_score_hist[s];
             double mean = sum / (double)n;
             double var = sumsq / (double)n - mean * mean;
             printf("\n  output scores: boards=%" PRIu64 " min=%d max=%d mean=%.2f std=%.2f "
-                   "median=%d (%" PRIu64 " boards >= %d)\n",
-                   n, smin, smax, mean, var > 0.0 ? sqrt(var) : 0.0, median, ge, median);
+                   "median=%.1f (--resume_score %d keeps %" PRIu64 ")\n",
+                   n, smin, smax, mean, var > 0.0 ? sqrt(var) : 0.0, median, keep_at, ge);
         }
     }
 
@@ -7607,25 +7700,25 @@ int main(int argc, char **argv) {
             printf("    (none -- no search was performed)\n");
         if (g_best_pure_count > 0) {
             const BestPartial *bp = &g_best_pure[0];
-            printf("    PURE     #1: cfg=%s sol=%lld  pieces=%d (added %d)  connected=%d  broken=0  deepest=(r=%d,c=%d)\n",
-                   bp->record_id, bp->sol_id_num, bp->n_total, bp->n_added,
+            printf("    PURE     #1: row %lld/%d %s  pieces=%d (added %d)  connected=%d  broken=0  deepest=(r=%d,c=%d)\n",
+                   bp->row_num, g_total_records, bp->record_id, bp->n_total, bp->n_added,
                    bp->n_connected, bp->deepest_row, bp->deepest_col);
             char title[CONFIG_ID_LEN + 160];
             snprintf(title, sizeof(title),
-                     "=== Best PURE #1: cfg=%s sol=%lld  pieces=%d (added %d)  connected=%d  broken=0 ===",
-                     bp->record_id, bp->sol_id_num, bp->n_total, bp->n_added, bp->n_connected);
+                     "=== Best PURE #1: row %lld/%d %s  pieces=%d (added %d)  connected=%d  broken=0 ===",
+                     bp->row_num, g_total_records, bp->record_id, bp->n_total, bp->n_added, bp->n_connected);
             print_board_ascii(stdout, (const Board *)&bp->board, title);
         }
         if (g_best_mm_count > 0) {
             const BestPartial *bp = &g_best_mm[0];
-            printf("    MISMATCH #1: cfg=%s sol=%lld  pieces=%d (added %d)  connected=%d  broken=%d  deepest=(r=%d,c=%d)\n",
-                   bp->record_id, bp->sol_id_num, bp->n_total, bp->n_added,
+            printf("    MISMATCH #1: row %lld/%d %s  pieces=%d (added %d)  connected=%d  broken=%d  deepest=(r=%d,c=%d)\n",
+                   bp->row_num, g_total_records, bp->record_id, bp->n_total, bp->n_added,
                    bp->n_connected, bp->n_broken, bp->deepest_row, bp->deepest_col);
             char title[CONFIG_ID_LEN + 160];
             snprintf(title, sizeof(title),
-                     "=== Best MISMATCH #1: cfg=%s sol=%lld  pieces=%d (added %d)  connected=%d  broken=%d "
+                     "=== Best MISMATCH #1: row %lld/%d %s  pieces=%d (added %d)  connected=%d  broken=%d "
                      "($ marks broken edges) ===",
-                     bp->record_id, bp->sol_id_num, bp->n_total, bp->n_added,
+                     bp->row_num, g_total_records, bp->record_id, bp->n_total, bp->n_added,
                      bp->n_connected, bp->n_broken);
             print_board_ascii(stdout, (const Board *)&bp->board, title);
         }

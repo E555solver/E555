@@ -2137,6 +2137,9 @@ EOF
         --no_hall --no_colour_count > "$OUT/fr_t4.log" || fail "frontier at 4 threads failed"
     grep -q "colour_count=off" "$OUT/fr_t4.log" || fail "--no_colour_count not in the header"
     cmp -s "$OUT/fr_cell.csv" "$OUT/fr_k.csv" || fail "frontier 13,5 differs from 32"
+    [ "$(grep -c 'frontier layers' "$OUT/fr_cell.log")" = 1 ] \
+        && grep -q "layer cells: 1:16 2:16 3:16   --early_release 13,5 is in layer 1: 32 cell(s) (layers 2-3)" \
+            "$OUT/fr_cell.log" || fail "frontier did not draw its layer map once"
     cmp -s "$OUT/fr_k.csv" "$OUT/fr_t4.csv" || fail "frontier differs at 4 threads"
     python3 - "$OUT/fr_cell.csv" <<'PY' || fail "frontier did not release after a complete row 13"
 import sys
@@ -2144,7 +2147,7 @@ f = [l for l in open(sys.argv[1]) if not l.startswith("#")][0].split(",")[-512:]
 cells = {int(x) for x in f[:256] if int(x) != 999}
 assert all(208 + c in cells for c in range(16)) and not any(x >= 224 for x in cells)
 PY
-    echo "ok: frontier releases after whole layers (13,5 == 32), the same at 4 threads"
+    echo "ok: frontier releases after whole layers (13,5 == 32), the same at 4 threads; the layer map is drawn once"
 }
 
 # --resume cuts one exact search into sessions.  The proof that nothing is
@@ -2243,6 +2246,11 @@ for tag, seedf, rot, n_open, want in (("er", "data/seed_Edge5.txt", 0, 108, 5),
         assert any(all(truth[x] == v for x, v in b) for b in boards), "ers: the truth's prefix was skipped"
     print("ok: %s: %d runs release %d distinct boards in search order, then done" % (tag, len(files), len(boards)))
 EOF
+    # A done row is not written again: the file that first wrote it keeps it.
+    "$bt" data/synth_seed.txt "$in" "$d/ers.again.csv" --rotate 1 --early_release 44 \
+        --order rowmajor --resume --threads 1 > "$d/ers.again.log" || fail "the run on a done row failed"
+    [ "$(grep -vc '^#' "$d/ers.again.csv")" = 0 ] && grep -q "skipped(done)        = 1" "$d/ers.again.log" \
+        || fail "a done row was written again"
 
     # 3. Many records: thread-independent, --resume_score, the score summary.
     python3 - "$d" <<'EOF' || exit 1
@@ -2272,28 +2280,32 @@ EOF
     local sbt=("$bt" data/synth_seed.txt)
     for n in 1 4; do
         "${sbt[@]}" "$d/multi.csv" "$d/m$n.csv" --order rowmajor --early_release 20 --resume \
-            --threads "$n" > "$d/m$n.log" || fail "the three-row run at $n thread(s) failed"
+            --threads "$n" --verbose > "$d/m$n.log" || fail "the three-row run at $n thread(s) failed"
+        [ "$(grep -c '=== INITIAL BOARD \[row ' "$d/m$n.log")$(grep -c '=== FINAL BOARD \[row ' "$d/m$n.log")" = 11 ] \
+            || fail "--verbose should draw one example row, before and after, at $n thread(s)"
     done
     cmp -s <(grep -v '^#' "$d/m1.csv" | sort) <(grep -v '^#' "$d/m4.csv" | sort) \
         || fail "--resume wrote other rows at 4 threads than at 1"
-    python3 - "$d/m1.csv" "$d/m1.log" <<'EOF' || exit 1
-import re, statistics, sys
-s = sorted(int(l.split(",")[1]) for l in open(sys.argv[1]) if l.strip() and not l.startswith("#"))
-m = re.search(r"output scores: boards=(\d+) min=(\d+) max=(\d+) mean=([\d.]+) std=([\d.]+) "
-              r"median=(\d+) \((\d+) boards >= (\d+)\)", open(sys.argv[2]).read())
-assert m, "no output scores line"
-med = s[len(s) // 2]
-want = (len(s), s[0], s[-1], "%.2f" % statistics.fmean(s), "%.2f" % statistics.pstdev(s),
-        med, sum(x >= med for x in s), med)
-got = (int(m[1]), int(m[2]), int(m[3]), m[4], m[5], int(m[6]), int(m[7]), int(m[8]))
-assert got == want, "summary %s, the rows say %s" % (got, want)
-print("ok: output scores line agrees with the rows: %s" % m[0])
-EOF
     "${sbt[@]}" "$d/multi.csv" "$d/ms.csv" --resume --resume_score "$(cat "$d/score_top2")" \
-        --threads 2 > "$d/ms.log" || fail "--resume_score run failed"
-    [ "$(grep -v '^#' "$d/ms.csv" | cut -d, -f1 | sort | tr '\n' ' ')" = "top1_0 top2_0 " ] \
-        || fail "--resume_score should keep top1 and top2 and drop top3"
+        --order rowmajor --early_release 20 --threads 2 > "$d/ms.log" || fail "--resume_score run failed"
+    [ "$(grep -v '^#' "$d/ms.csv" | cut -d, -f1 | sort | tr '\n' ' ')" = "top1 top2 " ] \
+        || fail "--resume_score should keep top1 and top2 (ids as read) and drop top3"
     grep -q "skipped(below" "$d/ms.log" || fail "no --resume_score count in the summary"
+    # The summary against the rows: 3 boards (odd), then 2 (even: 449 and 441 give 445.0).
+    python3 - "$d/m1.csv" "$d/m1.log" "$d/ms.csv" "$d/ms.log" <<'EOF' || exit 1
+import math, re, statistics, sys
+for csv, log in ((sys.argv[1], sys.argv[2]), (sys.argv[3], sys.argv[4])):
+    s = sorted(int(l.split(",")[1]) for l in open(csv) if l.strip() and not l.startswith("#"))
+    m = re.search(r"output scores: boards=(\d+) min=(\d+) max=(\d+) mean=([\d.]+) std=([\d.]+) "
+                  r"median=([\d.]+) \(--resume_score (\d+) keeps (\d+)\)", open(log).read())
+    assert m, "no output scores line in " + log
+    med = statistics.median(s)
+    want = (len(s), s[0], s[-1], "%.2f" % statistics.fmean(s), "%.2f" % statistics.pstdev(s),
+            "%.1f" % med, math.ceil(med), sum(x >= math.ceil(med) for x in s))
+    got = (int(m[1]), int(m[2]), int(m[3]), m[4], m[5], m[6], int(m[7]), int(m[8]))
+    assert got == want, "summary %s, the rows say %s" % (got, want)
+    print("ok: output scores line agrees with its %d rows: %s" % (len(s), m[0]))
+EOF
 
     # 4. Dedup: fresh rows identical after --holes are skipped and not written;
     #    rows carrying an identifier are each their own search state.
@@ -2347,6 +2359,48 @@ EOF
     "${sbt[@]}" "$d/same.csv" "$d/same.csv" > "$d/bad.log" 2>&1 && fail "input == output accepted"
     [ "$(grep -vc '^#' "$d/same.csv")" = 3 ] || fail "input == output emptied the input"
     echo "ok: --max_emitted, --breaks, --jump, 2sides, bands, --all_for_one, other settings and input == output refused"
+
+    # 7. SIGTERM: the running row stops and is written with its resume point; the
+    #    row not started is copied unchanged under --resume, else not written.
+    python3 - "$d" <<'EOF' || exit 1
+import sys
+d = sys.argv[1]
+l = [x for x in open("data/board_partial_row12.csv") if x.strip() and not x.startswith("#")][0]
+f = [v.strip() for v in l.split(",")]
+g = list(f); g[0] = "second"
+g[2 + [int(v) for v in f[2:258]].index(3 * 16 + 5)] = "999"     # one more open cell
+open(d + "/sig.csv", "w").write(",".join(f) + "\n" + ",".join(g) + "\n")
+open(d + "/r4.csv", "w").write("".join(",".join("1" if r >= 4 else "0" for c in range(16)) + "\n"
+                                       for r in range(16)))
+EOF
+    local pid i
+    for tag in sigr sign; do
+        extra=""; [ "$tag" = sigr ] && extra=--resume
+        "$bt" "$seed" "$d/sig.csv" "$d/$tag.csv" --holes "$d/r4.csv" --order rowmajor --threads 1 \
+            $extra > "$d/$tag.log" &
+        pid=$!
+        for i in $(seq 100); do grep -q '^\[5/5\]' "$d/$tag.log" && break; sleep 0.1; done
+        sleep 1
+        kill -TERM "$pid"
+        wait "$pid" || fail "$tag: the run did not exit 0 after SIGTERM"
+        grep -q "stopped by signal: yes  not_started=1" "$d/$tag.log" || fail "$tag: no signal summary"
+    done
+    python3 - "$d" <<'EOF' || exit 1
+import sys
+d = sys.argv[1]
+def rows(p):
+    return [[v.strip() for v in l.split(",")] for l in open(p) if l.strip() and not l.startswith("#")]
+src, r, n = rows(d + "/sig.csv"), rows(d + "/sigr.csv"), rows(d + "/sign.csv")
+assert [x[0] for x in r] == ["r0c669", "second"], "sigr rows: %s" % [x[0] for x in r]
+assert len(r[0]) == 515 and ";at=" in r[0][2], "sigr: row 1 has no resume point: " + r[0][2][:60]
+assert len(r[1]) == 514 and r[1][-512:] == src[1][-512:], "sigr: row 2 was not copied unchanged"
+assert [x[0] for x in n] == ["r0c669"], "sign: want row 1 only, got %s" % [x[0] for x in n]
+EOF
+    E555_BT_NODE_BUDGET=4096 "$bt" "$seed" "$d/sigr.csv" "$d/sig2.csv" --holes "$d/r4.csv" \
+        --order rowmajor --resume --threads 1 > "$d/sig2.log" || fail "the run after SIGTERM failed"
+    grep -q "fresh                = 1" "$d/sig2.log" && grep -q "continued            = 1" "$d/sig2.log" \
+        || fail "after SIGTERM: row 1 should continue and row 2 start fresh"
+    echo "ok: SIGTERM writes the running row with its resume point; the row not started is copied (--resume) or not written"
 }
 
 # The mismatch engines no longer test candidates one at a time: a placement's

@@ -1792,6 +1792,8 @@ not open is reported and not written.
 steps count one) to the nearest placed piece, and fills the innermost
 unfinished layer first, fewest fits first: it grows outward from the placed
 pieces, and `--early_release R,C` then releases after that cell's whole layer.
+The run prints the first row's layer map (`#` placed, digits the layers, `*` the
+release cell) with the cells per layer.
 `--no_colour_count` (like `--no_hall`) drops a start-of-record check that sees
 the cells to be released too; neither is recorded by `--resume`.
 
@@ -1810,8 +1812,13 @@ the best over all runs, never worse.
 - Requires `--breaks 0` and `--max_emitted 1`. Refused with 2sides/4sides,
   `--jump`, a stop band and `--all_for_one`.
 - `--resume_score S` skips, and does not write, the rows scoring below S.
-- Every run ends with `output scores: ... median=M (K boards >= M)`: M as the
-  next `--resume_score` keeps about half the rows.
+- Every run ends with `output scores: ... median=M (--resume_score T keeps K)`.
+  M is the true median (the mean of the middle two for an even count), T =
+  ceil(M) keeps the K rows at or above it, about half. std is over n.
+- A row already `done` is not written again: the file that first wrote it keeps
+  it (collect the finished boards with `grep -h ';done,' s*.csv`).
+- SIGINT/SIGTERM stops the running searches as their time limit would; their
+  rows go out resumable, and the rows not started are copied unchanged.
 - Without `--resume`, an identifier row is a plain board. Use that to finish
   the best boards with every thread.
 - `rank.py --top/--out` keeps identifiers; `--rescore` drops them. The format
@@ -1839,7 +1846,7 @@ node rate).
 | `--no_colour_count` | off | skip the colour/type count (root and per placement); the no-fit cut stays |
 | `--hall MODE`, `--hall_stride N`, `--hall_min N` | root, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
-| `--time_limit S` | unlimited exact, 30 s mismatch | per record |
+| `--time_limit S` | unlimited exact, 30 s mismatch | per record; SIGINT/SIGTERM stop every running record the same way (rows not started: copied under `--resume`, else not written), a second signal kills |
 | `--max_emitted N` | 1 | completions per record (0 = all) |
 | `--stop_row N`, `--stop_column N`, `--with_frame` | -- | band enumeration |
 | `--early_release N` or `R,C` | 0 | emit the break-free board N searched cells before the end, or right after cell (R,C) |
@@ -1848,7 +1855,7 @@ node rate).
 | `--clue_center`, `--clue_corners`, `--clue_orient N` | off | clues |
 | `--start_row`, `--num_rows`, `--dedup`/`--no_dedup` | 0, all, dedup | input |
 | `--best_n N`, `--status` | --, off | side files |
-| `--threads N`, `--all_for_one`, `--verbose`, `--version`, `--print_cmd` | all | |
+| `--threads N`, `--all_for_one`, `--verbose`, `--version`, `--print_cmd` | all | `--verbose`: statistics per row, and one example row drawn before and after its search |
 
 Output: one best-board row per input record in `output.csv` (with `--resume`,
 the identifier third; the run ends with the min/max/mean/std/median score), plus
