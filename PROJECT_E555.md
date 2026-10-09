@@ -552,6 +552,12 @@ under `--backtrack_row`, the column-major extension above the stop row (5.10).
 The right column and the top border above the stop row are left empty: the
 rotations file fixes which pieces go there, not their order.
 
+Under `--backtrack_unlock_right R` (5.9) a board carries only the block rows
+`0..stop_row` x columns `0..15-R` and the layered extension's prefix (5.10).
+With `--clue_corners` it also carries the corner clues whose cells lie in the
+band. Nothing else is written: not the rest of the bottom row, the right column,
+the left column above the block or the three other corners.
+
 ### 5.9 Exhaustive search to the stop row (`--backtrack_row N`)
 
 Past row 6 or 7 the beam keeps a small share of the legal boards, while an
@@ -603,6 +609,62 @@ N+1..N+3) while a thread is hungry hands its subtree to a job queue, leaving a
 placeholder in its output. Outputs are flattened placeholder by placeholder, so
 file and counts equal the serial search's. On two-socket machines set
 `OMP_PROC_BIND=close OMP_PLACES=cores`.
+
+**L-band boards (`--backtrack_unlock_right R`, R = 2..13).** The search above
+stops at the right edge, which has to chain at the end of every row: that is
+what makes its tree die out. With this flag the board becomes a **block**, rows
+`0..S` x columns `0..W` with `W = 15-R`, and everything outside it is the
+**band** for the tail tools (the backtracker's `--holes ... --order frontier`,
+the ender):
+
+- The beam is unchanged through row N. Each root then gives back columns
+  W+1..15 of rows 1..N: their inner pieces and right edges return to the pool.
+  The root is rebuilt from the bare border with only columns 1..W committed.
+  The tops under the band stay owed, so do the column-W right faces and the
+  edges given back, and colour parity (5.6) applies as it is.
+- Rows N+1..S are searched exhaustively over columns 1..W, a row closing at
+  column W.
+- Roots that differed only in the columns given back are the same board. The
+  first of each, in rank order, is kept (`root_repeats` in the log) before the
+  roots are selected, so the search still gets M x width distinct roots.
+- Every stop-row board is grown by the layered extension (5.10), which replaces
+  the column-major one. `--backtrack_min_col K` then counts the band columns a
+  board may leave open: K = R, the default, writes every board with its
+  longest extension; K < R writes only boards whose extension completes layers
+  1..R-K, out to column 15-K. Without `--end_dive`, a given `--emit_score S`
+  also drops boards whose extended board matches fewer than S edges. Both are
+  checked before a board is buffered, so the boards that miss them never
+  reach the disk.
+- **Written** (5.8): the block, the extension's prefix and the band corner
+  clues. The configuration's frame outside the block (the rest of the bottom
+  row with the BR corner, the left column above the block with the TL corner)
+  and the TR corner are given back: the extension may place any edge on any
+  side and any corner on any corner cell.
+- **Clues.** `--clue_corners` needs `--stop_row` 12 or below and, when R >= 3,
+  `--backtrack_row` 2 or more. Every corner clue whose cell is in the band
+  goes home: (2,13), whose left neighbour comes from the beam, and (13,2) and
+  (13,13). At stop row 12 the search pins the top colour of the stop-row cells
+  right under them, so a written clue never breaks against the block (the
+  tail's `--breaks 0` drops a board with a break among its kept pieces).
+  `--clue_center` needs every enabled centre cell inside the block.
+- **Refused:** `--lambda_corners` (its corner blocks are built on the frame the
+  band gives back), `--free_top_clue` and a nonzero `--cap_top` (both act in
+  the column-major extension). `--exhaust_border_color` and `--BR` still shape
+  the sampled border, but its band part is not written. `--lambda_reserve` acts
+  in the beam only; its tally counts the pieces given back as free.
+- **Size.** Without the right edge the tree no longer dies out. Measured on
+  border row 0 of `data/borders_annealed_fix12.csv` (width 2000, 2
+  configurations, R = 3), from `--backtrack_row 8`:
+
+  | stop row | roots | row-S boards | written (near twins dropped) | extension |
+  |---|---|---|---|---|
+  | 12 | 12,419 | 148,815 | 98,679 | mean 6.2 cells, max 25; no whole layer |
+  | 10 | 12,559 | 2.4 M | 1.44 M (2.8 GB) | mean 18.1 cells, max 60; 0.14 layers |
+
+  A root's boards are held in memory until the root is written. Use a high
+  `--backtrack_row`, `--backtrack_min_col`, `--emit_score` or `--max_emitted`
+  (checked after each root) to bound a run, and a separate `--out_dir` per R:
+  runs with different R append to the same `beam_completions_*` file.
 
 ### 5.10 Column-major extension (`--extend_nodes`, `--backtrack_min_col`)
 
@@ -722,6 +784,46 @@ dived with `E555_diver --end_dive 2000 --end_polish 200`:
 Use it with `--backtrack_min_col` for selection; use `--extend_nodes 0` when
 every stop-row board is dived anyway.
 
+**Layered extension** (under `--backtrack_unlock_right R`, 5.9). The stop-row
+board is the block rows 0..S x columns 0..W (W = 15-R); the extension grows the
+band around it in L-shaped layers along one fixed path:
+
+1. layer k goes up column W+k from row 0 to row min(S+k, 15);
+2. then left along row S+k from column min(W+k-1, 15) to column 0;
+3. then back to row 0 for layer k+1.
+
+An arm past column or row 15 is left out, so the last layer of a square block
+is the frame's right column and top row; a block lower than wide ends in
+row-only layers. Band corner clues are on the board from the start and the
+path steps over them.
+
+- Every cell takes an unused piece that matches each placed neighbour: an
+  inner piece inside, an edge with its grey side out on the frame, a corner
+  with both grey sides out on a corner cell. Any edge may go on any side and
+  any corner on any open corner cell. Going up, a cell knows its left and
+  bottom; going left, its right and bottom (a second catalog index by right and
+  bottom colour serves those); a layer's turning cell knows only its bottom.
+- An exact DFS of at most `--extend_nodes` placements per board keeps the
+  deepest prefix of the path, the first found at that depth: a prefix is a
+  fixed set of cells with no break, so the deepest is also the best scoring,
+  and the result does not depend on the thread count. It goes on past the
+  layers `--backtrack_min_col` asks for, as far as it can; it never changes
+  the block, whose alternatives are the search's own boards.
+- The column check and `--cap_top` do not apply. The near-duplicate filter
+  compares all of columns 1..W of the stop row.
+- `--end_dive`/`--end_polish` start from the extended board, with free edge
+  sides (the band's frame is no longer dealt by the rotations file).
+- The summary reports cells and whole layers (`[sum] extension: mean ...
+  layers`, the layered line under `--verbose`) and `[sum] unlock_right`:
+  roots searched, repeats dropped, boards short of the asked layers or under
+  `--emit_score`.
+
+On the measured runs of 5.9 the band's first layer is the hard part: its
+column-W+1 arm needs a piece per row that fits the block on its left and the
+cell below, from the 52 inner pieces a 13 x 13 block leaves. From stop row 12
+no board completed it; from stop row 10 (76 pieces left) 13% did, and the
+longest extensions reached 60 cells, two whole layers.
+
 ### 5.11 Finishing boards: end dives and polish (`--end_dive`, `--end_polish`)
 
 With `--end_dive M` every stop-row board is completed to 256 pieces, allowing
@@ -735,7 +837,7 @@ least-constraining value (fewest broken edges, then fewest stranded cells, then
 most room left, up to 8 candidates played out), ties at random. A dive never
 backtracks and cannot fail (piece-type counts always balance). Placed cells
 never move. Edge pieces stay on the side their rotations row deals them, or any
-side under `--free_edges`/`--random_edges`.
+side under `--free_edges`/`--random_edges`/`--backtrack_unlock_right`.
 
 **Per configuration:**
 
@@ -766,7 +868,8 @@ side under `--free_edges`/`--random_edges`.
 
 Boards reaching `S` are written after each configuration, best first, duplicates
 dropped, with the matched-edge count in field 2; `--max_emitted` then caps
-written boards instead of stopping the search.
+written boards instead of stopping the search. Without `--end_dive`, `--emit_score`
+acts only under `--backtrack_unlock_right`, on the extended board (5.9).
 
 **Corner-seeded copies** (`--corner_seeds N`, default 4, with
 `--lambda_corners`): a board with an alive top-corner block (5.12) is also dived
@@ -915,7 +1018,9 @@ A configuration cut short also shows `stopped=<reason> at row R` (`time`,
 `interrupted`). `dups` counts boards the near-duplicate filter dropped
 (5.9), `repeats` boards the backtracker reached twice (clue frames cause it),
 `below_min_col` appears with `--backtrack_min_col`, `best` the best dived
-score. A random-edges configuration that dies in the beam ends its line with
+score. Under `--backtrack_unlock_right`, `below_min_col` appears only for K < R,
+`below_score` with `--emit_score` and no dives, and `root_repeats` counts the
+roots dropped as repeats. A random-edges configuration that dies in the beam ends its line with
 `died rN`. In rotations mode the configurations that found nothing
 collapse into one line per run of them under a bottom, with the rows they died
 at:
@@ -930,7 +1035,8 @@ so every configuration appears, in order.
 (`cands uniq beam=n/width smax t`), the `[dfs]` line of the backtracker (roots,
 roots with boards, nodes, parity and corner cuts, `cut_col` partial rows the
 min-col check cut and `unknown` checks over budget, `near_dups`, boards
-completing each row, extension depth) and the `[dive]` line, and a `[sweep]`
+completing each row, extension depth; under `--backtrack_unlock_right` also
+`root_repeats` and, with `--emit_score`, `cut_score`) and the `[dive]` line, and a `[sweep]`
 line for every configuration in the older form:
 
 ```
@@ -967,7 +1073,11 @@ pins the row under it too). `emitted` is the configuration's unique boards,
 
 `backtrack` lists the boards completing each searched row; `corners` the share
 of written boards with a TL / TR block alive, both, and a piece-disjoint pair
-(5.12); `top cap` the row-15 closure `--cap_top` wrote (5.10); `reserve` the
+(5.12); `top cap` the row-15 closure `--cap_top` wrote (5.10); under
+`--backtrack_unlock_right`, `unlock_right` the block, the roots searched and
+dropped as repeats and the boards short of the asked layers or under
+`--emit_score`, and the extension lines count whole layers and band cells
+(5.9, 5.10); `reserve` the
 TOP reserve left free at the stop row; `exhausted colour`
 the configs by the frame colour their border used up (`--exhaust_border_color`,
 5.3). `Output boards score` counts the written boards by score, highest first
@@ -1011,10 +1121,11 @@ boards or roots they write the same file at any thread count.
 | `--stop_row R` | 11 | last row filled, 1..13 |
 | `--backtrack_row N` | off | exhaustive search from row N (5.9) |
 | `--backtrack_row_factor M` | 2 | roots = best M x width boards of row N; 0 = every candidate, raw (5.9) |
-| `--extend_nodes N` | 100000 | column-major extension budget per board; 0 = off (5.10) |
+| `--extend_nodes N` | 100000 | extension budget per board, column-major or layered; 0 = off (5.10) |
 | `--cap_top [N]` | 1 | close the top-left border exactly over the extension's whole columns; 0 = off (5.10) |
-| `--backtrack_min_col K` | 0 | write only boards whose extension fills K columns; cuts partial rows whose column 1 cannot reach row 14 (5.10) |
+| `--backtrack_min_col K` | 0 | write only boards whose extension fills K columns; cuts partial rows whose column 1 cannot reach row 14 (5.10). Under `--backtrack_unlock_right R`: band columns left open, 0..R, default R (5.9) |
 | `--no_top_dedup` | -- | keep top-row near duplicates (5.9) |
+| `--backtrack_unlock_right R` | 0 | from the backtrack row, the board is the block rows 0..S x columns 0..15-R; rows N+1..S are searched over those columns and the layered extension grows the band (5.9, 5.10) |
 | `--beam_expand E`, `--beam_expand_row R` | 4, 7 | late width multiplier and its row |
 | `--lambda_J F` | 1.0 | closure weight |
 | `--lambda_Mahalanobis F` | 1.0 | Mahalanobis correction, in its own SD units |
@@ -1025,7 +1136,7 @@ boards or roots they write the same file at any thread count.
 | `--pin_clue N` | 0 | one centre-clue frame, 1..4; implies `--clue_center` |
 | `--end_dive [M]` | off; bare 10000 | finish every stop-row board (5.11) |
 | `--end_polish R` | off | polish plus R kick rounds |
-| `--emit_score S` | 450 | matched edges a finished board needs to be written |
+| `--emit_score S` | 450 | matched edges a finished board needs to be written; without `--end_dive`, under `--backtrack_unlock_right` only and when given, the extended board's |
 | `--corner_seeds N` | 4 | corner-seeded copies per board (with `--lambda_corners`) |
 | `--frac_rand F` | 0.10 | random selection band |
 | `--parent_cap N` | 4 | children per parent in the score band; 0 = uncapped |

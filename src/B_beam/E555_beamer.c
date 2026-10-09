@@ -161,6 +161,23 @@ static bool     g_top_dedup       = true;
    its column 1 can no longer be stacked to row 14, and a stop-row cell of
    columns 2..K whose top nothing can sit on. Set from K; see col_reach. */
 static bool     g_col_check       = false;
+/* --backtrack_unlock_right R (0 = off): the backtracker's board is the block
+   rows 0..S x columns 0..W, W = 15-R. Each root gives back columns W+1..15 of
+   rows 1..N, rows N+1..S are searched over columns 1..W only, and the layered
+   extension (layer_extend) grows the band around the block. g_last_inner is
+   the last column a searched row fills (W; 14 when off) and g_block_mask the
+   columns a written board carries up to the stop row (all of them when off),
+   so the default path reads the values it always did. */
+static uint32_t g_unlock_right    = 0;
+static int      g_last_inner      = EDGE_LEN;
+static uint16_t g_block_mask      = ROWMASK_FULL;
+/* The stop row whose cells sit right under a band corner clue: the search pins
+   their top colour there, so the clue written home meets the block without a
+   break (-1 = none). */
+static int      g_band_pin_row    = -1;
+/* E555_ROOT_DEDUP=0 (test only): search every root, repeats included. */
+static bool     g_root_dedup      = true;
+static bool     g_cap_top_set     = false;
 /* --prefix: written in front of the configuration id in every board name. */
 static char     g_prefix[40]      = "";
 /* Boards found at the stop row and written, this configuration's and the
@@ -190,6 +207,16 @@ static int      g_emit_score     = 450;
 static int      g_end_polish     = -1;    /* --end_polish R; -1 = off */
 static int      g_corner_seeds   = 4;     /* --corner_seeds N; 0 = off */
 static bool     g_emit_score_set = false;
+/* Does --backtrack_min_col drop boards? Under --backtrack_unlock_right it counts
+   the band columns allowed to stay open, so K = R (its default there) drops
+   none. */
+static inline bool mincol_cuts(void) {
+    return g_unlock_right ? g_bt_min_col < g_unlock_right : g_bt_min_col > 0;
+}
+/* --emit_score as a floor on written boards without --end_dive (unlock only). */
+static inline bool score_cuts(void) {
+    return g_unlock_right && g_emit_score_set && !g_end_dive;
+}
 static uint32_t g_beam_expand     = 4;
 static uint32_t g_beam_expand_row = 7;
 static double   g_lambda_maha     = 1.0;   /* --lambda_Mahalanobis, in score-SD */
@@ -497,6 +524,32 @@ static void beam_init_border(BeamEntry *p, const BottomOrder *bot, const LeftOrd
     }
 }
 
+/* --backtrack_unlock_right: commit only columns 1..W of a row. Columns W+1..15
+   stay empty, so their tops keep the values below them (the row-0 tops under
+   the band stay owed), the column-W piece's right face is owed to the band, and
+   no right edge is taken: the edges given back stay owed through the pool count
+   of beam_init_border. Every colour still moves by an even amount (that right
+   face is consumed and owed at once), so parity_ok applies as it is. */
+static void commit_row_narrow(BeamEntry *p, int row, const RowChoice *rc) {
+    const int W = g_last_inner;
+    for (int i = 0; i < W; i++) {
+        const Oriented *o = &g_cat[rc->ci[i]];
+        used_set(p->used, o->piece_id);
+        p->color_consumed[INNER_IDX(o->top)]++;    p->color_consumed[INNER_IDX(o->right)]++;
+        p->color_consumed[INNER_IDX(o->bottom)]++; p->color_consumed[INNER_IDX(o->left)]++;
+        const int old_t = p->rtop[i + 1];
+        if (color_is_inner(old_t)) p->req_exposed[INNER_IDX(old_t)]--;
+        p->req_exposed[INNER_IDX(o->top)]++;
+        p->rtop[i + 1] = o->top;
+    }
+    p->rtop[0] = g_cur_left->p[row]->top;
+    p->req_exposed[INNER_IDX(g_cat[rc->ci[W - 1]].right)]++;
+    if (!g_free_edges || g_free_demand) {
+        const int la = g_cur_left->right[row];     /* segment-A interface satisfied */
+        if (color_is_inner(la)) p->req_exposed[INNER_IDX(la)]--;
+    }
+}
+
 /* Commit one inner row (cols 1..15) into the board (counters + frontier only;
    the move itself is logged by the caller). */
 static void commit_row(BeamEntry *p, int row, const RowChoice *rc) {
@@ -529,6 +582,12 @@ static void commit_row(BeamEntry *p, int row, const RowChoice *rc) {
         if (color_is_inner(tl)) p->req_exposed[INNER_IDX(tl)]--;
     }
 
+}
+
+/* A backtracker row: the whole row, or columns 1..W under --backtrack_unlock_right. */
+static inline void bt_commit(BeamEntry *p, int row, const RowChoice *rc) {
+    if (g_unlock_right) commit_row_narrow(p, row, rc);
+    else                commit_row(p, row, rc);
 }
 
 /* Color parity: every inner color's surplus must be non-negative, and even
@@ -733,6 +792,7 @@ static uint64_t board_fingerprint(const RowChoice rows[EDGE_LEN], int depth) {
     uint64_t fp = 14695981039346656037ULL;
     for (int r = 0; r <= depth; r++)
         for (int c = 0; c < PUZZLE_SIDE; c++) {
+            if (!((g_block_mask >> c) & 1u)) continue;   /* a band column: never read */
             uint16_t pid; uint8_t rot; board_cell(rows, r, c, &pid, &rot);
             fp ^= pid; fp *= prime; fp ^= rot; fp *= prime;
         }
@@ -792,9 +852,10 @@ static inline char *u32a(char *p, uint32_t v) {
 
 /* Does the board being formatted carry a piece at (r, c)? Rows below the top one
    are full; the top row carries only the columns in colmask. Anything above the
-   top row is empty, which is what makes an attached row-13 clue isolated. */
+   top row is empty, which is what makes an attached row-13 clue isolated, and
+   so is every band column under --backtrack_unlock_right. */
 static inline bool cell_is_placed(int r, int c, int row, uint16_t colmask) {
-    if (r < 0 || r > row) return false;
+    if (r < 0 || r > row || !((g_block_mask >> c) & 1u)) return false;
     return (r < row) || ((colmask >> c) & 1u) != 0;
 }
 
@@ -809,7 +870,16 @@ typedef struct {
     uint8_t  cell[PUZZLE_SIDE], rot[PUZZLE_SIDE];
     uint16_t pid[PUZZLE_SIDE];
 } Cap;
-typedef struct { uint16_t n; uint8_t cell[EXT_MAX]; uint16_t ci[EXT_MAX]; Cap cap; } Ext;
+/* raw: layer_extend's result, which may reach any open cell, frame included:
+   ci[k] is then a piece id and rot[k] its spin. */
+typedef struct {
+    uint16_t n;
+    bool     raw;
+    uint8_t  cell[NUM_PIECES];
+    uint16_t ci[NUM_PIECES];
+    uint8_t  rot[NUM_PIECES];
+    Cap      cap;
+} Ext;
 static const Oriented *g_edge_left = NULL;    /* --random_edges: every edge, frame left */
 static int             g_edge_left_n = 0;
 static const Oriented *g_edge_up = NULL;      /* every edge, frame up (--cap_top) */
@@ -861,7 +931,7 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
                          uint32_t pos[NUM_PIECES], uint32_t rot_arr[NUM_PIECES]) {
     for (int i = 0; i < NUM_PIECES; i++) { pos[i] = 999; rot_arr[i] = 0; }
     for (int r = 0; r <= row; r++) {
-        uint16_t m = (r == row) ? colmask : ROWMASK_FULL;
+        uint16_t m = ((r == row) ? colmask : ROWMASK_FULL) & g_block_mask;
         for (int c = 0; c < PUZZLE_SIDE; c++) {
             if (!((m >> c) & 1u)) continue;
             uint16_t pid; uint8_t rot; board_cell(rows, r, c, &pid, &rot);
@@ -871,8 +941,12 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
     bool ext_cell[NUM_PIECES] = { false };
     if (ext) {
         for (int k = 0; k < ext->n; k++) {
-            const Oriented *o = ext_or(ext->ci[k]);
-            pos[o->piece_id] = ext->cell[k]; rot_arr[o->piece_id] = o->rotation;
+            if (ext->raw) {
+                pos[ext->ci[k]] = ext->cell[k]; rot_arr[ext->ci[k]] = ext->rot[k];
+            } else {
+                const Oriented *o = ext_or(ext->ci[k]);
+                pos[o->piece_id] = ext->cell[k]; rot_arr[o->piece_id] = o->rotation;
+            }
             ext_cell[ext->cell[k]] = true;
         }
         for (int k = 0; k < ext->cap.n; k++) {          /* --cap_top, on row 15 */
@@ -896,9 +970,13 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
        stays break-free; otherwise it is left for the dives. The top-right clue
        was held through the extension and is always left for the dives, which
        place it among the open cells -- the top-right corner the column-major
-       extension leaves -- rather than on its own cell. */
+       extension leaves -- rather than on its own cell.
+
+       Under --backtrack_unlock_right every corner clue whose cell is in the
+       band goes home the same way, (2,13) included: the layered extension
+       builds around it, and the search pins the stop-row cells under it. */
     if (orient >= 0 && (g_clue_mask & CLUE_CORNERS))
-        for (int k = CLUE_TOP_LEFT; k <= CLUE_TOP_RIGHT; k++) {
+        for (int k = g_unlock_right ? 1 : CLUE_TOP_LEFT; k <= CLUE_TOP_RIGHT; k++) {
             const ClueCell *cc = &g_clue[orient][k];
             const int x = cc->row * PUZZLE_SIDE + cc->col;
             if (cell_is_placed(cc->row, cc->col, row, colmask)) continue;
@@ -936,8 +1014,10 @@ static void board_arrays(const RowChoice rows[EDGE_LEN], int row, uint16_t colma
        search did not score: above the top row their only placed neighbours are
        each other. Written only where the board is still empty, so rows the
        search placed are emitted exactly as before. Not under --random_edges,
-       where the frame is a sample rather than an input. */
-    if (!g_random_edges) {
+       where the frame is a sample rather than an input, and not under
+       --backtrack_unlock_right, whose band leaves that frame and the three
+       corners free. */
+    if (!g_random_edges && !g_unlock_right) {
         for (int r = 0; r < PUZZLE_SIDE; r++) {
             if (cell_is_placed(r, 0, row, colmask)) continue;
             const Oriented *o = g_cur_left->p[r];
@@ -2762,6 +2842,70 @@ static uint32_t select_roots(BeamCtx *ctx, uint32_t kept, uint32_t beam_n, int r
     return n;
 }
 
+/* --backtrack_unlock_right: candidates that differed only in the columns their
+   rows give back are now the same board, and would repeat the same search. The
+   first of each, in rank order, stays in ctx->keep[0..kept) (compacted in
+   place); the count left is returned and the repeats go to *repeats. The
+   fingerprints are computed in parallel and inserted serially in rank order,
+   so which candidate survives cannot depend on the thread count; a matching
+   fingerprint is confirmed cell by cell. ctx->sig_key/sig_idx are free here:
+   the next dedup_and_rank clears them before use. */
+static uint64_t *g_root_fp = NULL;
+static uint32_t  g_root_fp_cap = 0;
+
+static void root_rows(const BeamCtx *ctx, const BeamEntry *beam, uint32_t pi, int N,
+                      RowChoice rows[EDGE_LEN]) {
+    const PoolEntry *pe = &ctx->pool[pi];
+    collect_rows(ctx, &beam[pe->parent], rows);
+    rows[N] = pe->mv;
+}
+
+static bool root_same(const BeamCtx *ctx, const BeamEntry *beam, uint32_t a, uint32_t b, int N) {
+    if (ctx->pool[a].flags != ctx->pool[b].flags) return false;
+    RowChoice ra[EDGE_LEN], rb[EDGE_LEN];
+    root_rows(ctx, beam, a, N, ra);
+    root_rows(ctx, beam, b, N, rb);
+    for (int r = 1; r <= N; r++)
+        if (memcmp(ra[r].ci, rb[r].ci, (size_t)g_last_inner * sizeof ra[r].ci[0])) return false;
+    return true;
+}
+
+static uint32_t unique_roots(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, int N,
+                             int nt, uint64_t *repeats) {
+    if (g_root_fp_cap < kept) {
+        g_root_fp = xrealloc(g_root_fp, (size_t)kept * sizeof *g_root_fp);
+        g_root_fp_cap = kept;
+    }
+    #pragma omp parallel for schedule(static) num_threads(nt)
+    for (uint32_t i = 0; i < kept; i++) {
+        const uint32_t pi = ctx->keep[i];
+        RowChoice rows[EDGE_LEN];
+        root_rows(ctx, beam, pi, N, rows);
+        uint64_t fp = 14695981039346656037ULL ^ ctx->pool[pi].flags;
+        for (int r = 1; r <= N; r++)
+            for (int c = 0; c < g_last_inner; c++) { fp ^= rows[r].ci[c]; fp *= 1099511628211ULL; }
+        g_root_fp[i] = fp ? fp : 1;
+    }
+    size_t sz = 4;
+    while (sz < ctx->sig_sz && (uint64_t)sz < (uint64_t)kept * 2) sz *= 2;
+    const size_t mask = sz - 1;
+    memset(ctx->sig_key, 0, sz * sizeof *ctx->sig_key);
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < kept; i++) {
+        const uint64_t fp = g_root_fp[i];
+        const uint32_t pi = ctx->keep[i];
+        size_t h = (size_t)splitmix64(fp) & mask;
+        bool repeat = false;
+        for (; ctx->sig_key[h]; h = (h + 1) & mask)
+            if (ctx->sig_key[h] == fp && root_same(ctx, beam, ctx->sig_idx[h], pi, N)) { repeat = true; break; }
+        if (repeat) continue;
+        ctx->sig_key[h] = fp; ctx->sig_idx[h] = pi;
+        ctx->keep[n++] = pi;
+    }
+    *repeats = kept - n;
+    return n;
+}
+
 static void materialize_beam(BeamCtx *ctx, const BeamEntry *src, BeamEntry *dst,
                              uint32_t n_sel, int row) {
     if (ctx->log_cap[row] < n_sel) {
@@ -3275,7 +3419,7 @@ static void ext_dfs(ExtCtx *e, int d) {
    out; returns whether the node cap cut the search short. */
 static bool extend_board(const uint64_t used[4], const uint8_t rtop[PUZZLE_SIDE],
                          int stop, int orient, Ext *out) {
-    out->n = 0; out->cap.n = 0;
+    out->n = 0; out->raw = false; out->cap.n = 0;
     if (g_extend_nodes == 0 || stop >= EDGE_LEN) return false;
     ExtCtx e;
     uint64_t rel[4];
@@ -3329,6 +3473,206 @@ static inline int ext_cols_n(int n, int stop) {
 }
 
 static inline int ext_columns(const Ext *x, int stop) { return ext_cols_n(x->n, stop); }
+
+/* -- The layered extension (--backtrack_unlock_right) ------------------------ *
+
+   The stop-row board is the block rows 0..S x columns 0..W; everything else is
+   the band. The extension grows the band in L-shaped layers hugging the block,
+   along one fixed path: layer k goes up column W+k from row 0 to row S+k, then
+   left along row S+k to column 0 (an arm past column or row 15 is left out),
+   and the next layer starts again at row 0. Every cell takes an unused piece
+   that matches each placed neighbour -- an inner piece inside, an edge with its
+   grey side out on the frame, a corner with both grey sides out on a corner
+   cell -- so the band never breaks. Any edge may go on any side and any corner
+   on any open corner cell: the band gives the configuration's frame back.
+
+   Corner clues whose cell is in the band are on the board before it starts
+   (board_arrays writes them home) and the path steps over them. An exact DFS of
+   at most --extend_nodes placements keeps the deepest prefix of the path, the
+   first found at that depth: a prefix is a fixed set of cells, so the deepest
+   is also the best scoring, and the result does not depend on the thread
+   count. It never changes the block: other blocks are the backtracker's job. */
+
+#define LX_EMPTY  0xFFu                 /* a face nobody shows yet */
+#define LX_INNER  0
+#define LX_EDGE   1                     /* + d: an edge cell whose outer side is d */
+#define LX_CORNER 5                     /* + j: corner cell j (0 BL, 1 BR, 2 TL, 3 TR) */
+
+typedef struct { uint16_t pid; uint8_t rot; uint8_t f[4]; } LxPiece;   /* faces top, right, bottom, left */
+typedef struct {
+    int     n, nlayers;
+    uint8_t cell[NUM_PIECES];
+    int     done[PUZZLE_SIDE + 1];      /* path cells that complete layers 1..k */
+} LxPath;
+static LxPath   g_lx_path[5];           /* per orientation + 1 (0 = not known) */
+static uint8_t  g_lx_kind[NUM_PIECES];
+static LxPiece  g_lx_edge[4][NUM_PIECES / 4];
+static int      g_lx_edge_n[4];
+static LxPiece  g_lx_corner[4][4];
+static int      g_lx_corner_n[4];
+/* The inner catalog by (right, bottom): the cells the path fills leftwards know
+   those two sides, as g_lb_bucket serves the ones it fills upwards. */
+static uint16_t g_rb_bucket[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL][MAX_LB_BUCKET];
+static uint8_t  g_rb_count[NUM_COLORS_TOTAL][NUM_COLORS_TOTAL];
+
+static void lx_path_build(LxPath *P, int orient) {
+    const int S = (int)g_stop_row, W = g_last_inner;
+    bool clue[NUM_PIECES] = { false };
+    if (orient >= 0 && (g_clue_mask & CLUE_CORNERS))
+        for (int k = 1; k < CLUE_N; k++) {
+            const ClueCell *cc = &g_clue[orient][k];
+            if (cc->row > S || cc->col > W) clue[cc->row * PUZZLE_SIDE + cc->col] = true;
+        }
+    P->n = 0; P->nlayers = 0; P->done[0] = 0;
+    for (int k = 1; W + k <= PUZZLE_SIDE - 1 || S + k <= PUZZLE_SIDE - 1; k++) {
+        const int c = W + k, r = S + k;
+        if (c <= PUZZLE_SIDE - 1)
+            for (int y = 0; y <= (r < PUZZLE_SIDE - 1 ? r : PUZZLE_SIDE - 1); y++)
+                if (!clue[y * PUZZLE_SIDE + c]) P->cell[P->n++] = (uint8_t)(y * PUZZLE_SIDE + c);
+        if (r <= PUZZLE_SIDE - 1)
+            for (int x = (c - 1 < PUZZLE_SIDE - 1 ? c - 1 : PUZZLE_SIDE - 1); x >= 0; x--)
+                if (!clue[r * PUZZLE_SIDE + x]) P->cell[P->n++] = (uint8_t)(r * PUZZLE_SIDE + x);
+        P->done[k] = P->n; P->nlayers = k;
+    }
+}
+
+/* The frame pieces by the cells they may take, the (right, bottom) buckets, the
+   cell kinds and the paths. Once, after the clue tables and the catalog. */
+static void lx_init(void) {
+    static const int corner_side[4][2] = { { 2, 3 }, { 2, 1 }, { 0, 3 }, { 0, 1 } };
+    for (int p = 0; p < NUM_PIECES; p++) {
+        int grey = 0;
+        for (int d = 0; d < 4; d++) grey += seed_side((uint32_t)p, 0, d) == 0;
+        for (int s = 0; s < 4; s++) {
+            LxPiece q = { (uint16_t)p, (uint8_t)s, { 0, 0, 0, 0 } };
+            for (int d = 0; d < 4; d++) q.f[d] = (uint8_t)seed_side((uint32_t)p, (uint32_t)s, d);
+            if (grey == 1)
+                for (int d = 0; d < 4; d++)
+                    if (q.f[d] == 0) g_lx_edge[d][g_lx_edge_n[d]++] = q;
+            if (grey == 2)
+                for (int j = 0; j < 4; j++)
+                    if (q.f[corner_side[j][0]] == 0 && q.f[corner_side[j][1]] == 0)
+                        g_lx_corner[j][g_lx_corner_n[j]++] = q;
+        }
+    }
+    for (int i = 0; i < g_cat_count; i++) {
+        const Oriented *o = &g_cat[i];
+        uint8_t *n = &g_rb_count[o->right][o->bottom];
+        if (*n >= MAX_LB_BUCKET) fatal("internal: a (right, bottom) bucket holds over %d pieces", MAX_LB_BUCKET);
+        g_rb_bucket[o->right][o->bottom][(*n)++] = (uint16_t)i;
+    }
+    for (int x = 0; x < NUM_PIECES; x++) {
+        const int r = x / PUZZLE_SIDE, c = x % PUZZLE_SIDE;
+        const bool rb = r == 0 || r == PUZZLE_SIDE - 1, cb = c == 0 || c == PUZZLE_SIDE - 1;
+        if (rb && cb)  g_lx_kind[x] = (uint8_t)(LX_CORNER + (r ? 2 : 0) + (c ? 1 : 0));
+        else if (r == PUZZLE_SIDE - 1) g_lx_kind[x] = LX_EDGE + 0;
+        else if (c == PUZZLE_SIDE - 1) g_lx_kind[x] = LX_EDGE + 1;
+        else if (r == 0)               g_lx_kind[x] = LX_EDGE + 2;
+        else if (c == 0)               g_lx_kind[x] = LX_EDGE + 3;
+        else                           g_lx_kind[x] = LX_INNER;
+    }
+    for (int oi = 0; oi < 5; oi++) lx_path_build(&g_lx_path[oi], oi - 1);
+}
+
+typedef struct {
+    uint8_t  face[NUM_PIECES][4];       /* the colour each placed cell shows on each side */
+    uint64_t used[4];
+    const LxPath *path;
+    uint16_t pid[NUM_PIECES];           /* the current path's pieces */
+    uint8_t  rot[NUM_PIECES];
+    int      best;
+    uint64_t nodes, cap;
+    Ext     *out;
+} LxCtx;
+
+static void lx_dfs(LxCtx *e, int d);
+
+/* Place piece pid at spin rot (faces f) on path cell d (board cell x) if it is
+   unused and shows every colour `need` asks for, and search on from there. */
+static inline void lx_try(LxCtx *e, int d, int x, const uint8_t need[4],
+                          uint16_t pid, uint8_t rot, const uint8_t f[4]) {
+    for (int s = 0; s < 4; s++)
+        if (need[s] != LX_EMPTY && need[s] != f[s]) return;
+    if (used_test(e->used, pid) || e->nodes >= e->cap) return;
+    e->nodes++;
+    used_set(e->used, pid);
+    memcpy(e->face[x], f, 4);
+    e->pid[d] = pid; e->rot[d] = rot;
+    lx_dfs(e, d + 1);
+    memset(e->face[x], LX_EMPTY, 4);
+    used_clear(e->used, pid);
+}
+
+static inline void lx_try_cat(LxCtx *e, int d, int x, const uint8_t need[4], int ci) {
+    const Oriented *o = &g_cat[ci];
+    const uint8_t f[4] = { o->top, o->right, o->bottom, o->left };
+    lx_try(e, d, x, need, o->piece_id, o->rotation, f);
+}
+
+static void lx_dfs(LxCtx *e, int d) {
+    if (d > e->best) {
+        e->best = d;
+        memcpy(e->out->ci, e->pid, (size_t)d * sizeof e->pid[0]);
+        memcpy(e->out->rot, e->rot, (size_t)d);
+    }
+    if (d == e->path->n || e->nodes >= e->cap) return;
+    const int x = e->path->cell[d], r = x / PUZZLE_SIDE, c = x % PUZZLE_SIDE;
+    const uint8_t need[4] = {
+        r == PUZZLE_SIDE - 1 ? 0 : e->face[x + PUZZLE_SIDE][2],
+        c == PUZZLE_SIDE - 1 ? 0 : e->face[x + 1][3],
+        r == 0 ? 0 : e->face[x - PUZZLE_SIDE][0],
+        c == 0 ? 0 : e->face[x - 1][1] };
+    const int kind = g_lx_kind[x];
+    const int full = e->path->n;
+    if (kind >= LX_CORNER) {
+        const int j = kind - LX_CORNER;
+        for (int k = 0; k < g_lx_corner_n[j] && e->best < full; k++)
+            lx_try(e, d, x, need, g_lx_corner[j][k].pid, g_lx_corner[j][k].rot, g_lx_corner[j][k].f);
+    } else if (kind >= LX_EDGE) {
+        const int s = kind - LX_EDGE;
+        for (int k = 0; k < g_lx_edge_n[s] && e->best < full; k++)
+            lx_try(e, d, x, need, g_lx_edge[s][k].pid, g_lx_edge[s][k].rot, g_lx_edge[s][k].f);
+    } else if (need[3] != LX_EMPTY && need[2] != LX_EMPTY) {           /* going up */
+        for (int k = 0; k < g_lb_count[need[3]][need[2]] && e->best < full; k++)
+            lx_try_cat(e, d, x, need, g_lb_bucket[need[3]][need[2]][k]);
+    } else if (need[1] != LX_EMPTY && need[2] != LX_EMPTY) {           /* going left */
+        for (int k = 0; k < g_rb_count[need[1]][need[2]] && e->best < full; k++)
+            lx_try_cat(e, d, x, need, g_rb_bucket[need[1]][need[2]][k]);
+    } else if (need[2] != LX_EMPTY) {                                  /* a layer's turn */
+        for (int L = COLOR_MIN; L <= COLOR_MAX && e->best < full; L++)
+            for (int k = 0; k < g_lb_count[L][need[2]] && e->best < full; k++)
+                lx_try_cat(e, d, x, need, g_lb_bucket[L][need[2]][k]);
+    } else {
+        for (int i = 0; i < g_cat_count && e->best < full; i++) lx_try_cat(e, d, x, need, i);
+    }
+}
+
+/* Extend the stop-row board rows[0..stop] (orientation orient) along its path
+   into out; *layers gets the whole layers it fills. Returns whether the node
+   cap cut the search short. */
+static bool layer_extend(const RowChoice rows[EDGE_LEN], int stop, int orient,
+                         Ext *out, int *layers) {
+    out->n = 0; out->raw = true; out->cap.n = 0;
+    *layers = 0;
+    const LxPath *P = &g_lx_path[orient + 1];
+    if (g_extend_nodes == 0 || P->n == 0) return false;
+    uint32_t pos[NUM_PIECES], rot[NUM_PIECES];
+    board_arrays(rows, stop, ROWMASK_FULL, orient, NULL, pos, rot);
+    LxCtx e;
+    memset(e.face, LX_EMPTY, sizeof e.face);
+    memset(e.used, 0, sizeof e.used);
+    for (int p = 0; p < NUM_PIECES; p++) {
+        if (pos[p] >= NUM_PIECES) continue;
+        used_set(e.used, (uint16_t)p);
+        for (int d = 0; d < 4; d++) e.face[pos[p]][d] = (uint8_t)seed_side((uint32_t)p, rot[p], d);
+    }
+    e.path = P; e.best = 0; e.nodes = 0; e.cap = g_extend_nodes; e.out = out;
+    lx_dfs(&e, 0);
+    out->n = (uint16_t)e.best;
+    for (int k = 0; k < e.best; k++) out->cell[k] = P->cell[k];
+    while (*layers < P->nlayers && P->done[*layers + 1] <= e.best) (*layers)++;
+    return e.best < P->n && e.nodes >= e.cap;
+}
 
 /* -- The column check (--backtrack_min_col K >= 1) --------------------------- *
 
@@ -3516,6 +3860,7 @@ typedef struct BtNode {
     uint8_t  *rs;                         /* TOP reserve pieces left free */
     uint8_t  *ex;                         /* extension cells (--extend_nodes) */
     uint8_t  *cp;                         /* --cap_top: cap cells on row 15 */
+    uint8_t  *ly;                         /* --backtrack_unlock_right: whole layers */
     uint16_t *sc;                         /* matched edges (no --end_dive) */
     uint32_t  n, ncap;
     struct BtNode **kid;
@@ -3532,6 +3877,7 @@ typedef struct {
     uint8_t   flags[EDGE_LEN + 1];        /* orientation tag row r commits with */
     uint64_t  nodes, fill[EDGE_LEN + 1], cut_parity, cut_corner;
     uint64_t  ext_nodes_cap, cut_mincol;  /* extensions the node cap cut; under --backtrack_min_col */
+    uint64_t  cut_score;                  /* --backtrack_unlock_right: under --emit_score */
     /* --lambda_corners: alive live-block indices per level, slot and corner. */
     uint16_t  cn[EDGE_LEN + 1][4][2];
     uint16_t  cl[EDGE_LEN + 1][4][2][TC_MAX_BLOCKS];
@@ -3564,6 +3910,9 @@ static struct {
     uint64_t cap_cells, cap_boards, cap_closed;   /* --cap_top over the written boards:
                                            cells, boards with a whole column, of
                                            those closed over all of them */
+    uint64_t root_rep, cfg_root_rep;      /* --backtrack_unlock_right: roots dropped as
+                                           repeats, the run's and this configuration's */
+    uint64_t cut_score, cfg_cut_score;    /* boards under --emit_score, not written */
     uint64_t fill[EDGE_LEN + 1];
     double   t;
 } g_bt_run;
@@ -3603,6 +3952,7 @@ static struct {
     omp_lock_t commit;
     bool      abort;
     uint64_t  emitted, roots_emitting, dup;
+    BeamEntry border;                     /* --backtrack_unlock_right: the bare border */
 } g_bt;
 
 /* Is some thread out of work? Read without locks: a stale answer only moves a
@@ -3633,7 +3983,7 @@ static inline BtNode *bt_out(BtCtx *x) {
 static void bt_node_free(BtNode *o) {
     if (!o) return;
     for (uint32_t i = 0; i < o->nkid; i++) bt_node_free(o->kid[i]);
-    free(o->buf); free(o->off); free(o->fp); free(o->cc); free(o->rs); free(o->ex); free(o->cp); free(o->sc);
+    free(o->buf); free(o->off); free(o->fp); free(o->cc); free(o->rs); free(o->ex); free(o->cp); free(o->ly); free(o->sc);
     free(o->kid); free(o->kid_at);
     free(o);
 }
@@ -3710,13 +4060,21 @@ static void bt_out_push(BtNode *o, BtCtx *x, int stop) {
         o->rs  = xrealloc(o->rs,  (size_t)o->ncap * sizeof *o->rs);
         o->ex  = xrealloc(o->ex,  (size_t)o->ncap * sizeof *o->ex);
         o->cp  = xrealloc(o->cp,  (size_t)o->ncap * sizeof *o->cp);
+        o->ly  = xrealloc(o->ly,  (size_t)o->ncap * sizeof *o->ly);
         o->sc  = xrealloc(o->sc,  (size_t)o->ncap * sizeof *o->sc);
     }
     const BeamEntry *t = &x->lvl[stop];
     const int orient = ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) : -1;
     Ext ext;
-    if (extend_board(t->used, t->rtop, stop, orient, &ext)) x->ext_nodes_cap++;
-    if (g_bt_min_col && ext_columns(&ext, stop) < (int)g_bt_min_col) { x->cut_mincol++; return; }
+    int layers = 0;
+    if (g_unlock_right) {
+        /* K = --backtrack_min_col band columns may stay open: layers 1..R-K must be whole. */
+        if (layer_extend(x->rows, stop, orient, &ext, &layers)) x->ext_nodes_cap++;
+        if (layers < (int)(g_unlock_right - g_bt_min_col)) { x->cut_mincol++; return; }
+    } else {
+        if (extend_board(t->used, t->rtop, stop, orient, &ext)) x->ext_nodes_cap++;
+        if (g_bt_min_col && ext_columns(&ext, stop) < (int)g_bt_min_col) { x->cut_mincol++; return; }
+    }
     o->off[o->n] = o->len;
     o->fp[o->n]  = board_fingerprint(x->rows, stop);
     o->cc[o->n]  = g_corners_on
@@ -3724,7 +4082,15 @@ static void bt_out_push(BtNode *o, BtCtx *x, int stop) {
     o->rs[o->n]  = (uint8_t)(g_top_n ? top_free(t->used) : 0);
     o->ex[o->n]  = (uint8_t)ext.n;
     o->cp[o->n]  = ext.cap.n;
-    o->len += (size_t)prepare_board(x->rows, stop, orient, &ext, o->buf + o->len, &o->sc[o->n]);
+    o->ly[o->n]  = (uint8_t)layers;
+    const int len = prepare_board(x->rows, stop, orient, &ext, o->buf + o->len, &o->sc[o->n]);
+    /* --backtrack_unlock_right without dives: --emit_score, when given, is a
+       floor on the extended board's matched edges. */
+    if (score_cuts() && o->sc[o->n] < g_emit_score) {
+        x->cut_score++;
+        return;
+    }
+    o->len += (size_t)len;
     o->n++;
 }
 
@@ -3765,12 +4131,14 @@ static bool bt_corners_ok(BtCtx *x, int row, const BeamEntry *t) {
 /* The top-row near-duplicate test: does stop row b repeat a's columns 1..K
    exactly and differ from it in at most one other cell (columns K+1..15)? A
    board with a new piece in columns 1..K is never a near duplicate -- those
-   columns are where the extension starts from. */
+   columns are where the extension starts from. Under --backtrack_unlock_right
+   the row ends at column W and K counts band columns instead: all of columns
+   1..W are compared. */
 static bool top_near_dup(const RowChoice *a, const RowChoice *b) {
-    const int K = (int)g_bt_min_col;
+    const int K = g_unlock_right ? 0 : (int)g_bt_min_col;
     for (int c = 1; c <= K; c++) if (a->ci[c - 1] != b->ci[c - 1]) return false;
-    int diff = (a->rterm != b->rterm);
-    for (int c = K + 1; c <= EDGE_LEN && diff <= 1; c++) diff += (a->ci[c - 1] != b->ci[c - 1]);
+    int diff = g_unlock_right ? 0 : (a->rterm != b->rterm);
+    for (int c = K + 1; c <= g_last_inner && diff <= 1; c++) diff += (a->ci[c - 1] != b->ci[c - 1]);
     return diff <= 1;
 }
 
@@ -3787,7 +4155,7 @@ static bool top_near_dup(const RowChoice *a, const RowChoice *b) {
 static void bt_close_row(BtCtx *x, int row) {
     BeamEntry *t = &x->lvl[row];
     *t = x->lvl[row - 1];
-    commit_row(t, row, &x->rows[row]);
+    bt_commit(t, row, &x->rows[row]);
     t->depth = (uint16_t)row;
     t->flags = x->flags[row];
     if (!parity_ok(t)) { x->cut_parity++; return; }
@@ -3898,7 +4266,9 @@ static void bt_cell(BtCtx *x, int row, int col, int L) {
     const int B = x->lvl[row - 1].rtop[col];
     RowChoice *mv = &x->rows[row];
     uint64_t *used = x->used[row];
-    if (col == PUZZLE_SIDE - 1) {
+    if (col > g_last_inner) {
+        /* --backtrack_unlock_right: the row ends at column W, before the band. */
+        if (col != PUZZLE_SIDE - 1) { bt_close_row(x, row); return; }
         if (L < 0 || L >= NUM_COLORS_TOTAL) return;
         for (int kt = 0; kt < g_edge_term_by_left_n[L]; kt++) {
             int ti = g_edge_term_by_left[L][kt];
@@ -3945,8 +4315,22 @@ static void bt_set_pins(BtCtx *x, int row, const int pin_idx[3], const int pin_k
     for (int s = 0; s < 3; s++) {
         if (pin_idx[s] < 0) continue;
         int c = 1 + s * CHAIN_LEN + pin_idx[s];
+        if (c > g_last_inner) continue;       /* a band column: never searched */
         x->pin_kind[row][c] = (int8_t)pin_kind[s];
         x->pin_val[row][c]  = pin_val[s];
+    }
+}
+
+/* --backtrack_unlock_right with --clue_corners: a corner clue written home in
+   the band right above a cell of this row (the stop row) makes that cell show
+   the clue's bottom colour, so the clue meets the block without a break. */
+static void bt_band_pins(BtCtx *x, int row, int orient) {
+    if (row != g_band_pin_row || orient < 0) return;
+    for (int k = CLUE_TOP_LEFT; k <= CLUE_TOP_RIGHT; k++) {
+        const ClueCell *cc = &g_clue[orient][k];
+        if (cc->row != row + 1 || cc->col > g_last_inner) continue;
+        x->pin_kind[row][cc->col] = PIN_TOPCOLOR;
+        x->pin_val[row][cc->col]  = g_cat[g_clue_ci[orient][k]].bottom;
     }
 }
 
@@ -3960,6 +4344,7 @@ static void bt_row(BtCtx *x, int row) {
         if (ENTRY_HAS_ORIENT(p)) {
             if (clue_pins_for(row, (int)ENTRY_ORIENT(p), pi, pk, pv)) {
                 bt_set_pins(x, row, pi, pk, pv);
+                bt_band_pins(x, row, (int)ENTRY_ORIENT(p));
                 memcpy(x->used[row], p->used, sizeof x->used[row]);
                 x->flags[row] = p->flags;
                 bt_cell(x, row, 1, L);
@@ -3983,6 +4368,7 @@ static void bt_row(BtCtx *x, int row) {
                     if (pi[sg] >= 0 && pk[sg] == PIN_PIECE) places_piece = true;
                 if (may_defer && !places_piece) continue;
                 bt_set_pins(x, row, pi, pk, pv);
+                bt_band_pins(x, row, o);
                 memcpy(x->used[row], p->used, sizeof x->used[row]);
                 x->flags[row] = (uint8_t)(o | FLAG_ORIENT_SET);
                 bt_cell(x, row, 1, L);
@@ -3991,6 +4377,7 @@ static void bt_row(BtCtx *x, int row) {
         }
     }
     bt_set_pins(x, row, NULL, NULL, NULL);
+    bt_band_pins(x, row, ENTRY_HAS_ORIENT(p) ? (int)ENTRY_ORIENT(p) : -1);
     memcpy(x->used[row], p->used, sizeof x->used[row]);
     x->flags[row] = p->flags;
     bt_cell(x, row, 1, L);
@@ -4012,7 +4399,8 @@ static void bt_emit_node(const BtNode *o, uint64_t *boards) {
         g_stats.emitted_total++; g_bt.emitted++;
         if (!g_end_dive) { g_score_hist[o->sc[i]]++; top_add(&g_top_score, o->sc[i], at); }
         if (g_extend_nodes) {
-            const int n = o->ex[i], cols = ext_cols_n(n, (int)g_stop_row);
+            /* --backtrack_unlock_right: whole layers rather than whole columns */
+            const int n = o->ex[i], cols = g_unlock_right ? o->ly[i] : ext_cols_n(n, (int)g_stop_row);
             g_ext_hist[n]++;
             if (!g_end_dive) top_add(&g_top_ext, n, at);
             g_bt_run.ext_cells += (uint64_t)n; g_bt_run.ext_cols += (uint64_t)cols;
@@ -4084,8 +4472,13 @@ static void bt_run_job(BtCtx *x, const BtJob *j) {
     collect_rows(g_bt.ctx, &g_bt.beam[pe->parent], x->rows);
     x->rows[N] = pe->mv;
     BeamEntry *r = &x->lvl[N];
-    *r = g_bt.beam[pe->parent];
-    commit_row(r, N, &pe->mv);
+    if (g_unlock_right) {                 /* rows 1..N give back columns W+1..15 */
+        *r = g_bt.border;
+        for (int row = 1; row <= N; row++) commit_row_narrow(r, row, &x->rows[row]);
+    } else {
+        *r = g_bt.beam[pe->parent];
+        commit_row(r, N, &pe->mv);
+    }
     r->depth = (uint16_t)N; r->flags = pe->flags;
     x->out = j->out_slot ? j->out_slot : &handoff;
     x->deadline = g_bt.deadline; x->root = j->root;
@@ -4108,7 +4501,7 @@ static void bt_run_job(BtCtx *x, const BtJob *j) {
         x->rows[row] = j->rows[row - N - 1];
         BeamEntry *t = &x->lvl[row];
         *t = x->lvl[row - 1];
-        commit_row(t, row, &x->rows[row]);
+        bt_commit(t, row, &x->rows[row]);
         t->depth = (uint16_t)row;
         t->flags = j->flags[row - N - 1];
     }
@@ -4162,6 +4555,7 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     memset(g_bt.slot, 0, (size_t)g_bt.win * sizeof *g_bt.slot);
     g_bt.ctx = ctx; g_bt.beam = beam; g_bt.N = N; g_bt.kept = kept;
     g_bt.deadline = deadline;
+    if (g_unlock_right) beam_init_border(&g_bt.border, g_cur_bottom, g_cur_left);
     g_bt.qhead = g_bt.qn = 0;
     g_bt.next = g_bt.cursor = 0;
     g_bt.abort = false;
@@ -4171,7 +4565,7 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     for (int t = 0; t < nt; t++) {
         BtCtx *x = g_bt_ctx[t];
         x->nodes = x->cut_parity = x->cut_corner = 0;
-        x->ext_nodes_cap = x->cut_mincol = 0;
+        x->ext_nodes_cap = x->cut_mincol = x->cut_score = 0;
         x->cut_col = x->strip_unknown = x->near_dup = 0;
         memset(x->fill, 0, sizeof x->fill);
         x->abort = false;
@@ -4236,13 +4630,14 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     }
 
     uint64_t fill[EDGE_LEN + 1] = {0}, nodes = 0, cut_p = 0, cut_c = 0, ecap = 0, cut_m = 0;
-    uint64_t cut_col = 0, unknown = 0, near_dup = 0;
+    uint64_t cut_col = 0, unknown = 0, near_dup = 0, cut_s = 0;
     bool aborted = g_bt.abort;
     for (int t = 0; t < nt; t++) {
         BtCtx *x = g_bt_ctx[t];
         nodes += x->nodes; cut_p += x->cut_parity; cut_c += x->cut_corner;
         ecap += x->ext_nodes_cap; cut_m += x->cut_mincol;
         cut_col += x->cut_col; unknown += x->strip_unknown; near_dup += x->near_dup;
+        cut_s += x->cut_score;
         for (int r = 0; r <= EDGE_LEN; r++) fill[r] += x->fill[r];
         if (x->abort) aborted = true;
     }
@@ -4263,6 +4658,7 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     g_bt_run.cfg_dup = g_bt.dup; g_bt_run.cfg_mincol = cut_m;
     g_bt_run.cut_col += cut_col; g_bt_run.strip_unknown += unknown;
     g_bt_run.near_dup += near_dup; g_bt_run.cfg_near_dup = near_dup;
+    g_bt_run.cut_score += cut_s; g_bt_run.cfg_cut_score = cut_s;
     for (int r = 0; r <= EDGE_LEN; r++) g_bt_run.fill[r] += fill[r];
 
     if (fill[g_stop_row]) {
@@ -4285,7 +4681,9 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
                " cut_parity=%" PRIu64, g_config_id_str, roots, roots_emitting, nodes, cut_p);
         if (g_corners_on) printf(" cut_corner=%" PRIu64, cut_c);
         if (g_extend_nodes) printf(" ext_max=%d", g_bt_run.cfg_ext_max);
-        if (g_bt_min_col)   printf(" cut_mincol=%" PRIu64, cut_m);
+        if (mincol_cuts())  printf(" cut_mincol=%" PRIu64, cut_m);
+        if (g_unlock_right) printf(" root_repeats=%" PRIu64, g_bt_run.cfg_root_rep);
+        if (score_cuts())   printf(" cut_score=%" PRIu64, cut_s);
         if (g_col_check)    printf(" cut_col=%" PRIu64 " unknown=%" PRIu64, cut_col, unknown);
         if (g_top_dedup)    printf(" near_dups=%" PRIu64, near_dup);
         printf(" reached");
@@ -4365,6 +4763,11 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         uint32_t kept = raw ? rank_pool_raw(ctx, pool_n, nt)
                             : dedup_and_rank(ctx, pool_n, nt);
         g_stats.row_retained[row] += kept;
+        uint64_t root_rep = 0;
+        if (bt_row && g_unlock_right && g_root_dedup) {
+            kept = unique_roots(ctx, cur, kept, row, nt, &root_rep);
+            g_bt_run.root_rep += root_rep; g_bt_run.cfg_root_rep = root_rep;
+        }
         uint32_t roots = kept;
         if (bt_row && !raw) roots = select_roots(ctx, kept, beam_n, row, cfg_hash);
         g_stats.t_select += omp_get_wtime() - t_exp;
@@ -4375,9 +4778,10 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
             res.width = roots;
             g_stats.row_selected[row] += roots;
             if (g_verbose) {
-                printf("[beam] %s row=%d cands=%" PRIu64 " %s=%u roots=%u t=%.2fs\n",
-                       g_config_id_str, row, pool_n, raw ? "ranked" : "uniq", kept, roots,
-                       omp_get_wtime() - t_row);
+                printf("[beam] %s row=%d cands=%" PRIu64 " %s=%u roots=%u",
+                       g_config_id_str, row, pool_n, raw ? "ranked" : "uniq", kept, roots);
+                if (g_unlock_right) printf(" root_repeats=%" PRIu64, root_rep);
+                printf(" t=%.2fs\n", omp_get_wtime() - t_row);
                 fflush(stdout);
             }
             sweep_beam_done(roots);
@@ -4564,7 +4968,16 @@ static void print_summary_detail(double wall_total, double init_s, double sweep_
         for (int r = (int)g_backtrack_row + 1; r <= (int)g_stop_row; r++)
             printf("  r%d:%" PRIu64, r, g_bt_run.fill[r]);
         printf("\n");
-        if (g_extend_nodes) {
+        if (g_extend_nodes && g_unlock_right) {
+            const uint64_t b = g_bt_run.emitted;
+            printf("[sum] layered extension (--extend_nodes %u), over %" PRIu64 " board(s) kept: "
+                   "cells mean %.1f, max %d of %d in the band; whole layers mean %.2f, max %d of "
+                   "%d; node cap hit %" PRIu64 "\n",
+                   g_extend_nodes, b, b ? (double)g_bt_run.ext_cells / (double)b : 0.0,
+                   g_bt_run.ext_max, g_lx_path[0].n,
+                   b ? (double)g_bt_run.ext_cols / (double)b : 0.0, g_bt_run.ext_cols_max,
+                   g_lx_path[0].nlayers, g_bt_run.ext_cap);
+        } else if (g_extend_nodes) {
             const uint64_t b = g_bt_run.emitted;
             const int h = EDGE_LEN - (int)g_stop_row;
             printf("[sum] extension (--extend_nodes %u), over %" PRIu64 " board(s) kept: "
@@ -4667,7 +5080,7 @@ static void print_top_list(const char *what, const TopList *t, bool ext) {
     for (int i = 0; i < t->n; i++) {
         const TopRec *r = &t->r[i];
         printf("%s %d", i ? "," : "", r->v);
-        if (ext) printf(" (%d cols)", ext_cols_n(r->v, (int)g_stop_row));
+        if (ext && !g_unlock_right) printf(" (%d cols)", ext_cols_n(r->v, (int)g_stop_row));
         if (!one_file) printf(" %s", g_out_files[r->file]);
         printf(" row %" PRIu64, r->row);
     }
@@ -4710,8 +5123,8 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         printf("\n");
         if (g_extend_nodes) {
             const uint64_t b = g_bt_run.emitted;
-            printf("[sum] extension: mean %.2f cols, max %d", b ? (double)g_bt_run.ext_cols / (double)b : 0.0,
-                   g_bt_run.ext_cols_max);
+            printf("[sum] extension: mean %.2f %s, max %d", b ? (double)g_bt_run.ext_cols / (double)b : 0.0,
+                   g_unlock_right ? "layers" : "cols", g_bt_run.ext_cols_max);
             if (g_bt_run.ext_cap) printf("; node cap hit %" PRIu64, g_bt_run.ext_cap);
             printf("\n");
             if (g_cap_top && g_bt_run.cap_boards)
@@ -4720,7 +5133,19 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
                        (double)g_bt_run.cap_cells / (double)g_bt_run.cap_boards,
                        100.0 * (double)g_bt_run.cap_closed / (double)g_bt_run.cap_boards);
         }
-        if (g_bt_min_col) {
+        if (g_unlock_right) {
+            printf("[sum] unlock_right %u: block rows 0..%u x columns 0..%d; %s roots searched, ",
+                   g_unlock_right, g_stop_row, g_last_inner, fmt_cnt(b1, sizeof b1, g_bt_run.roots));
+            printf("%s repeats dropped", fmt_cnt(b1, sizeof b1, g_bt_run.root_rep));
+            if (mincol_cuts())
+                printf("; %s boards short of layer %u", fmt_cnt(b1, sizeof b1, g_bt_run.cut_mincol),
+                       g_unlock_right - g_bt_min_col);
+            if (score_cuts())
+                printf("; %s boards under --emit_score %d", fmt_cnt(b1, sizeof b1, g_bt_run.cut_score),
+                       g_emit_score);
+            printf("\n");
+        }
+        if (g_col_check) {
             printf("[sum] min_col %u: ", g_bt_min_col);
             printf("column check cut %s partial rows", fmt_cnt(b1, sizeof b1, g_bt_run.cut_col));
             if (g_bt_run.strip_unknown)
@@ -4744,7 +5169,8 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
     printf("[sum] boards: found %" PRIu64, g_found_total);
     if (g_backtrack_row && g_bt_run.near_dup) printf(", near-dups %" PRIu64, g_bt_run.near_dup);
     if (g_backtrack_row && g_bt_run.dup)      printf(", repeats %" PRIu64, g_bt_run.dup);
-    if (g_bt_min_col)                         printf(", below min_col %" PRIu64, g_bt_run.cut_mincol);
+    if (mincol_cuts())                        printf(", below min_col %" PRIu64, g_bt_run.cut_mincol);
+    if (score_cuts())                         printf(", below emit_score %" PRIu64, g_bt_run.cut_score);
     if (g_end_dive)                           printf(", dived %" PRIu64, dv_boards());
     printf("\n");
     if (g_incomplete_top) {
@@ -4775,8 +5201,9 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
     printf("%s%s (%" PRIu64 " written)\n", shown ? "" : " none", more ? " ..." : "", g_written_total);
     print_top_list("best boards", &g_top_score, false);
     if (g_backtrack_row && g_extend_nodes) {
-        printf("[sum] *** Output boards extension (cells above row %u, top cap not counted):",
-               g_stop_row);
+        if (g_unlock_right) printf("[sum] *** Output boards extension (band cells):");
+        else printf("[sum] *** Output boards extension (cells above row %u, top cap not counted):",
+                    g_stop_row);
         shown = 0; more = false;
         for (int n = (int)(sizeof g_ext_hist / sizeof g_ext_hist[0]) - 1; n >= 0; n--) {
             if (!g_ext_hist[n]) continue;
@@ -4795,9 +5222,10 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
 
 /* Finish the configuration's queued stop-row boards and write the kept ones
    now, so a killed run loses at most the configuration in flight. Edge pieces
-   keep the side their rotations row deals them, unless edges are free. */
+   keep the side their rotations row deals them, unless edges are free or the
+   --backtrack_unlock_right band has given the frame back. */
 static void dive_config(void) {
-    dv_frame(!g_free_edges && !g_random_edges);
+    dv_frame(!g_free_edges && !g_random_edges && !g_unlock_right);
     dv_run(g_board_id_str);
     dv_flush(g_completions_fp);
 }
@@ -5052,6 +5480,20 @@ static void usage(const char *a0) {
 "                         it in at most one other cell. By default such a near twin\n"
 "                         is dropped before its extension and dives, whether the\n"
 "                         previous board was written or not\n"
+"  --backtrack_unlock_right R\n"
+"                         with --backtrack_row N (R in 2..13; default 0 = off): the\n"
+"                         board is the block rows 0..S x columns 0..15-R and the rest\n"
+"                         is the band, frame and the three free corners included.\n"
+"                         Each root gives back columns 16-R..15 of rows 1..N, rows\n"
+"                         N+1..S are searched over columns 1..15-R, and the\n"
+"                         extension grows the band in layers hugging the block (up\n"
+"                         column 15-R+k from row 0, then left along row S+k to\n"
+"                         column 0), any edge on any side. --backtrack_min_col K then\n"
+"                         counts the band columns allowed to stay open (default R:\n"
+"                         every board is written with its longest extension), and\n"
+"                         without --end_dive --emit_score S drops boards that\n"
+"                         match fewer edges. Corner clues in the band go home.\n"
+"                         Not with --lambda_corners, --free_top_clue or --cap_top\n"
 "  --beam_expand E      late-search width multiplier (default 4; 1 = no expansion)\n"
 "  --beam_expand_row R    row with the full ExK width; half of the extra width is\n"
 "                         granted one row earlier (default 7)\n"
@@ -5142,7 +5584,9 @@ static void usage(const char *a0) {
 "                         (4 sampled swaps, re-polish, annealed accept) over 16\n"
 "                         walks. 0 = polish only; absent = off\n"
 "  --emit_score S         connected edges (of 480) a finished board needs to be\n"
-"                         written (default 450)\n"
+"                         written (default 450); without --end_dive, under\n"
+"                         --backtrack_unlock_right only, the extended board's\n"
+"                         edges when S is given\n"
 "  --corner_seeds N       with --end_dive and --lambda_corners: every stop-row board\n"
 "                         with an alive top-corner block also dives up to N copies\n"
 "                         with a block and a free pair of top witnesses fixed on\n"
@@ -5286,14 +5730,15 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (!g_free_demand)  printf(" --no_free_demand");
     printf(" --stop_row %u", g_stop_row);
     if (g_incomplete_top) printf(" --incomplete_top");
-    if (!g_cap_top)      printf(" --cap_top 0");
+    if (!g_cap_top && !g_unlock_right) printf(" --cap_top 0");
     if (g_backtrack_row) printf(" --backtrack_row %u --backtrack_row_factor %u --extend_nodes %u",
                                 g_backtrack_row, g_bt_factor, g_extend_nodes);
-    if (g_bt_min_col)    printf(" --backtrack_min_col %u", g_bt_min_col);
+    if (g_unlock_right)  printf(" --backtrack_unlock_right %u", g_unlock_right);
+    if (g_bt_min_col || g_unlock_right) printf(" --backtrack_min_col %u", g_bt_min_col);
     if (g_backtrack_row && !g_top_dedup) printf(" --no_top_dedup");
     if (g_end_dive) printf(" --end_dive %u", g_end_dive);
     if (g_end_dive && g_end_polish >= 0) printf(" --end_polish %d", g_end_polish);
-    if (g_end_dive) printf(" --emit_score %d", g_emit_score);
+    if (g_end_dive || score_cuts()) printf(" --emit_score %d", g_emit_score);
     if (g_end_dive && g_corners_on && g_corner_seeds != 4) printf(" --corner_seeds %d", g_corner_seeds);
     printf(" --time_limit %g --wall_time %g --max_emitted %" PRIu64 " --threads %d",
            g_config_time_sec, g_max_wall_sec, g_max_partials, g_nthreads);
@@ -5439,7 +5884,10 @@ static void sweep_report(const char *group, long li, const BeamResult *br, doubl
             if (g_backtrack_row && g_bt_run.cfg_dup) printf(" repeats=%" PRIu64, g_bt_run.cfg_dup);
             if (g_backtrack_row && g_bt_run.cfg_near_dup)
                 printf(" dups=%" PRIu64, g_bt_run.cfg_near_dup);
-            if (g_bt_min_col) printf(" below_min_col=%" PRIu64, g_bt_run.cfg_mincol);
+            if (mincol_cuts()) printf(" below_min_col=%" PRIu64, g_bt_run.cfg_mincol);
+            if (score_cuts()) printf(" below_score=%" PRIu64, g_bt_run.cfg_cut_score);
+            if (g_unlock_right && g_bt_run.cfg_root_rep)
+                printf(" root_repeats=%" PRIu64, g_bt_run.cfg_root_rep);
             printf(" written=%" PRIu64, g_cfg_written);
             if (g_end_dive && dv_last_best() >= 0) printf(" best=%d", dv_last_best());
             if (g_incomplete_top && g_partial_count) printf(" partials=%zu", g_partial_count);
@@ -5555,13 +6003,20 @@ int main(int argc, char *argv[]) {
                 fatal("--backtrack_min_col expects an integer in 0..%d, got '%s'", EDGE_LEN, argv[i]);
             g_bt_min_col = (uint32_t)v; g_min_col_set = true;
         }
+        else if (!strcmp(argv[i], "--backtrack_unlock_right") && i+1 < argc) {
+            char *end; long v = strtol(argv[++i], &end, 10);
+            if (*end || v < 0 || v == 1 || v > EDGE_LEN - 1)
+                fatal("--backtrack_unlock_right expects 0 (off) or an integer in 2..%d, got '%s'",
+                      EDGE_LEN - 1, argv[i]);
+            g_unlock_right = (uint32_t)v;
+        }
         else if (!strcmp(argv[i], "--free_top_clue"))             g_free_top_clue = true;
         else if (!strcmp(argv[i], "--no_top_dedup"))              g_top_dedup = false;
         else if (!strcmp(argv[i], "--exhaust_border_color"))      g_exhaust = true;
         else if (!strcmp(argv[i], "--cap_top")) {
             /* Bare or nonzero = on, 0 = off; the value is taken only when the
                next token is an integer in its entirety. */
-            g_cap_top = true;
+            g_cap_top = true; g_cap_top_set = true;
             if (i + 1 < argc) {
                 char *end = NULL;
                 long v = strtol(argv[i + 1], &end, 10);
@@ -5699,11 +6154,47 @@ int main(int argc, char *argv[]) {
     if (g_beam_expand_row < 2) fatal("--beam_expand_row must be >= 2");
     if (g_stop_row == 0 || g_stop_row > (uint32_t)MAX_DRILL_DEPTH)
         fatal("--stop_row must be in 1..%d (rows 14-15 belong to Stage C)", MAX_DRILL_DEPTH);
+    if (g_unlock_right) {
+        const int W = PUZZLE_SIDE - 1 - (int)g_unlock_right;
+        if (!g_backtrack_row_set)
+            fatal("--backtrack_unlock_right gives back columns from the backtrack row on: "
+                  "add --backtrack_row N");
+        if (g_min_col_set && g_bt_min_col > g_unlock_right)
+            fatal("--backtrack_min_col counts the band columns left open under "
+                  "--backtrack_unlock_right %u: it must be in 0..%u", g_unlock_right, g_unlock_right);
+        if (!g_min_col_set) g_bt_min_col = g_unlock_right;
+        if (g_bt_min_col < g_unlock_right && !g_extend_nodes)
+            fatal("--backtrack_min_col %u needs %u whole layer(s) of the extension: "
+                  "--extend_nodes 0 turns it off", g_bt_min_col, g_unlock_right - g_bt_min_col);
+        if (g_corners_on)
+            fatal("--lambda_corners protects top-corner blocks built on the configuration's "
+                  "frame, which --backtrack_unlock_right leaves open: drop one of the two");
+        if (g_free_top_clue)
+            fatal("--free_top_clue acts in the column-major extension, which "
+                  "--backtrack_unlock_right replaces: drop one of the two");
+        if (g_cap_top_set && g_cap_top)
+            fatal("--cap_top closes the top border over the column-major extension; under "
+                  "--backtrack_unlock_right the layered extension places the frame itself");
+        g_cap_top = false;
+        if (g_clue_mask & CLUE_CORNERS) {
+            if (g_stop_row > (uint32_t)(PUZZLE_SIDE - 4))
+                fatal("--backtrack_unlock_right with --clue_corners needs --stop_row 12 or below: "
+                      "the row-13 clues go home in the band");
+            if (W < 13 && g_backtrack_row < 2)
+                fatal("--backtrack_unlock_right %u with --clue_corners needs --backtrack_row 2 or "
+                      "more: the (2,13) clue goes home in the band, so the beam must place the "
+                      "cell beside it", g_unlock_right);
+            if (g_stop_row == (uint32_t)(PUZZLE_SIDE - 4)) g_band_pin_row = (int)g_stop_row;
+        }
+        g_last_inner = W;
+        g_block_mask = (uint16_t)((1u << (W + 1)) - 1u);
+        if (getenv("E555_ROOT_DEDUP") && !strcmp(getenv("E555_ROOT_DEDUP"), "0")) g_root_dedup = false;
+    }
     if (g_backtrack_row_set) {
         if (g_backtrack_row == 0 || g_backtrack_row >= g_stop_row)
             fatal("--backtrack_row must be in 1..%u (below --stop_row %u)",
                   g_stop_row - 1, g_stop_row);
-        if (g_bt_min_col && !g_extend_nodes)
+        if (g_bt_min_col && !g_extend_nodes && !g_unlock_right)
             fatal("--backtrack_min_col %u needs the extension: --extend_nodes 0 turns it off",
                   g_bt_min_col);
         if (g_incomplete_top) {
@@ -5728,11 +6219,11 @@ int main(int argc, char *argv[]) {
             fatal("--free_top_clue acts in the extension above the stop row: it needs "
                   "--backtrack_row N and --extend_nodes > 0");
     }
-    g_col_check = g_bt_min_col > 0;
+    g_col_check = g_bt_min_col > 0 && !g_unlock_right;
     if (g_emit_score < 0 || g_emit_score > 480) fatal("--emit_score must be in 0..480");
     if (g_end_polish >= 0 && !g_end_dive)
         fprintf(stderr, "[warn] --end_polish has no effect without --end_dive\n");
-    if (g_emit_score_set && !g_end_dive)
+    if (g_emit_score_set && !g_end_dive && !g_unlock_right)
         fprintf(stderr, "[warn] --emit_score has no effect without --end_dive\n");
     if (!(fabs(g_lambda_maha) <= 1e6)) fatal("--lambda_Mahalanobis in [-1e6,1e6]");
     if (!(fabs(g_lambda_J) <= 1e6))    fatal("--lambda_J in [-1e6,1e6]");
@@ -5806,6 +6297,16 @@ int main(int argc, char *argv[]) {
         g_clue_mask   |= CLUE_CENTER;
         g_clue_orients = (uint8_t)(1u << clue_orient_for_pin(g_pin_clue));
     }
+    if (g_unlock_right && (g_clue_mask & CLUE_CENTER))
+        for (int o = 0; o < 4; o++) {
+            if (!(g_clue_orients & (1u << o))) continue;
+            const ClueCell *cc = &g_clue[o][0];
+            if (cc->row > g_stop_row || cc->col > (uint32_t)g_last_inner)
+                fatal("--backtrack_unlock_right %u leaves the centre clue's cell (%u,%u) outside "
+                      "the block rows 0..%u x columns 0..%d: lower R, raise --stop_row, or pin "
+                      "another frame with --pin_clue", g_unlock_right, cc->row, cc->col,
+                      g_stop_row, g_last_inner);
+        }
 
     printf("\n=== E555 beamer ===\n\n");
     print_time_stamp("started", -1.0);
@@ -5833,18 +6334,44 @@ int main(int argc, char *argv[]) {
         printf("[cfg] backtrack_row=%u factor=0 (beam through row %u, then an exhaustive "
                "row-major search of every row-%u candidate to row %u)\n",
                g_backtrack_row, g_backtrack_row, g_backtrack_row, g_stop_row);
-    if (g_backtrack_row && g_extend_nodes)
-        printf("[cfg] extend_nodes=%u (each row-%u board continues column by column, rows %u..14, "
-               "up to %u nodes; written from its deepest zero-break prefix)\n",
-               g_extend_nodes, g_stop_row, g_stop_row + 1, g_extend_nodes);
-    if (g_bt_min_col)
-        printf("[cfg] backtrack_min_col=%u (only boards whose extension fills columns 1..%u "
-               "of rows %u..14 are written; a partial row whose column 1 cannot reach row 14 is "
-               "cut)\n", g_bt_min_col, g_bt_min_col, g_stop_row + 1);
+    if (g_unlock_right) {
+        const int W = g_last_inner;
+        printf("[cfg] backtrack_unlock_right=%u (the roots give back columns %d..15 of rows 1..%u; "
+               "rows %u..%u are searched over columns 1..%d; the board is the block rows 0..%u x "
+               "columns 0..%d, the rest is the band, frame and corners included)\n",
+               g_unlock_right, W + 1, g_backtrack_row, g_backtrack_row + 1, g_stop_row, W,
+               g_stop_row, W);
+        if (g_extend_nodes)
+            printf("[cfg] extend_nodes=%u (each row-%u board grows the band in layers hugging the "
+                   "block: up column %d+k from row 0, then left along row %u+k to column 0; any "
+                   "edge on any side, up to %u nodes; written from its deepest zero-break "
+                   "prefix)\n", g_extend_nodes, g_stop_row, W, g_stop_row, g_extend_nodes);
+        if (mincol_cuts())
+            printf("[cfg] backtrack_min_col=%u (band columns left open: only boards whose "
+                   "extension completes layers 1..%u, out to column %u, are written)\n",
+                   g_bt_min_col, g_unlock_right - g_bt_min_col, 15 - g_bt_min_col);
+        else
+            printf("[cfg] backtrack_min_col=%u (band columns left open: every stop-row board is "
+                   "written with its extension)\n", g_bt_min_col);
+        if (score_cuts())
+            printf("[cfg] emit_score=%d (a board whose extended board matches fewer edges is not "
+                   "written)\n", g_emit_score);
+    } else {
+        if (g_backtrack_row && g_extend_nodes)
+            printf("[cfg] extend_nodes=%u (each row-%u board continues column by column, rows %u..14, "
+                   "up to %u nodes; written from its deepest zero-break prefix)\n",
+                   g_extend_nodes, g_stop_row, g_stop_row + 1, g_extend_nodes);
+        if (g_bt_min_col)
+            printf("[cfg] backtrack_min_col=%u (only boards whose extension fills columns 1..%u "
+                   "of rows %u..14 are written; a partial row whose column 1 cannot reach row 14 is "
+                   "cut)\n", g_bt_min_col, g_bt_min_col, g_stop_row + 1);
+    }
     if (g_backtrack_row)
-        printf("[cfg] top_dedup=%s\n", g_top_dedup
-               ? "on (a stop-row board within one top-row cell of the previous one, its "
-                 "columns 1..K the same, is dropped before its extension)" : "off");
+        printf("[cfg] top_dedup=%s\n", !g_top_dedup ? "off" : g_unlock_right
+               ? "on (a stop-row board within one cell of the previous one's top row is "
+                 "dropped before its extension)"
+               : "on (a stop-row board within one top-row cell of the previous one, its "
+                 "columns 1..K the same, is dropped before its extension)");
     if (g_free_top_clue)
         printf("[cfg] free_top_clue=1 (the extension may place the top-left row-13 clue on any "
                "cell; the top-right one is left for the dives)\n");
@@ -5854,7 +6381,7 @@ int main(int argc, char *argv[]) {
                "cannot is a plain random one)\n", g_stop_row);
     if (g_random_edges && g_backtrack_row && g_extend_nodes)
         printf("[cfg] random edges: the extension chooses column 0 above row %u\n", g_stop_row);
-    if (g_backtrack_row && g_extend_nodes)
+    if (g_backtrack_row && g_extend_nodes && !g_unlock_right)
         printf("[cfg] cap_top=%d%s\n", g_cap_top ? 1 : 0,
                g_cap_top ? " (of its longest fillings, the extension keeps the one whose top-left "
                            "border closes exactly over the most whole columns, and writes that cap)" : "");
@@ -5933,6 +6460,7 @@ int main(int argc, char *argv[]) {
     init_clue_tables();
     clue_dump_schedule();
     ext_fix_init();
+    if (g_unlock_right) lx_init();
     if (g_random_edges) g_edge_left_n = edge_left_pool(&g_edge_left);
     {   /* --cap_top: the frame-up edges, by the inner colour they show down */
         const int n = edge_up_pool(&g_edge_up);
@@ -6117,7 +6645,7 @@ int main(int argc, char *argv[]) {
 
                 g_emit_count = 0; memset(g_emit_htable, 0, g_emit_htable_sz*sizeof(uint64_t));
                 g_bt_run.cfg_found = g_bt_run.cfg_dup = g_bt_run.cfg_mincol = 0;
-                g_bt_run.cfg_near_dup = 0;
+                g_bt_run.cfg_near_dup = g_bt_run.cfg_root_rep = g_bt_run.cfg_cut_score = 0;
                 g_bt_run.cfg_ext_max = 0;
                 if (g_incomplete_top) partial_config_reset();
                 double tc0 = omp_get_wtime();
@@ -6268,7 +6796,7 @@ int main(int argc, char *argv[]) {
 
                 g_emit_count = 0; memset(g_emit_htable, 0, g_emit_htable_sz*sizeof(uint64_t));
                 g_bt_run.cfg_found = g_bt_run.cfg_dup = g_bt_run.cfg_mincol = 0;
-                g_bt_run.cfg_near_dup = 0;
+                g_bt_run.cfg_near_dup = g_bt_run.cfg_root_rep = g_bt_run.cfg_cut_score = 0;
                 g_bt_run.cfg_ext_max = 0;
                 if (g_incomplete_top) partial_config_reset();
                 double tc0 = omp_get_wtime();

@@ -2463,7 +2463,9 @@ void dv_print_summary(double wall_total) {
     if (g_dv_run.written) {
         const double W = (double)g_dv_run.written;
         char seam[32];
-        if (g_dv_run.top_min == g_dv_run.top_max)
+        if (g_dv_run.top_max < 0)               /* no board has a full bottom row */
+            snprintf(seam, sizeof seam, "none");
+        else if (g_dv_run.top_min == g_dv_run.top_max)
             snprintf(seam, sizeof seam, "r%d/r%d", g_dv_run.top_min, g_dv_run.top_min + 1);
         else
             snprintf(seam, sizeof seam, "above the top full row");
