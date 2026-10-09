@@ -661,6 +661,11 @@ the ender):
   | 12 | 12,419 | 148,815 | 98,679 | mean 6.2 cells, max 25; no whole layer |
   | 10 | 12,559 | 2.4 M | 1.44 M (2.8 GB) | mean 18.1 cells, max 60; 0.14 layers |
 
+  From `--backtrack_row 7` (one configuration, stop row 12, 54 s on 4 threads)
+  the search made 6.3 G nodes and 13.0 M row-12 boards, 1,241 per root; 8.5 M
+  were extended after the near twins, and `--emit_score 365` wrote the 60 that
+  completed layer 1 (best 379, 35 band cells) instead of 17 GB.
+
   A root's boards are held in memory until the root is written. Use a high
   `--backtrack_row`, `--backtrack_min_col`, `--emit_score` or `--max_emitted`
   (checked after each root) to bound a run, and a separate `--out_dir` per R:
@@ -821,8 +826,9 @@ path steps over them.
 On the measured runs of 5.9 the band's first layer is the hard part: its
 column-W+1 arm needs a piece per row that fits the block on its left and the
 cell below, from the 52 inner pieces a 13 x 13 block leaves. From stop row 12
-no board completed it; from stop row 10 (76 pieces left) 13% did, and the
-longest extensions reached 60 cells, two whole layers.
+none of 98,679 boards completed it from `--backtrack_row 8`, and 60 of 8.5 M
+from row 7; from stop row 10 (76 pieces left) 13% did, and the longest
+extensions reached 60 cells, two whole layers.
 
 ### 5.11 Finishing boards: end dives and polish (`--end_dive`, `--end_polish`)
 
