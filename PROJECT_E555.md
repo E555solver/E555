@@ -640,13 +640,16 @@ the ender):
   row with the BR corner, the left column above the block with the TL corner)
   and the TR corner are given back: the extension may place any edge on any
   side and any corner on any corner cell.
-- **Clues.** `--clue_corners` needs `--stop_row` 12 or below and, when R >= 3,
-  `--backtrack_row` 2 or more. Every corner clue whose cell is in the band
-  goes home: (2,13), whose left neighbour comes from the beam, and (13,2) and
-  (13,13). At stop row 12 the search pins the top colour of the stop-row cells
-  right under them, so a written clue never breaks against the block (the
-  tail's `--breaks 0` drops a board with a break among its kept pieces).
-  `--clue_center` needs every enabled centre cell inside the block.
+- **Clues.** `--clue_corners` needs `--backtrack_row` 2 or more when R >= 3.
+  Every corner clue whose cell is in the band goes home: (2,13), whose left
+  neighbour comes from the beam, and (13,2) and (13,13) above a lower stop row.
+  The search also pins the row-13 clues, which the beam's pin schedule leaves
+  out: at stop row 13 one in the block is placed on its cell, a block cell
+  right under a clue shows its bottom colour, and a block cell right left of
+  a band clue (13,12 when R = 3) shows its left colour. So a clue on the board
+  never breaks against the block (the tail's `--breaks 0` drops a board with
+  a break among its kept pieces). `--clue_center` needs every enabled centre
+  cell inside the block.
 - **Refused:** `--lambda_corners` (its corner blocks are built on the frame the
   band gives back), `--free_top_clue` and a nonzero `--cap_top` (both act in
   the column-major extension). `--exhaust_border_color` and `--BR` still shape

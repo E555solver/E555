@@ -130,7 +130,7 @@ ALL_STEPS=(
     "beamer_backtrack_dive|extra|beamer,diver|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --lambda_reserve keeps the reserve for last"
     "beamer_min_col|extra|beamer|--backtrack_min_col: the column check drops no written board, random column 0 too; near-duplicate filter; --cap_top changes only row 15; log and score line"
     "beamer_free_top_clue|extra|beamer,diver|--free_top_clue: the top-left clue anywhere above the stop row, the top-right one left to the dives (builds a clue database in RAM)"
-    "beamer_unlock_right|extra|beamer|--backtrack_unlock_right: only the block and a prefix of the layered path, break-free; thread-independent; exact root dedup, min_col and emit_score filters; dives; random edges; corner clues home (builds a clue database in RAM)"
+    "beamer_unlock_right|extra|beamer|--backtrack_unlock_right: only the block and a prefix of the layered path, break-free; thread-independent; exact root dedup, min_col and emit_score filters; dives; random edges; corner clues home at stop rows 12 and 13 (builds a clue database in RAM twice)"
     "beamer_resume|extra|beamer|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
     "scripts_parse|core|scripts|every shipped script parses, and passes only flags that exist"
     "example_finalizer|extra|finalizer,scripts|examples/02 re-grows the synthetic board"
@@ -3236,7 +3236,8 @@ step_beamer_micro() {
 # (and the band corner clues), legal frame pieces and no break. The run is
 # thread-independent; the root dedup, --backtrack_min_col (band columns left
 # open) and --emit_score keep exactly the boards they should; dives and random
-# edges work. The clue run builds its own database in RAM (~1.5 min).
+# edges work. The two clue runs, stop rows 12 and 13, build their own database
+# in RAM (~1.5 min each).
 step_beamer_unlock_right() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
     gate_db
@@ -3276,6 +3277,11 @@ step_beamer_unlock_right() {
         --top_bottoms 1 --top_columns 2 --beam_width 2000 --clue_corners --backtrack_row 8 --stop_row 12 \
         --backtrack_unlock_right 3 --rng_seed 7 --threads 4 --out_dir "$OUT/ur_clue" > "$OUT/ur_clue.log" \
         || { tail -5 "$OUT/ur_clue.log"; fail "the clued unlock run exited non-zero"; }
+    # Stop row 13: the (13,2) clue is in the block, so the search places it.
+    bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv --start_row 1 --num_rows 1 \
+        --top_bottoms 1 --top_columns 2 --beam_width 2000 --clue_corners --backtrack_row 8 --stop_row 13 \
+        --backtrack_unlock_right 4 --rng_seed 7 --threads 4 --out_dir "$OUT/ur_clue13" > "$OUT/ur_clue13.log" \
+        || { tail -5 "$OUT/ur_clue13.log"; fail "the clued stop-row-13 unlock run exited non-zero"; }
     python3 - "$OUT" <<'EOF' || exit 1
 import glob, re, sys
 out = sys.argv[1]
@@ -3306,7 +3312,7 @@ def matched_broken(c):
             if side(c, x, d) == side(c, y, e): m += 1
             else: b += 1
     return m, b
-def path(S, skip):            # the documented layer path, and the cells completing each layer
+def path(S, skip, W=W):       # the documented layer path, and the cells completing each layer
     cells, done, k = [], [0], 1
     while W + k <= 15 or S + k <= 15:
         c, r = W + k, S + k
@@ -3315,16 +3321,18 @@ def path(S, skip):            # the documented layer path, and the cells complet
         cells = [x for x in cells if x not in skip]
         done.append(len(cells)); k += 1
     return cells, done
-FRAME = {180: (248, 207, 254), 248: (254, 180, 207), 254: (207, 248, 180), 207: (180, 254, 248)}
-def check(c, S, clues=False, dived=False):
+# keyed by the (2,2) clue: (piece, spin) on (2,13), (13,2), (13,13)
+FRAME = {180: ((248, 3), (207, 3), (254, 1)), 248: ((254, 0), (180, 3), (207, 2)),
+         254: ((207, 1), (248, 1), (180, 2)), 207: ((180, 1), (254, 2), (248, 0))}
+def check(c, S, clues=False, dived=False, W=W):
     """The board's whole layers, after checking the block, the path prefix, the frame and breaks."""
     block = {r * 16 + x for r in range(S + 1) for x in range(W + 1)}
     assert block <= set(c), "the block is not full"
     skip = set()
-    if clues:                               # the band corner clues, home
-        for x, piece in zip((2 * 16 + 13, 13 * 16 + 2, 13 * 16 + 13), FRAME[c[2 * 16 + 2][0]]):
-            assert c.get(x, (None,))[0] == piece, f"clue {piece} is not home on cell {x}"
-            skip.add(x)
+    if clues:                               # every corner clue home, at its spin
+        for x, clue in zip((2 * 16 + 13, 13 * 16 + 2, 13 * 16 + 13), FRAME[c[2 * 16 + 2][0]]):
+            assert c.get(x) == clue, f"clue {clue} is not home on cell {x}"
+            if x not in block: skip.add(x)
     for x, (p, r) in c.items():             # grey sides out, and only there
         row, col = divmod(x, 16)
         out_ = (row == 15, col == 15, row == 0, col == 0)
@@ -3336,7 +3344,7 @@ def check(c, S, clues=False, dived=False):
                 if y in block: assert side(c, x, d) == side(c, y, e), "a dived board broke the block"
         return 0
     assert matched_broken(c)[1] == 0, "a written board has a break"
-    P, done = path(S, skip)
+    P, done = path(S, skip, W)
     ext = set(c) - block - skip
     assert ext == set(P[:len(ext)]), "the extension is not a prefix of the layer path"
     return max(i for i in range(len(done)) if done[i] <= len(ext))
@@ -3381,9 +3389,12 @@ for l in rb: assert check(board(l), 10) >= 1, "a random-edges board short of lay
 cl = list(rows("ur_clue"))
 assert cl, "the clued unlock run wrote no board"
 for l in cl: check(board(l), 12, clues=True)
+c13 = list(rows("ur_clue13"))
+assert c13, "the clued stop-row-13 unlock run wrote no board"
+for l in c13: check(board(l), 13, clues=True, W=11)
 print(f"ok: {len(a)} block boards, 1 = 4 threads; {rep} root repeats dropped, output unchanged; "
       f"layers {dict(sorted(layers.items()))}: min_col 2 keeps {len(k2)}, emit_score 300 "
-      f"{len(es)}; {len(dv)} dived, {len(rb)} random-edges, {len(cl)} clued boards")
+      f"{len(es)}; {len(dv)} dived, {len(rb)} random-edges, {len(cl)} + {len(c13)} clued boards")
 EOF
 }
 

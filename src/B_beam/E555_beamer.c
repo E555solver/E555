@@ -152,6 +152,9 @@ static bool     g_free_top_clue   = false;
 /* The row-13 clue entries of g_clue: top-left on (13,2), top-right on (13,13). */
 #define CLUE_TOP_LEFT  3
 #define CLUE_TOP_RIGHT 4
+/* A backtracker pin beside PIN_PIECE/PIN_TOPCOLOR (E555_database.h): the
+   colour the cell must show to its RIGHT (bt_band_pins). */
+#define PIN_RIGHTCOLOR 2
 /* The top-row near-duplicate filter (--no_top_dedup turns it off): a stop-row
    board whose top row repeats the previous one's columns 1..K and differs from
    it in at most one other cell is dropped before its extension. See
@@ -171,10 +174,8 @@ static bool     g_col_check       = false;
 static uint32_t g_unlock_right    = 0;
 static int      g_last_inner      = EDGE_LEN;
 static uint16_t g_block_mask      = ROWMASK_FULL;
-/* The stop row whose cells sit right under a band corner clue: the search pins
-   their top colour there, so the clue written home meets the block without a
-   break (-1 = none). */
-static int      g_band_pin_row    = -1;
+/* --clue_corners: the backtracker pins the row-13 clues too (bt_band_pins). */
+static bool     g_band_pins       = false;
 /* E555_ROOT_DEDUP=0 (test only): search every root, repeats included. */
 static bool     g_root_dedup      = true;
 static bool     g_cap_top_set     = false;
@@ -4292,12 +4293,13 @@ static void bt_cell(BtCtx *x, int row, int col, int L) {
         bt_cell(x, row, col + 1, o->right);
         return;
     }
-    const bool top_pin = (kind == PIN_TOPCOLOR);
+    const bool top_pin = (kind == PIN_TOPCOLOR), right_pin = (kind == PIN_RIGHTCOLOR);
     const int nb = g_lb_count[L][B];
     for (int k = 0; k < nb; k++) {
         const int ci = g_lb_bucket[L][B][k];
         const Oriented *o = &g_cat[ci];
         if (top_pin && o->top != x->pin_val[row][col]) continue;
+        if (right_pin && o->right != x->pin_val[row][col]) continue;
         const uint16_t pid = o->piece_id;
         if (used_test(used, pid)) continue;
         used_set(used, pid);
@@ -4321,16 +4323,31 @@ static void bt_set_pins(BtCtx *x, int row, const int pin_idx[3], const int pin_k
     }
 }
 
-/* --backtrack_unlock_right with --clue_corners: a corner clue written home in
-   the band right above a cell of this row (the stop row) makes that cell show
-   the clue's bottom colour, so the clue meets the block without a break. */
+/* --backtrack_unlock_right with --clue_corners: the row-13 clues, which the
+   beam's pin schedule leaves out. A clue whose cell is in the block (a stop row
+   of 13) is placed there, as the row-2 ones are; a block cell right under a
+   clue shows its bottom colour, and a block cell right left of one, the clue
+   being in the band, shows its left colour. So a clue on the board never breaks
+   against the block. The clue piece is reserved from the start, as every clue
+   is, so a pinned cell is its only place. */
 static void bt_band_pins(BtCtx *x, int row, int orient) {
-    if (row != g_band_pin_row || orient < 0) return;
+    if (!g_band_pins || orient < 0) return;
+    const int S = (int)g_stop_row, W = g_last_inner;
     for (int k = CLUE_TOP_LEFT; k <= CLUE_TOP_RIGHT; k++) {
         const ClueCell *cc = &g_clue[orient][k];
-        if (cc->row != row + 1 || cc->col > g_last_inner) continue;
-        x->pin_kind[row][cc->col] = PIN_TOPCOLOR;
-        x->pin_val[row][cc->col]  = g_cat[g_clue_ci[orient][k]].bottom;
+        const int r = cc->row, c = cc->col;
+        const bool in_block = r <= S && c <= W;
+        const Oriented *o = &g_cat[g_clue_ci[orient][k]];
+        if (in_block && row == r) {
+            x->pin_kind[row][c] = PIN_PIECE;
+            x->pin_val[row][c]  = g_clue_ci[orient][k];
+        } else if (row == r - 1 && c <= W) {
+            x->pin_kind[row][c] = PIN_TOPCOLOR;
+            x->pin_val[row][c]  = o->bottom;
+        } else if (!in_block && row == r && c == W + 1) {
+            x->pin_kind[row][c - 1] = PIN_RIGHTCOLOR;
+            x->pin_val[row][c - 1]  = o->left;
+        }
     }
 }
 
@@ -6177,14 +6194,11 @@ int main(int argc, char *argv[]) {
                   "--backtrack_unlock_right the layered extension places the frame itself");
         g_cap_top = false;
         if (g_clue_mask & CLUE_CORNERS) {
-            if (g_stop_row > (uint32_t)(PUZZLE_SIDE - 4))
-                fatal("--backtrack_unlock_right with --clue_corners needs --stop_row 12 or below: "
-                      "the row-13 clues go home in the band");
             if (W < 13 && g_backtrack_row < 2)
                 fatal("--backtrack_unlock_right %u with --clue_corners needs --backtrack_row 2 or "
                       "more: the (2,13) clue goes home in the band, so the beam must place the "
                       "cell beside it", g_unlock_right);
-            if (g_stop_row == (uint32_t)(PUZZLE_SIDE - 4)) g_band_pin_row = (int)g_stop_row;
+            g_band_pins = true;
         }
         g_last_inner = W;
         g_block_mask = (uint16_t)((1u << (W + 1)) - 1u);
