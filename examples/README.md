@@ -258,7 +258,7 @@ Placed cells never move. The output does not depend on `THREADS`.
 ## 11 -- diver: improve complete boards
 
 ```bash
-bash examples/11_diver_reopen.sh                                   # the seven 463s, a minute each
+bash examples/11_diver_reopen.sh                                   # the 463s of data/best_463.csv, a minute each
 bash examples/11_diver_reopen.sh BOARDS=best.csv SECONDS_PER_BOARD=600 THREADS=32
 ```
 
@@ -281,7 +281,7 @@ if it beats the board, and start the next round from the better of the two.
 - **Time is the knob.** The defaults were the best setting measured at 15 s and
   120 s per board, and the gain grew with the budget (+1.03 to +1.33 edges per
   board; PROJECT_E555.md, E555_diver). Some boards do not move at any setting
-  tried (six of the seven 463s in 120 s): those need another attack, such as
+  tried (six of the first seven 463s in 120 s): those need another attack, such as
   04c.
 - **Clue pieces.** A clue inside the band may move. Boards that must keep
   their clues go through 04c (the ender, `CLUES=1`) instead.

@@ -342,7 +342,9 @@ EOF
     grep -q "E555_ender.py" "$OUT/dst_a.plan.sh" || fail "the plan does not run the ender"
     ! grep -q -- "--holes" "$OUT/dst_a.plan.sh" || fail "the plan still passes --holes"
 
-    ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" "$REPO/data/best_463.csv" \
+    # The first seven rows of best_463.csv: the original 463s, enough and fast.
+    head -n 7 data/best_463.csv > "$OUT/dst_463.csv"
+    ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" dst_463.csv \
         --top 1 --out dst_c.csv > dst_c.log 2>&1 ) || fail "the distiller failed on complete boards"
     python3 tools/E555_rank.py "$OUT/dst_c.csv" --seed_file data/seed_Edge5.txt --csv \
         > "$OUT/dst_c_rank.csv"
@@ -434,16 +436,18 @@ EOF
 }
 
 step_sink() {
+    # The first seven rows of best_463.csv: the original 463s these counts are of.
+    head -n 7 data/best_463.csv > "$OUT/sink_463.csv"
     # --sink 0 must leave the rotate path byte for byte where it was.
-    python3 tools/E555_rotate.py data/best_463.csv 1 --seed_file data/seed_Edge5.txt \
+    python3 tools/E555_rotate.py "$OUT/sink_463.csv" 1 --seed_file data/seed_Edge5.txt \
         --out "$OUT/sink_none.csv" > /dev/null
-    python3 tools/E555_rotate.py data/best_463.csv 1 --sink 0 \
+    python3 tools/E555_rotate.py "$OUT/sink_463.csv" 1 --sink 0 \
         --seed_file data/seed_Edge5.txt --out "$OUT/sink_zero.csv" > /dev/null
     cmp -s "$OUT/sink_none.csv" "$OUT/sink_zero.csv" \
         || fail "--sink 0 is not the identity"
 
     for d in 2 3; do
-        python3 tools/E555_rotate.py data/best_463.csv 2 --sink $d \
+        python3 tools/E555_rotate.py "$OUT/sink_463.csv" 2 --sink $d \
             --seed_file data/seed_Edge5.txt --out "$OUT/sink$d.csv" \
             > "$OUT/sink$d.log" || fail "--sink $d failed"
     done
@@ -498,7 +502,7 @@ EOF
 
     # Sinks compose, which is what lets N be turned one notch at a time on a
     # file that has already been sunk.
-    python3 tools/E555_rotate.py data/best_463.csv 2 --sink 1 \
+    python3 tools/E555_rotate.py "$OUT/sink_463.csv" 2 --sink 1 \
         --seed_file data/seed_Edge5.txt --out "$OUT/sink_1a.csv" > /dev/null
     python3 tools/E555_rotate.py "$OUT/sink_1a.csv" 0 --sink 1 \
         --seed_file data/seed_Edge5.txt --out "$OUT/sink_1b.csv" > /dev/null
@@ -507,12 +511,12 @@ EOF
 
     # the centre clue moves with the board but its spin does not, so the filter
     # keeps only a board already carrying the spin of the cell it lands on.
-    python3 tools/E555_rotate.py data/best_463.csv 0 --sink 4 --clue_center \
+    python3 tools/E555_rotate.py "$OUT/sink_463.csv" 0 --sink 4 --clue_center \
         --seed_file data/seed_Edge5.txt --out "$OUT/sink_clue.csv" > /dev/null \
         || fail "--clue_center dropped the one qualifying board"
     n=$(python3 tools/E555_rank.py "$OUT/sink_clue.csv" --seed_file data/seed_Edge5.txt --count)
     [ "$n" = 1 ] || fail "--clue_center kept $n of the 7 boards, expected 1"
-    if python3 tools/E555_rotate.py data/best_463.csv 2 --sink 2 --clue_center \
+    if python3 tools/E555_rotate.py "$OUT/sink_463.csv" 2 --sink 2 --clue_center \
             --seed_file data/seed_Edge5.txt --out "$OUT/sink_noclue.csv" \
             > /dev/null 2>&1; then
         fail "--clue_center kept a board at a setting where none qualifies"
@@ -520,7 +524,7 @@ EOF
 
     for bad in "--sink 15" "--sink 2 --rotations" \
                "--sink 2 --holes data/holes_open_border_TR.csv"; do
-        if python3 tools/E555_rotate.py data/best_463.csv 0 $bad \
+        if python3 tools/E555_rotate.py "$OUT/sink_463.csv" 0 $bad \
                 --seed_file data/seed_Edge5.txt --out "$OUT/sink_bad.csv" \
                 > /dev/null 2>&1; then
             fail "'$bad' was accepted"
@@ -542,11 +546,14 @@ EOF
 # the band rotate_cell actually sends the top rows to, checked against the map
 # rather than against the tool's own table.
 step_consensus() {
-    python3 - data/best_463.csv "$OUT/cons_clued.csv" <<'EOF' || exit 1
+    # The first seven rows of best_463.csv: the original 463s, none of them
+    # clued (the later rows carry the centre clue).
+    head -n 7 data/best_463.csv > "$OUT/cons_463.csv"
+    python3 - "$OUT/cons_463.csv" "$OUT/cons_clued.csv" <<'EOF' || exit 1
 import sys, csv
 sys.path.insert(0, "tools")
 import E555_viewer as V
-# data/ ships no clued board, and this tool reads nothing else. Piece 138 and
+# These seven boards carry no clue, and this tool reads nothing else. Piece 138 and
 # cell (7,7) are both interior, so planting the centre clue by swapping leaves
 # every frame piece where it was and the board frame-legal.
 w = csv.writer(open(sys.argv[2], "w", newline=""), lineterminator="\n")
@@ -781,7 +788,7 @@ EOF
 
     # A corpus with no centre clue is refused, loudly and nonzero: the whole
     # tool rests on being able to read a board's clue frame.
-    if python3 tools/E555_extract_consensus.py data/best_463.csv \
+    if python3 tools/E555_extract_consensus.py "$OUT/cons_463.csv" \
             > "$OUT/cons_unclued.log" 2>&1; then
         fail "an unclued corpus was accepted"
     fi
@@ -4024,10 +4031,12 @@ step_example_diver() {
 }
 
 step_example_diver_reopen() {
-    bash examples/11_diver_reopen.sh OUT="$OUT/ex11.csv" SECONDS_PER_BOARD=1 THREADS=4 \
+    head -n 7 data/best_463.csv > "$OUT/ex11_in.csv"     # its first seven boards
+    bash examples/11_diver_reopen.sh BOARDS="$OUT/ex11_in.csv" OUT="$OUT/ex11.csv" \
+        SECONDS_PER_BOARD=1 THREADS=4 \
         > "$OUT/ex11.log" || { tail -5 "$OUT/ex11.log"; fail "examples/11 exited non-zero"; }
     n=$(grep -c . "$OUT/ex11.csv")
-    [ "$n" = 7 ] || fail "examples/11 wrote $n rows for the 7 boards of data/best_463.csv"
+    [ "$n" = 7 ] || fail "examples/11 wrote $n rows for the first 7 boards of data/best_463.csv"
     nf=$(awk -F, '{print NF; exit}' "$OUT/ex11.csv")
     [ "$nf" = "514" ] || fail "examples/11 wrote $nf fields, want 514"
     python3 tools/E555_rank.py "$OUT/ex11.csv" --seed_file data/seed_Edge5.txt --csv \

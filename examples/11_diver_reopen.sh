@@ -1,7 +1,7 @@
 #!/bin/bash
 # 11_diver_reopen.sh -- improve finished boards; never returns a worse one.
 #
-#   bash examples/11_diver_reopen.sh                    # the seven 463s, a minute each
+#   bash examples/11_diver_reopen.sh                    # the 463s of data/best_463.csv, a minute each
 #   bash examples/11_diver_reopen.sh BOARDS=best.csv SECONDS_PER_BOARD=600 THREADS=32
 #
 # Each board in turn gets SECONDS_PER_BOARD of wall clock, spent in rounds:
