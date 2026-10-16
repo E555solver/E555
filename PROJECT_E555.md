@@ -674,6 +674,51 @@ the ender):
   (checked after each root) to bound a run, and a separate `--out_dir` per R:
   runs with different R append to the same `beam_completions_*` file.
 
+**Used-up inner colours (`--exhaust_inner_color N`).** The inner-colour
+counterpart of `--exhaust_border_color` (5.3): a board completing row S-1 must
+have used up N inner colours, i.e. no unplaced inner piece carries them. Colour
+parity (5.6) then gives `D_c = 0` as well: no top of row S-1, no owed frame face
+and no owed edge shows the colour, so rows S..14 are built from the other
+colours. Any colour counts; none is preferred.
+
+- **Where.** A beam that fills row S-1 checks each child, after the parity test
+  (no backtracking, or `--backtrack_row S-1`). The exhaustive search checks once
+  row S-1's last inner piece is placed (column 14, or 15-R under
+  `--backtrack_unlock_right`), before its right edge.
+- **Exact cuts**, which never drop a board that could pass. To be used up in
+  time, every unplaced inner piece carrying c must fit in the inner cells left
+  below the check, and every owed edge whose inner face is c in the right
+  column up to row S-1. Some colours can never be used up: those on the fixed
+  top border, on column 0 from the stop row up, or on a clue piece above row
+  S-1, and in row S-1 any colour already on a top. A board with fewer than N
+  colours left that can still make it is dropped. This happens at four points:
+  - a configuration, before its beam;
+  - a backtrack-row root, as the beam generates it, so root slots go to roots
+    that can get there. Under `--backtrack_row_factor 0`, where every candidate
+    is a root, the root is dropped as its search starts instead;
+  - every completed row of the search;
+  - every cell of row S-1.
+
+  Only the time changes, never the written boards.
+- **How rare.** These numbers are for random borders, `--stop_row 11`, without
+  the flag:
+  - From `--backtrack_row 6` (20 configurations at width 5000), 1 of the 63,496
+    boards completing row 11 had a colour used up by row 10.
+  - With N = 1 at width 1000, 23 of 40 configurations (one per `--rng_seed`)
+    had row-10 boards that used a colour up, 1 to 82 each, but none of those
+    boards completed row 11.
+
+  Breadth (many configurations) is what finds them. The cuts make the search
+  past row 9 almost free: from `--backtrack_row 7`, 34 boards reached the
+  row-10 check, against 22,513 completing row 10 without the flag, and the
+  extension and dives of the rejected boards are never run.
+- `[sum] exhaust_inner_color N:` gives the boards checked at row S-1 and kept,
+  what the cuts dropped (configurations, roots, partial boards), and the
+  backtracker's boards completing row S-1 by the colours they used up. In the
+  compact log a skipped configuration reads `skipped: fewer than N inner
+  colours can be used up by row S-1` (rotations mode: `skipped:k` on the
+  collapsed line).
+
 ### 5.10 Column-major extension (`--extend_nodes`, `--backtrack_min_col`)
 
 Under `--backtrack_row`, every board completing stop row S is continued before
@@ -1045,7 +1090,8 @@ so every configuration appears, in order.
 roots with boards, nodes, parity and corner cuts, `cut_col` partial rows the
 min-col check cut and `unknown` checks over budget, `near_dups`, boards
 completing each row, extension depth; under `--backtrack_unlock_right` also
-`root_repeats` and, with `--emit_score`, `cut_score`) and the `[dive]` line, and a `[sweep]`
+`root_repeats` and, with `--emit_score`, `cut_score`; under `--exhaust_inner_color`
+`cut_exhaust` and `cut_exh_bound`) and the `[dive]` line, and a `[sweep]`
 line for every configuration in the older form:
 
 ```
@@ -1089,7 +1135,8 @@ dropped as repeats and the boards short of the asked layers or under
 (5.9, 5.10); `reserve` the
 TOP reserve left free at the stop row; `exhausted colour`
 the configs by the frame colour their border used up (`--exhaust_border_color`,
-5.3). `Output boards score` counts the written boards by score, highest first
+5.3); `exhaust_inner_color` the boards checked and kept at row S-1, the exact
+cuts and the inner colours used up (5.9). `Output boards score` counts the written boards by score, highest first
 (at most six, `...` if there are more): the dives' matched edges under
 `--end_dive`, otherwise the matched edges of each written partial board, as
 `E555_rank` scores it. `best boards` says where the five best are: the 0-based
@@ -1125,6 +1172,7 @@ boards or roots they write the same file at any thread count.
 | `--random_edges`, `--samples N` | off, 1 | sample borders (5.3); 0 = unlimited bottoms |
 | `--BL/--BR/--TL/--TR P` | -- | pin a corner piece (`--random_edges`) |
 | `--exhaust_border_color` | off | every random border uses up one frame colour within the bottom row and column 0 rows 1..S (5.3) |
+| `--exhaust_inner_color N` | 0 | boards completing row S-1 must have used up N inner colours; exact cuts drop hopeless configurations, roots and partial rows earlier (5.9) |
 | `--incomplete_top` | off | also write stop-row boards with two of the three segments (`_partial.csv`) or segment B alone (`_partial_B.csv`); not with `--backtrack_row` |
 | `--beam_width K` | 250000 | boards per row |
 | `--stop_row R` | 11 | last row filled, 1..13 |
