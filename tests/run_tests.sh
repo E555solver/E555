@@ -132,7 +132,7 @@ ALL_STEPS=(
     "beamer_min_col|extra|beamer|--backtrack_min_col: the column check drops no written board, random column 0 too; near-duplicate filter; --cap_top changes only row 15; log and score line"
     "beamer_free_top_clue|extra|beamer,diver|--free_top_clue: the top-left clue anywhere above the stop row, the top-right one left to the dives (builds a clue database in RAM)"
     "beamer_unlock_right|extra|beamer|--backtrack_unlock_right: only the block and a prefix of the layered path, break-free; thread-independent; exact root dedup, min_col and emit_score filters; dives; random edges; corner clues home at stop rows 12 and 13 (builds a clue database in RAM twice)"
-    "beamer_exhaust_inner|extra|beamer|--exhaust_inner_color: the row-10 boards it keeps are exactly those a recount of the plain run finds; the exact cuts change no count; beam check, unlock and frame skip run"
+    "beamer_exhaust_inner|extra|beamer|--exhaust_inner_color: the row-10 check and the row-8 rule keep exactly the boards a recount of the plain run finds, alone and together, cuts on or off; N=2, beam, unlock and frame skip run"
     "beamer_resume|extra|beamer|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
     "scripts_parse|core|scripts|every shipped script parses, and passes only flags that exist"
     "example_finalizer|extra|finalizer,scripts|examples/02 re-grows the synthetic board"
@@ -3407,19 +3407,22 @@ print(f"ok: {len(a)} block boards, 1 = 4 threads; {rep} root repeats dropped, ou
 EOF
 }
 
-# --exhaust_inner_color 1 on one random border (seed 6 at width 1000: 5 of its
-# 19,006 row-10 boards use colour 17 up, and none of them reaches row 11):
-#  - the plain run, to stop row 10, is the oracle: a recount of its boards
-#    picks out those that used a colour up by row 10, and the check, with the
-#    exact cuts off (E555_EXH_BOUND=0, test only), must report exactly those,
-#    colour by colour;
-#  - with the cuts on, the same boards complete rows 10 and 11 and the same file
-#    is written, while the cuts drop partial boards. These three runs use one
-#    thread: at four the beam may hand the search other roots (PROJECT 5.15);
-#  - the beam dropping roots (default factor), the beam's own check (no
-#    --backtrack_row), --backtrack_unlock_right (whose rebuilt roots give
-#    edges back, so the search drops most of them at once), and a rotations
-#    row whose top border leaves too few colours (skipped).
+# --exhaust_inner_color on one random border (seed 6 at width 1000: 5 of its
+# 19,006 row-10 boards use colour 17 up, none of which reaches row 11). The
+# plain run, to stop row 10, is the oracle; its boards are recounted here:
+#  - the row-10 check with the row-8 rule off (E555_EXH_SEMI=0, test only):
+#    with the exact cuts off (E555_EXH_BOUND=0) and on, it reports exactly the
+#    boards the recount finds, colour by colour, and the cuts change no count;
+#  - the row-8 rule with the check off (E555_EXH_CHECK=0): exactly the row-10
+#    boards whose rows 1..8 keep a colour with at most 6 faces left complete
+#    row 10;
+#  - both on: exactly the boards that pass both;
+#  - these runs use one thread: at four the beam may hand the search other
+#    roots (PROJECT 5.15). Then, at four: N = 2, the beam dropping roots
+#    (default factor), the beam's own check and rule (no --backtrack_row),
+#    --backtrack_unlock_right (whose rebuilt roots give edges back, so the
+#    search drops most of them at once), and a rotations row whose top border
+#    leaves too few colours (skipped).
 step_beamer_exhaust_inner() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
     gate_db
@@ -3428,23 +3431,31 @@ step_beamer_exhaust_inner() {
     RND=(bin/E555_beamer data/seed_Edge5.txt --random_edges --samples 1 --top_columns 1
          --beam_width 1000 --rng_seed 6 "${DBA[@]}")
     BT=(--backtrack_row 7 --backtrack_row_factor 0 --no_top_dedup --threads 1)
+    EX=(--stop_row 11 --exhaust_inner_color 1)
     "${RND[@]}" "${BT[@]}" --stop_row 10 --extend_nodes 0 --out_dir "$OUT/ei_a" > "$OUT/ei_a.log" \
         || { tail -5 "$OUT/ei_a.log"; fail "the plain run exited non-zero"; }
-    E555_EXH_BOUND=0 "${RND[@]}" "${BT[@]}" --stop_row 11 --exhaust_inner_color 1 \
+    E555_EXH_SEMI=0 E555_EXH_BOUND=0 "${RND[@]}" "${BT[@]}" "${EX[@]}" \
         --out_dir "$OUT/ei_d" > "$OUT/ei_d.log" \
-        || { tail -5 "$OUT/ei_d.log"; fail "the run without the cuts exited non-zero"; }
-    "${RND[@]}" "${BT[@]}" --stop_row 11 --exhaust_inner_color 1 --verbose \
+        || { tail -5 "$OUT/ei_d.log"; fail "the check-only run without the cuts exited non-zero"; }
+    E555_EXH_SEMI=0 "${RND[@]}" "${BT[@]}" "${EX[@]}" --verbose \
         --out_dir "$OUT/ei_b" > "$OUT/ei_b.log" \
-        || { tail -5 "$OUT/ei_b.log"; fail "the run with the cuts exited non-zero"; }
+        || { tail -5 "$OUT/ei_b.log"; fail "the check-only run with the cuts exited non-zero"; }
     cmp -s "$OUT/ei_d/beam_completions_random_11.csv" "$OUT/ei_b/beam_completions_random_11.csv" \
         || fail "the exact cuts changed the written boards"
-    "${RND[@]}" --backtrack_row 9 --stop_row 11 --exhaust_inner_color 1 --threads 4 \
+    E555_EXH_CHECK=0 "${RND[@]}" "${BT[@]}" "${EX[@]}" --verbose \
+        --out_dir "$OUT/ei_x" > "$OUT/ei_x.log" \
+        || { tail -5 "$OUT/ei_x.log"; fail "the rule-only run exited non-zero"; }
+    "${RND[@]}" "${BT[@]}" "${EX[@]}" --out_dir "$OUT/ei_y" > "$OUT/ei_y.log" \
+        || { tail -5 "$OUT/ei_y.log"; fail "the run with the rule and the check exited non-zero"; }
+    "${RND[@]}" --backtrack_row 7 --stop_row 11 --exhaust_inner_color 2 --threads 4 \
+        --out_dir "$OUT/ei_n2" > "$OUT/ei_n2.log" \
+        || { tail -5 "$OUT/ei_n2.log"; fail "the N = 2 run exited non-zero"; }
+    "${RND[@]}" --backtrack_row 9 "${EX[@]}" --threads 4 \
         --out_dir "$OUT/ei_m" > "$OUT/ei_m.log" \
         || { tail -5 "$OUT/ei_m.log"; fail "the default-factor run exited non-zero"; }
-    "${RND[@]}" --stop_row 11 --exhaust_inner_color 1 --threads 4 \
-        --out_dir "$OUT/ei_f" > "$OUT/ei_f.log" \
+    "${RND[@]}" "${EX[@]}" --threads 4 --out_dir "$OUT/ei_f" > "$OUT/ei_f.log" \
         || { tail -5 "$OUT/ei_f.log"; fail "the beam-only run exited non-zero"; }
-    "${RND[@]}" --backtrack_unlock_right 3 --backtrack_row 9 --stop_row 11 --exhaust_inner_color 1 \
+    "${RND[@]}" --backtrack_unlock_right 3 --backtrack_row 9 "${EX[@]}" \
         --threads 4 --out_dir "$OUT/ei_u" > "$OUT/ei_u.log" \
         || { tail -5 "$OUT/ei_u.log"; fail "the unlock run exited non-zero"; }
     bin/E555_beamer data/seed_Edge5.txt data/annealer_MaxSides.csv --num_rows 1 --top_bottoms 1 \
@@ -3461,14 +3472,21 @@ def boards(d):
         for l in open(p):
             if l.strip() and l[0] not in "#%":
                 yield list(map(int, l.split(",")[-512:-256]))
-def closed(pos, R=10, W=14):
-    """The inner colours no inner piece outside rows 1..R x cols 1..W carries."""
-    left = set()
+def faces_left(pos, R, W=14):
+    """Faces of each inner colour on inner pieces outside rows 1..R x cols 1..W."""
+    left = collections.Counter()
     for p in inner:
         q = pos[p]
         if q == 999 or not (1 <= q // 16 <= R and 1 <= q % 16 <= W):
             left.update(seed[p])
-    return [c for c in range(6, 23) if c not in left]
+    return left
+def closed(pos, R=10, W=14):
+    left = faces_left(pos, R, W)
+    return [c for c in range(6, 23) if left[c] == 0]
+def rule(pos, N=1, R=8, W=14):
+    """The row S-3 rule: N colours with at most 5 + N faces left."""
+    left = faces_left(pos, R, W)
+    return sum(1 for c in range(6, 23) if left[c] <= 5 + N) >= N
 def log(d): return open(f"{out}/{d}.log").read()
 def roots(d):
     m = re.search(r"beam: (\d+) roots|^\[beam\] .* roots=(\d+)", log(d), re.M)
@@ -3478,41 +3496,61 @@ def reached(d):
     return dict(re.findall(r"r(\d+):(\S+)", m.group(1)))
 def tally(d):
     m = re.search(r"^\[sum\] exhaust_inner_color \d+: (\d+) boards checked at row 10, (\d+) kept"
-                  r"(?:; cut before: (\d+) configs, (\d+) roots, (\d+) partial boards)?"
-                  r"(?:; (\d+) backtracker boards completed row 10, colours used up: (.*))?$", log(d), re.M)
+                  r"(?:; cut before: (\d+) configs, (\d+) roots)?"
+                  r"(?:; (\d+) backtracker boards completed row 10, colours used up: ([^;\n]*))?"
+                  r"(?:; row 8 rule \(\d+ colours? with <= \d+ faces left\): (\d+) of (\d+) kept)?$",
+                  log(d), re.M)
     assert m, f"no exhaust_inner_color summary line in {d}"
     return m
 
-want, n_a = collections.Counter(), 0
+want, n_a, n_rule, both = collections.Counter(), 0, 0, collections.Counter()
 for pos in boards("ei_a"):
     n_a += 1
-    for c in closed(pos): want[c] += 1
+    c, r = closed(pos), rule(pos)
+    n_rule += r
+    for x in c:
+        want[x] += 1
+        if r: both[x] += 1
 assert want, f"the plain run's {n_a} row-10 boards use no colour up: the check would test nothing"
-assert len({roots(d) for d in ("ei_a", "ei_d", "ei_b")}) == 1, "the beam handed the runs other roots"
-ra, rd, rb = reached("ei_a"), reached("ei_d"), reached("ei_b")
+assert 0 < n_rule < n_a, f"{n_rule} of the plain run's {n_a} row-10 boards pass the row-8 rule"
+assert len({roots(d) for d in ("ei_a", "ei_d", "ei_b", "ei_x", "ei_y")}) == 1, \
+    "the beam handed the runs other roots"
+ra, rd, rb, rx = reached("ei_a"), reached("ei_d"), reached("ei_b"), reached("ei_x")
 assert (ra["8"], ra["9"]) == (rd["8"], rd["9"]), "the check changed the search below row 10"
-used_up = ", ".join(f"c{c} {want[c]}" for c in sorted(want))
-for d in ("ei_d", "ei_b"):
+def fmt(cnt): return ", ".join(f"c{c} {cnt[c]}" for c in sorted(cnt)) or "none"
+for d, cnt in (("ei_d", want), ("ei_b", want), ("ei_y", both)):
     t = tally(d)
-    assert (t.group(6), t.group(7)) == (str(sum(want.values())), used_up), \
-        f"{d}: {t.group(6)} boards used up {t.group(7)} by row 10; the plain run's recount: {used_up}"
+    assert (t.group(5), t.group(6)) == (str(sum(cnt.values())), fmt(cnt)), \
+        f"{d}: {t.group(5)} boards used up {t.group(6)} by row 10; the plain run's recount: {fmt(cnt)}"
 assert (rd["10"], rd["11"]) == (rb["10"], rb["11"]), "the exact cuts changed the boards completing rows 10-11"
-tb = tally("ei_b")
-assert int(tb.group(5)) > 0, "the cuts dropped no partial board"
+assert int(tally("ei_b").group(1)) > int(tally("ei_b").group(2)) > 0, "the check kept all or nothing"
 assert re.search(r"^\[cfg\] exhaust_inner_color=1 ", log("ei_b"), re.M), "no [cfg] line"
-assert re.search(r"^\[dfs\] .* cut_exhaust=\d+ cut_exh_bound=[1-9]", log("ei_b"), re.M), "no [dfs] cut counts"
-for d, W in (("ei_d", 14), ("ei_b", 14), ("ei_m", 14), ("ei_f", 14), ("ei_u", 12)):
+assert re.search(r"^\[dfs\] .* cut_exhaust=[1-9]\d* cut_exh_root=\d+ cut_semi=0", log("ei_b"), re.M), \
+    "no [dfs] cut counts"
+assert rx["10"] == str(n_rule), \
+    f"with the rule alone {rx['10']} boards completed row 10; the plain run's recount: {n_rule}"
+assert int(rx["8"]) < int(ra["8"]) and int(rx["9"]) <= int(ra["9"]), "the rule cut nothing at row 8"
+tx = tally("ei_x")
+assert int(tx.group(7)) == int(rx["8"]) < int(tx.group(8)), "the rule's kept/checked counts are off"
+for d, W in (("ei_d", 14), ("ei_b", 14), ("ei_y", 14), ("ei_m", 14), ("ei_f", 14), ("ei_u", 12)):
     for pos in boards(d):
         assert closed(pos, 10, W), f"{d} wrote a board that uses no colour up by row 10"
+        if d not in ("ei_d", "ei_b", "ei_u"):     # unlock: the beam tested row 8 at full width
+            assert rule(pos, 1, 8, W), f"{d} wrote a board that fails the row-8 rule"
+for pos in boards("ei_x"):
+    assert rule(pos), "the rule-only run wrote a board that fails the row-8 rule"
+for pos in boards("ei_n2"):
+    assert len(closed(pos)) >= 2 and rule(pos, 2), "the N = 2 run wrote a board short of 2 colours"
+assert tally("ei_n2").group(7) is not None, "no row-8 rule count in the N = 2 run"
 tally("ei_m")
-assert int(tally("ei_f").group(1)) > 0, "the beam checked no row-10 child"
+assert int(tally("ei_f").group(8)) > 0, "the beam tested no row-8 child"
 assert int(tally("ei_u").group(4)) > 0, "the unlock run dropped no rebuilt root"
 assert re.search(r"^\[sweep\] r0b0l0-l1 x2 found=0 skipped:2 ", log("ei_r"), re.M), "the frame skip did not log"
 assert tally("ei_r").group(3) == "2", "the rotations run did not skip both configurations"
 assert not list(boards("ei_r")), "a skipped configuration wrote boards"
-print(f"ok: {sum(want.values())} of {n_a} row-10 boards use a colour up ({used_up}), as the check "
-      f"reports with and without the cuts; the cuts dropped {tb.group(5)} partial boards and changed "
-      f"no count; beam check, root cut, unlock and frame skip run")
+print(f"ok: {sum(want.values())} of {n_a} row-10 boards use a colour up ({fmt(want)}), as the check "
+      f"reports with and without the cuts; {n_rule} keep a colour on <= 6 faces at row 8, as the rule "
+      f"lets through; both: {fmt(both)}; N = 2, beam, root cut, unlock and frame skip run")
 EOF
 }
 

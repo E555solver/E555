@@ -120,9 +120,10 @@ typedef struct {
     BeamEntry tmp;
     PoolEntry buf[POOL_BATCH];
     uint32_t  buf_n;
-    /* --exhaust_inner_color: children checked and cut at the check row, and
-       cut at the backtrack row; summed after each row. */
-    uint64_t  exh_checked, exh_cut, exh_root_cut;
+    /* --exhaust_inner_color: children checked and cut at the check row, cut
+       at the backtrack row, checked and cut by the row S-3 rule; summed after
+       each row. */
+    uint64_t  exh_checked, exh_cut, exh_root_cut, semi_checked, semi_cut;
     /* Clue-row candidate chains. Touched only on the two or three rows that
        carry a clue, so it lives AFTER the hot fields: putting it between tmp and
        buf pushed them 30 KB apart and cost ~2.8x on expand. */
