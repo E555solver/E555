@@ -34,11 +34,10 @@
 #
 # RUNTIME  --all: about 4 minutes with SKIP_BEAMER=1. The checks that need the
 # real 6.4 GB chain database -- beamer_micro, beamer_backtrack_dive,
-# beamer_min_col, beamer_free_top_clue, beamer_unlock_right,
-# beamer_exhaust_inner, beamer_resume, example_beamer and pipeline_full -- want
-# ~8 GB of RAM and share one cache, except the clue runs of
-# beamer_free_top_clue and beamer_unlock_right, which build their own in RAM.
-# None is core.
+# beamer_min_col, beamer_resume, example_beamer and pipeline_full -- want ~8 GB
+# of RAM and share one cache; no check builds a database of its own, and none
+# runs the beamer on one thread. The beamer tag takes about 2 minutes once the
+# cache exists. None is core.
 #
 # Environment switches:
 #   ARCH=generic    build for any CPU rather than the build host. Set it in CI
@@ -130,9 +129,6 @@ ALL_STEPS=(
     "beamer_micro|extra|beamer|random_edges micro-run: builds the real 6.4 GB database; no border runs twice"
     "beamer_backtrack_dive|extra|beamer,diver|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --lambda_reserve keeps the reserve for last"
     "beamer_min_col|extra|beamer|--backtrack_min_col: the column check drops no written board, random column 0 too; near-duplicate filter; --cap_top changes only row 15; log and score line"
-    "beamer_free_top_clue|extra|beamer,diver|--free_top_clue: the top-left clue anywhere above the stop row, the top-right one left to the dives (builds a clue database in RAM)"
-    "beamer_unlock_right|extra|beamer|--backtrack_unlock_right: only the block and a prefix of the layered path, break-free; thread-independent; exact root dedup, min_col and emit_score filters; dives; random edges; corner clues home at stop rows 12 and 13 (builds a clue database in RAM twice)"
-    "beamer_exhaust_inner|extra|beamer|--exhaust_inner_color: the row-10 check and the row-8 rule keep exactly the boards a recount of the plain run finds, alone and together, cuts on or off; N=2, beam, unlock and frame skip run"
     "beamer_resume|extra|beamer|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
     "scripts_parse|core|scripts|every shipped script parses, and passes only flags that exist"
     "example_finalizer|extra|finalizer,scripts|examples/02 re-grows the synthetic board"
@@ -3217,12 +3213,10 @@ step_beamer_micro() {
     # No (bottom, column) pair runs twice in a run: E555_BORDER_KEYS writes the
     # key of every border run to stderr, and 80 tiny configs over 2 bottoms
     # must give 80 distinct keys.
-    DD=(bin/E555_beamer data/seed_Edge5.txt --random_edges --exhaust_border_color --pin_clue 1
+    DD=(bin/E555_beamer data/seed_Edge5.txt --random_edges --exhaust_border_color
         --samples 2 --top_columns 40 --stop_row 8 --beam_width 1 --pool_factor 1
         --rng_seed 3 --threads 4 --out_dir "$OUT/beam_dd")
-    # No --db_file: --pin_clue takes the clue piece out of the database, so on
-    # the shared cache this run would rewrite it for its clue set and the next
-    # database check would have to build it back. It builds its own in RAM.
+    if [ -n "$GATE_DB" ]; then DD+=(--db_file "$GATE_DB"); fi
     E555_BORDER_KEYS=1 "${DD[@]}" > "$OUT/beam_dd.log" 2> "$OUT/beam_dd.err" \
         || { tail -5 "$OUT/beam_dd.log" "$OUT/beam_dd.err"; fail "the border-dedup run exited non-zero"; }
     grep "^\[bkey\]" "$OUT/beam_dd.err" > "$OUT/beam_dd.keys" || true
@@ -3237,329 +3231,16 @@ step_beamer_micro() {
 # --resume: one sweep over border rows 1..2, and the same sweep stopped by
 # --max_emitted inside row 2 and resumed. The resumed run must stay inside rows
 # 1..2 (a job that owns a slice of the rotations file must not spill into the
-# next job's rows), run exactly the configurations the first run did not, and
-# the two runs together must write exactly the uninterrupted sweep's boards.
-# --backtrack_unlock_right 3: the roots give back columns 13..15, rows above the
-# backtrack row are searched over columns 1..12, and the layered extension grows
-# the band. Every board holds the block, a prefix of the documented layer path
-# (and the band corner clues), legal frame pieces and no break. The run is
-# thread-independent; the root dedup, --backtrack_min_col (band columns left
-# open) and --emit_score keep exactly the boards they should; dives and random
-# edges work. The two clue runs, stop rows 12 and 13, build their own database
-# in RAM (~1.5 min each).
-step_beamer_unlock_right() {
-    if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
-    gate_db
-    local DBA=()
-    if [ -n "$GATE_DB" ]; then DBA=(--db_file "$GATE_DB"); fi
-    CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv --num_rows 1
-         --top_bottoms 1 --top_columns 2 --beam_width 2000 --rng_seed 7 --backtrack_unlock_right 3
-         --backtrack_row 9 --stop_row 12 "${DBA[@]}")
-    "${CMD[@]}" --threads 1 --out_dir "$OUT/ur_a" > "$OUT/ur_a.log" \
-        || { tail -5 "$OUT/ur_a.log"; fail "the unlock run exited non-zero"; }
-    "${CMD[@]}" --threads 4 --out_dir "$OUT/ur_a4" > "$OUT/ur_a4.log" \
-        || { tail -5 "$OUT/ur_a4.log"; fail "the 4-thread unlock run exited non-zero"; }
-    cmp -s "$OUT/ur_a/beam_completions_0_12.csv" "$OUT/ur_a4/beam_completions_0_12.csv" \
-        || fail "--backtrack_unlock_right wrote other boards at 4 threads than at 1"
-    "${CMD[@]}" --threads 4 --backtrack_row_factor 0 --verbose --out_dir "$OUT/ur_c" > "$OUT/ur_c.log" \
-        || { tail -5 "$OUT/ur_c.log"; fail "the factor-0 unlock run exited non-zero"; }
-    E555_ROOT_DEDUP=0 "${CMD[@]}" --threads 4 --backtrack_row_factor 0 --out_dir "$OUT/ur_cn" \
-        > "$OUT/ur_cn.log" || { tail -5 "$OUT/ur_cn.log"; fail "the run without root dedup exited non-zero"; }
-    cmp -s "$OUT/ur_c/beam_completions_0_12.csv" "$OUT/ur_cn/beam_completions_0_12.csv" \
-        || fail "the root dedup changed the written boards"
-    LOW=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv --num_rows 1
-         --top_bottoms 1 --top_columns 1 --beam_width 1000 --rng_seed 7 --backtrack_unlock_right 3
-         --backtrack_row 9 --stop_row 10 --threads 4 "${DBA[@]}")
-    local v
-    for v in "k3:" "k2:--backtrack_min_col 2" "e:--emit_score 300"; do
-        "${LOW[@]}" --no_top_dedup ${v#*:} --out_dir "$OUT/ur_d${v%%:*}" > "$OUT/ur_d${v%%:*}.log" \
-            || { tail -5 "$OUT/ur_d${v%%:*}.log"; fail "the unlock run '${v#*:}' exited non-zero"; }
-    done
-    "${LOW[@]}" --backtrack_min_col 2 --end_dive 100 --end_polish 20 --emit_score 0 \
-        --out_dir "$OUT/ur_dive" > "$OUT/ur_dive.log" \
-        || { tail -5 "$OUT/ur_dive.log"; fail "the unlock run with dives exited non-zero"; }
-    bin/E555_beamer data/seed_Edge5.txt --random_edges --exhaust_border_color --samples 1 --top_columns 1 \
-        --beam_width 1000 --backtrack_row 9 --stop_row 10 --backtrack_unlock_right 3 --backtrack_min_col 2 \
-        --rng_seed 3 --threads 4 --out_dir "$OUT/ur_rnd" "${DBA[@]}" > "$OUT/ur_rnd.log" \
-        || { tail -5 "$OUT/ur_rnd.log"; fail "the random-edges unlock run exited non-zero"; }
-    bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv --start_row 1 --num_rows 1 \
-        --top_bottoms 1 --top_columns 2 --beam_width 2000 --clue_corners --backtrack_row 8 --stop_row 12 \
-        --backtrack_unlock_right 3 --rng_seed 7 --threads 4 --out_dir "$OUT/ur_clue" > "$OUT/ur_clue.log" \
-        || { tail -5 "$OUT/ur_clue.log"; fail "the clued unlock run exited non-zero"; }
-    # Stop row 13: the (13,2) clue is in the block, so the search places it.
-    bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv --start_row 1 --num_rows 1 \
-        --top_bottoms 1 --top_columns 2 --beam_width 2000 --clue_corners --backtrack_row 8 --stop_row 13 \
-        --backtrack_unlock_right 4 --rng_seed 7 --threads 4 --out_dir "$OUT/ur_clue13" > "$OUT/ur_clue13.log" \
-        || { tail -5 "$OUT/ur_clue13.log"; fail "the clued stop-row-13 unlock run exited non-zero"; }
-    python3 - "$OUT" <<'EOF' || exit 1
-import glob, re, sys
-out = sys.argv[1]
-seed = [list(map(int, l.split())) for l in open("data/seed_Edge5.txt") if l.strip()]
-R, W = 3, 12
-def rows(d):
-    for p in sorted(glob.glob(f"{out}/{d}/beam_completions_*.csv")):
-        for l in open(p):
-            if l.strip() and l[0] not in "#%":
-                yield l
-def board(l):
-    v = [x.strip() for x in l.split(",")]
-    pos, rot = list(map(int, v[-512:-256])), list(map(int, v[-256:]))
-    c = {}
-    for p in range(256):
-        if pos[p] != 999:
-            assert pos[p] not in c, "two pieces on one cell"
-            c[pos[p]] = (p, rot[p])
-    return c
-def side(c, x, d):
-    p, r = c[x]; return seed[p][(d + r) % 4]
-def matched_broken(c):
-    m = b = 0
-    for x in c:
-        r, col = divmod(x, 16)
-        for y, d, e in ((x + 1, 1, 3), (x + 16, 0, 2)):
-            if (d == 1 and col == 15) or (d == 0 and r == 15) or y not in c: continue
-            if side(c, x, d) == side(c, y, e): m += 1
-            else: b += 1
-    return m, b
-def path(S, skip, W=W):       # the documented layer path, and the cells completing each layer
-    cells, done, k = [], [0], 1
-    while W + k <= 15 or S + k <= 15:
-        c, r = W + k, S + k
-        if c <= 15: cells += [y * 16 + c for y in range(min(r, 15) + 1)]
-        if r <= 15: cells += [r * 16 + x for x in range(min(c - 1, 15), -1, -1)]
-        cells = [x for x in cells if x not in skip]
-        done.append(len(cells)); k += 1
-    return cells, done
-# keyed by the (2,2) clue: (piece, spin) on (2,13), (13,2), (13,13)
-FRAME = {180: ((248, 3), (207, 3), (254, 1)), 248: ((254, 0), (180, 3), (207, 2)),
-         254: ((207, 1), (248, 1), (180, 2)), 207: ((180, 1), (254, 2), (248, 0))}
-def check(c, S, clues=False, dived=False, W=W):
-    """The board's whole layers, after checking the block, the path prefix, the frame and breaks."""
-    block = {r * 16 + x for r in range(S + 1) for x in range(W + 1)}
-    assert block <= set(c), "the block is not full"
-    skip = set()
-    if clues:                               # every corner clue home, at its spin
-        for x, clue in zip((2 * 16 + 13, 13 * 16 + 2, 13 * 16 + 13), FRAME[c[2 * 16 + 2][0]]):
-            assert c.get(x) == clue, f"clue {clue} is not home on cell {x}"
-            if x not in block: skip.add(x)
-    for x, (p, r) in c.items():             # grey sides out, and only there
-        row, col = divmod(x, 16)
-        out_ = (row == 15, col == 15, row == 0, col == 0)
-        assert all((seed[p][(d + r) % 4] == 0) == out_[d] for d in range(4)), f"a frame piece misplaced on {x}"
-    if dived:
-        assert len(c) == 256, "a dived board is not full"
-        for x in block:
-            for y, d, e in ((x + 1, 1, 3), (x + 16, 0, 2)):
-                if y in block: assert side(c, x, d) == side(c, y, e), "a dived board broke the block"
-        return 0
-    assert matched_broken(c)[1] == 0, "a written board has a break"
-    P, done = path(S, skip, W)
-    ext = set(c) - block - skip
-    assert ext == set(P[:len(ext)]), "the extension is not a prefix of the layer path"
-    return max(i for i in range(len(done)) if done[i] <= len(ext))
-def log(d): return open(f"{out}/{d}.log").read()
-content = lambda l: ",".join(l.split(",")[-512:])
-
-a = list(rows("ur_a"))
-assert a, "the unlock run wrote no board"
-for l in a: check(board(l), 12)
-t = log("ur_a")
-assert re.search(r"^\[cfg\] backtrack_unlock_right=3 ", t, re.M), "no [cfg] line"
-assert re.search(r"^\[sum\] unlock_right 3: block rows 0\.\.12 x columns 0\.\.12; ", t, re.M), "no [sum] line"
-m = re.search(r"^\[sum\] boards: found (\d+), near-dups (\d+)\n", t, re.M)
-assert m and int(m.group(1)) - int(m.group(2)) == len(a), \
-    "default K: not every stop-row board the near-duplicate filter kept was written"
-rep = sum(int(x) for x in re.findall(r"^\[dfs\] .* root_repeats=(\d+)", log("ur_c"), re.M))
-assert rep > 0, "no root repeat dropped at --backtrack_row_factor 0"
-c = [content(l) for l in rows("ur_c")]
-assert len(c) == len(set(c)), "a board was written twice"
-
-k3, layers = list(rows("ur_dk3")), {}
-for l in k3:
-    n = check(board(l), 10)
-    layers[n] = layers.get(n, 0) + 1
-k2 = [content(l) for l in rows("ur_dk2")]
-want = [content(l) for l in k3 if check(board(l), 10) >= 1]
-assert k2 and k2 == want, f"--backtrack_min_col 2 wrote {len(k2)} boards, {len(want)} complete layer 1"
-es = [content(l) for l in rows("ur_de")]
-want = [content(l) for l in k3 if matched_broken(board(l))[0] >= 300]
-assert es and es == want, f"--emit_score 300 wrote {len(es)} boards, {len(want)} score 300 or more"
-m = re.search(r"; (\d+) boards short of layer 1", log("ur_dk2"))
-assert m and int(m.group(1)) == len(k3) - len(k2), "the below-layer count is off"
-m = re.search(r"; (\d+) boards under --emit_score 300", log("ur_de"))
-assert m and int(m.group(1)) == len(k3) - len(es), "the below-score count is off"
-
-dv = list(rows("ur_dive"))
-assert dv, "the dived unlock run wrote no board"
-for l in dv: check(board(l), 10, dived=True)
-rb = list(rows("ur_rnd"))
-assert rb, "the random-edges unlock run wrote no board"
-for l in rb: assert check(board(l), 10) >= 1, "a random-edges board short of layer 1"
-cl = list(rows("ur_clue"))
-assert cl, "the clued unlock run wrote no board"
-for l in cl: check(board(l), 12, clues=True)
-c13 = list(rows("ur_clue13"))
-assert c13, "the clued stop-row-13 unlock run wrote no board"
-for l in c13: check(board(l), 13, clues=True, W=11)
-print(f"ok: {len(a)} block boards, 1 = 4 threads; {rep} root repeats dropped, output unchanged; "
-      f"layers {dict(sorted(layers.items()))}: min_col 2 keeps {len(k2)}, emit_score 300 "
-      f"{len(es)}; {len(dv)} dived, {len(rb)} random-edges, {len(cl)} + {len(c13)} clued boards")
-EOF
-}
-
-# --exhaust_inner_color on one random border (seed 6 at width 1000: 5 of its
-# 19,006 row-10 boards use colour 17 up, none of which reaches row 11). The
-# plain run, to stop row 10, is the oracle; its boards are recounted here:
-#  - the row-10 check with the row-8 rule off (E555_EXH_SEMI=0, test only):
-#    with the exact cuts off (E555_EXH_BOUND=0) and on, it reports exactly the
-#    boards the recount finds, colour by colour, and the cuts change no count;
-#  - the row-8 rule with the check off (E555_EXH_CHECK=0): exactly the row-10
-#    boards whose rows 1..8 keep a colour with at most 6 faces left complete
-#    row 10;
-#  - both on: exactly the boards that pass both;
-#  - these runs use one thread: at four the beam may hand the search other
-#    roots (PROJECT 5.15). Then, at four: N = 2, the beam dropping roots
-#    (default factor), the beam's own check and rule (no --backtrack_row),
-#    --backtrack_unlock_right (whose rebuilt roots give edges back, so the
-#    search drops most of them at once), and a rotations row whose top border
-#    leaves too few colours (skipped).
-step_beamer_exhaust_inner() {
-    if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
-    gate_db
-    local DBA=()
-    if [ -n "$GATE_DB" ]; then DBA=(--db_file "$GATE_DB"); fi
-    RND=(bin/E555_beamer data/seed_Edge5.txt --random_edges --samples 1 --top_columns 1
-         --beam_width 1000 --rng_seed 6 "${DBA[@]}")
-    BT=(--backtrack_row 7 --backtrack_row_factor 0 --no_top_dedup --threads 1)
-    EX=(--stop_row 11 --exhaust_inner_color 1)
-    "${RND[@]}" "${BT[@]}" --stop_row 10 --extend_nodes 0 --out_dir "$OUT/ei_a" > "$OUT/ei_a.log" \
-        || { tail -5 "$OUT/ei_a.log"; fail "the plain run exited non-zero"; }
-    E555_EXH_SEMI=0 E555_EXH_BOUND=0 "${RND[@]}" "${BT[@]}" "${EX[@]}" \
-        --out_dir "$OUT/ei_d" > "$OUT/ei_d.log" \
-        || { tail -5 "$OUT/ei_d.log"; fail "the check-only run without the cuts exited non-zero"; }
-    E555_EXH_SEMI=0 "${RND[@]}" "${BT[@]}" "${EX[@]}" --verbose \
-        --out_dir "$OUT/ei_b" > "$OUT/ei_b.log" \
-        || { tail -5 "$OUT/ei_b.log"; fail "the check-only run with the cuts exited non-zero"; }
-    cmp -s "$OUT/ei_d/beam_completions_random_11.csv" "$OUT/ei_b/beam_completions_random_11.csv" \
-        || fail "the exact cuts changed the written boards"
-    E555_EXH_CHECK=0 "${RND[@]}" "${BT[@]}" "${EX[@]}" --verbose \
-        --out_dir "$OUT/ei_x" > "$OUT/ei_x.log" \
-        || { tail -5 "$OUT/ei_x.log"; fail "the rule-only run exited non-zero"; }
-    "${RND[@]}" "${BT[@]}" "${EX[@]}" --out_dir "$OUT/ei_y" > "$OUT/ei_y.log" \
-        || { tail -5 "$OUT/ei_y.log"; fail "the run with the rule and the check exited non-zero"; }
-    "${RND[@]}" --backtrack_row 7 --stop_row 11 --exhaust_inner_color 2 --threads 4 \
-        --out_dir "$OUT/ei_n2" > "$OUT/ei_n2.log" \
-        || { tail -5 "$OUT/ei_n2.log"; fail "the N = 2 run exited non-zero"; }
-    "${RND[@]}" --backtrack_row 9 "${EX[@]}" --threads 4 \
-        --out_dir "$OUT/ei_m" > "$OUT/ei_m.log" \
-        || { tail -5 "$OUT/ei_m.log"; fail "the default-factor run exited non-zero"; }
-    "${RND[@]}" "${EX[@]}" --threads 4 --out_dir "$OUT/ei_f" > "$OUT/ei_f.log" \
-        || { tail -5 "$OUT/ei_f.log"; fail "the beam-only run exited non-zero"; }
-    "${RND[@]}" --backtrack_unlock_right 3 --backtrack_row 9 "${EX[@]}" \
-        --threads 4 --out_dir "$OUT/ei_u" > "$OUT/ei_u.log" \
-        || { tail -5 "$OUT/ei_u.log"; fail "the unlock run exited non-zero"; }
-    bin/E555_beamer data/seed_Edge5.txt data/annealer_MaxSides.csv --num_rows 1 --top_bottoms 1 \
-        --top_columns 2 --beam_width 1000 --backtrack_row 7 --stop_row 11 --exhaust_inner_color 10 \
-        --threads 4 "${DBA[@]}" --out_dir "$OUT/ei_r" > "$OUT/ei_r.log" \
-        || { tail -5 "$OUT/ei_r.log"; fail "the rotations run exited non-zero"; }
-    python3 - "$OUT" <<'EOF' || exit 1
-import collections, glob, re, sys
-out = sys.argv[1]
-seed = [list(map(int, l.split())) for l in open("data/seed_Edge5.txt") if l.strip()]
-inner = [p for p in range(256) if 0 not in seed[p]]
-def boards(d):
-    for p in sorted(glob.glob(f"{out}/{d}/beam_completions_*.csv")):
-        for l in open(p):
-            if l.strip() and l[0] not in "#%":
-                yield list(map(int, l.split(",")[-512:-256]))
-def faces_left(pos, R, W=14):
-    """Faces of each inner colour on inner pieces outside rows 1..R x cols 1..W."""
-    left = collections.Counter()
-    for p in inner:
-        q = pos[p]
-        if q == 999 or not (1 <= q // 16 <= R and 1 <= q % 16 <= W):
-            left.update(seed[p])
-    return left
-def closed(pos, R=10, W=14):
-    left = faces_left(pos, R, W)
-    return [c for c in range(6, 23) if left[c] == 0]
-def rule(pos, N=1, R=8, W=14):
-    """The row S-3 rule: N colours with at most 5 + N faces left."""
-    left = faces_left(pos, R, W)
-    return sum(1 for c in range(6, 23) if left[c] <= 5 + N) >= N
-def log(d): return open(f"{out}/{d}.log").read()
-def roots(d):
-    m = re.search(r"beam: (\d+) roots|^\[beam\] .* roots=(\d+)", log(d), re.M)
-    return m.group(1) or m.group(2)
-def reached(d):
-    m = re.search(r"^\[sum\] backtrack: .*?;(.*)$", log(d), re.M)
-    return dict(re.findall(r"r(\d+):(\S+)", m.group(1)))
-def tally(d):
-    m = re.search(r"^\[sum\] exhaust_inner_color \d+: (\d+) boards checked at row 10, (\d+) kept"
-                  r"(?:; cut before: (\d+) configs, (\d+) roots)?"
-                  r"(?:; (\d+) backtracker boards completed row 10, colours used up: ([^;\n]*))?"
-                  r"(?:; row 8 rule \(\d+ colours? with <= \d+ faces left\): (\d+) of (\d+) kept)?$",
-                  log(d), re.M)
-    assert m, f"no exhaust_inner_color summary line in {d}"
-    return m
-
-want, n_a, n_rule, both = collections.Counter(), 0, 0, collections.Counter()
-for pos in boards("ei_a"):
-    n_a += 1
-    c, r = closed(pos), rule(pos)
-    n_rule += r
-    for x in c:
-        want[x] += 1
-        if r: both[x] += 1
-assert want, f"the plain run's {n_a} row-10 boards use no colour up: the check would test nothing"
-assert 0 < n_rule < n_a, f"{n_rule} of the plain run's {n_a} row-10 boards pass the row-8 rule"
-assert len({roots(d) for d in ("ei_a", "ei_d", "ei_b", "ei_x", "ei_y")}) == 1, \
-    "the beam handed the runs other roots"
-ra, rd, rb, rx = reached("ei_a"), reached("ei_d"), reached("ei_b"), reached("ei_x")
-assert (ra["8"], ra["9"]) == (rd["8"], rd["9"]), "the check changed the search below row 10"
-def fmt(cnt): return ", ".join(f"c{c} {cnt[c]}" for c in sorted(cnt)) or "none"
-for d, cnt in (("ei_d", want), ("ei_b", want), ("ei_y", both)):
-    t = tally(d)
-    assert (t.group(5), t.group(6)) == (str(sum(cnt.values())), fmt(cnt)), \
-        f"{d}: {t.group(5)} boards used up {t.group(6)} by row 10; the plain run's recount: {fmt(cnt)}"
-assert (rd["10"], rd["11"]) == (rb["10"], rb["11"]), "the exact cuts changed the boards completing rows 10-11"
-assert int(tally("ei_b").group(1)) > int(tally("ei_b").group(2)) > 0, "the check kept all or nothing"
-assert re.search(r"^\[cfg\] exhaust_inner_color=1 ", log("ei_b"), re.M), "no [cfg] line"
-assert re.search(r"^\[dfs\] .* cut_exhaust=[1-9]\d* cut_exh_root=\d+ cut_semi=0", log("ei_b"), re.M), \
-    "no [dfs] cut counts"
-assert rx["10"] == str(n_rule), \
-    f"with the rule alone {rx['10']} boards completed row 10; the plain run's recount: {n_rule}"
-assert int(rx["8"]) < int(ra["8"]) and int(rx["9"]) <= int(ra["9"]), "the rule cut nothing at row 8"
-tx = tally("ei_x")
-assert int(tx.group(7)) == int(rx["8"]) < int(tx.group(8)), "the rule's kept/checked counts are off"
-for d, W in (("ei_d", 14), ("ei_b", 14), ("ei_y", 14), ("ei_m", 14), ("ei_f", 14), ("ei_u", 12)):
-    for pos in boards(d):
-        assert closed(pos, 10, W), f"{d} wrote a board that uses no colour up by row 10"
-        if d not in ("ei_d", "ei_b", "ei_u"):     # unlock: the beam tested row 8 at full width
-            assert rule(pos, 1, 8, W), f"{d} wrote a board that fails the row-8 rule"
-for pos in boards("ei_x"):
-    assert rule(pos), "the rule-only run wrote a board that fails the row-8 rule"
-for pos in boards("ei_n2"):
-    assert len(closed(pos)) >= 2 and rule(pos, 2), "the N = 2 run wrote a board short of 2 colours"
-assert tally("ei_n2").group(7) is not None, "no row-8 rule count in the N = 2 run"
-tally("ei_m")
-assert int(tally("ei_f").group(8)) > 0, "the beam tested no row-8 child"
-assert int(tally("ei_u").group(4)) > 0, "the unlock run dropped no rebuilt root"
-assert re.search(r"^\[sweep\] r0b0l0-l1 x2 found=0 skipped:2 ", log("ei_r"), re.M), "the frame skip did not log"
-assert tally("ei_r").group(3) == "2", "the rotations run did not skip both configurations"
-assert not list(boards("ei_r")), "a skipped configuration wrote boards"
-print(f"ok: {sum(want.values())} of {n_a} row-10 boards use a colour up ({fmt(want)}), as the check "
-      f"reports with and without the cuts; {n_rule} keep a colour on <= 6 faces at row 8, as the rule "
-      f"lets through; both: {fmt(both)}; N = 2, beam, root cut, unlock and frame skip run")
-EOF
-}
-
+# next job's rows) and run exactly the configurations the first run did not.
+# The two runs together run the uninterrupted sweep's configurations, each of
+# which writes boards; at 4 threads the boards themselves may differ (PROJECT
+# 5.15), so they are not compared.
 step_beamer_resume() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
     gate_db
     CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv
          --start_row 1 --num_rows 2 --top_bottoms 2 --top_columns 3 --beam_width 2000
-         --stop_row 6 --rng_seed 5 --threads 1 --verbose)
+         --stop_row 6 --rng_seed 5 --threads 4 --verbose)
     if [ -n "$GATE_DB" ]; then CMD+=(--db_file "$GATE_DB"); fi
     "${CMD[@]}" --out_dir "$OUT/rs_ref" > "$OUT/rs_ref.log" || fail "reference sweep failed"
     "${CMD[@]}" --out_dir "$OUT/rs_part" --max_emitted 80000 > "$OUT/rs_1.log" || fail "first half failed"
@@ -3569,14 +3250,14 @@ step_beamer_resume() {
     grep -oE '^\[sweep\] r[0-9]+b[0-9]+l[0-9]+' "$OUT/rs_ref.log" > "$OUT/rs_ref.cfg"
     cat "$OUT/rs_1.log" "$OUT/rs_2.log" | grep -oE '^\[sweep\] r[0-9]+b[0-9]+l[0-9]+' > "$OUT/rs_part.cfg"
     cmp -s "$OUT/rs_ref.cfg" "$OUT/rs_part.cfg" || fail "stop + resume ran different configurations"
-    sort "$OUT"/rs_ref/beam_completions_*.csv > "$OUT/rs_ref.sorted"
-    sort "$OUT"/rs_part/beam_completions_*.csv > "$OUT/rs_part.sorted"
-    cmp -s "$OUT/rs_ref.sorted" "$OUT/rs_part.sorted" || fail "stop + resume wrote different boards"
-    echo "ok: $(wc -l < "$OUT/rs_ref.cfg") configurations and their boards, identical after a stop and --resume"
+    cut -d, -f1 "$OUT"/rs_ref/beam_completions_*.csv | sort -u > "$OUT/rs_ref.ids"
+    cut -d, -f1 "$OUT"/rs_part/beam_completions_*.csv | sort -u > "$OUT/rs_part.ids"
+    cmp -s "$OUT/rs_ref.ids" "$OUT/rs_part.ids" || fail "stop + resume wrote boards for other configurations"
+    echo "ok: $(wc -l < "$OUT/rs_ref.cfg") configurations, the same after a stop and --resume"
 }
 
 # The backtracker and the end dives, on a rotations row. Two runs share every
-# setting but --end_dive, at one thread so the beam is exactly repeatable:
+# setting but --end_dive (at this width the beam repeats at 4 threads):
 #  - the plain run writes stop-row boards; every pair of placed cells that
 #    touch must match (the backtracker's rows AND the fixed frame it writes
 #    above the stop row), and the frame must be there;
@@ -3712,14 +3393,12 @@ EOF
     # from column 1, and its --cap_top closure a run on row 15 from column 1
     # over the whole columns (checked by the legality pass above: no break
     # anywhere).
-    # 1 thread writes the same file as 4; --backtrack_min_col 1 writes the
-    # subset whose extension fills column 1; --prefix names the boards.
+    # --backtrack_min_col 1 writes the subset whose extension fills column 1;
+    # --prefix names the boards.
     grep -q "^\[sum\] extension: " "$OUT/btd_plain.log" \
         || fail "no extension summary"
-    "${CMD[@]}" --extend_nodes 0 --out_dir "$OUT/btd_noext" > "$OUT/btd_noext.log" \
+    "${CMD[@]}" --extend_nodes 0 --prefix gate1 --out_dir "$OUT/btd_noext" > "$OUT/btd_noext.log" \
         || { tail -5 "$OUT/btd_noext.log"; fail "--extend_nodes 0 run exited non-zero"; }
-    "${CMD[@]}" --threads 1 --out_dir "$OUT/btd_t1" --prefix gate1 > "$OUT/btd_t1.log" \
-        || { tail -5 "$OUT/btd_t1.log"; fail "--prefix run exited non-zero"; }
     "${CMD[@]}" --backtrack_min_col 1 --out_dir "$OUT/btd_min1" --prefix > "$OUT/btd_min1.log" \
         || { tail -5 "$OUT/btd_min1.log"; fail "--backtrack_min_col 1 run exited non-zero"; }
     local code
@@ -3731,8 +3410,7 @@ EOF
         fi
     done
     python3 - "$OUT/btd_plain/beam_completions_0_10.csv" "$OUT/btd_noext/beam_completions_0_10.csv" \
-              "$OUT/btd_t1/beam_completions_0_10.csv" "$OUT/btd_min1/beam_completions_0_10.csv" \
-              "$code" <<'EOF' || exit 1
+              "$OUT/btd_min1/beam_completions_0_10.csv" "$code" <<'EOF' || exit 1
 import sys
 STOP, H = 10, 4
 def rows(p):
@@ -3754,18 +3432,17 @@ for name, pos, rot in ext_rows:
     core, ext = split(pos, rot)
     assert ext == sorted(order[:len(ext)]), f"{name}: extension cells are not a column-major prefix: {ext}"
     cores.append(core); n_ext += len(ext)
-plain = [split(p, r)[0] for _, p, r in rows(sys.argv[2])]
-assert all(not split(p, r)[1] for _, p, r in rows(sys.argv[2])), "--extend_nodes 0 placed cells above the stop row"
+noext = list(rows(sys.argv[2]))
+plain = [split(p, r)[0] for _, p, r in noext]
+assert all(not split(p, r)[1] for _, p, r in noext), "--extend_nodes 0 placed cells above the stop row"
 assert cores == plain, "the extension changed the stop-row boards or their order"
-t1 = list(rows(sys.argv[3]))
-assert [(p, r) for _, p, r in t1] == [(p, r) for _, p, r in ext_rows], "1 thread wrote other boards than 4"
-assert all(n.startswith("gate1_") for n, _, _ in t1), "--prefix gate1 did not name the boards"
-m1 = list(rows(sys.argv[4]))
-assert all(n.startswith(sys.argv[5] + "_") for n, _, _ in m1), "the bare --prefix code does not name the boards"
+assert all(n.startswith("gate1_") for n, _, _ in noext), "--prefix gate1 did not name the boards"
+m1 = list(rows(sys.argv[3]))
+assert all(n.startswith(sys.argv[4] + "_") for n, _, _ in m1), "the bare --prefix code does not name the boards"
 full1 = [(p, r) for _, p, r in ext_rows if len(split(p, r)[1]) >= H]
 assert [(p, r) for _, p, r in m1] == full1, "--backtrack_min_col 1 did not write exactly the boards filling column 1"
 print(f"ok: extension on {len(ext_rows)} boards ({n_ext} cells, column-major, stop-row boards unchanged); "
-      f"same at 1 thread; --backtrack_min_col 1 keeps {len(m1)}; --prefix names the rows")
+      f"--backtrack_min_col 1 keeps {len(m1)}; --prefix names the rows")
 EOF
 
     # E555_diver --stop_row runs the same extension on the same candidate order:
@@ -3786,22 +3463,20 @@ print(f"ok: E555_diver --stop_row 10 extends the {len(a)} stop-row boards exactl
 EOF
 }
 
-# --backtrack_min_col and what serves it, on one rotations row at one thread:
+# --backtrack_min_col and what serves it, on one rotations row (at this width
+# the beam repeats at 4 threads, so the runs compare board for board):
 #  - the column check cuts partial rows whose column 1 cannot reach row 14, so
 #    a run at K = 2 must write exactly the K = 0 run's boards (no check there)
 #    whose extension fills 2 columns, while finding fewer;
 #  - under --random_edges, where the extension and the check choose column 0
 #    above the stop row, the boards are legal, fill 2 columns and hold
-#    frame-left edges in column 0 (one run at 4 threads: a 1-thread pair, to
-#    compare against K = 0, spends ~50 s building the free-edge database); the
+#    frame-left edges in column 0 (one run, checked on its own); the
 #    run also passes --exhaust_border_color, so no border piece outside the
 #    bottom row and column 0 rows 1..10 carries the colour the border used up,
 #    unless the summary says the bottom fell back to a plain one (beamer_micro
 #    keeps the plain random path);
 #  - the near-duplicate filter (on by default) writes a subset of the
-#    --no_top_dedup boards and says how many it dropped, and with the check it
-#    writes the same file at 4 threads as at 1 (both reset where the search
-#    hands work to another thread);
+#    --no_top_dedup boards and says how many it dropped;
 #  - --cap_top (on by default) only breaks ties between extensions of equal
 #    length: a --cap_top 0 run writes the same boards, line for line, with the
 #    same rows up to the stop row and the same extension cells count; the cap
@@ -3815,7 +3490,7 @@ step_beamer_min_col() {
     gate_db
     CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv
          --num_rows 1 --top_bottoms 1 --top_columns 2 --beam_width 2000
-         --backtrack_row 7 --stop_row 10 --rng_seed 7 --threads 1)
+         --backtrack_row 7 --stop_row 10 --rng_seed 7 --threads 4)
     if [ -n "$GATE_DB" ]; then CMD+=(--db_file "$GATE_DB"); fi
     local k
     for k in 0 2; do
@@ -3826,10 +3501,6 @@ step_beamer_min_col() {
         || { tail -5 "$OUT/mc_nocap.log"; fail "the --cap_top 0 run exited non-zero"; }
     "${CMD[@]}" --backtrack_min_col 2 --out_dir "$OUT/mc_dd" > "$OUT/mc_dd.log" \
         || { tail -5 "$OUT/mc_dd.log"; fail "the near-duplicate run exited non-zero"; }
-    "${CMD[@]}" --backtrack_min_col 2 --threads 4 --out_dir "$OUT/mc_dd4" > "$OUT/mc_dd4.log" \
-        || { tail -5 "$OUT/mc_dd4.log"; fail "the 4-thread near-duplicate run exited non-zero"; }
-    cmp -s "$OUT/mc_dd/beam_completions_0_10.csv" "$OUT/mc_dd4/beam_completions_0_10.csv" \
-        || fail "the near-duplicate filter and the check wrote other boards at 4 threads than at 1"
     RND=(bin/E555_beamer data/seed_Edge5.txt --random_edges --exhaust_border_color --samples 1 --top_columns 1
          --beam_width 2000 --backtrack_row 8 --stop_row 10 --backtrack_min_col 2 --rng_seed 3
          --threads 4 --out_dir "$OUT/mc_rnd2")
@@ -3965,65 +3636,6 @@ print(f"ok: --cap_top changes only row 15 ({capped} cap cells over {len(kc)} boa
       f"{c0} column-0 edges, exhausted colour {xm.group(1)}; score lines recount")
 EOF
 }
-
-# --free_top_clue (--clue_corners): legal break-free boards with the top-left
-# row-13 clue home, elsewhere above the stop row or left off, and the top-right
-# clue always left off; E555_diver, the boards' dives, then places it. A clued
-# run needs its own database (clue pieces leave it), so it builds one in RAM at
-# 4 threads rather than replace the shared cache (~1.5 min on 4 cores); the
-# beam is then not repeatable, so only properties of its boards are tested.
-step_beamer_free_top_clue() {
-    if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
-    bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv --start_row 1 --num_rows 1 \
-        --top_bottoms 1 --top_columns 2 --beam_width 2000 --clue_corners --free_top_clue \
-        --backtrack_row 7 --stop_row 10 --backtrack_min_col 1 --rng_seed 7 --threads 4 \
-        --out_dir "$OUT/mc_ftc" > "$OUT/mc_ftc.log" \
-        || { tail -5 "$OUT/mc_ftc.log"; fail "the --free_top_clue run exited non-zero"; }
-    bin/E555_diver data/seed_Edge5.txt "$OUT/mc_ftc/beam_completions_1_10.csv" "$OUT/mc_ftc_dived.csv" \
-        --rotations data/borders_annealed_fix12.csv --end_dive 20 --emit_score 0 --rng_seed 7 \
-        --threads 2 > "$OUT/mc_ftc_dived.log" || fail "E555_diver on the free-top-clue boards exited non-zero"
-    python3 - "$OUT" <<'EOF' || exit 1
-import glob, sys
-out = sys.argv[1]
-seed = [list(map(int, l.split())) for l in open("data/seed_Edge5.txt") if l.strip()]
-def rows(path):
-    return [l for l in open(path) if l.strip() and l[0] not in "#%"]
-def board(l):
-    v = [x.strip() for x in l.split(",")]
-    pos, rot = list(map(int, v[-512:-256])), list(map(int, v[-256:]))
-    return {pos[p]: (p, rot[p]) for p in range(256) if pos[p] != 999}
-def broken(c):
-    b = 0
-    for x in c:
-        r, col = divmod(x, 16)
-        for y, d, e in ((x + 1, 1, 3), (x + 16, 0, 2)):
-            if (d == 1 and col == 15) or (d == 0 and r == 15) or y not in c: continue
-            p, rp = c[x]; q, rq = c[y]
-            b += seed[p][(d + rp) % 4] != seed[q][(e + rq) % 4]
-    return b
-STOP = 10
-# Per clue frame (keyed by the clue on (2,2)): the top-left and top-right row-13 clues.
-FRAME = {180: (207, 254), 248: (180, 207), 254: (248, 180), 207: (254, 248)}
-fb, tl_off = rows(glob.glob(f"{out}/mc_ftc/beam_completions_*.csv")[0]), 0
-assert fb, "the --free_top_clue run wrote no board"
-for l in fb:
-    c = board(l)
-    assert len({p for p, _ in c.values()}) == len(c) and not broken(c), "an illegal board"
-    tl, tr = FRAME[c[2 * 16 + 2][0]]
-    at = {p: x for x, (p, _) in c.items()}
-    assert tr not in at, "the top-right clue was written; it is the dives' to place"
-    if tl in at:
-        assert STOP < at[tl] // 16 < 15 and 0 < at[tl] % 16 < 15, f"the top-left clue sits at {at[tl]}"
-        tl_off += at[tl] != 13 * 16 + 2
-dv = [l for l in open(f"{out}/mc_ftc_dived.csv") if l.strip() and l[0] not in "#%"]
-assert len(dv) == len(fb), f"the diver wrote {len(dv)} boards for {len(fb)}"
-assert all(len(board(l)) == 256 for l in dv), "a dived board is not complete"
-
-print(f"ok: --free_top_clue wrote {len(fb)} legal boards, the top-right clue left off every one "
-      f"and placed by the dives, the top-left clue off its cell {tl_off}x")
-EOF
-}
-
 # =============================================================================
 # The shipped scripts. Everything above calls bin/* and the Python tools
 # directly, which is how two scripts that could not complete a run at all came

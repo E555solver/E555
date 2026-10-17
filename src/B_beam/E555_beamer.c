@@ -181,8 +181,6 @@ static int      g_last_inner      = EDGE_LEN;
 static uint16_t g_block_mask      = ROWMASK_FULL;
 /* --clue_corners: the backtracker pins the row-13 clues too (bt_band_pins). */
 static bool     g_band_pins       = false;
-/* E555_ROOT_DEDUP=0 (test only): search every root, repeats included. */
-static bool     g_root_dedup      = true;
 static bool     g_cap_top_set     = false;
 /* --prefix: written in front of the configuration id in every board name. */
 static char     g_prefix[40]      = "";
@@ -257,21 +255,17 @@ static bool     g_exhaust          = false;   /* --exhaust_border_color */
    them). g_exh_row is that row while the flag is on and -1 otherwise, so the
    default path pays one compare; g_exh_root_row is the backtrack row when the
    beam may drop roots that cannot get there (-1 otherwise, and under
-   --backtrack_row_factor 0). g_exh_bound
-   (E555_EXH_BOUND=0 clears it, test only) turns on the exact cuts that only
-   ever remove boards that could not pass. See exh_bound_ok.
+   --backtrack_row_factor 0). The exact cuts only ever remove boards that could
+   not pass; see exh_bound_ok.
 
    The row S-3 rule (heuristic): a board completing row stop_row-3 must have
    N colours with at most 5 + N faces left on unplaced inner pieces. g_semi_row
    is that row (-1: off), g_semi_beam_row the same row when the beam tests it
-   as it generates children. E555_EXH_SEMI=0 and E555_EXH_CHECK=0 (test only)
-   turn off the rule and the row S-1 check. See exh_semi_ok. */
+   as it generates children. See exh_semi_ok. */
 #define EXH_SEMI_BASE 5
 static uint32_t g_exhaust_inner    = 0;
 static int      g_exh_row          = -1;
 static int      g_exh_root_row     = -1;
-static bool     g_exh_bound        = true;
-static bool     g_exh_check        = true;
 static int      g_semi_row         = -1;
 static int      g_semi_beam_row    = -1;
 static uint64_t g_exhaust_cfgs[MAX_EDGE_SIDE_COLOR + 1];  /* configs run, by colour used up (0 = plain) */
@@ -784,7 +778,7 @@ static bool exh_child_ok(const BeamEntry *t, int row, Scratch *sc) {
         sc->semi_checked++;
         if (!exh_semi_ok(t)) { sc->semi_cut++; return false; }
     }
-    if (row == g_exh_row && g_exh_check) {
+    if (row == g_exh_row) {
         sc->exh_checked++;
         if ((uint32_t)__builtin_popcount(exh_closed(t)) >= g_exhaust_inner) return true;
         sc->exh_cut++;
@@ -4507,7 +4501,7 @@ static void bt_cell(BtCtx *x, int row, int col, int L) {
         }
     }
     /* --exhaust_inner_color: row S-1's inner pieces are all placed. */
-    if (row == g_exh_row && col > g_last_inner && g_exh_check && !bt_exh_ok(x, row)) return;
+    if (row == g_exh_row && col > g_last_inner && !bt_exh_ok(x, row)) return;
     const int B = x->lvl[row - 1].rtop[col];
     RowChoice *mv = &x->rows[row];
     uint64_t *used = x->used[row];
@@ -4766,13 +4760,13 @@ static void bt_run_job(BtCtx *x, const BtJob *j) {
             /* The beam checked the full-width board; under
                --backtrack_unlock_right the block gave pieces back. */
             const uint32_t closed = exh_closed(r);
-            if (g_unlock_right && g_exh_check) {
+            if (g_unlock_right) {
                 x->exh_checked++;
                 if ((uint32_t)__builtin_popcount(closed) < g_exhaust_inner) { x->cut_exhaust++; return; }
             }
             x->exh_completed++;
             for (uint32_t m = closed; m; m &= m - 1) x->exh_closed[__builtin_ctz(m)]++;
-        } else if (N < g_exh_row && g_exh_bound) {
+        } else if (N < g_exh_row) {
             const int k = g_exh_row - N;
             if (!exh_bound_ok(r->used, g_last_inner * k, g_unlock_right ? 0 : k,
                               exh_block(ENTRY_HAS_ORIENT(r) ? (int)ENTRY_ORIENT(r) : -1))) {
@@ -5039,7 +5033,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
            1..S-1 is looser than the block's, so it holds under
            --backtrack_unlock_right too. */
         exh_config_prepare();
-        if (g_exh_bound && !exh_bound_ok(cur[0].used, EDGE_LEN * g_exh_row, g_exh_row, exh_block(-1))) {
+        if (!exh_bound_ok(cur[0].used, EDGE_LEN * g_exh_row, g_exh_row, exh_block(-1))) {
             g_exh.cfg_skipped++;
             res.reason = "skipped";
             return res;
@@ -5079,7 +5073,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
                             : dedup_and_rank(ctx, pool_n, nt);
         g_stats.row_retained[row] += kept;
         uint64_t root_rep = 0;
-        if (bt_row && g_unlock_right && g_root_dedup) {
+        if (bt_row && g_unlock_right) {
             kept = unique_roots(ctx, cur, kept, row, nt, &root_rep);
             g_bt_run.root_rep += root_rep; g_bt_run.cfg_root_rep = root_rep;
         }
@@ -5506,9 +5500,8 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         const uint64_t ck = g_exh.beam_checked + g_exh.bt_checked, cut = g_exh.beam_cut + g_exh.bt_cut;
         printf("[sum] exhaust_inner_color %u: %" PRIu64 " boards checked at row %d, %" PRIu64 " kept",
                g_exhaust_inner, ck, g_exh_row, ck - cut);
-        if (g_exh_bound)
-            printf("; cut before: %" PRIu64 " configs, %" PRIu64 " roots",
-                   g_exh.cfg_skipped, g_exh.beam_root_cut + g_exh.bt_root);
+        printf("; cut before: %" PRIu64 " configs, %" PRIu64 " roots",
+               g_exh.cfg_skipped, g_exh.beam_root_cut + g_exh.bt_root);
         if (g_backtrack_row) {
             printf("; %" PRIu64 " backtracker boards completed row %d, colours used up:",
                    g_exh.bt_completed, g_exh_row);
@@ -6557,7 +6550,6 @@ int main(int argc, char *argv[]) {
         }
         g_last_inner = W;
         g_block_mask = (uint16_t)((1u << (W + 1)) - 1u);
-        if (getenv("E555_ROOT_DEDUP") && !strcmp(getenv("E555_ROOT_DEDUP"), "0")) g_root_dedup = false;
     }
     if (g_backtrack_row_set) {
         if (g_backtrack_row == 0 || g_backtrack_row >= g_stop_row)
@@ -6593,20 +6585,15 @@ int main(int argc, char *argv[]) {
         if (g_stop_row < 2)
             fatal("--exhaust_inner_color checks row stop_row-1: it needs --stop_row 2 or more");
         g_exh_row = (int)g_stop_row - 1;
-        if (getenv("E555_EXH_BOUND") && !strcmp(getenv("E555_EXH_BOUND"), "0")) g_exh_bound = false;
-        /* The exact cuts serve the check: without it they would drop boards. */
-        if (getenv("E555_EXH_CHECK") && !strcmp(getenv("E555_EXH_CHECK"), "0"))
-            g_exh_check = g_exh_bound = false;
         /* Under --backtrack_row_factor 0 every candidate is a root: dead ones
-           are left to the search's own first test (bt_run_job), so the same
-           candidates are generated with the cuts on or off. */
-        if (g_exh_bound && g_backtrack_row && g_bt_factor && (int)g_backtrack_row < g_exh_row)
+           are left to the search's own first test (bt_run_job). */
+        if (g_backtrack_row && g_bt_factor && (int)g_backtrack_row < g_exh_row)
             g_exh_root_row = (int)g_backtrack_row;
         /* The row S-3 rule, tested once by whoever fills that row: the beam as
            it generates children (the backtrack row too, unless it is kept raw
            under --backtrack_row_factor 0, where the search tests each root as
            it starts), or the exhaustive search when it closes the row. */
-        if (g_stop_row >= 4 && !(getenv("E555_EXH_SEMI") && !strcmp(getenv("E555_EXH_SEMI"), "0"))) {
+        if (g_stop_row >= 4) {
             g_semi_row = (int)g_stop_row - 3;
             const int beam_last = g_backtrack_row ? (int)g_backtrack_row : (int)g_stop_row;
             if (g_semi_row < beam_last || (g_semi_row == beam_last && g_bt_factor))
@@ -6770,15 +6757,13 @@ int main(int argc, char *argv[]) {
                "cell; the top-right one is left for the dives)\n");
     if (g_exhaust_inner) {
         printf("[cfg] exhaust_inner_color=%u (boards completing row %d must have used up %u inner "
-               "colour%s%s; exact cuts %s", g_exhaust_inner, g_exh_row, g_exhaust_inner,
-               g_exhaust_inner == 1 ? "" : "s", g_exh_check ? "" : " -- check off (E555_EXH_CHECK=0)",
-               g_exh_bound ? "on" : "off");
+               "colour%s", g_exhaust_inner, g_exh_row, g_exhaust_inner, g_exhaust_inner == 1 ? "" : "s");
         if (g_semi_row >= 0)
             printf("; boards completing row %d must have %u colour%s with at most %u faces left",
                    g_semi_row, g_exhaust_inner, g_exhaust_inner == 1 ? "" : "s",
                    EXH_SEMI_BASE + g_exhaust_inner);
         else
-            printf("; no row stop_row-3 rule%s", g_stop_row < 4 ? " below --stop_row 4" : " (E555_EXH_SEMI=0)");
+            printf("; no row stop_row-3 rule below --stop_row 4");
         printf(")\n");
     }
     if (g_exhaust)
