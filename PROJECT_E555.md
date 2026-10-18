@@ -112,9 +112,10 @@ instead. The database cache depends on the clue flags, hence its own file.
 
 `examples/` holds one small script per tool (start with
 `examples/01_beamer_quickstart.sh`); `pipeline/` holds long unattended runs
-(`run_pipeline.sh`, the board farm `run_farm.py`, the whirlpool, the topper
-sweeps and `slurm_wrapper.sh`). Scripts take their settings as `NAME=value`
-arguments and pass `--print_cmd`, so logs record the exact commands.
+(`run_pipeline.sh`, the board farm `run_farm.py`, the whirlpool, the halo loop
+`run_halo.sh`, the topper sweeps and `slurm_wrapper.sh`). Scripts take their
+settings as `NAME=value` arguments and pass `--print_cmd`, so logs record the
+exact commands.
 
 ---
 
