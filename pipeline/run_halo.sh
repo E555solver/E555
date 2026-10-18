@@ -14,7 +14,10 @@
 #      14 and 15 (the frame and the ring inside it), the clues go back on, and
 #      an exact search (--breaks 0, --order frontier) grows outward from the
 #      kept core over the lifted halo and the empty top at once, BT_TIME seconds
-#      a board. Each board comes back as the deepest break-free board reached.
+#      a board. Each board comes back as the deepest prefix of that order the
+#      search reached, break-free. It rarely keeps the beam's own halo: row 11
+#      shares the first layer with the halo's inner ring, and the frame waits
+#      for the second (pipeline/README.md, "Why the search does not keep ...").
 #   C  The threshold N is the score at the best ELITE_PCT% of every board scored
 #      so far, this round's included; E555_rank.py --split appends the round's
 #      boards scoring N or more to elite.csv. The rest are deleted, with the
