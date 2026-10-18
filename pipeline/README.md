@@ -437,9 +437,13 @@ the 25,515 boards of the run below, and `--no_hall --no_colour_count` change no
 board.
 
 A search that fills the halo first does keep it, and gains nothing. Searching
-rows 0-10 alone (`--stop_row 10`, the row-2 clue cells kept), a core has a
-median of 4 complete halos (2 to 51; all of them, for 100 cores, in 2.5 s), and
-the best top over all of them dives at 452.8, the mean of the boards as the
+rows 0-10 alone (`--stop_row 10 --max_emitted 0`, the row-2 clue cells kept)
+lists every break-free filling of the 78 halo cells around a core, from the 158
+pieces the core leaves: for 100 cores, all of them in 2.5 s, 611 halos, median
+4 per core (1 to 51; 14 cores admit only their own), the beam's own among them
+every time. The others are near copies: a median of 4 cells differ (at most
+19), 4 pieces come in from the pool, and 200 of 511 differ only on the frame.
+The best top over all of them dives at 452.8, the mean of the boards as the
 beam wrote them. Lifting only the rings inside the frame, the search rebuilds
 them as they were (mrv: 8 top pieces, as with no lift). The pieces the top
 needs are in the halo, and a halo without them does not close.
