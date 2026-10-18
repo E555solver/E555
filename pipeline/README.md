@@ -448,6 +448,18 @@ beam wrote them. Lifting only the rings inside the frame, the search rebuilds
 them as they were (mrv: 8 top pieces, as with no lift). The pieces the top
 needs are in the halo, and a halo without them does not close.
 
+Allowing breaks in B does not open the frame either (1 s and 3 s a board,
+same boards). The levels k = 0, 1, ... share the board's time limit, and about
+half the boards are still in level 0 when it runs out. `--break_mode any` never
+finished level 1, so `--breaks 1` to `5` wrote the same boards. `--break_mode
+lds --lds_max 0` (a break only where no exact fit is left) started level 2 on
+8-13 boards in 100. Both added 4-10 cells, but the best boards used almost no
+break (0.00-0.06 a board). The budget also lets that many cells sit without an
+exact fit, and the search fills around them; a break near the start would only
+be tried after everything below it. Layer 1 still keeps 7-17 cells open, only
+10-13 boards in 101 complete it, none places a frame cell, and the dives stay
+at 441.5-442.0.
+
 A second exact pass over B's boards adds nothing: on 78 of 101 the Hall bound
 proves at the root that no break-free completion exists, and mrv or spiral
 (frame first) over the rest left the dives at 441.7 and 440.0. The elite are
