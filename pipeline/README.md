@@ -334,9 +334,9 @@ A loop of four steps, until `TOTAL_TIME` is spent:
 
 | step | tool | what it does |
 |---|---|---|
-| A | `E555_beamer --random_edges` | `SAMPLES` bottoms x `COLUMNS` left columns, a beam `BEAM_WIDTH` wide to `STOP_ROW` with every clue held. No `--backtrack_row`, so nothing is extended above the stop row |
-| B | `E555_backtracker` | `data/holes_halo.csv` lifts rows 0-2 and columns 0, 1, 14, 15 (the frame and the ring inside it), the clues go back on, and an exact search (`--breaks 0 --order frontier`) grows outward from the kept core over the halo and the empty top at once, `BT_TIME` seconds a board. Each board comes back as the deepest break-free board the search reached |
-| C | `E555_rank.py --split` | boards scoring N or more are appended to `elite.csv`; the rest are deleted, with the beam's boards |
+| A | `E555_beamer --random_edges` | `SAMPLES` bottoms x `COLUMNS` left columns, a beam `BEAM_WIDTH` wide to `STOP_ROW` with the clues held; no backtracking, no extension |
+| B | `E555_backtracker` | `data/holes_halo.csv` lifts rows 0-2 and columns 0, 1, 14, 15, the clues go back on, and an exact search (`--breaks 0 --order frontier`) grows outward from the kept core over the halo and the empty top, `BT_TIME` seconds a board |
+| C | `E555_rank.py --split` | boards scoring N or more go to `elite.csv`; the rest are deleted with the beam's boards |
 | D | | back to A |
 
 ```bash
@@ -345,138 +345,19 @@ bash pipeline/run_halo.sh TOTAL_TIME=30m SAMPLES=4            # a short look
 bash pipeline/run_halo.sh TOTAL_TIME=2d DB_FILE=/tmp/E555.db  # a shared database cache
 ```
 
-**The idea.** The beam builds rows 0-10 from the bottom, and the rows it laid
-first, with the side columns, may hold the pieces the top needs. Lifting the
-halo gives them back, and the search decides where they go: `--order frontier`
-fills the layer next to the kept core (rows 3-10 x columns 2-13) and to the
-row-13 clues first, then the next, so the halo and the top grow together.
+The idea: the rows the beam laid first, and the side columns, may hold the
+pieces the top needs. Lifting the halo gives them back to an exact search.
 
-**The threshold.** N is the score at the best `ELITE_PCT`% (default 5) of every
-board scored so far, kept as a histogram in `scores.txt`, so a strong round adds
-more than 5% of its boards and a weak one fewer. `ELITE_SCORE=N` fixes it
-instead. The score counts matched edges between placed pieces before any dive,
-so it reads low: the same boards scored 325 before the lift. `FINISH_DIVES=M`
-dives the elite into `elite_dived.csv` after the loop.
-
-**A round** at the defaults takes 3-6 minutes on 4 threads: under a minute in A
-for 2,700-5,300 boards, the rest in B, at most (distinct boards) x `BT_TIME` /
-`THREADS`. Boards that differ only in the lifted cells are one search, so the
-script keeps one of each before B (about a fifth are repeats) and names every
-board `<config>_<beam index>`. `SAMPLES` and `BEAM_WIDTH` set a round's size. B
-is stopped cleanly 20 s before `TOTAL_TIME` ends, and what it searched is split
-as usual. A rerun with the same `RUN_DIR` goes on with its round count,
-histogram and elite.
-
-```
-[halo] round 2 seed 1009404890 | A 36s: 48 configs, 5 reached the stop row, 2798 boards | B 2m46s: 2107 of 2107 distinct boards searched (1152 to the limit), mean 265.1 best 316 | C: N=298 (best 5% of 5059) -> +115 elite (292) | 31m47s left
-```
-
-**Two beamer settings the defaults leave out**, measured on 4 threads:
-
-- `EXHAUST_INNER=1` (`--exhaust_inner_color 1`) starves A at stop row 10
-  without backtracking: 480 configurations wrote 21 boards in 7m19s (row 9 kept
-  76 of 522,424 boards), where 50 configurations without it write ~10,000 in
-  68 s. The 21 dived like any others (453.5 as they were, 441.6 after B). It
-  needs the backtracking this loop leaves out (PROJECT_E555.md 5.9).
-- `--lambda_corners` is refused with `--random_edges`: its catalog is built
-  from the sides a rotations row deals. `ROTATIONS=file` runs one border row of
-  a Stage A file per round, `SAMPLES` bottoms each, with `LAMBDA_CORNERS`.
-
-**Step B, measured** on 101 row-10 boards of 12 configurations (`BT_TIME` 2 s
-unless named):
-
-| search | trees finished | cells placed in B | score mean / p95 / max | pieces on rows 11-15 |
-|---|---|---|---|---|
-| frontier, 2 s | 61% | 48 | 265.5 / 300 / 306 | 20.2 |
-| frontier, 10 s | 79% | 49 | 267.5 / 302 / 306 | |
-| mrv | 1% | 68 | 289.8 / 301 / 328 | 44.3 |
-| frontier `--jump` | 0% | 117 | 348.0 / 363 / 367 | |
-| mrv, nothing lifted | 100% | 6 | 331.5 / 345 / 357 | 8.1 |
-
-`--no_hall --no_colour_count` change nothing. A shorter limit loses little:
-on 628 other boards (5 configurations) the boards scoring 298 or more per
-second of B were 0.85 at 0.25 s, 0.65 at 0.5 s, 0.38 at 1 s and 0.26 at 2 s,
-with the same best score (310) at every limit, and 400 more boards agreed.
-Hence `BT_TIME=0.5`, where half the trees still finish.
-
-**What the lift buys, and what it costs.** The top does grow: the same boards
-searched without the lift reach 8 pieces on rows 11-15 and their search ends at
-once, while the lifted ones reach 20 (frontier) or 44 (mrv). But the halo does
-not close again: frontier places none of the 60 frame cells, mrv 27. Dived with
-`E555_diver --end_dive 2000 --end_polish 2000`:
-
-| the 101 boards | dived mean | max |
-|---|---|---|
-| as the beam wrote them | 452.9 | 456 |
-| halo lifted, no search | 439.2 | 444 |
-| halo, frontier | 441.7 | 446 |
-| halo, mrv | 441.8 | 452 |
-| halo, frontier `--jump` | 407.0 | 439 |
-
-At 10000 dives and 10000 polish rounds (30 boards) it is 454.0 against 444.0
-(frontier) and 443.5 (mrv). The halo score does rank the halo boards (it
-correlates with their dived score at r = 0.19 for frontier, 0.47 for mrv; the
-best tenth dives at 443.6 and 445.5), so the elite are the right boards to
-finish, but the dives pay about ten edges for the open frame.
-
-**Why the search does not keep the beam's own halo.** B is exhaustive over
-complete break-free fillings of the whole open region (156 cells), and there are
-none; what it writes is the deepest prefix of its own cell order that it
-reached, not the best set of cells. `--order frontier` opens a layer only once
-the one before is full. Layer 1 (64 cells) holds 34 halo cells (row 2, columns
-1 and 14, six cells of row 1) and 30 top cells (row 11 and the ring around the
-row-13 clues); the 60 frame cells sit in layers 2 and 3. With the beam's own
-halo an exact search reaches 1.7 of those 30 top cells (none of the 101 boards
-fills them all), so a prefix that keeps it stops at about 36 cells. The search
-goes deeper by spending halo pieces on the top: it places 29.2 halo and 18.2
-top cells of layer 1 (47; 11 of the 78 lifted pieces stay where they were), 10
-of 101 boards finish layer 1, and none places a frame cell. Forward checking
-also cuts every placement that leaves an open cell, top cells included, without
-a fitting piece. Hall plays no part: it runs at the root only, stopped none of
-the 25,515 boards of the run below, and `--no_hall --no_colour_count` change no
-board.
-
-A search that fills the halo first does keep it, and gains nothing. Searching
-rows 0-10 alone (`--stop_row 10 --max_emitted 0`, the row-2 clue cells kept)
-lists every break-free filling of the 78 halo cells around a core, from the 158
-pieces the core leaves: for 100 cores, all of them in 2.5 s, 611 halos, median
-4 per core (1 to 51; 14 cores admit only their own), the beam's own among them
-every time. The others are near copies: a median of 4 cells differ (at most
-19), 4 pieces come in from the pool, and 200 of 511 differ only on the frame.
-The best top over all of them dives at 452.8, the mean of the boards as the
-beam wrote them. Lifting only the rings inside the frame, the search rebuilds
-them as they were (mrv: 8 top pieces, as with no lift). The pieces the top
-needs are in the halo, and a halo without them does not close.
-
-Allowing breaks in B does not open the frame either (1 s and 3 s a board,
-same boards). The levels k = 0, 1, ... share the board's time limit, and about
-half the boards are still in level 0 when it runs out. `--break_mode any` never
-finished level 1, so `--breaks 1` to `5` wrote the same boards. `--break_mode
-lds --lds_max 0` (a break only where no exact fit is left) started level 2 on
-8-13 boards in 100. Both added 4-10 cells, but the best boards used almost no
-break (0.00-0.06 a board). The budget also lets that many cells sit without an
-exact fit, and the search fills around them; a break near the start would only
-be tried after everything below it. Layer 1 still keeps 7-17 cells open, only
-10-13 boards in 101 complete it, none places a frame cell, and the dives stay
-at 441.5-442.0. At 10 s a board the same holds (441.8-442.2). Restarting from
-B's best boards with `--breaks 5` does not help: the root Hall bound already
-proves 1 or more breaks are needed on 79 of 100, more than 5 on 29, and the
-rest gain 6-16 cells (dives 441.9-442.1). Frontier and mrv take the cell with
-the fewest candidates, and under a budget a dead cell counts all its break
-candidates, so they fill around it and seldom break. `--order rowmajor` breaks
-where it is stuck: on the beam's own boards, frame kept, `--break_mode lds
---lds_max 0 --breaks 3` searches its whole tree in 0.1 s, places 2.1 breaks and
-completes row 11 on 63 of 101 boards (`--breaks 6`, 5 s: 3.4 breaks, 99 rows 11,
-one row 12), but the dives fall to 452.0 and 451.7 from 452.9: the dives place
-their own breaks better.
-
-A second exact pass over B's boards adds nothing: on 78 of 101 the Hall bound
-proves at the root that no break-free completion exists, and mrv or spiral
-(frame first) over the rest left the dives at 441.7 and 440.0. The elite are
-therefore boards waiting for a better frame closer than the dives, e.g. the
-CP-SAT tools' frame and window steps. A 40-minute run at the defaults (7
-rounds, 25,515 boards searched, 1,361 kept at N=298) dived its elite with
-`FINISH_DIVES=2000` to a mean of 444.3, best 453.
+- **Threshold.** N is the score at the best `ELITE_PCT`% (default 5) of every
+  board scored so far (`scores.txt`), so the elite stay the run's top 5%;
+  `ELITE_SCORE=N` fixes it. Scores count matched edges between placed pieces.
+- **Rounds.** Boards that differ only in the lifted cells are searched once,
+  and each board is named `<config>_<beam index>`. B stops cleanly before
+  `TOTAL_TIME` ends and what it searched is split; Ctrl-C does the same. A rerun
+  with the same `RUN_DIR` goes on with its rounds, histogram and elite.
+- **Beamer settings.** `EXHAUST_INNER=1` leaves A almost empty at stop row 10
+  without backtracking, hence the default 0. `--lambda_corners` is refused with
+  `--random_edges`; it applies with `ROTATIONS=file` (one border row a round).
 
 ## The topper sweep
 
