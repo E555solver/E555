@@ -14,10 +14,8 @@
 #      14 and 15 (the frame and the ring inside it), the clues go back on, and
 #      an exact search (--breaks 0, --order frontier) grows outward from the
 #      kept core over the lifted halo and the empty top at once, BT_TIME seconds
-#      a board. Each board comes back as the deepest prefix of that order the
-#      search reached, break-free. It rarely keeps the beam's own halo: row 11
-#      shares the first layer with the halo's inner ring, and the frame waits
-#      for the second (pipeline/README.md, "Why the search does not keep ...").
+#      a board. Each board comes back as the deepest break-free board the
+#      search reached along that order.
 #   C  The threshold N is the score at the best ELITE_PCT% of every board scored
 #      so far, this round's included; E555_rank.py --split appends the round's
 #      boards scoring N or more to elite.csv. The rest are deleted, with the
@@ -37,10 +35,9 @@
 # B, the boards already searched are split as usual; stopped in A, the round's
 # boards are dropped.
 #
-# The elite are break-free partial boards. Their score counts matched edges
-# between placed pieces, before any dive, so it reads low. FINISH_DIVES=M dives
-# the elite into elite_dived.csv once the loop is over. NEEDS ~8 GB RAM for the
-# beamer. Measured settings and numbers: pipeline/README.md, "The halo".
+# The elite are break-free partial boards; their score counts matched edges
+# between placed pieces. NEEDS ~8 GB RAM for the beamer. pipeline/README.md,
+# "The halo", has the details.
 set -uo pipefail        # not -e: a round that fails must not kill the run
 
 # ---- settings: edit here, or pass NAME=value on the command line ------------
@@ -71,10 +68,8 @@ STOP_ROW=10
 BC_WINDOW=7,7
 POOL=64                 # --pool_factor
 TAU=0.1                 # --tau_bottoms and --tau_columns
-EXHAUST_INNER=0         # --exhaust_inner_color N. Measured at stop row 10 with no
-                        # backtracking: N=1 wrote 21 boards from 480 configurations
-                        # in 7 minutes, where N=0 writes ~10000 from 50 in one
-                        # (pipeline/README.md, "The halo")
+EXHAUST_INNER=0         # --exhaust_inner_color N; 1 leaves A almost empty at stop
+                        # row 10 without backtracking
 LAMBDA_CORNERS=0.5      # --lambda_corners, with ROTATIONS only: the beamer
                         # refuses it with --random_edges. 0 = off
 RNG_SEED=0              # 0 = a fresh seed every round; S = S, S+1, ... per round.
@@ -83,22 +78,15 @@ BEAM_WALL=1800          # cap on one beamer call, seconds
 
 # B. backtracker
 HOLES=data/holes_halo.csv
-BT_ORDER=frontier       # --order. mrv puts more pieces on the top (44 top cells
-                        # against 20 on average), at the halo's expense
-BT_TIME=0.5             # seconds per board (--time_limit). Half the searches
-                        # finish their whole tree by then, and more boards beat
-                        # longer searches: 2 s found 25% more boards scoring 298+
-                        # in 3 times the time
+BT_ORDER=frontier       # --order
+BT_TIME=0.5             # seconds per board (--time_limit); about half the
+                        # searches finish their whole tree by then
 BT_EXTRA=               # more backtracker flags, e.g. BT_EXTRA="--no_hall"
 
 # C. elite
 ELITE_PCT=5             # keep the best ELITE_PCT% of every board scored so far
 ELITE_SCORE=0           # > 0: a fixed threshold instead of ELITE_PCT
 KEEP_LOGS=1             # 1 = keep each round's logs, gzipped, in RUN_DIR/logs
-
-# After the loop (not counted in TOTAL_TIME)
-FINISH_DIVES=0          # > 0: dive every elite board (E555_diver --end_dive M)
-FINISH_POLISH=2000      # --end_polish of those dives
 # -----------------------------------------------------------------------------
 for arg in "$@"; do
     case "$arg" in
@@ -123,7 +111,7 @@ case "$CLUES" in
     *) die "CLUES must be all, center or none (got: $CLUES)" ;;
 esac
 for v in SAMPLES COLUMNS BEAM_WIDTH STOP_ROW POOL EXHAUST_INNER BEAM_WALL \
-         ELITE_SCORE KEEP_LOGS FINISH_DIVES FINISH_POLISH RNG_SEED; do
+         ELITE_SCORE KEEP_LOGS RNG_SEED; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
 done
 [[ $ELITE_PCT =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v p="$ELITE_PCT" 'BEGIN { exit !(p > 0 && p <= 100) }' ||
@@ -133,7 +121,7 @@ done
 case "$RUN_DIR" in /*) ;; *) RUN_DIR="$PWD/$RUN_DIR" ;; esac
 cd "$REPO" || die "REPO=$REPO does not exist"
 [ -d bin ] && [ -d tools ] || die "REPO=$REPO is not an E555 checkout -- set REPO at the top"
-[ -x bin/E555_beamer ] && [ -x bin/E555_backtracker ] && [ -x bin/E555_diver ] || make ||
+[ -x bin/E555_beamer ] && [ -x bin/E555_backtracker ] || make ||
     die "the build failed; try make ARCH=generic"
 [ -f "$SEED" ]  || die "seed file not found: $SEED"
 [ -f "$HOLES" ] || die "holes mask not found: $HOLES"
@@ -369,14 +357,3 @@ echo "[halo] $(date '+%F %T') end, $DONE_ROUNDS rounds, elite $(rows "$ELITE")" 
 [ "$(rows "$ELITE")" -gt 0 ] || exit 0
 python3 tools/E555_rank.py "$ELITE" --seed_file "$SEED" --top 5
 
-if [ "$FINISH_DIVES" -gt 0 ] && [ "$STOP" = 0 ]; then
-    echo
-    echo "[halo] finishing the elite: $FINISH_DIVES dives and $FINISH_POLISH polish rounds a board"
-    T0=$SECONDS
-    bin/E555_diver "$SEED" "$ELITE" "$RUN_DIR/elite_dived.csv" --end_dive "$FINISH_DIVES" \
-        --end_polish "$FINISH_POLISH" --emit_score 0 --threads "$THREADS" --print_cmd \
-        > "$RUN_DIR/logs/finish.log" 2>&1 ||
-        { tail -5 "$RUN_DIR/logs/finish.log"; die "the diver failed; its log: $RUN_DIR/logs/finish.log"; }
-    echo "[halo] dived in $(hms $(( SECONDS - T0 ))) -> $RUN_DIR/elite_dived.csv"
-    python3 tools/E555_rank.py "$RUN_DIR/elite_dived.csv" --seed_file "$SEED" --top 5
-fi
