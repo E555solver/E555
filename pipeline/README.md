@@ -419,13 +419,30 @@ correlates with their dived score at r = 0.19 for frontier, 0.47 for mrv; the
 best tenth dives at 443.6 and 445.5), so the elite are the right boards to
 finish, but the dives pay about ten edges for the open frame.
 
-The reason is how little room the core leaves. Lifting only the rings inside
-the frame, the search rebuilds them as they were (mrv: 8 top pieces, as with no
-lift). Searching rows 0-10 alone (`--stop_row 10`, the row-2 clue cells kept),
-a core has a median of 4 complete halos (2 to 51; all of them, for 100 cores,
-in 2.5 s), and the best top over all of them dives at 452.8, the mean of the
-boards as the beam wrote them. The pieces the top needs are in the halo, and a
-halo without them does not close.
+**Why the search does not keep the beam's own halo.** B is exhaustive over
+complete break-free fillings of the whole open region (156 cells), and there are
+none; what it writes is the deepest prefix of its own cell order that it
+reached, not the best set of cells. `--order frontier` opens a layer only once
+the one before is full. Layer 1 (64 cells) holds 34 halo cells (row 2, columns
+1 and 14, six cells of row 1) and 30 top cells (row 11 and the ring around the
+row-13 clues); the 60 frame cells sit in layers 2 and 3. With the beam's own
+halo an exact search reaches 1.7 of those 30 top cells (none of the 101 boards
+fills them all), so a prefix that keeps it stops at about 36 cells. The search
+goes deeper by spending halo pieces on the top: it places 29.2 halo and 18.2
+top cells of layer 1 (47; 11 of the 78 lifted pieces stay where they were), 10
+of 101 boards finish layer 1, and none places a frame cell. Forward checking
+also cuts every placement that leaves an open cell, top cells included, without
+a fitting piece. Hall plays no part: it runs at the root only, stopped none of
+the 25,515 boards of the run below, and `--no_hall --no_colour_count` change no
+board.
+
+A search that fills the halo first does keep it, and gains nothing. Searching
+rows 0-10 alone (`--stop_row 10`, the row-2 clue cells kept), a core has a
+median of 4 complete halos (2 to 51; all of them, for 100 cores, in 2.5 s), and
+the best top over all of them dives at 452.8, the mean of the boards as the
+beam wrote them. Lifting only the rings inside the frame, the search rebuilds
+them as they were (mrv: 8 top pieces, as with no lift). The pieces the top
+needs are in the halo, and a halo without them does not close.
 
 A second exact pass over B's boards adds nothing: on 78 of 101 the Hall bound
 proves at the root that no break-free completion exists, and mrv or spiral
