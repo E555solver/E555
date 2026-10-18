@@ -15,6 +15,7 @@ distiller_out/
 plan_*/
 pipeline_out/
 farm/
+halo_out/
 tests/out/
 rotations.csv
 backtracked.csv

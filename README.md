@@ -87,8 +87,8 @@ src/C_tail/     Stage C tail toolbox (C + Python/OR-Tools)
 tools/          board viewer, ranker, distiller, rotator, CSV cleaner, rotations sorter
 data/           seeds, example boards, masks (see data/README.md)
 examples/       thirteen short scripts (01-11): one per tool or task, plus the whole chain
-pipeline/       the full pipeline, the whirlpool and the board farm, plus a
-                Slurm wrapper: long unattended runs
+pipeline/       the full pipeline, the whirlpool, the board farm and the halo
+                loop, plus a Slurm wrapper: long unattended runs
 tests/          run_tests.sh: the core checks, or the release gate with --all
 agent/          an experimental self-driving optimisation mode: untested and just for fun
 ```
