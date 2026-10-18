@@ -458,7 +458,17 @@ break (0.00-0.06 a board). The budget also lets that many cells sit without an
 exact fit, and the search fills around them; a break near the start would only
 be tried after everything below it. Layer 1 still keeps 7-17 cells open, only
 10-13 boards in 101 complete it, none places a frame cell, and the dives stay
-at 441.5-442.0.
+at 441.5-442.0. At 10 s a board the same holds (441.8-442.2). Restarting from
+B's best boards with `--breaks 5` does not help: the root Hall bound already
+proves 1 or more breaks are needed on 79 of 100, more than 5 on 29, and the
+rest gain 6-16 cells (dives 441.9-442.1). Frontier and mrv take the cell with
+the fewest candidates, and under a budget a dead cell counts all its break
+candidates, so they fill around it and seldom break. `--order rowmajor` breaks
+where it is stuck: on the beam's own boards, frame kept, `--break_mode lds
+--lds_max 0 --breaks 3` searches its whole tree in 0.1 s, places 2.1 breaks and
+completes row 11 on 63 of 101 boards (`--breaks 6`, 5 s: 3.4 breaks, 99 rows 11,
+one row 12), but the dives fall to 452.0 and 451.7 from 452.9: the dives place
+their own breaks better.
 
 A second exact pass over B's boards adds nothing: on 78 of 101 the Hall bound
 proves at the root that no break-free completion exists, and mrv or spiral
