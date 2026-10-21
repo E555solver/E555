@@ -18,14 +18,14 @@ pip install ortools       # only needed for src/C_tail/E555_topper.py and E555_e
 - Flags are `-Wall -Wextra -O3 -fopenmp`. The test gate fails on **any** compiler warning.
 - Changing `ARCH`/`OPT`/`CC` forces a rebuild through `bin/.buildflags`. A binary built with `-march=native` dies with SIGILL on an older CPU.
 - beamer, finalizer and roundhouse all link `src/B_beam/E555_database.c`; the beamer, the finalizer and the diver also link `src/C_tail/E555_dive.c` (the end-dive engine, no argv of its own), and the diver links `E555_database.c` too. The backtracker is standalone.
-- `tests/datadriven/` is a self-contained beamer fork with its own Makefile (`cd tests/datadriven && make ARCH=generic`).
+- `tests/datadriven/` is a self-contained beamer fork with its own Makefile (`cd tests/datadriven && make ARCH=generic`). It compiles `E555_database.c` unmodified, but no check builds it: after changing that file or its header, build the fork by hand.
 
 ## Tests
 
 `tests/run_tests.sh` holds every check. It runs the selected ones in order, stops at the first failure, and writes everything to `tests/out/`, which is wiped at the start of each run. Run only what a change needs:
 
 ```bash
-ARCH=generic bash tests/run_tests.sh                    # the core checks (~20 s): run for any change
+ARCH=generic bash tests/run_tests.sh                    # the core checks (~30 s on 4 cores, half of it compile): run for any change
 ARCH=generic bash tests/run_tests.sh beamer             # every check of one tool (+ compile, no_stray_output)
 ARCH=generic SKIP_BEAMER=1 bash tests/run_tests.sh --all   # the release gate without the 6.4 GB DB (~4 min)
 bash tests/run_tests.sh --list                          # numbered list: tier, name, tags, label
@@ -39,7 +39,7 @@ bash tests/run_tests.sh 6 8-11 roundhouse_cache         # by number, range or na
 - Each check runs on its own and never depends on an earlier check's artifacts. If check 1 (`compile`) isn't selected, the checks use whatever is already in `bin/`.
 - The `beamer` checks and `pipeline_full` need the real 6.4 GB chain database (~8 GB RAM). The gate builds it once per run, on every core (~100 s on 4), before the first of them; `DB_FILE=path` keeps that cache across runs, after which each of those checks takes under a minute. `SKIP_BEAMER=1` skips them. `DB_IN_MEMORY=1` avoids writing it to disk but rebuilds it in every beamer run, so the beamer checks then take many minutes: use it only when the disk is full.
 - Key regressions: the finalizer and roundhouse must rediscover `data/synth_solution_480.csv` (seed `data/synth_seed.txt`), and `viewer` must score it 480/480.
-- Checks that need OR-Tools print `SKIPPED` and **pass** when it is missing. That includes the core regression `ender_repair`. Run `pip install ortools` before trusting a green run that touches the ender, topper or diver.
+- Checks that need OR-Tools print `SKIPPED` and **pass** when it is missing. That includes the core regression `ender_repair`. A fresh cloud container has no OR-Tools, so run `pip install ortools` before trusting a green run that touches the ender, topper or diver.
 - `no_stray_output` fails if any check leaves a file in the repo root, so tools that write to the working directory must run from inside `tests/out`.
 - `scripts_parse` (`tests/check_script_flags.py`) collects each binary's accepted flags from its `strcmp(argv[i], "--x")` sites. Every `--flag` that a script in `pipeline/`, `examples/` or `tests/` passes must be in that set. If you rename or remove a C flag, update every script that uses it. The check also fails when a tool's hand-written `print_cmd()` doesn't mention every flag its parser accepts, or when a comment sits between two backslash-continued lines.
 - Bash idiom used in the gate (`set -euo pipefail`): don't write `$(ls GLOB | head -1)`; use `first_match`. Don't pipe a tool's long output into `grep -q`, because SIGPIPE plus pipefail causes false failures. Write to a file and grep that instead.
