@@ -76,7 +76,7 @@ tools/   viewer, rank (--rescore), rotate (--sink), distiller (dive screen -> fi
 - **Script/runner convention** (`examples/`, `pipeline/`): each script opens with a block of plain settings, overridden by `NAME=value` **arguments** (not environment variables). Stages hand off through the `outputs.txt` each tool writes and pass `--print_cmd` so the log records the exact commands. `examples/` is for learning single tools. `pipeline/` holds long unattended runs, plus `slurm_wrapper.sh` for clusters.
 - Run products (`beam_out/`, `final_out/`, `tests/out/`, `*.db_cache`, `rotations.csv`, …) are gitignored. Don't commit them.
 - **End-dive engine** (`E555_dive.c`): its tuning constants are the `DV_*` defines at the top of the file (measured; PROJECT_E555.md 5.11). To expose one in a single tool, add a `DvParams` field whose 0 means the built-in default; tools that don't set it keep byte-identical output (example: the diver's `--polish_top`).
-- `agent/` holds an experimental, untested autonomous `/goal` kit. It is not part of the toolchain.
+- `agent/` holds an experimental, untested autonomous `/goal` kit. It is not part of the toolchain and no check covers it. Its `referee.sh` parses the viewer's `Placed cells`, `Correct edges` and `Border check` lines, so keep those when changing the viewer's output.
 
 ## Making changes
 
