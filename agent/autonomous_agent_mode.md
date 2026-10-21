@@ -49,7 +49,7 @@ These are non-negotiable. Section 8 repeats them inside the `/goal` condition.
   `agent/lab/`**.
 - No git command that changes the repository (no commit, push, checkout, reset,
   stash or clean). `agent/lab/` is gitignored.
-- The beamer's 6.5 GB chain-database cache, if used, goes to `agent/lab/cache/`
+- The beamer's 6.8 GB chain-database cache, if used, goes to `agent/lab/cache/`
   on **local** disk, never on a network drive.
 - You **may** edit the lab's copies of the source, write new tools in
   `agent/lab/tools/`, and rebuild the lab's binaries. Improve anything you like:
@@ -262,7 +262,7 @@ and their value is that they differ from the elites (H5).
 
 ### 4.2 Pre-flight and launch
 
-- **Resources.** Stage B (F4) needs ~8 GB of free RAM and ~6.5 GB of local disk
+- **Resources.** Stage B (F4) needs ~8 GB of free RAM and ~7 GB of local disk
   for `cache/`. Everything else is small. The agent records the answer as
   `stage_b_ok` in iteration 0 (`free -g`, `df -h .`).
 - **A durable terminal:** `tmux new -s e555`.
@@ -406,9 +406,10 @@ append their ids to `pool/consumed.txt` and skip the ids already there.
 | **F6 exact** | an unpolished board, or a small hole to prove | `timeout 1200 bash pipeline/topper_sweep.sh INPUT=<root.csv> PRESET=safe OUT=<D>/out.csv OUT_DIR=<D> WORKERS=<T>`, or `timeout 1200 bin/E555_backtracker data/seed_Edge5.txt <root.csv> <D>/out.csv --holes <D>/mask.csv --break_mode any --breaks <K> --time_limit 1100 --threads <T>`, with a mask you write (16 lines of 16 `0`/`1`, first line = row 0, under ~30 open cells around the breaks). An exhausted level K proves that no filling of the hole has K or fewer breaks; a search that runs out of time writes the board with the hole still open, which the referee calls `INVALID reason=incomplete`: log it as a run that found nothing |
 | **F7 tool** | an idea none of the above covers | write it in `agent/lab/tools/`, check it against the referee on `data/best_46*.csv` first, then run it like any other family |
 
-The first F4 run builds the database cache (about 100 s on 4 cores); later runs
-map it in seconds. F5 lifts cells, so its output can score below its input. It
-is still a run: referee it and log it.
+The first F4 run builds the database cache (about 2 minutes on 4 cores,
+writing the 6.8 GB file included); later runs map it in seconds. Measured: one
+5-minute F4 run on 4 cores wrote 3,077 boards, the best 462. F5 lifts cells, so
+its output can score below its input. It is still a run: referee it and log it.
 
 **Ideas the agent is encouraged to build** (all legitimate, all in the lab): a
 portfolio allocator that gives more budget to the family that is gaining; a
