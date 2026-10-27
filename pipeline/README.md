@@ -14,7 +14,7 @@ settings here will make far more sense afterwards.
 | `run_pipeline_whirlpool.sh` | turns the board 90 degrees between every re-grow, so the buried bottom rows get re-searched too | hours, or one lap in minutes |
 | `run_board_farm.sh` | runs a pipeline pass in a loop forever, keeps only the best boards, and periodically re-attacks them | days |
 | `run_farm.py` | the same idea with a different chain, and boards that graduate: built, endered once, then deeply endered into `elite.csv` and never searched again | days |
-| `run_halo.sh` | a loop of beam to row 10, then an exact search of the lifted halo (rows 0-2, columns 0, 1, 14, 15) and the empty top together; the best 5% of every board scored go to `elite.csv` | hours |
+| `run_halo.sh` | beam to row 10, lift the halo (rows 0-2, columns 0, 1, 14, 15) and search for a board with every inner piece placed, the frame last; the best boards climb a ladder of longer resumed searches | hours |
 | `topper_sweep.sh` | one plan of topper passes over a slice of a board file | minutes |
 | `slurm_wrapper.sh` | runs any of the above as a batch job | -- |
 
@@ -330,14 +330,15 @@ keeps a multi-day run to kilobytes.
 
 ## The halo: `run_halo.sh`
 
-A loop of four steps, until `TOTAL_TIME` is spent:
+A loop until `TOTAL_TIME` is spent, looking for a board whose 196 inner pieces
+are all placed break-free, the frame left for last:
 
 | step | tool | what it does |
 |---|---|---|
-| A | `E555_beamer --random_edges` | `SAMPLES` bottoms x `COLUMNS` left columns, a beam `BEAM_WIDTH` wide to `STOP_ROW` with the clues held; no backtracking, no extension |
-| B | `E555_backtracker` | `data/holes_halo.csv` lifts rows 0-2 and columns 0, 1, 14, 15, the clues go back on, and an exact search (`--breaks 0 --order frontier`) grows outward from the kept core over the halo and the empty top, `BT_TIME` seconds a board |
-| C | `E555_rank.py --split` | boards scoring N or more go to `elite.csv`; the rest are deleted with the beam's boards |
-| D | | back to A |
+| A | `E555_beamer --random_edges` | `SAMPLES` bottoms x `COLUMNS` left columns, a beam `BEAM_WIDTH` wide, exhaustive from `BACKTRACK_ROW` to `STOP_ROW`, no extension |
+| B | `E555_backtracker` | up to `MAX_BOARDS` distinct boards: `data/holes_halo.csv` lifts rows 0-2 and columns 0, 1, 14, 15, and an exact search (`--breaks 0 --frame_last --resume`) fills the inner cells, `BT_TIME` seconds a board |
+| C | `E555_rank.py --split` | the boards scoring N or more go to `elite.csv` and onto the ladder; the rest are deleted with the beam's boards |
+| D | `E555_backtracker --resume` | the ladder: each rung continues its boards' searches, `LADDER_TIME` seconds a board doubled per rung, and the better `RUNG_KEEP`% move up |
 
 ```bash
 bash pipeline/run_halo.sh                                     # four hours, every core
@@ -346,18 +347,27 @@ bash pipeline/run_halo.sh TOTAL_TIME=2d DB_FILE=/tmp/E555.db  # a shared databas
 ```
 
 The idea: the rows the beam laid first, and the side columns, may hold the
-pieces the top needs. Lifting the halo gives them back to an exact search.
+pieces the top needs. Lifting them gives those pieces back to an exact search
+that fails early on most boards; the ladder keeps a lucky one going.
 
+- **Jackpots.** With the 60 frame cells searched last, `--early_release 60`
+  releases the first board that places every inner cell; it goes to
+  `jackpots.csv`, and its search goes on to the next one.
 - **Threshold.** N is the score at the best `ELITE_PCT`% (default 5) of every
-  board scored so far (`scores.txt`), so the elite stay the run's top 5%;
-  `ELITE_SCORE=N` fixes it. Scores count matched edges between placed pieces.
-- **Rounds.** Boards that differ only in the lifted cells are searched once,
-  and each board is named `<config>_<beam index>`. B stops cleanly before
-  `TOTAL_TIME` ends and what it searched is split; Ctrl-C does the same. A rerun
-  with the same `RUN_DIR` goes on with its rounds, histogram and elite.
-- **Beamer settings.** `EXHAUST_INNER=1` leaves A almost empty at stop row 10
-  without backtracking, hence the default 0. `--lambda_corners` is refused with
-  `--random_edges`; it applies with `ROTATIONS=file` (one border row a round).
+  board scored so far (`scores.txt`); `ELITE_SCORE=N` fixes it.
+- **Ladder.** Boards compete only with boards that have had the same search
+  time; a finished search leaves the ladder. The top rung keeps its best
+  `TOP_RUNG_CAP` and searches them on every round. `top.csv` holds the deepest
+  boards seen.
+- **Clues.** `CLUES=center` by default: the corner clues kill most beams on
+  row 2 and most halo searches at once.
+- **Rounds.** B, D and the beam stop cleanly before `TOTAL_TIME` ends; Ctrl-C
+  does the same. A rerun with the same `RUN_DIR` goes on with its rounds,
+  histogram and ladder. Rows of B and D carry a resume identifier (515 fields).
+- **Beamer settings.** `BACKTRACK_ROW=6` writes millions of boards a round;
+  `BEAM_MAX` caps them. `EXHAUST_INNER=1` leaves A almost empty at stop row 10.
+  `--lambda_corners` is refused with `--random_edges`; it applies with
+  `ROTATIONS=file` (one border row a round).
 
 ## The topper sweep
 
