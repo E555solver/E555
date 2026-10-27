@@ -1,10 +1,10 @@
 #!/bin/bash
 # run_datadriven.sh -- the two phases in one command.
 #
-#   bash tests/datadriven/run_datadriven.sh
-#   bash tests/datadriven/run_datadriven.sh THREADS=16 SEARCH_STOP_ROW=12
-#   bash tests/datadriven/run_datadriven.sh LEARN=0 \
-#        TABLE=tests/datadriven/example_run/table_rnd_s9_row2.txt   # reuse a table
+#   bash experiments/datadriven/run_datadriven.sh
+#   bash experiments/datadriven/run_datadriven.sh THREADS=16 SEARCH_STOP_ROW=12
+#   bash experiments/datadriven/run_datadriven.sh LEARN=0 \
+#        TABLE=experiments/datadriven/example_run/table_rnd_s9_row2.txt   # reuse a table
 #
 # The learning phase measures where each piece sits and writes a table; the
 # search phase reads it and steers by it. Learning writes no boards; the search
@@ -16,11 +16,11 @@ set -euo pipefail
 # ---- settings: edit here, or pass NAME=value on the command line ------------
 REPO=$(cd "$(dirname "$0")/../.." && pwd)   # E555 checkout
 SEED=data/seed_Edge5.txt                    # paths below are relative to REPO
-ROTATIONS=tests/datadriven/borders_stageAx6.csv
+ROTATIONS=experiments/datadriven/borders_stageAx6.csv
 BORDER_ROW=4            # which rotations row to use, for both phases (4 = r16178,
                         # the border of example_run/table_rnd_s9_row2.txt)
-OUT_DIR=tests/datadriven/runs/pipeline
-TABLE=tests/datadriven/runs/pipeline/table.txt
+OUT_DIR=experiments/datadriven/runs/pipeline
+TABLE=experiments/datadriven/runs/pipeline/table.txt
 DB_FILE=                # chain DB cache file (~6 GB); empty = build in memory
 THREADS=4
 RNG_SEED=12345          # determinism is this AND --threads, never this alone
@@ -55,8 +55,8 @@ for arg in "$@"; do
 done
 cd "$REPO"
 
-BIN=tests/datadriven/bin/E555_beamer_datadriven
-[ -x "$BIN" ] || { echo "build it first: (cd tests/datadriven && make)" >&2; exit 1; }
+BIN=experiments/datadriven/bin/E555_beamer_datadriven
+[ -x "$BIN" ] || { echo "build it first: (cd experiments/datadriven && make)" >&2; exit 1; }
 mkdir -p "$(dirname "$TABLE")" "$OUT_DIR"
 
 CLUES="--clue_center --clue_corners --pin_clue 1"
@@ -95,5 +95,5 @@ $BIN "$SEED" "$ROTATIONS" \
     --out_dir "$OUT_DIR" --print_cmd
 
 echo
-echo "table   : $TABLE   (python3 tests/datadriven/freq_view.py $TABLE)"
+echo "table   : $TABLE   (python3 experiments/datadriven/freq_view.py $TABLE)"
 echo "boards  : listed in $OUT_DIR/outputs.txt"

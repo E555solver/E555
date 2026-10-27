@@ -12,14 +12,13 @@ E555 is a pipeline of solvers for Eternity II (16x16 edge-matching puzzle, 256 p
 make                      # bin/E555_beamer, E555_finalizer, E555_roundhouse, E555_backtracker, E555_diver
 make ARCH=generic         # use this in containers / CI / cloud sandboxes (default is -march=native)
 make beamer               # single target; also finalizer | roundhouse | backtracker | diver | clean
-make soft                 # optional, not in `all`: bin/E555_soft needs NLopt (libnlopt-dev, or NLOPT=/prefix)
 pip install ortools       # only needed for src/C_tail/E555_topper.py and E555_ender.py
 ```
 
 - Flags are `-Wall -Wextra -O3 -fopenmp`. The test gate fails on **any** compiler warning.
 - Changing `ARCH`/`OPT`/`CC` forces a rebuild through `bin/.buildflags`. A binary built with `-march=native` dies with SIGILL on an older CPU.
-- beamer, finalizer and roundhouse all link `src/B_beam/E555_database.c`; the beamer, the finalizer, the diver and the soft tool also link `src/C_tail/E555_dive.c` (the end-dive engine, no argv of its own), and the diver and the soft tool link `E555_database.c` too. The backtracker is standalone.
-- `tests/datadriven/` is a self-contained beamer fork with its own Makefile (`cd tests/datadriven && make ARCH=generic`). It compiles `E555_database.c` unmodified, but no check builds it: after changing that file or its header, build the fork by hand.
+- beamer, finalizer and roundhouse all link `src/B_beam/E555_database.c`; the beamer, the finalizer and the diver also link `src/C_tail/E555_dive.c` (the end-dive engine, no argv of its own), and the diver links `E555_database.c` too. The backtracker is standalone.
+- `experiments/` holds old experiments, each with its own Makefile (`cd experiments/<name> && make ARCH=generic`) and no check: `datadriven/` (a beamer fork) compiles `E555_database.c` unmodified, `soft/` (needs NLopt) also `E555_dive.c`. After changing those files or their headers, build them by hand.
 
 ## Tests
 
@@ -65,8 +64,6 @@ Stage C  src/C_tail/E555_topper.py            CP-SAT break minimizer over bands 
          src/C_tail/E555_diver.c              the beamer's --end_dive/--end_polish on any board file; no DB;
                                                --holes/--pin_clue/--stop_row rebuild the top like the beamer first
          src/C_tail/E555_ender.py             CP-SAT closer, never returns a worse board
-         src/C_tail/E555_soft.c               experimental, needs NLopt: free cells as (piece, spin) mixes, mean-field
-                                               annealing of the expected breaks (L-BFGS), rounded and climbed
 tools/   viewer, rank (--rescore), rotate (--sink), distiller (dive screen -> finish -> redive probe -> ender plan), extract_consensus, sort_rotations, clean_csv
 ```
 

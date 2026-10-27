@@ -3,8 +3,6 @@
 #
 #   make [all|beamer|finalizer|roundhouse|backtracker|diver|clean]
 #   make ARCH=v3 | OPT=-O2 | ARCHFLAGS='-march=skylake-avx512' | CC=clang
-#   make soft [NLOPT=/prefix]   optional, not in all: needs NLopt (libnlopt-dev, or
-#                               a build installed under /prefix)
 #
 #   ARCH     native (default)  -march=native                  build host only
 #            v3                -march=x86-64-v3 -mtune=native AVX2, Haswell+/Zen+
@@ -38,14 +36,13 @@ LDLIBS = -lm
 B := src/B_beam
 C := src/C_tail
 
-.PHONY: all beamer finalizer roundhouse backtracker diver soft clean FORCE
+.PHONY: all beamer finalizer roundhouse backtracker diver clean FORCE
 all: beamer finalizer roundhouse backtracker diver
 beamer:      bin/E555_beamer
 finalizer:   bin/E555_finalizer
 roundhouse:  bin/E555_roundhouse
 backtracker: bin/E555_backtracker
 diver:       bin/E555_diver
-soft:        bin/E555_soft
 
 bin:
 	mkdir -p bin
@@ -73,16 +70,6 @@ bin/E555_backtracker: $(C)/E555_backtracker.c $(STAMP) | bin
 bin/E555_diver: $(C)/E555_diver.c $(C)/E555_dive.c $(C)/E555_dive.h \
                 $(B)/E555_database.c $(B)/E555_database.h $(STAMP) | bin
 	$(CC) $(CFLAGS) $(B)/E555_database.c $(C)/E555_dive.c $(C)/E555_diver.c -o $@ $(LDLIBS)
-
-NLOPT ?=
-ifneq ($(NLOPT),)
-NLOPT_CFLAGS := -I$(NLOPT)/include
-NLOPT_LIBS   := -L$(NLOPT)/lib -L$(NLOPT)/lib64 -Wl,-rpath,$(NLOPT)/lib -Wl,-rpath,$(NLOPT)/lib64
-endif
-
-bin/E555_soft: $(C)/E555_soft.c $(C)/E555_dive.c $(C)/E555_dive.h \
-               $(B)/E555_database.c $(B)/E555_database.h $(STAMP) | bin
-	$(CC) $(CFLAGS) $(NLOPT_CFLAGS) $(B)/E555_database.c $(C)/E555_dive.c $(C)/E555_soft.c -o $@ $(NLOPT_LIBS) -lnlopt $(LDLIBS)
 
 clean:
 	rm -rf bin

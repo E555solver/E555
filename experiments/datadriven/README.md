@@ -6,7 +6,7 @@ self-contained: one C file, its own `Makefile`, a viewer, and runners.
 `src/B_beam/E555_database.c` is linked unmodified.
 
 ```bash
-cd tests/datadriven && make ARCH=generic     # -> bin/E555_beamer_datadriven
+cd experiments/datadriven && make ARCH=generic     # -> bin/E555_beamer_datadriven
 ```
 
 The stock objective is local: a colour ledger plus a one-row fan-out lookahead.
@@ -35,13 +35,13 @@ Both phases need `--clue_center`, `--pin_clue 1..4`, a rotations file and
 `--num_rows 1`. A table belongs to one seed, one clue frame and one border.
 
 ```bash
-bash tests/datadriven/run_datadriven.sh                                   # learn, then search
-bash tests/datadriven/run_datadriven.sh LEARN=0 \
-     TABLE=tests/datadriven/example_run/table_rnd_s9_row2.txt             # search with a table
-sbatch tests/datadriven/example_run/slurm_datadriven.sh                   # cluster, from the repo root
+bash experiments/datadriven/run_datadriven.sh                                   # learn, then search
+bash experiments/datadriven/run_datadriven.sh LEARN=0 \
+     TABLE=experiments/datadriven/example_run/table_rnd_s9_row2.txt             # search with a table
+sbatch experiments/datadriven/example_run/slurm_datadriven.sh                   # cluster, from the repo root
 
-python3 tests/datadriven/freq_view.py TABLE --text                        # summary
-python3 tests/datadriven/freq_view.py TABLE --out table.html              # HTML report
+python3 experiments/datadriven/freq_view.py TABLE --text                        # summary
+python3 experiments/datadriven/freq_view.py TABLE --out table.html              # HTML report
 ```
 
 ### Learning
@@ -709,8 +709,8 @@ A table and the boards found with it, kept as a reference and a test input.
 To search with the table:
 
 ```bash
-bash tests/datadriven/run_datadriven.sh LEARN=0 \
-     TABLE=tests/datadriven/example_run/table_rnd_s9_row2.txt   # ROTATIONS/BORDER_ROW default to row 4
+bash experiments/datadriven/run_datadriven.sh LEARN=0 \
+     TABLE=experiments/datadriven/example_run/table_rnd_s9_row2.txt   # ROTATIONS/BORDER_ROW default to row 4
 ```
 
 ## borders_stageAx6.csv
