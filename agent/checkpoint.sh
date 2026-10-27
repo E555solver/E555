@@ -14,10 +14,8 @@
 #
 # Saved: scoreboard.json, run_log.csv, JOURNAL.md, STRATEGY.md, SUMMARY.md,
 # frontier/*.csv, pool/distilled*.csv and pool/consumed.txt. Not saved: runs/,
-# bin/ and the lab's sources, which setup_lab.sh rebuilds, and cache/: the
-# 6.8 GB database cache is never committed, because the first F4 run in a fresh
-# container rebuilds it. A file over 20 MB is refused, so nothing that large
-# reaches git. Exit status 0 = pushed, 1 = committed but not pushed (the next
+# bin/ and the lab's sources, which setup_lab.sh rebuilds. A file over 20 MB is
+# refused, so nothing that large (such as a chain database) reaches git. Exit status 0 = pushed, 1 = committed but not pushed (the next
 # call pushes it too), 2 = refused.
 set -euo pipefail
 

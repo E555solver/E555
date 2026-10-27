@@ -162,10 +162,9 @@ The Bash tool stops a foreground command after 2 minutes by default and
   (`pgrep -f <D>` prints nothing), referee what it wrote and log it with the note
   `lost`.
 - **Long jobs come in pieces.** The distiller (F3) resumes where a killed run
-  stopped, so rerun the same command until it finishes. The first F4 run in a
-  container also builds the 6.8 GB database cache, which takes about 2 minutes
-  of its cap. The cache lives in `agent/cache/` and is never checkpointed or
-  committed: after a container is replaced, the next F4 run builds it again.
+  stopped, so rerun the same command until it finishes. Every F4 run builds
+  the chain database in memory before it searches, within its cap. Never pass
+  `DB_FILE`: the database is never written to disk, checkpointed or committed.
 
 ### Checkpoints
 

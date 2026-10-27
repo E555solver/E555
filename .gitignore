@@ -19,7 +19,7 @@ tests/out/
 rotations.csv
 backtracked.csv
 *.db_cache
-# the chain database cache (6.8 GB): rebuilt where it is needed, never committed
+# chain database files (6.4 GB): never committed
 *.db
 *.db.tmp
 db_cache*.bin
@@ -28,7 +28,6 @@ sweep_checkpoint.txt
 *.status.csv
 runs/
 agent/labs/
-agent/cache/
 under_development/
 old/
 .claude/

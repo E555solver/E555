@@ -65,11 +65,10 @@ These are non-negotiable. Section 8 repeats them inside the `/goal` condition.
   session's checkpoint (section 11): `agent/checkpoint.sh` commits this
   campaign's `agent/checkpoints/<id>/` alone and pushes it to the session's
   own branch.
-- The beamer's 6.8 GB chain-database cache, if used, goes to the lab's
-  `cache/`, a link to `agent/cache/` that every campaign shares (the file is
-  the same for all), on **local** disk, never on a network drive. It is never
-  committed or checkpointed (`.gitignore` covers `agent/cache/` and every
-  `*.db`). A fresh container rebuilds it in its first F4 run.
+- **The chain database is never saved.** The beamer builds its 6.4 GB chain
+  database in memory at the start of every F4 run, so never pass it
+  `--db_file`/`DB_FILE`. The kit keeps no cache folder, and a database file is
+  never written to disk, checkpointed or committed.
 - You **may** edit the lab's copies of the source, write new tools in the
   lab's `tools/`, and rebuild the lab's binaries. Improve anything you like:
   samplers, allocators, heuristics.
@@ -156,9 +155,7 @@ than 60.
   `--mode`/`--reach`/`--stall_time` flags only to ignore them.
 - beamer: `--random_edges` or a rotations file, `--beam_width`,
   `--backtrack_row`, `--stop_row`, `--end_dive`/`--end_polish`,
-  `--lambda_Mahalanobis`, `--clue_center`/`--clue_corners`, `--rng_seed`. The
-  database cache depends on the clue flags, so use one cache file per clue
-  setting.
+  `--lambda_Mahalanobis`, `--clue_center`/`--clue_corners`, `--rng_seed`.
 - topper: `--side {T,B,L,R,TR,TL,BR,BL,TB,LR}`, `--band_depth`, `--locked_rows`,
   `--top`, `--time_limit`, `--stall_time`.
 - backtracker: `--break_mode any --breaks K`, `--holes FILE`,
@@ -226,8 +223,8 @@ seeds the bookkeeping of section 6:
 - `STRATEGY.md`, with what was measured before the campaign.
 
 It also writes this machine's facts into `scoreboard.json`: `threads` (what
-`nproc` prints), `stage_b_ok` (8 GB of free RAM, plus 8 GB of free disk or a
-cache already in `cache/`), `ortools_ok`, the CPU model and the build's arch.
+`nproc` prints), `stage_b_ok` (8 GB of free RAM, for the chain database the
+beamer builds in memory), `ortools_ok`, the CPU model and the build's arch.
 It ends with two lines:
 ```
 REFEREE verdict=VALID score=465 breaks=15 placed=256 frame_violations=0 ...
@@ -268,8 +265,8 @@ and their value is that they differ from the elites (H5).
 ### 4.2 Pre-flight and launch
 
 - **Cloud session?** None of this section or the next applies: section 11.
-- **Resources.** Stage B (F4) needs ~8 GB of free RAM and ~7 GB of local disk
-  for the 6.8 GB `cache/`. Everything else is small. `setup_lab.sh` records the
+- **Resources.** Stage B (F4) needs ~8 GB of free RAM for the chain database it
+  builds in memory; nothing goes to disk. Everything else is small. `setup_lab.sh` records the
   answer as `stage_b_ok`.
 - **A durable terminal:** `tmux new -s e555`.
 - **Pick the permission mode** (section 5).
@@ -438,13 +435,13 @@ append their ids to `pool/consumed.txt` and skip the ids already there.
 | **F1 reopen** | any complete root | `timeout 1200 bash examples/11_diver_reopen.sh BOARDS=<root.csv> OUT=<D>/out.csv SECONDS_PER_BOARD=<1100 / boards> THREADS=<T> RNG_SEED=<S> REOPEN=<auto, auto+1, top:5 or top:6>` |
 | **F2 ender** | a complete root after F1 stalls | `timeout 1200 python3 src/C_tail/E555_ender.py data/seed_Edge5.txt <root.csv> <D>/out.csv --profile deep --board_time_limit <1000 / boards> --threads <T> --rng_seed <S>` |
 | **F3 distil** | a corpus not yet distilled (4.1) | `timeout 1200 python3 tools/E555_distiller.py <corpus> --top 5 --out pool/distilled_<k>.csv`; rerun the same command until it finishes; its boards then go to F1/F2 |
-| **F4 beam** | `stage_b_ok` is true; new raw material | `timeout 1200 bash examples/01_beamer_quickstart.sh OUT_DIR=<D> THREADS=<T> BEAM_WIDTH=10000 BACKTRACK_ROW=6 STOP_ROW=11 END_DIVE=10000 END_POLISH=20000 MAX_WALL=1100 RNG_SEED=<S> DB_FILE=cache/E555.db` (with `CLUES=1`, use `DB_FILE=cache/E555_clues.db`); the files it wrote are listed in `<D>/outputs.txt`, and its boards go to F1 |
+| **F4 beam** | `stage_b_ok` is true; new raw material | `timeout 1200 bash examples/01_beamer_quickstart.sh OUT_DIR=<D> THREADS=<T> BEAM_WIDTH=10000 BACKTRACK_ROW=6 STOP_ROW=11 END_DIVE=10000 END_POLISH=20000 MAX_WALL=1100 RNG_SEED=<S>` (no `DB_FILE`: the database is built in memory); the files it wrote are listed in `<D>/outputs.txt`, and its boards go to F1 |
 | **F5 rebuild** | an elite F1 cannot move | `timeout 1200 bin/E555_diver data/seed_Edge5.txt <root.csv> <D>/out.csv --holes top:6 --stop_row 11 --end_dive 10000 --end_polish 20000 --emit_score 455 --wall_time 1100 --threads <T> --rng_seed <S>` |
 | **F6 exact** | an unpolished board, or a small hole to prove | `timeout 1200 bash pipeline/topper_sweep.sh INPUT=<root.csv> PRESET=safe OUT=<D>/out.csv OUT_DIR=<D> WORKERS=<T>`, or `timeout 1200 bin/E555_backtracker data/seed_Edge5.txt <root.csv> <D>/out.csv --holes <D>/mask.csv --break_mode any --breaks <K> --time_limit 1100 --threads <T>`, with a mask you write (16 lines of 16 `0`/`1`, first line = row 0, under ~30 open cells around the breaks). An exhausted level K proves that no filling of the hole has K or fewer breaks; a search that runs out of time writes the board with the hole still open, which the referee calls `INVALID reason=incomplete`: log it as a run that found nothing |
 | **F7 tool** | an idea none of the above covers | write it in the lab's `tools/`, check it against the referee on `data/best_46*.csv` first, then run it like any other family |
 
-The first F4 run builds the database cache (about 2 minutes on 4 cores,
-writing the 6.8 GB file included); later runs map it in seconds. Measured: one
+Every F4 run builds the chain database in memory before it searches, so its
+cap covers that build too. Measured: one
 5-minute F4 run on 4 cores wrote 3,077 boards, the best 462. F5 lifts cells, so
 its output can score below its input. It is still a run: referee it and log it.
 
@@ -545,9 +542,9 @@ from a terminal, and how the launcher handles it:
 | No command-line flags: the model and the permission mode come from the session's pickers, so the launch line of 4.2 and section 5 do not apply. Bypass permissions is not offered | you pick Opus and Auto, and send `/effort medium` (`/model` and `/effort` take their value as an argument in a cloud session) |
 | A usage limit stops the turns until the 5-hour window resets. The docs promise an automatic wait only for interactive terminal sessions, and an idle cloud VM is reclaimed | on its first turn the agent creates an hourly scheduled task that wakes this session. A wake-up after the reset continues the campaign, restoring the lab from its checkpoint if the VM was reclaimed. The clocks count run time (section 6), so the wait costs nothing. The agent deletes the task when the campaign ends |
 | The Bash tool stops a foreground command after 2 minutes by default and 10 at most, and `BASH_*_TIMEOUT_MS` cannot be set at launch | `RUN_CAP` (default 540 s) keeps each run in the foreground. A larger cap sends runs to the background, where the tool allows up to 2 hours |
-| Limited compute: the container this kit was measured in had 4 cores, 15 GB of RAM and a 30 GB disk allowance, and yours may have less | the health check at the start of every turn measures cores, free RAM and disk. F4 runs only with 8 GB of free RAM and room for the 6.8 GB cache |
+| Limited compute: the container this kit was measured in had 4 cores, 15 GB of RAM and a 30 GB disk allowance, and yours may have less | the health check at the start of every turn measures cores, free RAM and disk. F4 runs only with 8 GB of free RAM, for the chain database it builds in memory |
 | The session can move to another machine, with another CPU, where a `-march=native` binary dies with SIGILL | the lab builds for x86-64-v3 (AVX2), which runs on any current server and here ran as fast as native, and falls back to generic below that or after a SIGILL. A new CPU shows as `cpu_changed=yes`, and the agent takes the new `threads` |
-| The container can be replaced (idle, restarts). `agent/labs/` is gitignored, so the lab goes with the container, runs in flight included | `agent/checkpoint.sh` commits the campaign's `agent/checkpoints/<id>/` (scoreboard, logs, journal, strategy, frontier, elite, distilled pools) to the session's own branch, on every new best and every `CHECKPOINT` (30 min). The health check restores a lost lab from it. The 6.8 GB database cache is never committed: the first F4 run in a new container rebuilds it, and `checkpoint.sh` refuses any file over 20 MB |
+| The container can be replaced (idle, restarts). `agent/labs/` is gitignored, so the lab goes with the container, runs in flight included | `agent/checkpoint.sh` commits the campaign's `agent/checkpoints/<id>/` (scoreboard, logs, journal, strategy, frontier, elite, distilled pools) to the session's own branch, on every new best and every `CHECKPOINT` (30 min). The health check restores a lost lab from it. The chain database is never saved: every F4 run builds it in memory, and `checkpoint.sh` refuses any file over 20 MB |
 | A fresh container has no OR-Tools | `setup_lab.sh` installs it. Without it, F2 and the topper are skipped |
 
 **Settings** go in the pasted line: `BUDGET` (8h of run time), `RUN_CAP` (540),

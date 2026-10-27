@@ -15,8 +15,6 @@
 #
 # 1. Copies the toolchain into the lab when it is not there: Makefile, src,
 #    tools, examples, pipeline, data, the two docs, and the kit as KIT.md.
-#    cache/ links to agent/cache/: the 6.8 GB database cache is the same for
-#    every campaign, so they share one copy.
 # 2. Builds the lab's bin/. ARCH=auto picks v3 (AVX2) where the CPU runs
 #    x86-64-v3, else generic. Measured on the reopen: v3 is as fast as native
 #    and generic 45% slower, all three with identical output; a native build
@@ -30,8 +28,8 @@
 #    restored campaign a new budget.
 # 5. Writes this machine's facts into scoreboard.json (cpu, arch, threads,
 #    ram_gb, disk_gb, ortools_ok, stage_b_ok) and checks the frontier with the
-#    referee. stage_b_ok needs 8 GB of free RAM and 8 GB of free disk for the
-#    database cache, or a cache already in agent/cache/E555.db.
+#    referee. stage_b_ok needs 8 GB of free RAM: the beamer builds its chain
+#    database in memory in every run, and the kit never writes it to disk.
 # Exit status 0 = ready, 1 = a step failed, 2 = usage.
 # ---- settings: pass NAME=value on the command line ---------------------------
 CAMPAIGN=           # empty: the lab this runs in, else a new campaign;
@@ -96,7 +94,7 @@ if [ "$CAMPAIGN" = new ]; then
 fi
 [[ "$CAMPAIGN" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "bad campaign id '$CAMPAIGN'"
 LAB="$LABS/$CAMPAIGN"
-mkdir -p "$LAB" "$REPO/agent/cache"
+mkdir -p "$LAB"
 cd "$LAB"
 
 # 1. the toolchain
@@ -106,7 +104,6 @@ if [ ! -f Makefile ]; then
     state=fresh
 fi
 [ -f KIT.md ] || cp "$REPO/agent/autonomous_agent_mode.md" KIT.md
-[ -e cache ] || [ -L cache ] || ln -s ../../cache cache
 mkdir -p runs frontier pool
 
 # 2. the binaries
@@ -189,7 +186,7 @@ cpu=${cpu:-unknown}
 ram_gb=$(awk '/^MemAvailable/ {printf "%d", $2 / 1048576}' /proc/meminfo)
 disk_gb=$(df -Pk . | awk 'NR == 2 {printf "%d", $4 / 1048576}')
 stage_b_ok=false
-if [ "$ram_gb" -ge 8 ] && { [ -s cache/E555.db ] || [ "$disk_gb" -ge 8 ]; }; then
+if [ "$ram_gb" -ge 8 ]; then
     stage_b_ok=true
 fi
 read -r cpu_changed best < <(python3 - "$CAMPAIGN" "$cpu" "$ARCH" "$threads" "$ram_gb" "$disk_gb" "$ortools" "$stage_b_ok" <<'EOF'
