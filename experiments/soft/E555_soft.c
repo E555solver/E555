@@ -8,7 +8,8 @@
  * entropy term, lowered in stages, lets every mix settle on a single choice (mean
  * field annealing); the result is rounded to a real board and hill-climbed. Many
  * starts per board give distinct complete boards: new places to start for
- * E555_diver --reopen and E555_ender.py. Needs NLopt (make soft).
+ * E555_diver --reopen and E555_ender.py. An experiment (README.md beside this
+ * file has the measurements); needs NLopt; build it here with make.
  *
  * INPUT. Any board CSV: the last 512 fields of a row are pos[256] and rot[256]
  * (999 = unplaced), a leading field is the config id, '#' and '%' lines are
@@ -49,7 +50,7 @@
  * raised from 0 -- this one settles (the cell sums made the bounded problem
  * so stiff that the mixes never did), and it starts from a nearly convex
  * problem: B alone is not convex, so a ladder starting at mu = 0 froze in the
- * first local minimum it met (PROJECT_E555.md, "E555_soft").
+ * first local minimum it met (README.md).
  *
  * FINISH. Per piece kind, a linear assignment (Hungarian) takes the board of
  * most mass, each (cell, piece) at its heaviest spin; the dive engine's polish
@@ -72,11 +73,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "../B_beam/E555_database.h"
-#include "E555_dive.h"
+#include "../../src/B_beam/E555_database.h"
+#include "../../src/C_tail/E555_dive.h"
 
 /* ============================================================================
- * Tuning (measured; see PROJECT_E555.md, "E555_soft")
+ * Tuning (measured; see README.md)
  * ========================================================================== */
 #define SOFT_T0        0.45    /* temperature of the first stage: nearly uniform mixes... */
 #define SOFT_T1        0.12    /* ...and of the last: the cells have committed */

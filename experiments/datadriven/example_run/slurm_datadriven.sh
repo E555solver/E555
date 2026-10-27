@@ -9,9 +9,9 @@
 # slurm_datadriven.sh -- learn a positional table from a de-biased beam, then
 # search with it. Submit from the repository root:
 #
-#   sbatch tests/datadriven/example_run/slurm_datadriven.sh
-#   sbatch tests/datadriven/example_run/slurm_datadriven.sh LEARN=0
-#   sbatch --array=0-5 tests/datadriven/example_run/slurm_datadriven.sh   # one border row per task
+#   sbatch experiments/datadriven/example_run/slurm_datadriven.sh
+#   sbatch experiments/datadriven/example_run/slurm_datadriven.sh LEARN=0
+#   sbatch --array=0-5 experiments/datadriven/example_run/slurm_datadriven.sh   # one border row per task
 #
 # The defaults match the settings recorded in table_rnd_s9_row2.txt (border
 # r16178 = borders_stageAx6.csv row 4). Runs are deterministic for a given
@@ -27,9 +27,9 @@ set -euo pipefail
 # ---- settings: edit here, or pass NAME=value on the command line ------------
 REPO=${SLURM_SUBMIT_DIR:-$(cd "$(dirname "$0")/../../.." && pwd)}
 SEED=data/seed_Edge5.txt
-ROTATIONS=tests/datadriven/borders_stageAx6.csv
+ROTATIONS=experiments/datadriven/borders_stageAx6.csv
 BORDER_ROW=${SLURM_ARRAY_TASK_ID:-4}
-OUT_DIR=                # default: tests/datadriven/runs/rnd_s9_row$BORDER_ROW
+OUT_DIR=                # default: experiments/datadriven/runs/rnd_s9_row$BORDER_ROW
 TABLE=                  # default: $OUT_DIR/table_rnd_s9_row$BORDER_ROW.txt
 DB_FILE=                # clued chain DB cache; empty = build in memory (~6 GB)
 THREADS=${SLURM_CPUS_PER_TASK:-24}
@@ -58,13 +58,13 @@ for arg in "$@"; do
         *) echo "expected NAME=value, got: $arg" >&2; exit 1 ;;
     esac
 done
-OUT_DIR=${OUT_DIR:-tests/datadriven/runs/rnd_s9_row$BORDER_ROW}
+OUT_DIR=${OUT_DIR:-experiments/datadriven/runs/rnd_s9_row$BORDER_ROW}
 TABLE=${TABLE:-$OUT_DIR/table_rnd_s9_row$BORDER_ROW.txt}
 cd "$REPO"
 [ -f "$SEED" ] || { echo "no $SEED under $REPO: submit from the repository root" >&2; exit 1; }
 
-BIN=tests/datadriven/bin/E555_beamer_datadriven
-[ -x "$BIN" ] || { echo "build it first: (cd tests/datadriven && make)" >&2; exit 1; }
+BIN=experiments/datadriven/bin/E555_beamer_datadriven
+[ -x "$BIN" ] || { echo "build it first: (cd experiments/datadriven && make)" >&2; exit 1; }
 mkdir -p "$(dirname "$TABLE")" "$OUT_DIR"
 
 CLUES=(--clue_center --clue_corners --pin_clue 1)
@@ -110,6 +110,6 @@ date
     --beam_expand 2 --beam_expand_row 5
 
 echo
-echo "table   : $TABLE   (python3 tests/datadriven/freq_view.py $TABLE --text)"
+echo "table   : $TABLE   (python3 experiments/datadriven/freq_view.py $TABLE --text)"
 echo "boards  : listed in $OUT_DIR/outputs.txt"
 date

@@ -3181,7 +3181,7 @@ def warm_start_report(path: str, row: int, lineno: int, comment: Optional[str],
     are recomputed from the reconstructed border, and a comment that carries
     counts can only agree with them if the row and this seed file describe the
     same pieces. Checked against all 18 rows shipped in data/ and
-    tests/datadriven/ -- every one reconstructs to 14/14/14/14 with four
+    experiments/datadriven/ -- every one reconstructs to 14/14/14/14 with four
     corners and counts identical to its comment -- so a disagreement means the
     wrong seed file, and annealing on would silently optimize a different
     board."""
