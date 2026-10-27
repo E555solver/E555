@@ -150,5 +150,11 @@ int      dv_result(size_t i, uint16_t pid[NUM_PIECES], uint8_t rot[NUM_PIECES]);
 void     dv_keeping(bool on);
 uint64_t dv_keep_last(void);
 void     dv_print_summary(double wall_total);
+/* The polish's hill-climb on a complete board, in place, over cells[0..n):
+   turn one piece or swap two, with frame-legal spins under the current
+   dv_frame, while any such move adds a matched edge. Needs dv_init and
+   dv_frame; it touches no engine state, so threads may climb different boards
+   at once. Returns the edges gained. */
+int      dv_climb(uint16_t pid[NUM_PIECES], uint8_t rot[NUM_PIECES], const uint8_t *cells, int n);
 
 #endif /* E555_DIVE_H */
