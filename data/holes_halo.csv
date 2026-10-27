@@ -1,12 +1,10 @@
 # The halo: lift rows 0-2 and columns 0, 1, 14, 15 (100 cells), keep the core rows 3+ x cols 2-13.
 # Row convention: first data line below = row 0 (BOTTOM), last = row 15 (TOP).
 # Made for pipeline/run_halo.sh. On a beamer stop-row-10 board it lifts 80 pieces (the frame and
-# the ring inside it, up to row 10) and keeps the 8 x 12 core rows 3-10 x cols 2-13. The row-2
-# corner clue cells are lifted too: --clue_corners puts the clues back on them. --order frontier
-# then grows the lifted halo and the empty top together, outward from the core and the row-13
-# clues: layers 1-5 hold 64, 68, 16, 6 and 2 cells (the ring around the core with row 11 and the
-# cells around the row-13 clues first; the frame, row 1 and row 12 next).
-# bin/E555_backtracker data/seed_Edge5.txt boards.csv halo.csv --holes data/holes_halo.csv --clue_center --clue_corners --breaks 0 --order frontier --time_limit 2
+# the ring inside it, up to row 10) and keeps the 8 x 12 core rows 3-10 x cols 2-13, so all 60
+# frame cells are open: with --frame_last, --early_release 60 releases the first board that
+# places every inner cell.
+# bin/E555_backtracker data/seed_Edge5.txt boards.csv halo.csv --holes data/holes_halo.csv --clue_center --breaks 0 --order frontier --frame_last --early_release 60 --no_colour_count --no_hall --time_limit 1
 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
