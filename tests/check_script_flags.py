@@ -54,6 +54,7 @@ TOOL_SOURCES = {
     "E555_roundhouse":  ["src/B_beam/E555_roundhouse.c", "src/B_beam/E555_database.c"],
     "E555_backtracker": ["src/C_tail/E555_backtracker.c"],
     "E555_diver":       ["src/C_tail/E555_diver.c"],
+    "E555_soft":        ["src/C_tail/E555_soft.c"],
 }
 
 SCRIPT_DIRS = ["examples", "pipeline", "tests"]

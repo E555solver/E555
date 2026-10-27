@@ -75,6 +75,8 @@ Stage C  E555_distiller.py       screen a corpus with dives, keep the N best
          E555_ender.py           exact CP-SAT regions + redive; never returns worse
          E555_topper.py          CP-SAT break minimizer over border bands
          E555_backtracker        exact / bounded-mismatch DFS; band enumeration
+         E555_soft               experimental (NLopt): relaxed boards settled into
+                                 real ones, new starts for the closers
 ```
 
 Stage B grows every board upward, one complete row at a time, from a fixed
@@ -2055,6 +2057,156 @@ the identifier third; the run ends with the min/max/mean/std/median score), plus
 `.best_mismatch.csv` and the stop-band files. The gate rebuilds the solver with
 `-DVERIFY_BREAKCOUNT` to check the break counters against a full scan.
 
+### 9.6 `E555_soft` -- relaxed boards settled into real ones (experimental)
+
+```bash
+make soft                                    # needs NLopt; not part of `make`
+bin/E555_soft seed.txt boards.csv output.csv [--core N] [--starts N] [--keep K]
+```
+
+The free cells of a board hold probability mixes over (piece, spin) instead of
+pieces. The expected number of breaks is minimised over the mixes while a
+falling temperature lets every mix settle on one choice (mean-field
+annealing); the result is rounded to a real board and hill-climbed. Each start
+plans the whole free region at once, where a dive fills it cell by cell, so its
+boards are other places to start for `E555_diver --reopen` and the ender.
+
+**Free region.**
+- Without `--core`: the open cells of each board, for its unplaced pieces. A
+  complete board has nothing free and is skipped.
+- `--core N` keeps the N placed pieces nearest the board centre (square rings
+  out from the central 2x2, each ring from the middle of its sides) and frees
+  all the others; on a complete board `--core 196` frees exactly the frame.
+  `--core 0` builds a whole new board.
+- To free the top rows, or any other `--holes` shape, of complete boards, cut
+  them first: `E555_diver seed in.csv cut.csv --holes top:K --end_dive 0 --emit_score 0`.
+
+**Model.** A variable `y[c,p,s] >= 0` per free cell c, free piece p of its kind
+and frame-legal spin s (one spin for a corner or edge piece in a cell of its
+kind, four for an inner piece; edge pieces may take any free border cell).
+Every cell is filled once and every piece used once; the constraint matrix is
+a bipartite incidence matrix, so every vertex of the region is a real board.
+`pi[c,d,k] = sum y[c,p,s] [side d of p at spin s is k]` is the chance that c
+shows colour k on side d (a placed neighbour's is 0 or 1), and
+
+```
+B(y)          = sum over the junctions touching the free region of (1 - sum_k pi[c,d,k] pi[c',d',k])
+dB/dy[c,p,s]  = - sum over the sides d of c that face a cell of pi_neighbour[colour of p at spin s on side d]
+```
+
+is the expected number of breaks, exact on a real board. A row-11 partial has
+7.5k variables, `--core 128` 22k, a whole board 157k.
+
+**Method.**
+- Each cell's mix is a softmax of free parameters, `y[c,.] = softmax(theta[c,.])`,
+  so the cell sums hold exactly. At temperature T,
+  `F_T = B + T sum y log y + sum_p lambda_p h_p + rho/2 sum_p h_p^2`, with h_p
+  the piece sums minus 1, is minimised over theta by NLopt's L-BFGS
+  (`NLOPT_LD_LBFGS`, 4 vectors) in rounds of at most 100 evaluations. After a
+  round `lambda += rho h`, and rho (10 at first) is multiplied by 10, up to
+  100, when the worst residual did not fall by 4.
+- T falls geometrically from 0.45, where the mixes are nearly uniform, to 0.12
+  over 30 stages of at most 3 rounds, each stage from the last one's result.
+  On seed_Edge5 the cells commit between T = 0.3 and 0.2.
+- Start 0 is the uniform mix; start j a Gumbel-Sinkhorn mix (weights
+  `exp(Gumbel noise)`, scaled 50 times per piece and per cell).
+- Finish: per piece kind, a linear assignment (Hungarian) takes the board of
+  most mass, each (cell, piece) at its heaviest spin; the polish's climb
+  (`dv_climb`, E555_dive.c: turn one piece or swap two while an edge is gained)
+  then runs over the free cells.
+- Per input the `--keep` best boards are written, best first, skipping any that
+  shares more than 80% of its free cells with a better one, as
+  `<id>_s<start>, score, pos[256], rot[256]`.
+- Every start runs serially on a stream keyed by the input board, the start and
+  `--rng_seed`, so the output does not depend on `--threads`.
+
+**Why this formulation.** The first version kept `y` as variables in [0,1],
+put both sums in the Lagrangian, and raised a concave penalty `mu sum y (1 - y)`
+geometrically from 0.02 to 4. On the synthetic solution with its top 4 rows cut,
+16 starts:
+
+| variant | rounded mean | rounded best | climbed best |
+|---|---|---|---|
+| y in [0,1], both sums in the Lagrangian, mu 0.02 -> 4 | 381.8 | 418 | 440 |
+| softmax per cell, the same mu ladder | 405.8 | 434 | 441 |
+| softmax, mu from -20 (convex) to 4 | 441.6 | 447 | 453 |
+| softmax, entropy, T 0.5 -> 0.005 | 456.6 | 462 | 466 |
+
+- A cell constraint sums ~170 variables, so its squared residual is ~170 times
+  stiffer than the objective: L-BFGS spent 8,400 evaluations a start and the
+  mixes never settled (a cell's largest share 0.32 on average).
+- B is not convex, so a ladder that starts at mu = 0 drops into the local
+  minimum nearest its start in the first stage and stays there. It needs a
+  convex start: a negative mu, or the entropy, which did better.
+- NLopt's `AUGLAG` evaluates every constraint's gradient as a dense vector: 160
+  x 13k operations an evaluation for 80 free cells, where the objective costs
+  ~0.1M, and 512 x 157k for a whole board. `G_MLSL` samples the box, almost
+  none of which is near the assignment polytope, and runs sequentially. Neither
+  is used.
+- NLopt's L-BFGS costs ~4mn flops an iteration with m vectors; m = 4 gave the
+  same boards as m = 10 in 26% less time.
+
+**Measured** (seed_Edge5, 4 threads, the defaults).
+
+Refills with a known answer: 15 boards of `data/best_463.csv` turned 180
+degrees, their top K rows cut. Those rows were built by the backtracker with no
+break, so a zero-break refill exists. Breaks are counted inside the cut region:
+
+| rows cut | soft: perfect, mean breaks, time a board | dives 10000/20000: perfect, mean breaks, time a board |
+|---|---|---|
+| 4 | 5 of 15, 10.0, 12 s | 15 of 15, 0.0, 0.16 s |
+| 6 | 0 of 15, 26.5, 34 s | 11 of 15, 5.1, 0.36 s |
+| 8 | 0 of 15, 32.1, 69 s | 0 of 15, 25.8, 0.58 s |
+
+Stage B partials: 35 distinct row-11 boards of `data/E565_FixCorners23.csv.gz`
+(64 free cells), sampled with a fixed seed. Each arm was then re-dived with
+`E555_diver --reopen auto --copies 8 --end_dive 1000 --end_polish 10000`, 15 s
+a board, and the ender (`--profile overnight`, 60 s a board) took each arm's
+best 5:
+
+| arm | start | `--reopen` 15 s | 30 s | ender on the best 5 |
+|---|---|---|---|---|
+| dives 10000/20000 (0.26 s a board) | 458.3 | 459.8 | 459.8 | 461 x5 -> one 462 |
+| dives, 32 copies (8 s a board) | 459.5 | -- | -- | -- |
+| soft, 16 starts (13 s a board) | 454.8 | 459.7 | -- | 461 x5, no gain |
+
+- The soft board is 3.5 below the dived one on average (0 to 6) and never above
+  it. It shares 15% of the free cells with it: a different board, not a worse
+  copy of the same one.
+- Every dived board stopped gaining after its first 15 s. Re-dived from the soft
+  board instead, 1 of the 35 went past that plateau, 28 reached it and 6 fell
+  short.
+- On the complete synthetic board, `--core 196` (the frame) and `--core 144`
+  come back 480/480 (the latter on 2 of 4 starts), `--core 128` 458. A whole
+  new seed_Edge5 board (`--core 0`, 157k variables) takes 73 s a start and
+  scores 425-428.
+
+**Verdict.** The soft boards are close to the dives on Stage B partials and
+mostly different, but the closers take them back to the dives' plateau rather
+than past it, and on refills with a known answer the dives are far ahead at a
+hundredth of the time. At these budgets this is not a better source of starts
+than the dives. The tool stays as the base for the next relaxation (the free
+region, the objective and its gradient, the NLopt driver, the rounding).
+
+| option | default | meaning |
+|---|---|---|
+| `--core N` | every placed piece | keep the N placed pieces nearest the centre; 0 = a whole new board |
+| `--starts N` | 16 | relaxations per board, each from its own mix |
+| `--keep K` | 4 | distinct boards written per input |
+| `--start_row R`, `--num_rows N` | 0, 0 (all) | input records R..R+N-1 |
+| `--threads N`, `--rng_seed S` | all, 1 | output independent of threads |
+| `--wall_time S` | -- | stop after the boards in flight (SIGINT/SIGTERM too) |
+| `--print_cmd`, `--verbose` | off | `--verbose`: one line per start |
+
+**Summary lines.**
+- `[sum] free region`: cells, variables, pieces kept and freed;
+- `[sum] relaxation`: at the end, expected breaks, how unsettled the cells are and the worst residual; evaluations per start;
+- `[sum] boards`: rounded and climbed, mean and best;
+- `[sum] written`: boards, and the share of the pieces `--core` freed that went back to their cell;
+- `[sum] time`: per board and per start.
+
+The tuning constants are the `SOFT_*` defines at the top of `E555_soft.c`.
+
 ---
 
 ## 10. Tools
@@ -2139,6 +2291,7 @@ the identifier third; the run ends with the min/max/mean/std/median score), plus
 | diver | the output CSV, `<out>.outputs.txt` | canonical, matched edges in field 2 |
 | backtracker | output CSV, `.checkpoint.csv`, `.status.csv`, `.best_*.csv`, `.stop_row<N>.csv` / `.stop_col<N>.csv` (`_rev`) | canonical; with `--resume`, `config_id, score, identifier, pos, rot` |
 | topper, ender, distiller | output CSV | canonical |
+| soft | the output CSV, `<out>.outputs.txt` | canonical, matched edges in field 2; ids `<input id>_s<start>` |
 
 ## 12. Build and test
 
@@ -2147,6 +2300,7 @@ make                  # bin/E555_beamer, E555_finalizer, E555_roundhouse, E555_b
 make ARCH=v3          # x86-64-v3 (AVX2): one binary for a mixed cluster
 make ARCH=generic     # CI, containers, cloud sandboxes
 pip install ortools   # topper and ender only
+make soft             # optional: bin/E555_soft, needs NLopt (libnlopt-dev; or NLOPT=/prefix)
 bash tests/run_tests.sh                       # the core checks (~20 s)
 bash tests/run_tests.sh beamer                # the checks of one tool (see --list for tags)
 bash tests/run_tests.sh --all                 # the release gate
@@ -2171,6 +2325,7 @@ the roundhouse must rediscover `data/synth_solution_480.csv` from
 | `src/C_tail/E555_dive.{c,h}` | end-dive engine: dives, cross-entropy rounds, polish, corner seeds, copies and incumbents, job queue |
 | `src/C_tail/E555_diver.c` | the dive engine on any board file; `--holes`, `--pin_clue`, `--stop_row`, `--reopen` |
 | `src/C_tail/E555_ender.py` | exact region re-solves and redive |
+| `src/C_tail/E555_soft.c` | relaxed boards: mean-field annealing with NLopt, rounding, the polish climb (experimental) |
 | `src/C_tail/E555_topper.py` | CP-SAT band minimizer |
 | `src/C_tail/E555_backtracker.c` | exact / mismatch DFS, stop bands |
 | `tools/` | viewer, rank, rotate, sort_rotations, extract_consensus, distiller, clean_csv |
