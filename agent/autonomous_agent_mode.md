@@ -7,17 +7,23 @@ repo. Do the setup (sections 4 and 5), paste section 8, walk away, and come back
 to a documented campaign. In a **cloud session** (claude.ai/code, the Claude
 app), paste the `/goal` line of `agent/launch_cloud_agent.md` instead: section 11.
 
-Written to be driven by the economical **Sonnet** model on a Pro subscription
-(a long run, with tokens that refill on a flat cadence). Sonnet is capable but
-literal, so this kit is deliberately *prescriptive*: exact commands, explicit
-budgets, a fixed decision procedure, and hard guardrails. When in doubt, the
-agent follows the recipe rather than improvising.
+Written for the latest **Opus** model (the `opus` alias; Opus 5.5 today) at
+**medium** effort, on a claude.ai subscription. A campaign outlasts a 5-hour
+usage window, and that is expected. When the limit hits, the session waits and
+continues once the window resets (section 4.2, and for cloud sessions section
+11). The campaign's clocks count run time, not wall time (section 6), so the
+wait costs none of its budget. The kit stays deliberately *prescriptive*:
+exact commands, explicit budgets, a fixed decision procedure, and hard
+guardrails. A long unattended run should follow the recipe rather than
+improvise.
 
 v3 changes from v2: the current Stage C tools (the diver's `--reopen`, the
 distiller, the ender's profiles), a referee script the agent cannot edit, a
 lab that is a self-contained checkout, and a `/goal` condition that fits the
 4,000-character limit. v3.1 adds `agent/setup_lab.sh`, which replaces the
-hand-run setup block, and cloud sessions with checkpoints (section 11).
+hand-run setup block, and cloud sessions with checkpoints (section 11). v3.2
+moves the kit to Opus at medium effort, measures budgets in run time
+(`agent/status.sh`), and continues campaigns across usage-limit resets.
 
 ---
 
@@ -257,13 +263,30 @@ and their value is that they differ from the elites (H5).
   answer as `stage_b_ok`.
 - **A durable terminal:** `tmux new -s e555`.
 - **Pick the permission mode** (section 5).
-- **Launch from the lab**, in the mode you picked, with a Bash time limit long
-  enough for one run. The Bash tool stops a foreground command after 2 minutes
-  by default and 10 minutes at most; the kit's runs take up to 20:
+- **Launch from the lab** on the latest Opus at medium effort, in the mode you
+  picked, with a Bash time limit long enough for one run. The Bash tool stops a
+  foreground command after 2 minutes by default and 10 minutes at most; the
+  kit's runs take up to 20:
   ```bash
   cd agent/lab
-  BASH_DEFAULT_TIMEOUT_MS=1500000 BASH_MAX_TIMEOUT_MS=1500000 claude --permission-mode auto --model sonnet
+  BASH_DEFAULT_TIMEOUT_MS=1500000 BASH_MAX_TIMEOUT_MS=1500000 claude --permission-mode auto --model opus --effort medium
   ```
+  On a laptop, keep the machine awake by putting `caffeinate -i` (macOS) or
+  `systemd-inhibit --what=sleep:idle` (Linux) in front of `claude`.
+- **Usage limits.** Opus at medium effort spends a 5-hour usage window in a few
+  hours of campaign. When the limit stops a turn, Claude Code waits in the open
+  session and continues the task on its own after the reset. It needs Claude
+  Code v2.1.234 or later and a claude.ai sign-in, and it is on by default
+  (`/config`: "Continue automatically at usage limit"). The campaign's clocks
+  count run time, so the wait costs nothing. For the wait to work:
+  - keep the session open: `tmux`, and no exit;
+  - keep Auto mode, since a permission prompt would stop the continued turn;
+  - after a sleep of more than about 30 minutes past the reset, press `Enter`.
+  If continuations keep hitting the limit, Claude Code re-arms the wait twice
+  in a row and then stops. It never waits on its own for a limit more than 24
+  hours away, such as a weekly limit. In either case, run `/rate-limit-options`
+  and pick **Wait here, then continue automatically**, or send `continue` after
+  the reset.
 - Threads: the number `nproc` prints (`setup_lab.sh` records it as `threads`),
   never a guess.
 
@@ -329,12 +352,22 @@ Everything under `agent/lab/`:
   and tokens are the budget.
 
 **The status line.** The `/goal` evaluator only sees the conversation; it cannot
-read files. So every turn ends with this line, its values computed by commands
-in that turn (elapsed = `date +%s` − `goal_start_unix`; since_best uses
-`last_best_unix`, or `goal_start_unix` before the first new best):
+read files. So every turn ends with the line `bash ../status.sh` prints, run in
+that turn, followed by ` next=<next move>`:
 ```
-STATUS best=465/480 breaks=15 runs=12 elapsed=2h05m since_best=0h40m families_since_best=2 next=<next move>
+STATUS best=465/480 breaks=15 runs=12 run_time=2h05m/8h00m since_best=0h40m/1h00m families_since_best=2/3 stop=none next=<next move>
 ```
+The first call passes the settings (`bash ../status.sh BUDGET=8h PLATEAU=1h/3`),
+and later calls reuse them from `scoreboard.json`; the first call also sets
+`goal_start_unix` when it is null. The clocks are **run time**: `run_time` sums
+`runtime_s` over the `run_log.csv` rows logged since `goal_start_unix`, and
+`since_best` sums it over the rows logged after `last_best_unix`. A usage-limit
+wait, a restart or the agent's own thinking never counts, so a campaign that
+waits out a 5-hour window resumes with its budget and plateau intact. `stop=`
+names the stop rule that holds: `480`, `budget`, or `plateau` (since_best and
+families_since_best both at their limits); otherwise `none`. So `unix` in
+`run_log.csv` is when the row was logged, after the run, and `runtime_s` is the
+run's wall seconds.
 
 **`SUMMARY.md`** (written when a stop rule holds): the final referee line; the
 winning family, tool, exact command and file; the five best runs from
@@ -348,8 +381,10 @@ specific things to try next with more time or a bigger machine.
 
 A fixed, prescriptive cycle.
 
-0. **First turn only:** if `goal_start_unix` is null, set it to `date +%s`.
-   `threads` and `stage_b_ok` come from `setup_lab.sh` (section 4). If the
+0. **First turn only:** run `bash ../status.sh` with the goal's settings
+   (`BUDGET=8h PLATEAU=1h/3` unless the goal says otherwise). It stores them
+   and sets `goal_start_unix`. `threads` and `stage_b_ok` come from
+   `setup_lab.sh` (section 4). If the
    machine may have changed, run `bash ../setup_lab.sh` again: it rebuilds
    what the new CPU needs and rewrites them.
 1. **Orient.** Read `scoreboard.json`, the last few `JOURNAL.md` blocks and
@@ -429,18 +464,17 @@ HARD RULES (breaking any voids the run):
 
 EACH TURN: follow KIT.md section 7. Orient, choose a family by the heuristics of section 3, run it bounded (timeout 1200, output in a new runs/<ts>_<tool>/), referee the output, log it, update scoreboard.json and the frontier on a new best, chain the closers on it, and journal it. On the first turn, set goal_start_unix as section 7 step 0 says; threads and stage_b_ok are in scoreboard.json.
 
-END EVERY TURN with this line, its values computed by commands in that same turn:
-STATUS best=<score>/480 breaks=<n> runs=<total_runs> elapsed=<h>h<mm>m since_best=<h>h<mm>m families_since_best=<k> next=<next move>
+END EVERY TURN with the line `bash ../status.sh BUDGET=8h PLATEAU=1h/3` prints in that same turn, followed by next=<next move>. Its clocks count run time, so usage-limit waits do not count.
 
-The goal is met only when SUMMARY.md has been written as KIT.md section 6 describes and its first ten lines are printed in the transcript, after one of these held in a STATUS or REFEREE line of this conversation:
+The goal is met only when SUMMARY.md has been written as KIT.md section 6 describes and its first ten lines are printed in the transcript, after one of these held in this conversation:
 (a) the referee printed verdict=VALID score=480;
-(b) elapsed reached 8h00m;
-(c) since_best reached 1h00m with families_since_best at least 3.
-Until then, keep working.
+(b) a STATUS line showed stop=budget or stop=plateau.
+If a usage limit stops a turn, continue the campaign where it stopped once the limit resets. Until then, keep working.
 ```
 
-Tune before pasting only if you want to: the `1200` s per-run cap, the `8h00m`
-total budget, and the `1h00m` / 3-family plateau rule. Everything else is
+Tune before pasting only if you want to: the `1200` s per-run cap, and the
+`BUDGET=8h` run-time budget and `PLATEAU=1h/3` plateau rule (one hour of run
+time without a new best, after at least three families). Everything else is
 repo-correct as written. The condition is under the 4,000-character limit of
 `/goal`; keep it there if you edit it.
 
@@ -457,11 +491,14 @@ repo-correct as written. The condition is under the 4,000-character limit of
 - The frontier board is always `agent/lab/frontier/frontier.csv`. View it with
   `python3 tools/E555_viewer.py agent/lab/frontier/frontier.csv` from the repo
   root (the viewer's URL opens it on e2.bucas.name).
+- **A usage limit** pauses the campaign until the window resets, then Claude
+  Code continues it (section 4.2). Nothing is lost: the clocks count run time.
 - **Resume another day:** `cd agent/lab` and relaunch with the same command
   plus `--continue`. Claude Code restores an active goal, but restarts its own
-  timer and turn count, which is why the kit keeps its clock in
-  `scoreboard.json`. That clock includes the downtime: set `goal_start_unix`
-  (and `last_best_unix`) to null to give the run a fresh 8 hours. In a new
+  timer and turn count, which is why the kit keeps its clocks in
+  `scoreboard.json` and `run_log.csv`. They count run time, so downtime costs
+  nothing. To give the run a fresh budget, set `goal_start_unix` and
+  `last_best_unix` to null and empty `families_since_best`. In a new
   session, paste section 8 again; the scoreboard, frontier, elite file,
   `run_log.csv` and `STRATEGY.md` are all the state it needs. A cloud session
   resumes differently, from a checkpoint: section 11.
@@ -484,40 +521,50 @@ run (or the next machine) starts smarter. That documentation is the win even if
 ## 11. Cloud sessions (claude.ai/code, the Claude app)
 
 In a cloud session, Claude Code runs in a container on a machine you do not
-choose. Do not do sections 4, 4.2, 5 and 8 by hand. Instead, start a new
-session on this repository, pick Sonnet and Auto mode, and paste the `/goal`
-line of **`agent/launch_cloud_agent.md`**. On its first turn the agent runs
-`setup_lab.sh` itself. Here is what differs from a terminal, and how the
-launcher handles it:
+choose. Do not do sections 4, 4.2, 5 and 8 by hand. Instead:
+1. Start a new session on this repository.
+2. Pick the latest Opus and Auto mode.
+3. Send `/effort medium`.
+4. Paste the `/goal` line of **`agent/launch_cloud_agent.md`**.
+
+On its first turn the agent runs `setup_lab.sh` itself. Here is what differs
+from a terminal, and how the launcher handles it:
 
 | in a cloud session | the launcher's answer |
 |---|---|
-| No command-line flags: the model and the permission mode come from the session's pickers, so the launch line of 4.2 and section 5 do not apply. Bypass permissions is not offered | you pick Sonnet and Auto |
+| No command-line flags: the model and the permission mode come from the session's pickers, so the launch line of 4.2 and section 5 do not apply. Bypass permissions is not offered | you pick Opus and Auto, and send `/effort medium` (`/model` and `/effort` take their value as an argument in a cloud session) |
+| A usage limit stops the turns until the 5-hour window resets. The docs promise an automatic wait only for interactive terminal sessions, and an idle cloud VM is reclaimed | on its first turn the agent creates an hourly scheduled task that wakes this session. A wake-up after the reset continues the campaign, restoring the lab from its checkpoint if the VM was reclaimed. The clocks count run time (section 6), so the wait costs nothing. The agent deletes the task when the campaign ends |
 | The Bash tool stops a foreground command after 2 minutes by default and 10 at most, and `BASH_*_TIMEOUT_MS` cannot be set at launch | `RUN_CAP` (default 540 s) keeps each run in the foreground. A larger cap sends runs to the background, where the tool allows up to 2 hours |
 | Limited compute: the container this kit was measured in had 4 cores, 15 GB of RAM and a 30 GB disk allowance, and yours may have less | the health check at the start of every turn measures cores, free RAM and disk. F4 runs only with 8 GB of free RAM and room for the 6.8 GB cache |
 | The session can move to another machine, with another CPU, where a `-march=native` binary dies with SIGILL | the lab builds for x86-64-v3 (AVX2), which runs on any current server and here ran as fast as native, and falls back to generic below that or after a SIGILL. A new CPU shows as `cpu_changed=yes`, and the agent takes the new `threads` |
 | The container can be replaced (idle, restarts). `agent/lab/` is gitignored, so it goes with the container, runs in flight included | `agent/checkpoint.sh` commits `agent/checkpoint/` (scoreboard, logs, journal, strategy, frontier, elite, distilled pools) to the session's own branch, on every new best and every `CHECKPOINT` (30 min). The health check restores a lost lab from it |
 | A fresh container has no OR-Tools | `setup_lab.sh` installs it. Without it, F2 and the topper are skipped |
 
-**Settings** go in the pasted line: `BUDGET` (8h), `RUN_CAP` (540), `PLATEAU`
-(1h/3), `CHECKPOINT` (30m) and `RESUME` (none), plus free-text constraints such
+**Settings** go in the pasted line: `BUDGET` (8h of run time), `RUN_CAP` (540),
+`PLATEAU` (1h/3), `CHECKPOINT` (30m) and `RESUME` (none), plus free-text constraints such
 as `no Stage B`, `THREADS=2` or `stop at the first VALID board above 465`. The
 launcher's table explains each one.
 
 **Resume in a new session:** paste the line with `RESUME=<the old session's
 branch>`. The campaign continues from its last checkpoint with a fresh
-`BUDGET` clock (add `keep the clock` to keep the old one), and the new session
-checkpoints to its own branch. To paste the line again in the same session,
-after a usage limit or a `/goal clear`, set `RESUME=<this session's branch>` and
-`keep the clock`: a lab that is still there is kept, and a lost one is restored.
+`BUDGET` (add `keep the clock` to keep the old one), and the new session
+checkpoints to its own branch. If the STATUS lines stop for more than an hour
+after a usage limit has reset, the goal may have been lost with the VM. In that
+case, paste the line again in the same session with `RESUME=<this session's
+branch>` and `keep the clock`: a lab that is still there is kept, a lost one is
+restored, and no second wake-up task is created.
 
 **Keeping a result:** the best board is
 `agent/checkpoint/frontier/frontier.csv` on the session's branch. Confirm it
 with `bash agent/referee.sh FILE` and copy it into `data/` on `main` by hand.
 Keep `agent/checkpoint/` itself out of `main`.
 
-**Tested so far:** both scripts, in a cloud container: a fresh setup in 32 s,
-a health check in under a second, a refusal to checkpoint on `main`, a
-checkpoint push, a restore from a branch, a simulated CPU change and a binary
-that dies with SIGILL. A whole campaign under `/goal` in a cloud session has
-not been run.
+**Tested so far,** in a cloud container:
+- `setup_lab.sh`: a fresh setup in 32 s, and a health check in under a second;
+- `checkpoint.sh`: a refusal on `main`, a pushed checkpoint, and a restore from
+  a branch;
+- a simulated CPU change, and a binary that dies with SIGILL;
+- `status.sh` on a log with a 5-hour gap, which did not count.
+
+A whole campaign under `/goal` in a cloud session has not been run, and neither
+has a wake-up after a real usage limit.
