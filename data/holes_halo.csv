@@ -4,7 +4,7 @@
 # the ring inside it, up to row 10) and keeps the 8 x 12 core rows 3-10 x cols 2-13, so all 60
 # frame cells are open: with --frame_last, --early_release 60 releases the first board that
 # places every inner cell.
-# bin/E555_backtracker data/seed_Edge5.txt boards.csv halo.csv --holes data/holes_halo.csv --clue_center --breaks 0 --order frontier --frame_last --early_release 60 --no_colour_count --no_hall --time_limit 1
+# bin/E555_backtracker data/seed_Edge5.txt boards.csv halo.csv --holes data/holes_halo.csv --clue_center --breaks 0 --order frontier --frame_last --edge_supply --early_release 60 --no_colour_count --no_hall --time_limit 1
 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1

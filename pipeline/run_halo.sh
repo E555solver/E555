@@ -14,7 +14,9 @@
 #      0-2 and columns 0, 1, 14, 15 (the frame and the ring inside it), and an
 #      exact search (--breaks 0 --frame_last) fills the inner cells first and the
 #      frame last, BT_TIME seconds a board. A board whose 196 inner cells are all
-#      placed is released at once (the frame left open) and kept in jackpots.csv.
+#      placed is released at once (the frame left open) and kept in jackpots.csv;
+#      --edge_supply has kept the edge pieces left able to meet every inner edge
+#      facing the frame.
 #   C  The boards scoring at least the best ELITE_PCT% of every board scored so
 #      far go to elite.csv and to the first rung of the ladder; the rest are
 #      deleted with the beam's boards.
@@ -295,11 +297,13 @@ BEAM=(--stop_row "$STOP_ROW" --beam_width "$BEAM_WIDTH" --bc_window "$BC_WINDOW"
 [ "$BACKTRACK_ROW" -eq 0 ] || BEAM+=(--backtrack_row "$BACKTRACK_ROW" --extend_nodes 0)
 read -r -a BT_MORE <<< "$BT_EXTRA"
 # The 60 frame cells are the last open ones, so --early_release 60 releases the
-# first board with every inner cell placed. The colour count and Hall would
-# also ask the frame to close; it is left for later.
+# first board with every inner cell placed. --edge_supply cuts a path once the
+# inner cells ask the frame for more of a colour than the unused edge pieces
+# carry inward. The colour count and Hall would also ask the rest of the frame
+# to close; that is left for later.
 BT=(--holes "$HOLES" "${CLUE_ARG[@]}" --breaks 0 --order "$BT_ORDER" --frame_last
-    --early_release 60 --no_colour_count --no_hall --resume --threads "$THREADS"
-    --print_cmd "${BT_MORE[@]}")
+    --edge_supply --early_release 60 --no_colour_count --no_hall --resume
+    --threads "$THREADS" --print_cmd "${BT_MORE[@]}")
 
 echo "[halo] $RUN_DIR: $THREADS threads, $(hms "$TOTAL_S"), clues $CLUES, db ${DB_FILE:-<in memory>}"
 if [ -n "$ROTATIONS" ]; then
@@ -310,7 +314,7 @@ else
         echo "[halo]    (--lambda_corners left out: the beamer refuses it with --random_edges)"
 fi
 echo "[halo]    width $BEAM_WIDTH to row $STOP_ROW, backtrack row $BACKTRACK_ROW, bc_window $BC_WINDOW, pool $POOL, tau $TAU, exhaust_inner $EXHAUST_INNER"
-echo "[halo] B: up to $MAX_BOARDS boards a round, $(basename "$HOLES") lifted, --order $BT_ORDER --frame_last, ${BT_TIME}s a board${BT_EXTRA:+, $BT_EXTRA}"
+echo "[halo] B: up to $MAX_BOARDS boards a round, $(basename "$HOLES") lifted, --order $BT_ORDER --frame_last --edge_supply, ${BT_TIME}s a board${BT_EXTRA:+, $BT_EXTRA}"
 if [ "$ELITE_SCORE" -gt 0 ]; then echo "[halo] C: boards scoring $ELITE_SCORE or more climb the ladder"
 else echo "[halo] C: the best $ELITE_PCT% of every board scored climb the ladder"; fi
 [ "$RUNGS" -eq 0 ] || echo "[halo] D: $RUNGS rungs from ${LADDER_TIME}s a board, doubling, $RUNG_KEEP% move up; top rung keeps $TOP_RUNG_CAP"

@@ -116,7 +116,7 @@ ALL_STEPS=(
     "backtracker_stop_band|extra|backtracker|--stop_row/--stop_column emit exact, finalizer-shaped bands"
     "backtracker_release|extra|backtracker|--early_release stops N cells early in every order; --reverse moves the gate; --frame_last"
     "backtracker_resume|extra|backtracker,finalizer|--resume: sessions add up to one run node for node; each run releases the next board; dedup, --resume_score, readers"
-    "backtracker_breakcount|extra|backtracker|break classes agree with the per-candidate scan they replaced"
+    "backtracker_breakcount|extra|backtracker|break classes agree with the per-candidate scan they replaced; --edge_supply keeps the minimum"
     "backtracker_clues|extra|backtracker|--clue_center/--clue_corners force the hints on, or drop the board"
     "diver|core|diver|E555_diver finishes held boards: identical at 1 and 4 threads, scores recount, placed cells untouched"
     "diver_reopen|extra|diver|E555_diver --reopen: never worse, one row per board, only the band changes; scrambled top rows come back 480/480; copies differ"
@@ -2484,7 +2484,37 @@ step_backtracker_breakcount() {
             || fail "--break_mode $m differs between the instrumented and shipped builds"
     done
 
-    echo "ok: break classes and availability counters match the scan, on both paths"
+    # --edge_supply is a sound cut: the synthetic solution with two ring-1 pieces
+    # swapped and the frame open has a frame deficit at the root, and the swapped
+    # board's minimum (8 or 6 breaks) must come out the same, the same board,
+    # with the cut as without it (~3 s, against 0.03 s with it).  With Hall and
+    # the colour count off, nothing else sees the deficit.
+    python3 - data/synth_solution_480.csv > "$OUT/btes_in.csv" <<'EOF' || exit 1
+import sys
+f = open(sys.argv[1]).read().strip().split('\n')[-1].split(',')
+pos = [int(x) for x in f[-512:-256]]; rot = f[-256:]
+at = {c: p for p, c in enumerate(pos)}
+for i, (a, b) in enumerate([(21, 233), (40, 94), (18, 225), (30, 172)]):
+    P = pos[:]
+    P[at[a]], P[at[b]] = b, a
+    for c in range(256):
+        if c // 16 in (0, 15) or c % 16 in (0, 15): P[at[c]] = 999
+    print(','.join([f'swap{i}', '0'] + [str(x) for x in P] + rot))
+EOF
+    for f in plain cut; do
+        bin/E555_backtracker data/synth_seed.txt "$OUT/btes_in.csv" "$OUT/btes_$f.csv" \
+            --order mrv --break_mode lds --breaks 12 --no_hall --no_colour_count \
+            --threads 1 --time_limit 0 --verbose $([ $f = cut ] && echo --edge_supply) \
+            > "$OUT/btes_$f.log" 2>&1 || fail "the --edge_supply comparison run ($f) failed"
+    done
+    cmp -s <(grep -v "^#" "$OUT/btes_plain.csv") <(grep -v "^#" "$OUT/btes_cut.csv") \
+        || fail "--edge_supply changed the minimum-break boards"
+    [ "$(grep -c 'root edge supply deficit=' "$OUT/btes_cut.log")" = 4 ] \
+        || fail "--edge_supply did not lift the first break level of every record"
+    grep -qE 'edge_supply_rejects=[1-9]' "$OUT/btes_cut.log" \
+        || fail "--edge_supply cut nothing inside the search"
+
+    echo "ok: break classes and availability counters match the scan, on both paths; --edge_supply keeps the minimum"
 }
 
 # --clue_center/--clue_corners force the published hint pieces onto their cells

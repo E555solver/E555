@@ -336,7 +336,7 @@ are all placed break-free, the frame left for last:
 | step | tool | what it does |
 |---|---|---|
 | A | `E555_beamer --random_edges` | `SAMPLES` bottoms x `COLUMNS` left columns, a beam `BEAM_WIDTH` wide, exhaustive from `BACKTRACK_ROW` to `STOP_ROW`, no extension |
-| B | `E555_backtracker` | up to `MAX_BOARDS` distinct boards: `data/holes_halo.csv` lifts rows 0-2 and columns 0, 1, 14, 15, and an exact search (`--breaks 0 --frame_last --resume`) fills the inner cells, `BT_TIME` seconds a board |
+| B | `E555_backtracker` | up to `MAX_BOARDS` distinct boards: `data/holes_halo.csv` lifts rows 0-2 and columns 0, 1, 14, 15, and an exact search (`--breaks 0 --frame_last --edge_supply --resume`) fills the inner cells, `BT_TIME` seconds a board |
 | C | `E555_rank.py --split` | the boards scoring N or more go to `elite.csv` and onto the ladder; the rest are deleted with the beam's boards |
 | D | `E555_backtracker --resume` | the ladder: each rung continues its boards' searches, `LADDER_TIME` seconds a board doubled per rung, and the better `RUNG_KEEP`% move up |
 
@@ -352,7 +352,9 @@ that fails early on most boards; the ladder keeps a lucky one going.
 
 - **Jackpots.** With the 60 frame cells searched last, `--early_release 60`
   releases the first board that places every inner cell; it goes to
-  `jackpots.csv`, and its search goes on to the next one.
+  `jackpots.csv`, and its search goes on to the next one. `--edge_supply`
+  keeps the edge pieces left able to meet every inner edge facing the frame,
+  so a jackpot's frame can still close on its inward edges without a break.
 - **Threshold.** N is the score at the best `ELITE_PCT`% (default 5) of every
   board scored so far (`scores.txt`); `ELITE_SCORE=N` fixes it.
 - **Ladder.** Boards compete only with boards that have had the same search
