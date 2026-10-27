@@ -67,7 +67,9 @@ These are non-negotiable. Section 8 repeats them inside the `/goal` condition.
   own branch.
 - The beamer's 6.8 GB chain-database cache, if used, goes to the lab's
   `cache/`, a link to `agent/cache/` that every campaign shares (the file is
-  the same for all), on **local** disk, never on a network drive.
+  the same for all), on **local** disk, never on a network drive. It is never
+  committed or checkpointed (`.gitignore` covers `agent/cache/` and every
+  `*.db`). A fresh container rebuilds it in its first F4 run.
 - You **may** edit the lab's copies of the source, write new tools in the
   lab's `tools/`, and rebuild the lab's binaries. Improve anything you like:
   samplers, allocators, heuristics.
@@ -545,7 +547,7 @@ from a terminal, and how the launcher handles it:
 | The Bash tool stops a foreground command after 2 minutes by default and 10 at most, and `BASH_*_TIMEOUT_MS` cannot be set at launch | `RUN_CAP` (default 540 s) keeps each run in the foreground. A larger cap sends runs to the background, where the tool allows up to 2 hours |
 | Limited compute: the container this kit was measured in had 4 cores, 15 GB of RAM and a 30 GB disk allowance, and yours may have less | the health check at the start of every turn measures cores, free RAM and disk. F4 runs only with 8 GB of free RAM and room for the 6.8 GB cache |
 | The session can move to another machine, with another CPU, where a `-march=native` binary dies with SIGILL | the lab builds for x86-64-v3 (AVX2), which runs on any current server and here ran as fast as native, and falls back to generic below that or after a SIGILL. A new CPU shows as `cpu_changed=yes`, and the agent takes the new `threads` |
-| The container can be replaced (idle, restarts). `agent/labs/` is gitignored, so the lab goes with the container, runs in flight included | `agent/checkpoint.sh` commits the campaign's `agent/checkpoints/<id>/` (scoreboard, logs, journal, strategy, frontier, elite, distilled pools) to the session's own branch, on every new best and every `CHECKPOINT` (30 min). The health check restores a lost lab from it |
+| The container can be replaced (idle, restarts). `agent/labs/` is gitignored, so the lab goes with the container, runs in flight included | `agent/checkpoint.sh` commits the campaign's `agent/checkpoints/<id>/` (scoreboard, logs, journal, strategy, frontier, elite, distilled pools) to the session's own branch, on every new best and every `CHECKPOINT` (30 min). The health check restores a lost lab from it. The 6.8 GB database cache is never committed: the first F4 run in a new container rebuilds it, and `checkpoint.sh` refuses any file over 20 MB |
 | A fresh container has no OR-Tools | `setup_lab.sh` installs it. Without it, F2 and the topper are skipped |
 
 **Settings** go in the pasted line: `BUDGET` (8h of run time), `RUN_CAP` (540),
