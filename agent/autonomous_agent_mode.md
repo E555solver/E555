@@ -4,7 +4,8 @@
 A ready-to-paste `/goal` setup that turns one interactive Claude Code session
 into a self-driving, multi-hour optimizer over the *real* E555 toolchain in this
 repo. Do the setup (sections 4 and 5), paste section 8, walk away, and come back
-to a documented campaign.
+to a documented campaign. In a **cloud session** (claude.ai/code, the Claude
+app), paste the `/goal` line of `agent/launch_cloud_agent.md` instead: section 11.
 
 Written to be driven by the economical **Sonnet** model on a Pro subscription
 (a long run, with tokens that refill on a flat cadence). Sonnet is capable but
@@ -15,7 +16,8 @@ agent follows the recipe rather than improvising.
 v3 changes from v2: the current Stage C tools (the diver's `--reopen`, the
 distiller, the ender's profiles), a referee script the agent cannot edit, a
 lab that is a self-contained checkout, and a `/goal` condition that fits the
-4,000-character limit.
+4,000-character limit. v3.1 adds `agent/setup_lab.sh`, which replaces the
+hand-run setup block, and cloud sessions with checkpoints (section 11).
 
 ---
 
@@ -46,9 +48,12 @@ These are non-negotiable. Section 8 repeats them inside the `/goal` condition.
 - The session runs **in `agent/lab/`** (section 4.2 launches Claude Code there),
   so the permission system itself treats the rest of the repo as outside the
   working directory. Read anything in the repo; **write only inside
-  `agent/lab/`**.
+  `agent/lab/`**. A cloud session starts at the repository root instead, so
+  there this rule holds by instruction alone.
 - No git command that changes the repository (no commit, push, checkout, reset,
-  stash or clean). `agent/lab/` is gitignored.
+  stash or clean). `agent/lab/` is gitignored. The one exception is a cloud
+  session's checkpoint (section 11): `agent/checkpoint.sh` commits
+  `agent/checkpoint/` alone and pushes it to the session's own branch.
 - The beamer's 6.8 GB chain-database cache, if used, goes to `agent/lab/cache/`
   on **local** disk, never on a network drive.
 - You **may** edit the lab's copies of the source, write new tools in
@@ -191,56 +196,39 @@ with `rank --diverse K` or `--max_agree 0.9`.
 
 ## 4. One-time setup (do this by hand before `/goal`)
 
+From the repository root:
 ```bash
-cd <repo root>                                   # the folder with agent/, src/, data/
-mkdir -p agent/lab
-cp -r Makefile src tools examples pipeline data PROJECT_E555.md README.md agent/lab/
-cp agent/autonomous_agent_mode.md agent/lab/KIT.md   # the agent's manual
-cd agent/lab
-mkdir -p cache runs frontier pool
-make                       # the lab's own bin/; tuned for this CPU (ARCH=generic only
-                           # if the binaries must run on another machine)
-pip install ortools        # the ender and the topper
-python3 -c 'import ortools; print("ortools", ortools.__version__)'
-
-# the bookkeeping
-cp data/best_465.csv frontier/frontier.csv                       # start from the known best
-python3 tools/E555_rank.py data/best_46[345].csv --out frontier/elite.csv --rescore --quiet
-cat > scoreboard.json <<'JSON'
-{ "puzzle": "seed_Edge5", "perfect_score": 480,
-  "baseline_score": 465, "best_score": 465, "best_breaks": 15,
-  "best_source": "data/best_465.csv (shipped baseline)",
-  "best_file": "frontier/frontier.csv",
-  "total_runs": 0, "goal_start_unix": null, "last_best_unix": null,
-  "families_since_best": [], "threads": null, "stage_b_ok": null, "history": [] }
-JSON
-printf 'unix,iso,family,tool,params,input,output,score,breaks,verdict,runtime_s,note\n' > run_log.csv
-: > JOURNAL.md
-cat > STRATEGY.md <<'EOF'
-# Strategy ledger
-
-Measured before this campaign (PROJECT_E555.md 9.2, 9.3); re-test only with a new idea:
-- CP-SAT windows around the breaks of polished boards (457-463): already optimal
-  (78/78 4x4 windows); exact regions of 48-102 cells gained nothing.
-- diver --reopen auto on the seven first 463s of data/best_463.csv, 120 s each:
-  the first gained 2 (that board is also the root of data/best_465.csv), the
-  other six gained nothing.
-- Best measured reopen setting: --copies 8 --end_dive 1000 --end_polish 10000;
-  it kept gaining from 15 s to 120 s per board.
-
-## Families tried in this campaign
-EOF
+bash agent/setup_lab.sh
 ```
+It copies the toolchain into `agent/lab/` (Makefile, src, tools, examples,
+pipeline, data, the two docs, and this kit as `KIT.md`), builds the lab's
+`bin/`, installs OR-Tools when Python lacks it (the ender and the topper), and
+seeds the bookkeeping of section 6:
+- `frontier/frontier.csv`, from `data/best_465.csv`;
+- `frontier/elite.csv`, the 42 shipped boards;
+- `scoreboard.json`, `run_log.csv`, `JOURNAL.md`;
+- `STRATEGY.md`, with what was measured before the campaign.
 
-**Check the referee and the lab before trusting anything:**
-```bash
-bash ../referee.sh frontier/frontier.csv
-# must print: REFEREE verdict=VALID score=465 breaks=15 placed=256 frame_violations=0 ...
-python3 tools/E555_rank.py frontier/elite.csv --count     # 42
+It also writes this machine's facts into `scoreboard.json`: `threads` (what
+`nproc` prints), `stage_b_ok` (8 GB of free RAM, plus 8 GB of free disk or a
+cache already in `cache/`), `ortools_ok`, the CPU model and the build's arch.
+It ends with two lines:
 ```
-If either differs, stop and fix the setup; do not start the goal. Optionally,
-run the repo's own gate from the repo root first (`bash tests/run_tests.sh`,
-about 30 s), which proves the toolchain on this machine.
+REFEREE verdict=VALID score=465 breaks=15 placed=256 frame_violations=0 ...
+SETUP lab=fresh path=.../agent/lab arch=v3 cpu="..." ... ortools=yes stage_b_ok=true best=465 elite=42
+```
+If it fails, or `elite` is not 42, fix the setup before you start the goal.
+`ortools=no` means no F2 and no topper: install OR-Tools and rerun, or accept
+that. The script is safe to rerun: it repairs what is missing and never touches
+the campaign's files, so it doubles as a health check. Optionally, run the
+repo's own gate first (`bash tests/run_tests.sh`, about 30 s), which proves the
+toolchain on this machine.
+
+The build uses `ARCH=v3` (AVX2) where the CPU runs x86-64-v3, and `generic`
+otherwise. Measured on a reopen run, v3 is as fast as `-march=native` and
+generic is 45% slower, all three with byte-identical output. `ARCH=native` is
+still available (`bash agent/setup_lab.sh ARCH=native`), but such a binary dies
+with SIGILL on an older CPU.
 
 ### 4.1 Starter pool (optional, recommended)
 
@@ -253,6 +241,7 @@ plain or gzipped, go in `pool/`.
 Distil once, before or during the run (it resumes where a killed run stopped, so
 `timeout` plus a rerun is safe):
 ```bash
+cd agent/lab
 python3 tools/E555_distiller.py data/E565_FixCorners23.csv.gz --top 5 --out pool/distilled.csv
 bash ../referee.sh pool/distilled.csv
 : > pool/consumed.txt          # ids the agent has already used as roots
@@ -262,9 +251,10 @@ and their value is that they differ from the elites (H5).
 
 ### 4.2 Pre-flight and launch
 
+- **Cloud session?** None of this section or the next applies: section 11.
 - **Resources.** Stage B (F4) needs ~8 GB of free RAM and ~7 GB of local disk
-  for `cache/`. Everything else is small. The agent records the answer as
-  `stage_b_ok` in iteration 0 (`free -g`, `df -h .`).
+  for the 6.8 GB `cache/`. Everything else is small. `setup_lab.sh` records the
+  answer as `stage_b_ok`.
 - **A durable terminal:** `tmux new -s e555`.
 - **Pick the permission mode** (section 5).
 - **Launch from the lab**, in the mode you picked, with a Bash time limit long
@@ -274,8 +264,8 @@ and their value is that they differ from the elites (H5).
   cd agent/lab
   BASH_DEFAULT_TIMEOUT_MS=1500000 BASH_MAX_TIMEOUT_MS=1500000 claude --permission-mode auto --model sonnet
   ```
-- Threads: the number `nproc` prints (the agent records it as `threads` in
-  iteration 0), never a guess.
+- Threads: the number `nproc` prints (`setup_lab.sh` records it as `threads`),
+  never a guess.
 
 ---
 
@@ -314,8 +304,10 @@ so C is a convenience, not a sandbox.
 Everything under `agent/lab/`:
 - **`scoreboard.json`**: the current best, `goal_start_unix`, `last_best_unix`,
   `families_since_best` (the distinct families run since the last new best),
-  `stage_b_ok`, `total_runs`, and `history[]` (one entry per accepted best:
-  unix, score, breaks, family, tool, params, file).
+  `total_runs`, and `history[]` (one entry per accepted best: unix, score,
+  breaks, family, tool, params, file). `setup_lab.sh` keeps the machine's facts
+  there (`threads`, `stage_b_ok`, `ortools_ok`, `cpu`, `arch`, `ram_gb`,
+  `disk_gb`), and `checkpoint.sh` keeps `last_checkpoint_unix`.
 - **`run_log.csv`**: **every** run, improvement or not:
   `unix,iso,family,tool,params,input,output,score,breaks,verdict,runtime_s,note`,
   with score and verdict from the referee. No field may contain a comma (write
@@ -356,10 +348,10 @@ specific things to try next with more time or a bigger machine.
 
 A fixed, prescriptive cycle.
 
-0. **First turn only:** if `goal_start_unix` is null, set it to `date +%s`; if
-   `threads` is null, set it to what `nproc` prints; if `stage_b_ok` is null,
-   set it from `free -g` and `df -h .` (true only with ≥ 8 GB free RAM and
-   ≥ 7 GB free disk).
+0. **First turn only:** if `goal_start_unix` is null, set it to `date +%s`.
+   `threads` and `stage_b_ok` come from `setup_lab.sh` (section 4). If the
+   machine may have changed, run `bash ../setup_lab.sh` again: it rebuilds
+   what the new CPU needs and rewrites them.
 1. **Orient.** Read `scoreboard.json`, the last few `JOURNAL.md` blocks and
    `STRATEGY.md`. Run the referee on `frontier/frontier.csv` and `rank` on it
    for the shape.
@@ -435,7 +427,7 @@ HARD RULES (breaking any voids the run):
 - A new best needs verdict=VALID and a score above best_score, from a fresh referee call on the emitted file.
 - Write only inside agent/lab. No git command that changes the repository. Keep parallelism to the tools' own --threads or plain background jobs.
 
-EACH TURN: follow KIT.md section 7. Orient, choose a family by the heuristics of section 3, run it bounded (timeout 1200, output in a new runs/<ts>_<tool>/), referee the output, log it, update scoreboard.json and the frontier on a new best, chain the closers on it, and journal it. On the first turn, set goal_start_unix, threads and stage_b_ok as section 7 step 0 says.
+EACH TURN: follow KIT.md section 7. Orient, choose a family by the heuristics of section 3, run it bounded (timeout 1200, output in a new runs/<ts>_<tool>/), referee the output, log it, update scoreboard.json and the frontier on a new best, chain the closers on it, and journal it. On the first turn, set goal_start_unix as section 7 step 0 says; threads and stage_b_ok are in scoreboard.json.
 
 END EVERY TURN with this line, its values computed by commands in that same turn:
 STATUS best=<score>/480 breaks=<n> runs=<total_runs> elapsed=<h>h<mm>m since_best=<h>h<mm>m families_since_best=<k> next=<next move>
@@ -471,7 +463,8 @@ repo-correct as written. The condition is under the 4,000-character limit of
   `scoreboard.json`. That clock includes the downtime: set `goal_start_unix`
   (and `last_best_unix`) to null to give the run a fresh 8 hours. In a new
   session, paste section 8 again; the scoreboard, frontier, elite file,
-  `run_log.csv` and `STRATEGY.md` are all the state it needs.
+  `run_log.csv` and `STRATEGY.md` are all the state it needs. A cloud session
+  resumes differently, from a checkpoint: section 11.
 - **Keeping a result:** the agent never writes outside the lab. Copy a new
   best into `data/` yourself, after `bash agent/referee.sh` confirms it.
 
@@ -485,3 +478,46 @@ The run's deliverable is twofold: the best
 board found, and a documented map of what worked and what didn't, so the next
 run (or the next machine) starts smarter. That documentation is the win even if
 480 stays out of reach.
+
+---
+
+## 11. Cloud sessions (claude.ai/code, the Claude app)
+
+In a cloud session, Claude Code runs in a container on a machine you do not
+choose. Do not do sections 4, 4.2, 5 and 8 by hand. Instead, start a new
+session on this repository, pick Sonnet and Auto mode, and paste the `/goal`
+line of **`agent/launch_cloud_agent.md`**. On its first turn the agent runs
+`setup_lab.sh` itself. Here is what differs from a terminal, and how the
+launcher handles it:
+
+| in a cloud session | the launcher's answer |
+|---|---|
+| No command-line flags: the model and the permission mode come from the session's pickers, so the launch line of 4.2 and section 5 do not apply. Bypass permissions is not offered | you pick Sonnet and Auto |
+| The Bash tool stops a foreground command after 2 minutes by default and 10 at most, and `BASH_*_TIMEOUT_MS` cannot be set at launch | `RUN_CAP` (default 540 s) keeps each run in the foreground. A larger cap sends runs to the background, where the tool allows up to 2 hours |
+| Limited compute: the container this kit was measured in had 4 cores, 15 GB of RAM and a 30 GB disk allowance, and yours may have less | the health check at the start of every turn measures cores, free RAM and disk. F4 runs only with 8 GB of free RAM and room for the 6.8 GB cache |
+| The session can move to another machine, with another CPU, where a `-march=native` binary dies with SIGILL | the lab builds for x86-64-v3 (AVX2), which runs on any current server and here ran as fast as native, and falls back to generic below that or after a SIGILL. A new CPU shows as `cpu_changed=yes`, and the agent takes the new `threads` |
+| The container can be replaced (idle, restarts). `agent/lab/` is gitignored, so it goes with the container, runs in flight included | `agent/checkpoint.sh` commits `agent/checkpoint/` (scoreboard, logs, journal, strategy, frontier, elite, distilled pools) to the session's own branch, on every new best and every `CHECKPOINT` (30 min). The health check restores a lost lab from it |
+| A fresh container has no OR-Tools | `setup_lab.sh` installs it. Without it, F2 and the topper are skipped |
+
+**Settings** go in the pasted line: `BUDGET` (8h), `RUN_CAP` (540), `PLATEAU`
+(1h/3), `CHECKPOINT` (30m) and `RESUME` (none), plus free-text constraints such
+as `no Stage B`, `THREADS=2` or `stop at the first VALID board above 465`. The
+launcher's table explains each one.
+
+**Resume in a new session:** paste the line with `RESUME=<the old session's
+branch>`. The campaign continues from its last checkpoint with a fresh
+`BUDGET` clock (add `keep the clock` to keep the old one), and the new session
+checkpoints to its own branch. To paste the line again in the same session,
+after a usage limit or a `/goal clear`, set `RESUME=<this session's branch>` and
+`keep the clock`: a lab that is still there is kept, and a lost one is restored.
+
+**Keeping a result:** the best board is
+`agent/checkpoint/frontier/frontier.csv` on the session's branch. Confirm it
+with `bash agent/referee.sh FILE` and copy it into `data/` on `main` by hand.
+Keep `agent/checkpoint/` itself out of `main`.
+
+**Tested so far:** both scripts, in a cloud container: a fresh setup in 32 s,
+a health check in under a second, a refusal to checkpoint on `main`, a
+checkpoint push, a restore from a branch, a simulated CPU change and a binary
+that dies with SIGILL. A whole campaign under `/goal` in a cloud session has
+not been run.
