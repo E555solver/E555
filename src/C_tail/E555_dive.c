@@ -789,6 +789,14 @@ static int dv_polish(DvBoard *b, const uint8_t *cells, int n) {
     return gained;
 }
 
+int dv_climb(uint16_t pid[NUM_PIECES], uint8_t rot[NUM_PIECES], const uint8_t *cells, int n) {
+    DvBoard b;
+    for (int x = 0; x < NUM_PIECES; x++) b.c[x] = g_dv_or[pid[x]][rot[x] & 3u];
+    const int gained = dv_polish(&b, cells, n);
+    for (int x = 0; x < NUM_PIECES; x++) { pid[x] = b.c[x].piece_id; rot[x] = b.c[x].rotation; }
+    return gained;
+}
+
 /* The queue polish's view of the region: what each cell's neighbours show it
    and its deficit (neighbours minus matched edges), kept current as moves land.
    A move of x and y gains at most def[x] + def[y] -- a rotation at most def[x]
