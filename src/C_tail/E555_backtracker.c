@@ -515,6 +515,15 @@ typedef enum {
 } OrderMode;
 static OrderMode g_order_mode = ORD_MRV;
 static bool g_reverse = false;   /* --reverse: reversed traversal; mrv tie-break -> column-major */
+/* --frame_last: no frame cell (row or column 0 or 15) is searched while an inner
+ * cell is still open.  Static orders sort the frame cells after the inner ones,
+ * frontier puts them in layers after the last inner layer, mrv skips them; the
+ * order within each part is unchanged.  The frame cells stay in every prune, so
+ * a frame cell left without a fitting edge still ends the path. */
+static bool g_frame_last = false;
+static inline bool is_frame_cell(int r, int c) {
+    return r == 0 || c == 0 || r == PUZZLE_SIDE - 1 || c == PUZZLE_SIDE - 1;
+}
 
 /* -- Stop band (--stop_row / --stop_column) ----------------------------------- *
  * The beamer stops at --stop_row R and emits every board that fills rows 0..R,
@@ -605,6 +614,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_verbose)      printf(" --verbose");
     if (g_print_cmd)    printf(" --print_cmd");
     if (g_reverse)      printf(" --reverse");
+    if (g_frame_last)   printf(" --frame_last");
     if (g_jump)         printf(" --jump");
     if (g_with_frame)   printf(" --with_frame");
     if (g_write_status) printf(" --status");
@@ -1600,15 +1610,17 @@ static bool board_cells_equal(const Board *a, const Board *b) {
  *
  * FORMAT bt1.  One CSV field without commas or spaces, for example
  *
- *     bt1;order=spiralout;reverse=0;rotate=0;early_release=60;open=<64 hex>;start=<8 hex>;at=812.33.1020.7+
+ *     bt1;order=spiralout;reverse=0;rotate=0;early_release=60;frame_last=0;open=<64 hex>;start=<8 hex>;at=812.33.1020.7+
  *
  * "bt1", then ';'-separated items in any order, each key=value or the bare word
  * "done":
  *
- *   order, reverse, rotate, early_release
+ *   order, reverse, rotate, early_release, frame_last
  *       The run settings that shape the search tree, named and valued like
- *       their command-line flags (reverse is 0 or 1; early_release is K, or R.C
- *       for --early_release R,C -- a dot, as the field holds no commas).  A resuming run must be
+ *       their command-line flags (reverse and frame_last are 0 or 1;
+ *       early_release is K, or R.C for --early_release R,C -- a dot, as the
+ *       field holds no commas).  frame_last came later: a row without it was
+ *       searched without --frame_last.  A resuming run must be
  *       given the same values; any difference is fatal at load and names the
  *       setting.  Settings that do not change the tree (--threads,
  *       --time_limit, --hall, --no_colour_count, --best_n, ...) are not
@@ -1662,7 +1674,7 @@ static bool board_cells_equal(const Board *a, const Board *b) {
 #define RESUME_EMPTY    1024   /* start= value of an empty cell */
 
 typedef struct {
-    int      order, reverse, rotate, early_release;
+    int      order, reverse, rotate, early_release, frame_last;
     uint8_t  open[NUM_PIECES];      /* 1 = cell the search fills, CSV frame */
     uint32_t start;                 /* resume_start_sum() of the start board */
     bool     done;
@@ -1709,9 +1721,10 @@ static bool resume_parse(const char *s, ResumeId *id, char *why, size_t why_sz) 
     }
     char buf[RESUME_ID_MAX];
     memcpy(buf, s, len + 1);
-    enum { K_ORDER, K_REVERSE, K_ROTATE, K_EARLY, K_OPEN, K_START, K_STATE, K_N };
+    enum { K_ORDER, K_REVERSE, K_ROTATE, K_EARLY, K_OPEN, K_START, K_STATE, K_FRAME, K_N };
     static const char *const kname[K_N] = { "order", "reverse", "rotate",
-                                            "early_release", "open", "start", "at|done" };
+                                            "early_release", "open", "start", "at|done",
+                                            "frame_last" };
     bool seen[K_N] = { false };
     char *save = NULL;
     strtok_r(buf, ";", &save);                          /* the version */
@@ -1733,6 +1746,7 @@ static bool resume_parse(const char *s, ResumeId *id, char *why, size_t why_sz) 
             else if (!strcmp(it, "open"))          k = K_OPEN;
             else if (!strcmp(it, "start"))         k = K_START;
             else if (!strcmp(it, "at"))            k = K_STATE;
+            else if (!strcmp(it, "frame_last"))    k = K_FRAME;
             else {
                 snprintf(why, why_sz, "resume identifier key '%s' is unknown to this build", it);
                 return false;
@@ -1764,15 +1778,16 @@ static bool resume_parse(const char *s, ResumeId *id, char *why, size_t why_sz) 
                 break;
             }
             /* fall through */
-        case K_REVERSE: case K_ROTATE:
+        case K_REVERSE: case K_ROTATE: case K_FRAME:
             errno = 0; v = strtol(val, &end, 10);
             if (errno || end == val || *end ||
-                v < 0 || v > (k == K_REVERSE ? 1 : k == K_ROTATE ? 3 : NUM_PIECES)) {
+                v < 0 || v > (k == K_REVERSE || k == K_FRAME ? 1 : k == K_ROTATE ? 3 : NUM_PIECES)) {
                 snprintf(why, why_sz, "resume identifier: bad %s value '%s'", kname[k], val);
                 return false;
             }
             if (k == K_REVERSE) id->reverse = (int)v;
             else if (k == K_ROTATE) id->rotate = (int)v;
+            else if (k == K_FRAME) id->frame_last = (int)v;
             else id->early_release = (int)v;
             break;
         case K_OPEN:
@@ -1822,7 +1837,7 @@ static bool resume_parse(const char *s, ResumeId *id, char *why, size_t why_sz) 
         }
     }
     for (int k = 0; k < K_N; k++)
-        if (!seen[k]) {
+        if (!seen[k] && k != K_FRAME) {                 /* frame_last: optional */
             snprintf(why, why_sz, "resume identifier lacks %s", kname[k]);
             return false;
         }
@@ -1854,6 +1869,9 @@ static bool resume_settings_match(const ResumeId *id, char *why, size_t why_sz) 
         snprintf(why, why_sz, "it was searched with --early_release %s, this run has "
                  "--early_release %s", a, b);
     }
+    else if (id->frame_last != (int)g_frame_last)
+        snprintf(why, why_sz, "it was searched %s --frame_last, this run %s",
+                 id->frame_last ? "with" : "without", g_frame_last ? "has it" : "does not");
     else
         return true;
     return false;
@@ -1868,9 +1886,9 @@ static void resume_format(char *out, size_t cap, const uint8_t open[NUM_PIECES],
     char rel[16];
     release_text(release_code(), rel, sizeof(rel));
     for (char *q = rel; *q; q++) if (*q == ',') *q = '.';    /* no commas in a CSV field */
-    appendf(out, cap, &off, "%s;order=%s;reverse=%d;rotate=%d;early_release=%s;open=",
-            RESUME_VERSION, order_name(g_order_mode), g_reverse ? 1 : 0,
-            g_rotation, rel);
+    appendf(out, cap, &off, "%s;order=%s;reverse=%d;rotate=%d;early_release=%s;"
+            "frame_last=%d;open=", RESUME_VERSION, order_name(g_order_mode),
+            g_reverse ? 1 : 0, g_rotation, rel, g_frame_last ? 1 : 0);
     for (int i = 0; i < NUM_PIECES / 4; i++) {
         int d = 0;
         for (int j = 0; j < 4; j++) d |= open[4 * i + j] << j;
@@ -3066,7 +3084,9 @@ static void build_search_sequence_ordered(const Board *b, Cell *seq, int *n_seq,
             if (b->cell[r][c].piece_id == EMPTY_PIECE && cell_in_band_search(r, c)) {
                 if (n >= MAX_SEQ_LEN)
                     fatal("search sequence overflow (MAX_SEQ_LEN=%d)", MAX_SEQ_LEN);
-                items[n].key  = order_key(mode, r, c);
+                /* --frame_last: past every key order_key() gives (< 2^20) */
+                items[n].key  = order_key(mode, r, c) +
+                                (g_frame_last && is_frame_cell(r, c) ? (1L << 40) : 0);
                 items[n].cell = (Cell){(int8_t)r, (int8_t)c};
                 n++;
             }
@@ -4322,8 +4342,9 @@ static inline int placed_neighbor_count(const Board *b, int r, int c);
  * unfinished layer first, and within it the cell with the fewest fits, so it
  * grows from the placed pieces outward and a layer is complete before the next
  * opens -- which is what lets --early_release R,C mean "after that cell's
- * layer".  A pure function of the start board: --resume rebuilds it exactly.
- * With no placed piece every cell is layer 1, i.e. plain fail-first.
+ * layer".  A pure function of the start board and --frame_last: --resume
+ * rebuilds it exactly.  With no placed piece every cell is layer 1, i.e. plain
+ * fail-first (inner cells 1 and frame cells 2 under --frame_last).
  */
 static void frontier_layers(const Board *b, int8_t layer[PUZZLE_SIDE][PUZZLE_SIDE]) {
     int q[NUM_PIECES], h = 0, t = 0;
@@ -4335,7 +4356,8 @@ static void frontier_layers(const Board *b, int8_t layer[PUZZLE_SIDE][PUZZLE_SID
         }
     if (t == 0) {
         for (int r = 0; r < PUZZLE_SIDE; r++)
-            for (int c = 0; c < PUZZLE_SIDE; c++) layer[r][c] = 1;
+            for (int c = 0; c < PUZZLE_SIDE; c++)
+                layer[r][c] = (int8_t)(g_frame_last && is_frame_cell(r, c) ? 2 : 1);
         return;
     }
     while (h < t) {
@@ -4348,6 +4370,18 @@ static void frontier_layers(const Board *b, int8_t layer[PUZZLE_SIDE][PUZZLE_SID
                 layer[nr][nc] = (int8_t)(layer[r][c] + 1);
                 q[t++] = nr * PUZZLE_SIDE + nc;
             }
+    }
+    /* --frame_last: the open frame cells come after the last inner layer, in
+     * their own distance order (each part is at most 15 layers deep). */
+    if (g_frame_last) {
+        int inner_top = 0;
+        for (int r = 0; r < PUZZLE_SIDE; r++)
+            for (int c = 0; c < PUZZLE_SIDE; c++)
+                if (!is_frame_cell(r, c) && layer[r][c] > inner_top) inner_top = layer[r][c];
+        for (int r = 0; r < PUZZLE_SIDE; r++)
+            for (int c = 0; c < PUZZLE_SIDE; c++)
+                if (is_frame_cell(r, c) && layer[r][c] > 0)
+                    layer[r][c] = (int8_t)(layer[r][c] + inner_top);
     }
 }
 
@@ -4429,9 +4463,15 @@ static int pick_next_cell(const Board *b, const FcState *fc,
     int best_eff = INT_MAX;
     int best_fixed = -1;
     long best_key = LONG_MAX;
+    /* --frame_last: the frame waits while any inner cell is open. */
+    bool inner_open = false;
+    if (g_frame_last)
+        for (int j = pos; j < n_rem && !inner_open; j++)
+            inner_open = !is_frame_cell((int)rem[j].row, (int)rem[j].col);
 
     for (int j = pos; j < n_rem; j++) {
         int r = (int)rem[j].row, c = (int)rem[j].col;
+        if (inner_open && is_frame_cell(r, c)) continue;
         int effective = mrv_cell_count(b, fc, r, c, remaining_budget);
         int fixed = fixed_side_score(b, r, c);
         /* MRV tie-break axis: row-major by default, column-major with --reverse
@@ -6659,6 +6699,11 @@ static void usage(const char *prog) {
         "                         opposite chirality (border-first preserved); mrv uses\n"
         "                         a column-major tie-break instead of row-major.  No\n"
         "                         effect on 2sides/4sides.\n"
+        "  --frame_last           Search the frame (rows and columns 0 and 15) last: no\n"
+        "                         frame cell is chosen while an inner cell is open; the\n"
+        "                         order within each part is unchanged.  With N the open\n"
+        "                         frame cells, --early_release N stops at the first\n"
+        "                         board that places every inner cell.\n"
         "  --jump                 Best-partial mode: skip a dead cell and continue.\n"
         "  --hall MODE            off, root (default), adaptive, or always.\n"
         "  --no_hall              Alias for --hall off.\n"
@@ -6856,6 +6901,8 @@ int main(int argc, char **argv) {
             g_parallel_mode = PAR_SEARCH;
         } else if (strcmp(argv[i], "--reverse") == 0) {
             g_reverse = true;
+        } else if (strcmp(argv[i], "--frame_last") == 0) {
+            g_frame_last = true;
         } else if (strcmp(argv[i], "--jump") == 0) {
             g_jump = true;
         } else if (strcmp(argv[i], "--restarts") == 0 && i+1 < argc) {
@@ -7101,6 +7148,14 @@ int main(int argc, char **argv) {
             fatal("--early_release R,C needs a static --order: under mrv the cell "
                   "order changes as the search runs, so the cell has no fixed place");
     }
+    if (g_frame_last) {
+        if (order_is_side_growth(g_order_mode))
+            fatal("--frame_last does not apply to --order %s: side growth walks its "
+                  "own layers from the sides inward", order_name(g_order_mode));
+        if (g_break_mode == BREAK_STUCK && g_max_mismatch > 0)
+            fatal("--frame_last orders the backtracking search; the greedy dives "
+                  "(--break_mode stuck with --breaks > 0) choose their cells themselves");
+    }
     /* --resume continues ONE serial exact DFS per record from a recorded path.
      * Everything that would make that path mean something else, or would split
      * the record across threads, is refused rather than reinterpreted. */
@@ -7211,8 +7266,9 @@ int main(int argc, char **argv) {
                g_stop_isrow ? "row" : "column", g_stop_n,
                g_reverse ? " (far side)" : "", g_with_frame ? "on" : "off");
     const bool side_growth = order_is_side_growth(g_order_mode);
-    printf("  order=%s%s  jump=%s  completion_feasibility=%s\n",
-           order_name(g_order_mode), g_reverse ? " (reverse)" : "", g_jump ? "on" : "off",
+    printf("  order=%s%s%s  jump=%s  completion_feasibility=%s\n",
+           order_name(g_order_mode), g_reverse ? " (reverse)" : "",
+           g_frame_last ? " (frame last)" : "", g_jump ? "on" : "off",
            g_jump ? "soft-for-partials" :
            (side_growth ? "soft-side-growth" : "hard-prune"));
     if (g_order_mode == ORD_2SIDES) {
@@ -7248,7 +7304,7 @@ int main(int argc, char **argv) {
         double el = g_time_limit_sec;
         if (el < 0.0) el = (g_max_mismatch > 0) ? TIME_LIMIT_DEFAULT : 0.0;
         printf("  time_limit=");
-        if (el > 0.0) printf("%.0fs/record", el); else printf("unlimited");
+        if (el > 0.0) printf("%gs/record", el); else printf("unlimited");
     }
     printf("\n");
     printf("  max_emitted=");

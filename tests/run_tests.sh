@@ -114,7 +114,7 @@ ALL_STEPS=(
     "backtracker_dives|extra|backtracker|greedy dives on the example board, plus an own-output round-trip"
     "backtracker_exhaustive|core|backtracker|exhaustive enumeration identical at 1 and 4 threads"
     "backtracker_stop_band|extra|backtracker|--stop_row/--stop_column emit exact, finalizer-shaped bands"
-    "backtracker_release|extra|backtracker|--early_release stops N cells early in every order; --reverse moves the gate"
+    "backtracker_release|extra|backtracker|--early_release stops N cells early in every order; --reverse moves the gate; --frame_last"
     "backtracker_resume|extra|backtracker,finalizer|--resume: sessions add up to one run node for node; each run releases the next board; dedup, --resume_score, readers"
     "backtracker_breakcount|extra|backtracker|break classes agree with the per-candidate scan they replaced"
     "backtracker_clues|extra|backtracker|--clue_center/--clue_corners force the hints on, or drop the board"
@@ -2155,6 +2155,30 @@ cells = {int(x) for x in f[:256] if int(x) != 999}
 assert all(208 + c in cells for c in range(16)) and not any(x >= 224 for x in cells)
 PY
     echo "ok: frontier releases after whole layers (13,5 == 32), the same at 4 threads; the layer map is drawn once"
+
+    # --frame_last: with the frame and the ring inside it lifted, --early_release
+    # 60 (the open frame cells) releases a board whose 196 inner cells are placed.
+    local ring=(--holes data/holes_open_border_TBLR.csv --breaks 0 --no_hall
+                --no_colour_count --frame_last --early_release 60 --threads 1)
+    for o in frontier mrv rowmajor; do
+        "${bt[@]}" "$OUT/fl_$o.csv" "${ring[@]}" --order "$o" > "$OUT/fl_$o.log" \
+            || fail "--frame_last --order $o failed"
+        python3 - "$OUT/fl_$o.csv" <<'PY' || fail "--frame_last --order $o: not the whole interior with the frame open"
+import sys
+f = [l for l in open(sys.argv[1]) if not l.startswith("#")][0].split(",")[-512:]
+cells = {int(x) for x in f[:256] if int(x) != 999}
+assert len(cells) == 196 and not any(x // 16 in (0, 15) or x % 16 in (0, 15) for x in cells)
+PY
+    done
+    "${bt[@]}" "$OUT/fl_res.csv" "${ring[@]}" --order frontier --resume > "$OUT/fl_res.log" \
+        || fail "--frame_last --resume failed"
+    grep -q ';frame_last=1;' "$OUT/fl_res.csv" || fail "the identifier does not record --frame_last"
+    bin/E555_backtracker data/synth_seed.txt "$OUT/fl_res.csv" "$OUT/fl_res2.csv" --order frontier \
+        --early_release 60 --breaks 0 --resume > "$OUT/fl_res2.log" 2>&1 \
+        && fail "a --frame_last row was resumed without --frame_last"
+    "${bt[@]}" "$OUT/fl_bad.csv" --frame_last --order 2sides > "$OUT/fl_bad.log" 2>&1 \
+        && fail "--frame_last accepted --order 2sides"
+    echo "ok: --frame_last releases the whole interior, frame open, in frontier, mrv and rowmajor; recorded by --resume; 2sides refused"
 }
 
 # --resume cuts one exact search into sessions.  The proof that nothing is

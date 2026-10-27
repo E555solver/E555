@@ -1987,6 +1987,12 @@ unfinished layer first, fewest fits first: it grows outward from the placed
 pieces, and `--early_release R,C` then releases after that cell's whole layer.
 The run prints the first row's layer map (`#` placed, digits the layers, `*` the
 release cell) with the cells per layer.
+`--frame_last` searches the frame (rows and columns 0 and 15) last: no frame cell
+is chosen while an inner cell is open, in any order but 2sides/4sides and the
+greedy dives (static orders sort the frame after the inner cells, frontier puts
+it in layers after the last inner one, mrv skips it). The frame cells stay in
+every prune. With N the open frame cells, `--early_release N` stops at the first
+board that places every inner cell, leaving the edges to place last.
 `--no_colour_count` (like `--no_hall`) drops a start-of-record check that sees
 the cells to be released too; neither is recorded by `--resume`.
 
@@ -2000,8 +2006,8 @@ the best over all runs, never worse.
   them only, and dedup skips those identical after `--holes`; under `--resume`
   a skipped duplicate is not written.
 - Each record runs on one thread; records still run in parallel.
-- `--order`, `--reverse`, `--rotate` and `--early_release` must match the
-  identifier; `--threads`, `--time_limit` and `--hall` may change between runs.
+- `--order`, `--reverse`, `--rotate`, `--early_release` and `--frame_last` must
+  match the identifier (a row without `frame_last=` was searched without it); `--threads`, `--time_limit` and `--hall` may change between runs.
 - Requires `--breaks 0` and `--max_emitted 1`. Refused with 2sides/4sides,
   `--jump`, a stop band and `--all_for_one`.
 - `--resume_score S` skips, and does not write, the rows scoring below S.
@@ -2036,6 +2042,7 @@ node rate).
 | `--break_mode`, `--breaks K` | stuck, 0 | engine; break ceiling |
 | `--restarts N`, `--no_lcv` | 50000, off | dives; value ordering off |
 | `--order`, `--reverse`, `--jump` | mrv, off, off | cell order |
+| `--frame_last` | off | the frame cells only once every inner cell is placed |
 | `--no_colour_count` | off | skip the colour/type count (root and per placement); the no-fit cut stays |
 | `--hall MODE`, `--hall_stride N`, `--hall_min N` | root, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
