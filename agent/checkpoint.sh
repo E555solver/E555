@@ -14,9 +14,10 @@
 #
 # Saved: scoreboard.json, run_log.csv, JOURNAL.md, STRATEGY.md, SUMMARY.md,
 # frontier/*.csv, pool/distilled*.csv and pool/consumed.txt. Not saved: runs/,
-# bin/ and the lab's sources, which setup_lab.sh rebuilds. A file over 20 MB is
-# refused, so nothing that large (such as a chain database) reaches git. Exit status 0 = pushed, 1 = committed but not pushed (the next
-# call pushes it too), 2 = refused.
+# bin/ and the lab's sources, which setup_lab.sh rebuilds, and the chain
+# database E555.db, which the next F4 run rebuilds. A file over 50 MB is
+# refused, so nothing that large reaches git. Exit status 0 = pushed, 1 =
+# committed but not pushed (the next call pushes it too), 2 = refused.
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -43,9 +44,9 @@ for f in scoreboard.json run_log.csv JOURNAL.md STRATEGY.md SUMMARY.md \
          pool/distilled*.csv pool/consumed.txt frontier/*.csv; do
     if [ -f "$f" ]; then saved+=("$f"); fi
 done
-big=$(find "${saved[@]}" -size +20M)
+big=$(find "${saved[@]}" -size +50M)
 if [ -n "$big" ]; then
-    echo "CHECKPOINT refused: too large for git (over 20 MB):" $big
+    echo "CHECKPOINT refused: too large for git (over 50 MB):" $big
     exit 2
 fi
 rm -rf "$CK"

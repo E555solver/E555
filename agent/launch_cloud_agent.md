@@ -139,6 +139,7 @@ yourself. The rest of that folder is the campaign's record.
      already rebuilt the binaries if needed and written the new `threads` and
      `stage_b_ok`. Journal it, and use the new `threads` from now on.
    - `ortools=no`: skip F2 and the topper (F6). `stage_b_ok=false`: skip F4.
+     `db_on_disk=false`: run F4 without `DB_FILE`.
 1. Then KIT section 7, steps 1 to 7, with the changes below.
 
 ### Timeouts
@@ -162,9 +163,10 @@ The Bash tool stops a foreground command after 2 minutes by default and
   (`pgrep -f <D>` prints nothing), referee what it wrote and log it with the note
   `lost`.
 - **Long jobs come in pieces.** The distiller (F3) resumes where a killed run
-  stopped, so rerun the same command until it finishes. Every F4 run builds
-  the chain database in memory before it searches, within its cap. Never pass
-  `DB_FILE`: the database is never written to disk, checkpointed or committed.
+  stopped, so rerun the same command until it finishes. The first F4 run in a
+  container builds the chain database within its cap and keeps it in the lab
+  as `E555.db`, and later runs load it. That file is never checkpointed or
+  committed, so after a container is replaced the next F4 run builds it again.
 
 ### Checkpoints
 

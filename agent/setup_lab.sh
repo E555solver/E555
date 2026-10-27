@@ -27,9 +27,11 @@
 #    or starts a fresh one from data/best_465.csv. FRESH_CLOCK=1 gives a
 #    restored campaign a new budget.
 # 5. Writes this machine's facts into scoreboard.json (cpu, arch, threads,
-#    ram_gb, disk_gb, ortools_ok, stage_b_ok) and checks the frontier with the
-#    referee. stage_b_ok needs 8 GB of free RAM: the beamer builds its chain
-#    database in memory in every run, and the kit never writes it to disk.
+#    ram_gb, disk_gb, ortools_ok, stage_b_ok, db_on_disk) and checks the
+#    frontier with the referee. stage_b_ok needs 8 GB of free RAM for the
+#    beamer's chain database; db_on_disk means the lab can keep that database
+#    as E555.db (already there, or 8 GB of free disk). The file is never
+#    committed: *.db is gitignored, and checkpoint.sh never saves it.
 # Exit status 0 = ready, 1 = a step failed, 2 = usage.
 # ---- settings: pass NAME=value on the command line ---------------------------
 CAMPAIGN=           # empty: the lab this runs in, else a new campaign;
@@ -186,16 +188,17 @@ cpu=${cpu:-unknown}
 ram_gb=$(awk '/^MemAvailable/ {printf "%d", $2 / 1048576}' /proc/meminfo)
 disk_gb=$(df -Pk . | awk 'NR == 2 {printf "%d", $4 / 1048576}')
 stage_b_ok=false
-if [ "$ram_gb" -ge 8 ]; then
-    stage_b_ok=true
-fi
-read -r cpu_changed best < <(python3 - "$CAMPAIGN" "$cpu" "$ARCH" "$threads" "$ram_gb" "$disk_gb" "$ortools" "$stage_b_ok" <<'EOF'
+if [ "$ram_gb" -ge 8 ]; then stage_b_ok=true; fi
+db_on_disk=false
+if [ -s E555.db ] || [ "$disk_gb" -ge 8 ]; then db_on_disk=true; fi
+read -r cpu_changed best < <(python3 - "$CAMPAIGN" "$cpu" "$ARCH" "$threads" "$ram_gb" "$disk_gb" "$ortools" "$stage_b_ok" "$db_on_disk" <<'EOF'
 import json, sys
-campaign, cpu, arch, threads, ram, disk, ortools, stage_b = sys.argv[1:]
+campaign, cpu, arch, threads, ram, disk, ortools, stage_b, db_on_disk = sys.argv[1:]
 s = json.load(open("scoreboard.json"))
 changed = "yes" if s.get("cpu") not in (None, cpu) else "no"
 s.update(campaign=campaign, cpu=cpu, arch=arch, threads=int(threads), ram_gb=int(ram),
-         disk_gb=int(disk), ortools_ok=ortools == "yes", stage_b_ok=stage_b == "true")
+         disk_gb=int(disk), ortools_ok=ortools == "yes", stage_b_ok=stage_b == "true",
+         db_on_disk=db_on_disk == "true")
 json.dump(s, open("scoreboard.json", "w"), indent=1)
 print(changed, s["best_score"])
 EOF
@@ -207,4 +210,4 @@ score=$(sed -n 's/.* score=\([0-9]*\) .*/\1/p' <<< "$ref")
 elite=$(python3 "$REPO/tools/E555_rank.py" frontier/elite.csv --seed_file "$SEED" --count)
 echo "SETUP campaign=$CAMPAIGN lab=$state path=$LAB arch=$ARCH cpu=\"$cpu\"" \
      "cpu_changed=$cpu_changed threads=$threads ram_gb=$ram_gb disk_gb=$disk_gb" \
-     "ortools=$ortools stage_b_ok=$stage_b_ok best=$best elite=$elite"
+     "ortools=$ortools stage_b_ok=$stage_b_ok db_on_disk=$db_on_disk best=$best elite=$elite"
