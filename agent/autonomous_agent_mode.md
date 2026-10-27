@@ -51,19 +51,25 @@ progress under a trustworthy referee, not a number that merely *looks* good.
 These are non-negotiable. Section 8 repeats them inside the `/goal` condition.
 
 **Containment**
-- The session runs **in `agent/lab/`** (section 4.2 launches Claude Code there),
-  so the permission system itself treats the rest of the repo as outside the
-  working directory. Read anything in the repo; **write only inside
-  `agent/lab/`**. A cloud session starts at the repository root instead, so
-  there this rule holds by instruction alone.
+- **Every campaign has a lab of its own**, `agent/labs/<id>/`, named by the
+  UTC date and time it started (`20261027-1930`), so the campaigns you run now
+  and later never mix their results. "The lab" below always means this
+  campaign's lab.
+- The session runs **in the lab** (section 4.2 launches Claude Code there), so
+  the permission system itself treats the rest of the repo as outside the
+  working directory. Read anything in the repo, other campaigns included;
+  **write only inside the lab**. A cloud session starts at the repository root
+  instead, so there this rule holds by instruction alone.
 - No git command that changes the repository (no commit, push, checkout, reset,
-  stash or clean). `agent/lab/` is gitignored. The one exception is a cloud
-  session's checkpoint (section 11): `agent/checkpoint.sh` commits
-  `agent/checkpoint/` alone and pushes it to the session's own branch.
-- The beamer's 6.8 GB chain-database cache, if used, goes to `agent/lab/cache/`
-  on **local** disk, never on a network drive.
-- You **may** edit the lab's copies of the source, write new tools in
-  `agent/lab/tools/`, and rebuild the lab's binaries. Improve anything you like:
+  stash or clean). `agent/labs/` is gitignored. The one exception is a cloud
+  session's checkpoint (section 11): `agent/checkpoint.sh` commits this
+  campaign's `agent/checkpoints/<id>/` alone and pushes it to the session's
+  own branch.
+- The beamer's 6.8 GB chain-database cache, if used, goes to the lab's
+  `cache/`, a link to `agent/cache/` that every campaign shares (the file is
+  the same for all), on **local** disk, never on a network drive.
+- You **may** edit the lab's copies of the source, write new tools in the
+  lab's `tools/`, and rebuild the lab's binaries. Improve anything you like:
   samplers, allocators, heuristics.
 
 **Anti-cheating contract** (the run is worthless if any of these is broken)
@@ -72,7 +78,7 @@ These are non-negotiable. Section 8 repeats them inside the `/goal` condition.
    construction). Solving them is **not** progress and never touches the
    scoreboard.
 2. **The referee decides.** The official score of a board file is the line
-   `bash ../referee.sh FILE` prints. `agent/referee.sh` runs the repo's own
+   `bash ../../referee.sh FILE` prints. `agent/referee.sh` runs the repo's own
    `tools/E555_rank.py` and `tools/E555_viewer.py` on the repo's own seed, all
    outside the lab, so editing the lab's copies cannot change its verdict.
    Never edit the referee, the repo's tools or the seed. You may write your own
@@ -96,7 +102,7 @@ These are non-negotiable. Section 8 repeats them inside the `/goal` condition.
 
 ## 2. The terrain: what each tool does and how to call it
 
-Every command below runs from `agent/lab/`, which is a small checkout of its
+Every command below runs from the lab, `agent/labs/<id>/`, which is a small checkout of its
 own (`bin/ src/ tools/ examples/ pipeline/ data/ Makefile`). The example
 scripts set `REPO` to their own parent directory, so `bash examples/X.sh` run
 from the lab reads and writes in the lab. Always give them an `OUT`/`OUT_DIR`
@@ -127,7 +133,7 @@ index there without `--end_dive`. Never trust field 2: ask the referee.
 
 **The measure.** The referee gives the number; `rank` shows the shape:
 ```bash
-bash ../referee.sh FILE                       # official: REFEREE verdict=VALID score=465 breaks=15 ...
+bash ../../referee.sh FILE                       # official: REFEREE verdict=VALID score=465 breaks=15 ...
 python3 tools/E555_rank.py FILE --top 5       # where the breaks are
 python3 tools/E555_rank.py FILE --diverse 10 --out x.csv   # 10 mutually distinct boards
 python3 tools/E555_viewer.py FILE --row 0 --no_url         # the picture ('#' = break)
@@ -206,7 +212,9 @@ From the repository root:
 ```bash
 bash agent/setup_lab.sh
 ```
-It copies the toolchain into `agent/lab/` (Makefile, src, tools, examples,
+It starts a new campaign in a lab of its own, `agent/labs/<id>/`, where `<id>`
+is the UTC date and time (`20261027-1930`, with `-2` added if that name is
+taken). It copies the toolchain into the lab (Makefile, src, tools, examples,
 pipeline, data, the two docs, and this kit as `KIT.md`), builds the lab's
 `bin/`, installs OR-Tools when Python lacks it (the ender and the topper), and
 seeds the bookkeeping of section 6:
@@ -221,7 +229,7 @@ cache already in `cache/`), `ortools_ok`, the CPU model and the build's arch.
 It ends with two lines:
 ```
 REFEREE verdict=VALID score=465 breaks=15 placed=256 frame_violations=0 ...
-SETUP lab=fresh path=.../agent/lab arch=v3 cpu="..." ... ortools=yes stage_b_ok=true best=465 elite=42
+SETUP campaign=20261027-1930 lab=fresh path=.../agent/labs/20261027-1930 arch=v3 cpu="..." ... ortools=yes stage_b_ok=true best=465 elite=42
 ```
 If it fails, or `elite` is not 42, fix the setup before you start the goal.
 `ortools=no` means no F2 and no topper: install OR-Tools and rerun, or accept
@@ -247,9 +255,9 @@ plain or gzipped, go in `pool/`.
 Distil once, before or during the run (it resumes where a killed run stopped, so
 `timeout` plus a rerun is safe):
 ```bash
-cd agent/lab
+cd agent/labs/<id>             # the campaign's lab, as SETUP printed it
 python3 tools/E555_distiller.py data/E565_FixCorners23.csv.gz --top 5 --out pool/distilled.csv
-bash ../referee.sh pool/distilled.csv
+bash ../../referee.sh pool/distilled.csv
 : > pool/consumed.txt          # ids the agent has already used as roots
 ```
 Distilled boards land around 462, below the frontier. They are roots for F1/F2,
@@ -268,7 +276,7 @@ and their value is that they differ from the elites (H5).
   foreground command after 2 minutes by default and 10 minutes at most; the
   kit's runs take up to 20:
   ```bash
-  cd agent/lab
+  cd agent/labs/<id>             # the campaign's lab, as SETUP printed it
   BASH_DEFAULT_TIMEOUT_MS=1500000 BASH_MAX_TIMEOUT_MS=1500000 claude --permission-mode auto --model opus --effort medium
   ```
   On a laptop, keep the machine awake by putting `caffeinate -i` (macOS) or
@@ -312,7 +320,7 @@ accepts file edits inside the working directory (the lab). Add Bash rules with
 Bash(bin/E555_diver *)  Bash(bin/E555_beamer *)  Bash(bin/E555_finalizer *)
 Bash(bin/E555_backtracker *)  Bash(bin/E555_roundhouse *)
 Bash(python3 tools/*)  Bash(python3 src/*)  Bash(bash examples/*)  Bash(bash pipeline/*)
-Bash(bash ../referee.sh *)  Bash(make *)  Bash(date *)  Bash(nproc)
+Bash(bash ../../referee.sh *)  Bash(make *)  Bash(date *)  Bash(nproc)
 ```
 A rule also matches the command behind a `timeout` prefix. The kit writes run
 directories and thread counts literally, never as shell variables, so these
@@ -324,7 +332,7 @@ so C is a convenience, not a sandbox.
 
 ## 6. Bookkeeping the agent must maintain (this is how you evaluate progress)
 
-Everything under `agent/lab/`:
+Everything under the lab, `agent/labs/<id>/`:
 - **`scoreboard.json`**: the current best, `goal_start_unix`, `last_best_unix`,
   `families_since_best` (the distinct families run since the last new best),
   `total_runs`, and `history[]` (one entry per accepted best: unix, score,
@@ -352,12 +360,12 @@ Everything under `agent/lab/`:
   and tokens are the budget.
 
 **The status line.** The `/goal` evaluator only sees the conversation; it cannot
-read files. So every turn ends with the line `bash ../status.sh` prints, run in
+read files. So every turn ends with the line `bash ../../status.sh` prints, run in
 that turn, followed by ` next=<next move>`:
 ```
 STATUS best=465/480 breaks=15 runs=12 run_time=2h05m/8h00m since_best=0h40m/1h00m families_since_best=2/3 stop=none next=<next move>
 ```
-The first call passes the settings (`bash ../status.sh BUDGET=8h PLATEAU=1h/3`),
+The first call passes the settings (`bash ../../status.sh BUDGET=8h PLATEAU=1h/3`),
 and later calls reuse them from `scoreboard.json`; the first call also sets
 `goal_start_unix` when it is null. The clocks are **run time**: `run_time` sums
 `runtime_s` over the `run_log.csv` rows logged since `goal_start_unix`, and
@@ -381,12 +389,12 @@ specific things to try next with more time or a bigger machine.
 
 A fixed, prescriptive cycle.
 
-0. **First turn only:** run `bash ../status.sh` with the goal's settings
+0. **First turn only:** run `bash ../../status.sh` with the goal's settings
    (`BUDGET=8h PLATEAU=1h/3` unless the goal says otherwise). It stores them
    and sets `goal_start_unix`. `threads` and `stage_b_ok` come from
-   `setup_lab.sh` (section 4). If the
-   machine may have changed, run `bash ../setup_lab.sh` again: it rebuilds
-   what the new CPU needs and rewrites them.
+   `setup_lab.sh` (section 4). If the machine may have changed, run
+   `bash ../../setup_lab.sh` again (from the lab it checks this campaign): it
+   rebuilds what the new CPU needs and rewrites them.
 1. **Orient.** Read `scoreboard.json`, the last few `JOURNAL.md` blocks and
    `STRATEGY.md`. Run the referee on `frontier/frontier.csv` and `rank` on it
    for the shape.
@@ -405,7 +413,7 @@ A fixed, prescriptive cycle.
    only with a one-line reason in the journal. If the Bash tool cannot wait
    that long, start the run in the background and end the turn; its result
    arrives as the next turn.
-4. **Referee the output** (`bash ../referee.sh <D>/out.csv`) and append a
+4. **Referee the output** (`bash ../../referee.sh <D>/out.csv`) and append a
    `run_log.csv` row **whether or not it improved**. Increment `total_runs`.
 5. **On a new best** (VALID and above `best_score`): update `scoreboard.json`
    (best, `last_best_unix`, empty `families_since_best`, a `history` entry),
@@ -423,7 +431,7 @@ distilled pool, or a slice of one (`python3 tools/E555_rank.py frontier/elite.cs
 --diverse 4 --out <D>/roots.csv`). When you take roots from a distilled pool,
 append their ids to `pool/consumed.txt` and skip the ids already there.
 
-| family | when | command (from `agent/lab`) |
+| family | when | command (from the lab) |
 |---|---|---|
 | **F1 reopen** | any complete root | `timeout 1200 bash examples/11_diver_reopen.sh BOARDS=<root.csv> OUT=<D>/out.csv SECONDS_PER_BOARD=<1100 / boards> THREADS=<T> RNG_SEED=<S> REOPEN=<auto, auto+1, top:5 or top:6>` |
 | **F2 ender** | a complete root after F1 stalls | `timeout 1200 python3 src/C_tail/E555_ender.py data/seed_Edge5.txt <root.csv> <D>/out.csv --profile deep --board_time_limit <1000 / boards> --threads <T> --rng_seed <S>` |
@@ -431,7 +439,7 @@ append their ids to `pool/consumed.txt` and skip the ids already there.
 | **F4 beam** | `stage_b_ok` is true; new raw material | `timeout 1200 bash examples/01_beamer_quickstart.sh OUT_DIR=<D> THREADS=<T> BEAM_WIDTH=10000 BACKTRACK_ROW=6 STOP_ROW=11 END_DIVE=10000 END_POLISH=20000 MAX_WALL=1100 RNG_SEED=<S> DB_FILE=cache/E555.db` (with `CLUES=1`, use `DB_FILE=cache/E555_clues.db`); the files it wrote are listed in `<D>/outputs.txt`, and its boards go to F1 |
 | **F5 rebuild** | an elite F1 cannot move | `timeout 1200 bin/E555_diver data/seed_Edge5.txt <root.csv> <D>/out.csv --holes top:6 --stop_row 11 --end_dive 10000 --end_polish 20000 --emit_score 455 --wall_time 1100 --threads <T> --rng_seed <S>` |
 | **F6 exact** | an unpolished board, or a small hole to prove | `timeout 1200 bash pipeline/topper_sweep.sh INPUT=<root.csv> PRESET=safe OUT=<D>/out.csv OUT_DIR=<D> WORKERS=<T>`, or `timeout 1200 bin/E555_backtracker data/seed_Edge5.txt <root.csv> <D>/out.csv --holes <D>/mask.csv --break_mode any --breaks <K> --time_limit 1100 --threads <T>`, with a mask you write (16 lines of 16 `0`/`1`, first line = row 0, under ~30 open cells around the breaks). An exhausted level K proves that no filling of the hole has K or fewer breaks; a search that runs out of time writes the board with the hole still open, which the referee calls `INVALID reason=incomplete`: log it as a run that found nothing |
-| **F7 tool** | an idea none of the above covers | write it in `agent/lab/tools/`, check it against the referee on `data/best_46*.csv` first, then run it like any other family |
+| **F7 tool** | an idea none of the above covers | write it in the lab's `tools/`, check it against the referee on `data/best_46*.csv` first, then run it like any other family |
 
 The first F4 run builds the database cache (about 2 minutes on 4 cores,
 writing the 6.8 GB file included); later runs map it in seconds. Measured: one
@@ -453,18 +461,18 @@ search to make it faster.
 ```
 /goal Run an unattended optimization campaign on the E555 Eternity II puzzle data/seed_Edge5.txt. A board scores matched internal edges out of 480; breaks = 480 - score. The best known board, 465/480, is frontier/frontier.csv. Mission: a referee-VALID board above 465, as close to 480 as the tools allow, with every step documented.
 
-The working directory is agent/lab. KIT.md is your manual: read its sections 1-7 now, and again after any context compaction, and follow them exactly. Read an examples/*.sh header before first using its tool.
+The working directory is this campaign's lab, agent/labs/<id>/: the folder Claude Code started in. Other campaigns' labs and checkpoints are not yours. KIT.md is your manual: read its sections 1-7 now, and again after any context compaction, and follow them exactly. Read an examples/*.sh header before first using its tool.
 
 HARD RULES (breaking any voids the run):
-- The official score of a board file is the line `bash ../referee.sh FILE` prints. Never edit anything outside agent/lab: not the referee, not the repository's tools, not its seed. Your lab copies may change; their numbers never count.
+- The official score of a board file is the line `bash ../../referee.sh FILE` prints. Never edit anything outside this lab: not the referee, not the repository's tools, not its seed. Your lab copies may change; their numbers never count.
 - Never treat synth_seed.txt or synth_solution_480.csv as the puzzle; they are self-test fixtures.
 - Every frontier board comes from a command logged in run_log.csv. No hand-written boards. Log every run with its real referee result, improved or not.
 - A new best needs verdict=VALID and a score above best_score, from a fresh referee call on the emitted file.
-- Write only inside agent/lab. No git command that changes the repository. Keep parallelism to the tools' own --threads or plain background jobs.
+- Write only inside this lab. No git command that changes the repository. Keep parallelism to the tools' own --threads or plain background jobs.
 
 EACH TURN: follow KIT.md section 7. Orient, choose a family by the heuristics of section 3, run it bounded (timeout 1200, output in a new runs/<ts>_<tool>/), referee the output, log it, update scoreboard.json and the frontier on a new best, chain the closers on it, and journal it. On the first turn, set goal_start_unix as section 7 step 0 says; threads and stage_b_ok are in scoreboard.json.
 
-END EVERY TURN with the line `bash ../status.sh BUDGET=8h PLATEAU=1h/3` prints in that same turn, followed by next=<next move>. Its clocks count run time, so usage-limit waits do not count.
+END EVERY TURN with the line `bash ../../status.sh BUDGET=8h PLATEAU=1h/3` prints in that same turn, followed by next=<next move>. Its clocks count run time, so usage-limit waits do not count.
 
 The goal is met only when SUMMARY.md has been written as KIT.md section 6 describes and its first ten lines are printed in the transcript, after one of these held in this conversation:
 (a) the referee printed verdict=VALID score=480;
@@ -485,15 +493,15 @@ repo-correct as written. The condition is under the 4,000-character limit of
 - `/goal` with no argument shows the condition, how long it has run, the turns
   evaluated, the token spend and the evaluator's last reason (`Ctrl+O` on a
   verdict shows the reason too). `/goal clear` stops it early.
-- Follow the story without spending tokens: `tail -f agent/lab/JOURNAL.md`,
-  `column -s, -t agent/lab/run_log.csv | tail`, and
-  `bash agent/referee.sh agent/lab/frontier/frontier.csv` from the repo root.
-- The frontier board is always `agent/lab/frontier/frontier.csv`. View it with
-  `python3 tools/E555_viewer.py agent/lab/frontier/frontier.csv` from the repo
+- Follow the story without spending tokens: `tail -f agent/labs/<id>/JOURNAL.md`,
+  `column -s, -t agent/labs/<id>/run_log.csv | tail`, and
+  `bash agent/referee.sh agent/labs/<id>/frontier/frontier.csv` from the repo root.
+- The frontier board is always `agent/labs/<id>/frontier/frontier.csv`. View it with
+  `python3 tools/E555_viewer.py agent/labs/<id>/frontier/frontier.csv` from the repo
   root (the viewer's URL opens it on e2.bucas.name).
 - **A usage limit** pauses the campaign until the window resets, then Claude
   Code continues it (section 4.2). Nothing is lost: the clocks count run time.
-- **Resume another day:** `cd agent/lab` and relaunch with the same command
+- **Resume another day:** `cd agent/labs/<id>` and relaunch with the same command
   plus `--continue`. Claude Code restores an active goal, but restarts its own
   timer and turn count, which is why the kit keeps its clocks in
   `scoreboard.json` and `run_log.csv`. They count run time, so downtime costs
@@ -537,7 +545,7 @@ from a terminal, and how the launcher handles it:
 | The Bash tool stops a foreground command after 2 minutes by default and 10 at most, and `BASH_*_TIMEOUT_MS` cannot be set at launch | `RUN_CAP` (default 540 s) keeps each run in the foreground. A larger cap sends runs to the background, where the tool allows up to 2 hours |
 | Limited compute: the container this kit was measured in had 4 cores, 15 GB of RAM and a 30 GB disk allowance, and yours may have less | the health check at the start of every turn measures cores, free RAM and disk. F4 runs only with 8 GB of free RAM and room for the 6.8 GB cache |
 | The session can move to another machine, with another CPU, where a `-march=native` binary dies with SIGILL | the lab builds for x86-64-v3 (AVX2), which runs on any current server and here ran as fast as native, and falls back to generic below that or after a SIGILL. A new CPU shows as `cpu_changed=yes`, and the agent takes the new `threads` |
-| The container can be replaced (idle, restarts). `agent/lab/` is gitignored, so it goes with the container, runs in flight included | `agent/checkpoint.sh` commits `agent/checkpoint/` (scoreboard, logs, journal, strategy, frontier, elite, distilled pools) to the session's own branch, on every new best and every `CHECKPOINT` (30 min). The health check restores a lost lab from it |
+| The container can be replaced (idle, restarts). `agent/labs/` is gitignored, so the lab goes with the container, runs in flight included | `agent/checkpoint.sh` commits the campaign's `agent/checkpoints/<id>/` (scoreboard, logs, journal, strategy, frontier, elite, distilled pools) to the session's own branch, on every new best and every `CHECKPOINT` (30 min). The health check restores a lost lab from it |
 | A fresh container has no OR-Tools | `setup_lab.sh` installs it. Without it, F2 and the topper are skipped |
 
 **Settings** go in the pasted line: `BUDGET` (8h of run time), `RUN_CAP` (540),
@@ -545,24 +553,35 @@ from a terminal, and how the launcher handles it:
 as `no Stage B`, `THREADS=2` or `stop at the first VALID board above 465`. The
 launcher's table explains each one.
 
+**Each campaign is its own folder.** A new session starts a new campaign,
+named by its UTC start time: its lab is `agent/labs/<id>/` and its checkpoint
+`agent/checkpoints/<id>/`. Campaigns you run later never write into an earlier
+one's folders, and their checkpoints can sit side by side on one branch.
+
 **Resume in a new session:** paste the line with `RESUME=<the old session's
-branch>`. The campaign continues from its last checkpoint with a fresh
+branch>`, plus `CAMPAIGN=<id>` if that branch holds more than one campaign. The
+campaign keeps its id and continues from its last checkpoint with a fresh
 `BUDGET` (add `keep the clock` to keep the old one), and the new session
-checkpoints to its own branch. If the STATUS lines stop for more than an hour
+checkpoints it to its own branch. If the STATUS lines stop for more than an hour
 after a usage limit has reset, the goal may have been lost with the VM. In that
 case, paste the line again in the same session with `RESUME=<this session's
 branch>` and `keep the clock`: a lab that is still there is kept, a lost one is
 restored, and no second wake-up task is created.
 
 **Keeping a result:** the best board is
-`agent/checkpoint/frontier/frontier.csv` on the session's branch. Confirm it
-with `bash agent/referee.sh FILE` and copy it into `data/` on `main` by hand.
-Keep `agent/checkpoint/` itself out of `main`.
+`agent/checkpoints/<id>/frontier/frontier.csv` on the session's branch. Confirm
+it with `bash agent/referee.sh FILE` and copy it into `data/` on `main` by hand.
+A campaign's checkpoint folder is also its record (journal, run log, strategy,
+summary). Because every campaign has its own folder, the records of several
+campaigns can be merged into one branch without overlapping.
 
 **Tested so far,** in a cloud container:
 - `setup_lab.sh`: a fresh setup in 32 s, and a health check in under a second;
 - `checkpoint.sh`: a refusal on `main`, a pushed checkpoint, and a restore from
   a branch;
+- two campaigns started in the same minute (`-2` added to the second), each
+  with its own lab and checkpoint on one branch; a restore that asks which
+  campaign when the branch holds two, and picks the only one otherwise;
 - a simulated CPU change, and a binary that dies with SIGILL;
 - `status.sh` on a log with a 5-hour gap, which did not count.
 

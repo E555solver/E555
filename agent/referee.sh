@@ -2,10 +2,10 @@
 # referee.sh -- the official score of the best board in a board file, for the
 # /goal kit (agent/autonomous_agent_mode.md). It runs the repository's own
 # tools/E555_rank.py and tools/E555_viewer.py against the repository's own
-# data/seed_Edge5.txt, wherever it is called from, so editing the copies in
-# agent/lab cannot change its verdict.
+# data/seed_Edge5.txt, wherever it is called from, so editing the copies in a
+# campaign's lab (agent/labs/<id>/) cannot change its verdict.
 #
-#   bash ../referee.sh frontier/frontier.csv          (from agent/lab)
+#   bash ../../referee.sh frontier/frontier.csv       (from a lab, agent/labs/<id>/)
 #   REFEREE verdict=VALID score=465 breaks=15 placed=256 frame_violations=0 id=... file=...
 #
 # The best board is the one tools/E555_rank.py ranks first (fewest breaks).

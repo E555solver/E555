@@ -1,15 +1,22 @@
 #!/bin/bash
-# setup_lab.sh -- build, repair or restore agent/lab, the working copy of the
-# /goal kit (agent/autonomous_agent_mode.md, sections 4 and 11). Safe to run at
-# any time, from anywhere: each step does only what is missing, so a healthy
-# lab costs a few seconds. It never touches the campaign's results.
+# setup_lab.sh -- start, repair or restore a campaign's lab, the working copy of
+# the /goal kit (agent/autonomous_agent_mode.md, sections 4 and 11). Every
+# campaign gets a lab of its own, agent/labs/<id>/, named by the UTC date and
+# time it started (20261027-1930), and its checkpoints go to
+# agent/checkpoints/<id>/, so campaigns never write into each other's results.
+# Safe to run at any time: each step does only what is missing, so a healthy
+# lab costs a second, and it never touches a campaign's results.
 #
-#   bash agent/setup_lab.sh                      # first setup, or a health check
-#   bash agent/setup_lab.sh RESUME=my-branch     # a lost campaign comes back from my-branch
-#   SETUP lab=fresh path=/.../agent/lab arch=v3 cpu="..." cpu_changed=no threads=4 ...
+#   bash agent/setup_lab.sh                          # a new campaign
+#   bash ../../setup_lab.sh                          # inside a lab: that campaign's health check
+#   bash agent/setup_lab.sh CAMPAIGN=20261027-1930   # the same, from anywhere
+#   bash agent/setup_lab.sh RESUME=my-branch         # continue the campaign checkpointed on my-branch
+#   SETUP campaign=20261027-1930 lab=fresh path=/.../agent/labs/20261027-1930 arch=v3 ...
 #
 # 1. Copies the toolchain into the lab when it is not there: Makefile, src,
 #    tools, examples, pipeline, data, the two docs, and the kit as KIT.md.
+#    cache/ links to agent/cache/: the 6.8 GB database cache is the same for
+#    every campaign, so they share one copy.
 # 2. Builds the lab's bin/. ARCH=auto picks v3 (AVX2) where the CPU runs
 #    x86-64-v3, else generic. Measured on the reopen: v3 is as fast as native
 #    and generic 45% slower, all three with identical output; a native build
@@ -17,20 +24,24 @@
 #    not on any current server. A changed ARCH rebuilds (bin/.buildflags), and a
 #    binary that still dies with SIGILL forces generic.
 # 3. Installs OR-Tools when Python lacks it (the ender and the topper need it).
-# 4. Without a scoreboard.json: restores the campaign from the agent/checkpoint/
-#    of branch RESUME (written by agent/checkpoint.sh), or starts a fresh one
-#    from data/best_465.csv. FRESH_CLOCK=1 gives a restored campaign a new clock.
+# 4. Without a scoreboard.json: restores the campaign from its
+#    agent/checkpoints/<id>/ on branch RESUME (written by agent/checkpoint.sh),
+#    or starts a fresh one from data/best_465.csv. FRESH_CLOCK=1 gives a
+#    restored campaign a new budget.
 # 5. Writes this machine's facts into scoreboard.json (cpu, arch, threads,
 #    ram_gb, disk_gb, ortools_ok, stage_b_ok) and checks the frontier with the
 #    referee. stage_b_ok needs 8 GB of free RAM and 8 GB of free disk for the
-#    6.8 GB database cache, or a cache already in cache/E555.db.
+#    database cache, or a cache already in agent/cache/E555.db.
 # Exit status 0 = ready, 1 = a step failed, 2 = usage.
 # ---- settings: pass NAME=value on the command line ---------------------------
+CAMPAIGN=           # empty: the lab this runs in, else a new campaign;
+                    # new: a new campaign; or an id. With RESUME, empty or new
+                    # means the one campaign checkpointed on that branch
 ARCH=auto           # auto, v3, v2, generic or native (the Makefile's ARCH)
-RESUME=none         # a git branch whose agent/checkpoint/ restores a lost campaign
-FRESH_CLOCK=0       # 1: a restored campaign starts its BUDGET clock again
+RESUME=none         # a git branch whose agent/checkpoints/<id>/ restores a lost campaign
+FRESH_CLOCK=0       # 1: a restored campaign starts its BUDGET again
 # -----------------------------------------------------------------------------
-SETTINGS=" ARCH RESUME FRESH_CLOCK "
+SETTINGS=" CAMPAIGN ARCH RESUME FRESH_CLOCK "
 for arg in "$@"; do
     case "$arg" in
         [A-Za-z_]*=*) [[ "$SETTINGS" == *" ${arg%%=*} "* ]] ||
@@ -42,10 +53,50 @@ done
 set -euo pipefail
 
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-LAB="$REPO/agent/lab"
+LABS="$REPO/agent/labs"
 SEED="$REPO/data/seed_Edge5.txt"
 fail() { echo "SETUP failed: $*"; exit 1; }
-mkdir -p "$LAB"
+
+fetched=0
+fetch_resume() {
+    [ "$fetched" = 1 ] && return 0
+    local wait
+    mkdir -p "$LABS"
+    for wait in 2 4 8 16 0; do
+        if git -C "$REPO" fetch -q origin "$RESUME" 2>> "$LABS/git_fetch.log"; then
+            fetched=1; return 0
+        fi
+        [ "$wait" = 0 ] || sleep "$wait"
+    done
+    fail "git fetch origin $RESUME; see $LABS/git_fetch.log"
+}
+
+# 0. which campaign
+if [ -z "$CAMPAIGN" ]; then
+    case "$PWD/" in
+        "$LABS"/*/*) CAMPAIGN=${PWD#"$LABS/"}; CAMPAIGN=${CAMPAIGN%%/*} ;;
+        *) CAMPAIGN=new ;;
+    esac
+fi
+if [ "$CAMPAIGN" = new ]; then
+    if [ "$RESUME" != none ]; then
+        fetch_resume
+        ids=$(git -C "$REPO" ls-tree --name-only FETCH_HEAD agent/checkpoints/ | sed 's#.*/##')
+        [ -n "$ids" ] || fail "branch $RESUME has no agent/checkpoints/"
+        [ "$(wc -l <<< "$ids")" = 1 ] ||
+            fail "branch $RESUME holds several campaigns; pass CAMPAIGN= one of:" $ids
+        CAMPAIGN=$ids
+    else
+        CAMPAIGN=$(date -u +%Y%m%d-%H%M)
+        n=1
+        while [ -e "$LABS/$CAMPAIGN" ]; do
+            n=$((n + 1)); CAMPAIGN=$(date -u +%Y%m%d-%H%M)-$n
+        done
+    fi
+fi
+[[ "$CAMPAIGN" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || fail "bad campaign id '$CAMPAIGN'"
+LAB="$LABS/$CAMPAIGN"
+mkdir -p "$LAB" "$REPO/agent/cache"
 cd "$LAB"
 
 # 1. the toolchain
@@ -55,7 +106,8 @@ if [ ! -f Makefile ]; then
     state=fresh
 fi
 [ -f KIT.md ] || cp "$REPO/agent/autonomous_agent_mode.md" KIT.md
-mkdir -p cache runs frontier pool
+[ -e cache ] || [ -L cache ] || ln -s ../../cache cache
+mkdir -p runs frontier pool
 
 # 2. the binaries
 if [ "$ARCH" = auto ]; then
@@ -79,20 +131,15 @@ fi
 ortools=no
 if python3 -c 'import ortools' 2> /dev/null; then ortools=yes; fi
 
-# 4. the campaign
+# 4. the campaign's state
 if [ ! -f scoreboard.json ]; then
     if [ "$RESUME" != none ]; then
+        fetch_resume
         TMP=$(mktemp -d)
         trap 'rm -rf "$TMP"' EXIT
-        fetched=0
-        for wait in 2 4 8 16 0; do
-            if git -C "$REPO" fetch -q origin "$RESUME" 2>> runs/git.log; then fetched=1; break; fi
-            [ "$wait" = 0 ] || sleep "$wait"
-        done
-        [ "$fetched" = 1 ] || fail "git fetch origin $RESUME; see $LAB/runs/git.log"
-        git -C "$REPO" archive FETCH_HEAD agent/checkpoint 2>> runs/git.log | tar -x -C "$TMP" ||
-            fail "branch $RESUME has no agent/checkpoint/"
-        cp -r "$TMP/agent/checkpoint/." .
+        git -C "$REPO" archive FETCH_HEAD "agent/checkpoints/$CAMPAIGN" 2>> runs/git.log | tar -x -C "$TMP" ||
+            fail "branch $RESUME has no agent/checkpoints/$CAMPAIGN/"
+        cp -r "$TMP/agent/checkpoints/$CAMPAIGN/." .
         [ -f scoreboard.json ] || fail "the checkpoint on $RESUME has no scoreboard.json"
         if [ "$FRESH_CLOCK" = 1 ]; then
             python3 - <<'EOF'
@@ -145,13 +192,13 @@ stage_b_ok=false
 if [ "$ram_gb" -ge 8 ] && { [ -s cache/E555.db ] || [ "$disk_gb" -ge 8 ]; }; then
     stage_b_ok=true
 fi
-read -r cpu_changed best < <(python3 - "$cpu" "$ARCH" "$threads" "$ram_gb" "$disk_gb" "$ortools" "$stage_b_ok" <<'EOF'
+read -r cpu_changed best < <(python3 - "$CAMPAIGN" "$cpu" "$ARCH" "$threads" "$ram_gb" "$disk_gb" "$ortools" "$stage_b_ok" <<'EOF'
 import json, sys
-cpu, arch, threads, ram, disk, ortools, stage_b = sys.argv[1:]
+campaign, cpu, arch, threads, ram, disk, ortools, stage_b = sys.argv[1:]
 s = json.load(open("scoreboard.json"))
 changed = "yes" if s.get("cpu") not in (None, cpu) else "no"
-s.update(cpu=cpu, arch=arch, threads=int(threads), ram_gb=int(ram), disk_gb=int(disk),
-         ortools_ok=ortools == "yes", stage_b_ok=stage_b == "true")
+s.update(campaign=campaign, cpu=cpu, arch=arch, threads=int(threads), ram_gb=int(ram),
+         disk_gb=int(disk), ortools_ok=ortools == "yes", stage_b_ok=stage_b == "true")
 json.dump(s, open("scoreboard.json", "w"), indent=1)
 print(changed, s["best_score"])
 EOF
@@ -161,6 +208,6 @@ echo "$ref"
 score=$(sed -n 's/.* score=\([0-9]*\) .*/\1/p' <<< "$ref")
 [ "$score" = "$best" ] || fail "the frontier scores $score, but scoreboard.json says best_score=$best"
 elite=$(python3 "$REPO/tools/E555_rank.py" frontier/elite.csv --seed_file "$SEED" --count)
-echo "SETUP lab=$state path=$LAB arch=$ARCH cpu=\"$cpu\" cpu_changed=$cpu_changed" \
-     "threads=$threads ram_gb=$ram_gb disk_gb=$disk_gb ortools=$ortools" \
-     "stage_b_ok=$stage_b_ok best=$best elite=$elite"
+echo "SETUP campaign=$CAMPAIGN lab=$state path=$LAB arch=$ARCH cpu=\"$cpu\"" \
+     "cpu_changed=$cpu_changed threads=$threads ram_gb=$ram_gb disk_gb=$disk_gb" \
+     "ortools=$ortools stage_b_ok=$stage_b_ok best=$best elite=$elite"

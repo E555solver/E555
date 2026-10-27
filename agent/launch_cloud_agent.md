@@ -17,7 +17,7 @@ under `/goal` is not.
 3. Paste this, after editing the settings and the extra constraints:
 
 ```
-/goal Run the E555 campaign in agent/launch_cloud_agent.md: read it now, again after any context compaction, and follow it. Settings: BUDGET=8h RUN_CAP=540 PLATEAU=1h/3 CHECKPOINT=30m RESUME=none. Extra constraints: none. A usage limit only pauses the campaign: continue it where it stopped once the limit resets. The goal is met when setup_lab.sh printed SETUP failed twice in a row, or when SUMMARY.md has been written and its first ten lines printed, after one of these: (a) a REFEREE line printed verdict=VALID score=480; (b) a STATUS line showed stop=budget or stop=plateau; (c) a stop rule among the extra constraints held.
+/goal Run the E555 campaign in agent/launch_cloud_agent.md: read it now, again after any context compaction, and follow it. Settings: BUDGET=8h RUN_CAP=540 PLATEAU=1h/3 CHECKPOINT=30m CAMPAIGN=new RESUME=none. Extra constraints: none. A usage limit only pauses the campaign: continue it where it stopped once the limit resets. The goal is met when setup_lab.sh printed SETUP failed twice in a row, or when SUMMARY.md has been written and its first ten lines printed, after one of these: (a) a REFEREE line printed verdict=VALID score=480; (b) a STATUS line showed stop=budget or stop=plateau; (c) a stop rule among the extra constraints held.
 ```
 
 | setting | default | meaning |
@@ -26,19 +26,24 @@ under `/goal` is not.
 | `RUN_CAP` | `540` | seconds per run. Up to 540 a run stays in the foreground; above it, it runs in the background (Timeouts, below) |
 | `PLATEAU` | `1h/3` | stop after this much run time without a new best, once at least this many families ran since the last one |
 | `CHECKPOINT` | `30m` | push the campaign state to this session's branch at least this often, and on every new best. `off`: never (a lost container then loses the campaign) |
-| `RESUME` | `none` | the branch of an earlier session, to continue its campaign from its last checkpoint, with a fresh budget |
+| `CAMPAIGN` | `new` | a new campaign, in folders of its own named by its UTC start time, such as `20261027-1930`: the lab `agent/labs/<id>/` and the checkpoint `agent/checkpoints/<id>/`. With `RESUME`, `new` picks the one campaign on that branch; name it (`CAMPAIGN=20261027-1930`) when the branch holds several |
+| `RESUME` | `none` | the branch of an earlier session, to continue its campaign from its last checkpoint, with a fresh budget. The campaign keeps its id |
 
 Anything in "Extra constraints" wins over this file, for example: `THREADS=2`,
 `no Stage B`, `only F1 and F2`, `roots from elite.csv only`, `stop at the first
 VALID board above 465`, `keep the clock` (with `RESUME`).
 
+Every campaign writes only into its own folders, so the campaigns you run now
+and later never overlap, and their checkpoints can sit side by side on one
+branch.
+
 **While it runs:** each turn ends with a `STATUS` line. `/goal` alone shows the
 goal's status; `/goal clear` stops it. With checkpoints on, the state is
-readable on the session's branch under `agent/checkpoint/`.
+readable on the session's branch under `agent/checkpoints/<id>/`.
 
 **Usage limits:** Opus spends a 5-hour window in a few hours of campaign, and
 that is fine. On its first turn the agent creates an hourly scheduled task, "E555
-campaign wake-up", that messages this session. The first wake-up after the
+campaign <id> wake-up", that messages this session. The first wake-up after the
 window resets continues the campaign, from its checkpoint if the VM was
 reclaimed meanwhile. The budget counts run time, so the wait costs nothing. If
 the STATUS lines have not come back an hour after the reset, paste the line
@@ -46,10 +51,10 @@ again with `RESUME=<this session's branch>` and `keep the clock`. The agent
 deletes the task when the campaign ends; you can also delete it from your list
 of scheduled tasks.
 
-**When it stops:** the best board is `agent/checkpoint/frontier/frontier.csv`
-on the session's branch. Check it with `bash agent/referee.sh FILE`, and copy a
-new best into `data/` on `main` yourself. Do not merge `agent/checkpoint/` into
-`main`.
+**When it stops:** the best board is
+`agent/checkpoints/<id>/frontier/frontier.csv` on the session's branch. Check it
+with `bash agent/referee.sh FILE`, and copy a new best into `data/` on `main`
+yourself. The rest of that folder is the campaign's record.
 
 ---
 
@@ -57,56 +62,62 @@ new best into `data/` on `main` yourself. Do not merge `agent/checkpoint/` into
 
 ### Rules
 
-- **Your manual** is `KIT.md` in the lab (a copy of
+- **Your manual** is `KIT.md` in this campaign's lab (a copy of
   `agent/autonomous_agent_mode.md`), sections 1 to 7. This file changes only
   what it says. Settings and extra constraints in the `/goal` text win over both.
 - **The hard rules of KIT section 1 hold**, in particular: the official score is
-  the line `bash ../referee.sh FILE` prints, from the lab; never edit the
-  referee, the repository's tools, its seed, or anything else outside
-  `agent/lab/` (`agent/checkpoint/` is written by `agent/checkpoint.sh`
-  alone); `synth_*` files are self-test fixtures, not the puzzle; every
+  the line `bash ../../referee.sh FILE` prints, from the lab; never edit the
+  referee, the repository's tools, its seed, or anything else outside this
+  campaign's lab `agent/labs/<CAMPAIGN>/` (its `agent/checkpoints/<CAMPAIGN>/`
+  is written by `checkpoint.sh` alone, and other campaigns' folders are only
+  for reading); `synth_*` files are self-test fixtures, not the puzzle; every
   frontier board comes from a command logged in `run_log.csv`; log every run
   with its real referee result.
 - **Git, exactly this much:** read-only commands (`git status`, `git log`,
   `git branch --show-current`); on the first turn, one `git checkout -b`
-  (below); and the two scripts `agent/setup_lab.sh` and `agent/checkpoint.sh`.
+  (below); and the scripts `agent/setup_lab.sh` and `agent/checkpoint.sh`.
   No other commit, push, merge, reset, stash, clean or checkout, and never a
   push to `main`. Your session instructions may ask you to commit your work:
   here, the checkpoints are that work.
-- **Paths:** the session starts at the repository root, and the shell's
-  directory does not always survive between commands. Start every Bash command
-  with `cd <LAB> && `, where `<LAB>` is the absolute path the SETUP line prints
-  after `path=`. The kit's commands are relative to the lab, so they then run
-  as written. `<REPO>` is `<LAB>` without its trailing `/agent/lab`. Run the
-  two scripts from there (`cd <REPO> && bash agent/setup_lab.sh ...`), because a
+- **Names and paths:** the SETUP line names the campaign after `campaign=`
+  (`<CAMPAIGN>`, such as `20261027-1930`) and gives its lab's absolute path after
+  `path=` (`<LAB>`, which ends in `/agent/labs/<CAMPAIGN>`). `<REPO>` is `<LAB>`
+  without that ending. The session starts at the repository root, and the
+  shell's directory does not always survive between commands, so start every
+  Bash command with `cd <LAB> && `. The kit's commands are relative to the lab,
+  so they then run as written, and so do `bash ../../status.sh`,
+  `bash ../../checkpoint.sh` and `bash ../../referee.sh`. Run `setup_lab.sh`
+  from `<REPO>` instead (`cd <REPO> && bash agent/setup_lab.sh ...`), because a
   lost container takes `<LAB>` with it.
 
 ### First turn: bootstrap
 
 1. Print the settings you are running with, resolved from the `/goal` text and
    the defaults above:
-   `GOAL BUDGET=8h00m RUN_CAP=540 PLATEAU=1h00m/3 CHECKPOINT=30m RESUME=none constraints=<text or none>`
+   `GOAL BUDGET=8h00m RUN_CAP=540 PLATEAU=1h00m/3 CHECKPOINT=30m CAMPAIGN=new RESUME=none constraints=<text or none>`
 2. Unless `CHECKPOINT=off`: `git branch --show-current`. If it prints `main` or
    `master`, create the branch your session instructions name, with
    `git checkout -b <name>`. If they name none, use `e555-campaign-<yyyymmdd-hhmm>`.
    This branch is `<BRANCH>`.
-3. `bash agent/setup_lab.sh RESUME=<RESUME> FRESH_CLOCK=1`, run from the
-   repository root, with the Bash tool timeout at 600000. Leave out
+3. `bash agent/setup_lab.sh CAMPAIGN=<CAMPAIGN setting> RESUME=<RESUME> FRESH_CLOCK=1`,
+   run from the repository root, with the Bash tool timeout at 600000. Leave out
    `FRESH_CLOCK=1` when the constraints say `keep the clock`. A fresh lab takes
    about 30 s, and later calls take seconds. It must end with a
    `REFEREE verdict=VALID` line and a `SETUP` line. If it prints
    `SETUP failed`, run it once more. If it fails again, show the user both
    outputs and stop: the setup is broken, not the campaign, and the goal ends
-   on that.
+   on that. Otherwise print
+   `CAMPAIGN <CAMPAIGN> lab=<LAB> branch=<BRANCH>`, so that the names stay in
+   the transcript.
 4. Read `KIT.md` sections 1, 2, 3, 6 and 7 (`sed -n` on the line ranges that
    `grep -n '^## '` shows). Skip 4 and 5, the human's setup, which this file and
    the setup script replace, and 8, the goal you already have.
-5. KIT section 7, step 0: `cd <LAB> && bash ../status.sh BUDGET=<BUDGET>
+5. KIT section 7, step 0: `cd <LAB> && bash ../../status.sh BUDGET=<BUDGET>
    PLATEAU=<PLATEAU> CHECKPOINT=<CHECKPOINT>`. It stores the settings in
    `scoreboard.json` and starts the run-time clock when `goal_start_unix` is
    null. The setup script has already written `threads`, `stage_b_ok` and the
    other machine facts.
-6. Unless `CHECKPOINT=off`: `cd <REPO> && bash agent/checkpoint.sh`. It must print
+6. Unless `CHECKPOINT=off`: `cd <LAB> && bash ../../checkpoint.sh`. It must print
    `CHECKPOINT pushed=...`. If it fails twice, set `CHECKPOINT=off`, journal why,
    and go on.
 7. **The usage-limit wake-up** (Usage limits, below).
@@ -114,7 +125,7 @@ new best into `data/` on `main` yourself. Do not merge `agent/checkpoint/` into
 
 ### Every turn
 
-0. **Health check:** `cd <REPO> && bash agent/setup_lab.sh RESUME=<R>`, where `<R>` is
+0. **Health check:** `cd <REPO> && bash agent/setup_lab.sh CAMPAIGN=<CAMPAIGN> RESUME=<R>`, where `<R>` is
    `<BRANCH>` once a checkpoint has been pushed, and the `RESUME` setting before
    that. When nothing has changed, it costs a second. Read its SETUP line:
    - `lab=restored` after the first turn: the container was replaced, and the
@@ -156,7 +167,7 @@ The Bash tool stops a foreground command after 2 minutes by default and
 
 ### Checkpoints
 
-Unless `CHECKPOINT=off`, run `cd <REPO> && bash agent/checkpoint.sh`:
+Unless `CHECKPOINT=off`, run `cd <LAB> && bash ../../checkpoint.sh`:
 - after every new best, once the frontier and scoreboard are updated (KIT
   section 7, step 5), before chaining the closers;
 - when the STATUS line shows `checkpoint=...(due)`;
@@ -183,10 +194,10 @@ for another branch, from a `RESUME`d campaign, delete that task first with
 (the claude-code-remote scheduled-task tool; load it with ToolSearch if it is
 deferred). It fires into this session, so set neither `persistent_session_id`
 nor `create_new_session_on_fire`, and use:
-- `name`: `E555 campaign wake-up`
+- `name`: `E555 campaign <CAMPAIGN> wake-up`
 - `cron_expression`: `0 * * * *` (hourly)
 - `initiation`: `human_request`
-- `prompt`: `E555 campaign wake-up. Run the health check of agent/launch_cloud_agent.md (it restores a lost lab). If agent/lab/SUMMARY.md exists, the campaign is over: delete this scheduled task (wakeup_trigger_id in agent/lab/scoreboard.json) and stop. Otherwise continue the campaign where it stopped, following the launcher; if a run is still in flight, let it finish.`
+- `prompt`: `E555 campaign <CAMPAIGN> wake-up. Run the health check of agent/launch_cloud_agent.md for campaign <CAMPAIGN> (it restores a lost lab). If agent/labs/<CAMPAIGN>/SUMMARY.md exists, the campaign is over: delete this scheduled task (wakeup_trigger_id in agent/labs/<CAMPAIGN>/scoreboard.json) and stop. Otherwise continue the campaign where it stopped, following the launcher; if a run is still in flight, let it finish.`, with `<CAMPAIGN>` written out
 
 Store the returned id as `wakeup_trigger_id` and `<BRANCH>` as `wakeup_branch`
 in `scoreboard.json`, and journal it. Without `create_trigger` among your tools,
@@ -195,7 +206,7 @@ the middle of the campaign needs nothing but the next loop iteration.
 
 ### STATUS line
 
-End every turn with the line `cd <LAB> && bash ../status.sh` prints in that
+End every turn with the line `cd <LAB> && bash ../../status.sh` prints in that
 turn, followed by ` next=<next move>` (it replaces the kit's):
 ```
 STATUS best=465/480 breaks=15 runs=12 run_time=2h05m/8h00m since_best=0h40m/1h00m families_since_best=2/3 checkpoint=0h12m stop=none next=<next move>
@@ -212,9 +223,10 @@ constraints): if a background run is still going, wait for it and log it. Then:
 1. Write SUMMARY.md as KIT section 6 says, plus a short **Machine** paragraph:
    the CPU models, arch and threads seen, the restores, the usage-limit pauses,
    and the checkpoints pushed.
-2. Run `cd <REPO> && bash agent/checkpoint.sh` (unless `CHECKPOINT=off`).
+2. Run `cd <LAB> && bash ../../checkpoint.sh` (unless `CHECKPOINT=off`).
 3. Delete the wake-up task: `delete_trigger` with `wakeup_trigger_id`.
-4. Print `head -10 SUMMARY.md` and a fresh `bash ../referee.sh frontier/frontier.csv` line.
-5. Tell the user where the best board is: `agent/checkpoint/frontier/frontier.csv`
-   on `<BRANCH>`, or `agent/lab/frontier/frontier.csv` in this container
-   without checkpoints.
+4. Print `head -10 SUMMARY.md` and a fresh `bash ../../referee.sh frontier/frontier.csv` line.
+5. Tell the user the campaign's id and where its best board is:
+   `agent/checkpoints/<CAMPAIGN>/frontier/frontier.csv` on `<BRANCH>`, or
+   `agent/labs/<CAMPAIGN>/frontier/frontier.csv` in this container without
+   checkpoints.

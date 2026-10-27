@@ -1,13 +1,14 @@
 #!/bin/bash
 # status.sh -- the STATUS line of the /goal kit (agent/autonomous_agent_mode.md,
-# sections 6 and 11), computed from agent/lab's scoreboard.json and run_log.csv.
+# sections 6 and 11), computed from a campaign's scoreboard.json and run_log.csv.
+# Run it from the campaign's lab, agent/labs/<id>/.
 # The campaign's clocks count run time, the runtime_s column of run_log.csv,
 # not wall time: a usage-limit wait, a replaced container or the agent's own
 # thinking costs nothing, so a campaign that waits out a 5-hour usage window
 # resumes without tripping its budget or its plateau.
 #
-#   bash agent/status.sh BUDGET=8h PLATEAU=1h/3 CHECKPOINT=30m   # the first call stores the settings
-#   bash agent/status.sh                                         # later calls reuse them
+#   bash ../../status.sh BUDGET=8h PLATEAU=1h/3 CHECKPOINT=30m   # the first call stores the settings
+#   bash ../../status.sh                                         # later calls reuse them
 #   STATUS best=465/480 breaks=15 runs=12 run_time=2h05m/8h00m since_best=0h40m/1h00m families_since_best=2/3 checkpoint=0h12m stop=none
 #
 # run_time sums runtime_s over the runs logged since goal_start_unix (the first
@@ -33,9 +34,8 @@ for arg in "$@"; do
 done
 set -euo pipefail
 
-LAB="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lab"
-[ -f "$LAB/scoreboard.json" ] || { echo "status: no campaign in $LAB" >&2; exit 2; }
-cd "$LAB"
+[ -f scoreboard.json ] && [ -f run_log.csv ] ||
+    { echo "status: no campaign here; run it from a campaign's lab, agent/labs/<id>/" >&2; exit 2; }
 python3 - "$BUDGET" "$PLATEAU" "$CHECKPOINT" <<'EOF'
 import csv, json, re, sys, time
 
