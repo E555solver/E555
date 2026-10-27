@@ -267,6 +267,7 @@ static uint8_t g_piece_spin_mask[NUM_PIECES]; /* one bit per distinct orientatio
 /* Pre-classified by frame-degree: g_pieces_by_zero[d][i] = pid for degree d */
 static int g_pieces_by_zero[3][NUM_PIECES];
 static int g_pieces_by_zero_n[3];
+static int8_t g_edge_inner[NUM_PIECES];  /* an edge piece's face opposite its grey one; -1 otherwise */
 
 /* -- Holes -------------------------------------------------------------------- */
 
@@ -363,6 +364,9 @@ static bool        g_resume             = false;
  * For runs whose last cells are meant to take breaks; not recorded in the
  * resume identifier, like --hall, so it may change between runs. */
 static bool        g_colour_count       = true;
+/* --edge_supply: cut a path once the frame's inward edges need more breaks than
+ * are left (edge_supply_deficit).  Like --hall, not recorded by --resume. */
+static bool        g_edge_supply        = false;
 static int         g_resume_score       = -1;
 /* Test hook, from the environment variable E555_BT_NODE_BUDGET: a record's
  * search stops as if its --time_limit had run out once it has visited this
@@ -641,6 +645,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     printf(" --restarts %lld", (long long)g_stuck_restarts);
     if (!g_lcv) printf(" --no_lcv");
     if (!g_colour_count) printf(" --no_colour_count");
+    if (g_edge_supply)   printf(" --edge_supply");
     if (g_hall_mode == HALL_OFF) printf(" --no_hall");
     else                         printf(" --hall %s", hall_mode_name(g_hall_mode));
     printf(" --hall_stride %d --hall_min %d", g_hall_stride, g_hall_small);
@@ -681,7 +686,7 @@ static uint64_t g_cnt_solution_cutoff= 0;
 static uint64_t g_cnt_no_solution    = 0;
 static uint64_t g_cnt_cutoff         = 0;
 static uint64_t g_cnt_release_closed = 0;   /* --early_release R,C: cell not open */
-static uint64_t g_feas_code_cnt[5]   = {0};
+static uint64_t g_feas_code_cnt[6]   = {0};
 
 /* -- Best-partial-board tracking ---------------------------------------------- */
 
@@ -1235,6 +1240,9 @@ static void load_seed(const char *path) {
         int z = (g_seed_top[i]==0) + (g_seed_right[i]==0)
               + (g_seed_bottom[i]==0) + (g_seed_left[i]==0);
         g_piece_zero_count[i] = z;
+        g_edge_inner[i] = -1;
+        for (int k = 0; k < 4 && z == 1; k++)
+            if (e[k] == 0) g_edge_inner[i] = (int8_t)e[(k + 2) & 3];
         if      (z == 0) { n_inner++; g_pieces_by_zero[0][g_pieces_by_zero_n[0]++] = i; }
         else if (z == 1) { n_edge++;  g_pieces_by_zero[1][g_pieces_by_zero_n[1]++] = i; }
         else if (z == 2) { n_corner++; g_pieces_by_zero[2][g_pieces_by_zero_n[2]++] = i; }
@@ -1623,7 +1631,7 @@ static bool board_cells_equal(const Board *a, const Board *b) {
  *       searched without --frame_last.  A resuming run must be
  *       given the same values; any difference is fatal at load and names the
  *       setting.  Settings that do not change the tree (--threads,
- *       --time_limit, --hall, --no_colour_count, --best_n, ...) are not
+ *       --time_limit, --hall, --no_colour_count, --edge_supply, --best_n, ...) are not
  *       recorded and may change from run to run; the region before the
  *       position keeps the cuts that were in force when it was searched.  --hall only ever prunes subtrees holding no
  *       completion, so it cannot change what lies before a point.
@@ -3116,7 +3124,8 @@ typedef enum {
     FEAS_TYPE_MISMATCH,
     FEAS_COLOR_DEFICIT,
     FEAS_COLOR_ODD,
-    FEAS_EMPTY_DOMAIN
+    FEAS_EMPTY_DOMAIN,
+    FEAS_EDGE_SUPPLY
 } FeasCode;
 
 typedef struct {
@@ -3133,6 +3142,7 @@ static const char *feas_code_name(FeasCode c) {
         case FEAS_COLOR_DEFICIT: return "color_deficit";
         case FEAS_COLOR_ODD:     return "color_odd_surplus";
         case FEAS_EMPTY_DOMAIN:  return "empty_exact_domain";
+        case FEAS_EDGE_SUPPLY:   return "edge_supply";
         default:                 return "unknown";
     }
 }
@@ -3150,8 +3160,51 @@ static void describe_feas(const FeasIssue *x, char *buf, size_t cap) {
                  x->required, x->available);
         return;
     }
+    if (x->code == FEAS_EDGE_SUPPLY) {
+        snprintf(buf, cap, "edge_supply deficit=%d remaining_break_budget=%d",
+                 x->required, x->available);
+        return;
+    }
     snprintf(buf, cap, "%s color=%d available=%d required=%d surplus=%d",
              feas_code_name(x->code), x->color, x->available, x->required, x->remainder);
+}
+
+/*
+ * --edge_supply.  An open frame cell other than a corner whose inward neighbour
+ * is placed takes an edge piece, and its inward edge matches only if that
+ * piece's inner face (g_edge_inner) has the neighbour's colour.  Each unused
+ * edge piece serves one cell, so at least sum over colours x of
+ * max(0, cells demanding x - unused edge pieces with inner face x) of these
+ * edges break.  It is Hall's bound on just these cells, cheap enough for every
+ * placement; it changes only when a frame or ring-1 cell is placed.
+ */
+static inline bool near_frame_cell(int r, int c) {
+    return r <= 1 || c <= 1 || r >= PUZZLE_SIDE - 2 || c >= PUZZLE_SIDE - 2;
+}
+
+static int edge_supply_deficit(const Board *b) {
+    int need[NUM_COLORS] = {0}, n = 0;
+    for (int i = 1; i < PUZZLE_SIDE - 1; i++) {
+        const int L = PUZZLE_SIDE - 1;
+        /* (cell, its inward neighbour, the neighbour's face toward it) */
+        if (b->cell[0][i].piece_id == EMPTY_PIECE && b->cell[1][i].piece_id != EMPTY_PIECE)
+            { need[b->cell[1][i].bottom]++; n++; }
+        if (b->cell[L][i].piece_id == EMPTY_PIECE && b->cell[L-1][i].piece_id != EMPTY_PIECE)
+            { need[b->cell[L-1][i].top]++; n++; }
+        if (b->cell[i][0].piece_id == EMPTY_PIECE && b->cell[i][1].piece_id != EMPTY_PIECE)
+            { need[b->cell[i][1].left]++; n++; }
+        if (b->cell[i][L].piece_id == EMPTY_PIECE && b->cell[i][L-1].piece_id != EMPTY_PIECE)
+            { need[b->cell[i][L-1].right]++; n++; }
+    }
+    if (n == 0) return 0;
+    for (int j = 0; j < g_pieces_by_zero_n[1]; j++) {
+        int pid = g_pieces_by_zero[1][j];
+        if (!used_test(b->used, pid)) need[g_edge_inner[pid]]--;
+    }
+    int deficit = 0;
+    for (int x = 0; x < NUM_COLORS; x++)
+        if (need[x] > 0) deficit += need[x];
+    return deficit;
 }
 
 /*
@@ -3288,6 +3341,7 @@ typedef struct {
     uint64_t parity_rejects[MAX_SEQ_LEN+1];
     uint64_t fc_rejects[MAX_SEQ_LEN+1];    /* global empty-domain lower bound */
     uint64_t hall_rejects[MAX_SEQ_LEN+1];  /* Hall/deficiency matching prune */
+    uint64_t edge_rejects[MAX_SEQ_LEN+1];  /* --edge_supply */
     uint64_t hall_calls[MAX_SEQ_LEN+1];
     uint64_t recursed[MAX_SEQ_LEN+1];
     uint64_t dead_nodes[MAX_SEQ_LEN+1];
@@ -3334,6 +3388,7 @@ static void stats_merge(DfsStats *dst, const DfsStats *src) {
     MERGE_FIELD(parity_rejects);
     MERGE_FIELD(fc_rejects);
     MERGE_FIELD(hall_rejects);
+    MERGE_FIELD(edge_rejects);
     MERGE_FIELD(hall_calls);
     MERGE_FIELD(recursed);
     MERGE_FIELD(dead_nodes);
@@ -4194,13 +4249,16 @@ static int count_break_candidates_scan(const Board *b, const FcState *fc,
 /* Exact MRV in strict mode.  In BREAK_ANY mode the break candidates are part
  * of the branching factor and must be counted too; v9 ignored them whenever
  * one exact fit existed, which could select a nominally 1-way cell having
- * hundreds of actual children. */
+ * hundreds of actual children.  In BREAK_LDS mode a cell with no exact fit
+ * counts 0 while breaks are left: its forced break is placed at once, where it
+ * is stuck, rather than after every cell with fewer break candidates (often
+ * never, the search ending first; a dead cell never regains a fit). */
 static int mrv_cell_count(const Board *b, const FcState *fc, int r, int c, int budget) {
     int ex = fc_exact_count(fc, r, c);
     if (budget <= 0) return ex;
     if (g_break_mode == BREAK_ANY)
         return ex + count_break_candidates_scan(b, fc, r, c, budget);
-    if (ex > 0) return ex;
+    if (ex > 0 || g_break_mode == BREAK_LDS) return ex;
     return count_break_candidates_scan(b, fc, r, c, budget);
 }
 
@@ -4433,6 +4491,27 @@ static int pick_next_cell(const Board *b, const FcState *fc,
                           OrderMode mode, int remaining_budget,
                           const int8_t (*layer)[PUZZLE_SIDE]) {
     if (mode == ORD_FRONTIER) {
+        /* lds with breaks left: a cell with no exact fit first, in any layer
+         * (see mrv_cell_count), innermost then row-major; under --frame_last
+         * the frame still waits for the inner cells. */
+        if (g_break_mode == BREAK_LDS && remaining_budget > 0 && fc->zero_domains > 0) {
+            bool inner_open = false;
+            if (g_frame_last)
+                for (int j = pos; j < n_rem && !inner_open; j++)
+                    inner_open = !is_frame_cell((int)rem[j].row, (int)rem[j].col);
+            int dead = -1, dead_l = INT_MAX;
+            long dead_key = LONG_MAX;
+            for (int j = pos; j < n_rem; j++) {
+                int r = (int)rem[j].row, c = (int)rem[j].col;
+                if (inner_open && is_frame_cell(r, c)) continue;
+                if (fc_exact_count(fc, r, c) > 0) continue;
+                long key = g_reverse ? (long)c * PUZZLE_SIDE + r : (long)r * PUZZLE_SIDE + c;
+                if (layer[r][c] < dead_l || (layer[r][c] == dead_l && key < dead_key)) {
+                    dead = j; dead_l = layer[r][c]; dead_key = key;
+                }
+            }
+            if (dead >= 0) return dead;
+        }
         /* The innermost unfinished layer only; in it, fewest fits, then more
          * placed neighbours (the board edge does not count), then row-major
          * (column-major with --reverse). */
@@ -5096,6 +5175,14 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
                 st->fc_rejects[depth]++;
                 viable = false;
             }
+            /* The deficit moves only near the frame, the budget only on a
+             * break; the record root (and k_start) covers the rest. */
+            if (viable && g_edge_supply &&
+                (cand[i].breaks > 0 || near_frame_cell(row, col)) &&
+                edge_supply_deficit(b) > cx->k_budget - new_breaks) {
+                st->edge_rejects[depth]++;
+                viable = false;
+            }
             if (viable && g_colour_count) {
                 FeasIssue issue;
                 if (!remaining_feasibility_ex(b, fc, &issue,
@@ -5418,6 +5505,14 @@ static void afo_build_frontier(Board *b, FcState *fc, Cell *rem, int n_rem, int 
         if (!soft_completion) {
             if (fc->zero_domains > cx->k_budget - new_breaks) {
                 st->fc_rejects[depth]++;
+                viable = false;
+            }
+            /* The deficit moves only near the frame, the budget only on a
+             * break; the record root (and k_start) covers the rest. */
+            if (viable && g_edge_supply &&
+                (cand[i].breaks > 0 || near_frame_cell(row, col)) &&
+                edge_supply_deficit(b) > cx->k_budget - new_breaks) {
+                st->edge_rejects[depth]++;
                 viable = false;
             }
             if (viable && g_colour_count) {
@@ -6072,13 +6167,25 @@ static void process_line(const char *config_id_str, long long field2, long long 
         init_issue.remainder = init_issue.available - init_issue.required;
         initial_feasible = false;
     }
+    int root_edge_deficit = 0;
+    if (initial_feasible && g_edge_supply) {
+        root_edge_deficit = edge_supply_deficit(&base);
+        if (root_edge_deficit > total_budget - input_breaks) {
+            memset(&init_issue, 0, sizeof(init_issue));
+            init_issue.code = FEAS_EDGE_SUPPLY;
+            init_issue.required = root_edge_deficit;
+            init_issue.available = total_budget - input_breaks;
+            init_issue.remainder = init_issue.available - init_issue.required;
+            initial_feasible = false;
+        }
+    }
 
     if (!initial_feasible) {
         char desc[256]; describe_feas(&init_issue, desc, sizeof(desc));
         #pragma omp atomic
         g_cnt_infeasible++;
         #pragma omp critical(feas_cnt_update)
-        { if (init_issue.code < 5) g_feas_code_cnt[(int)init_issue.code]++; }
+        { if (init_issue.code < 6) g_feas_code_cnt[(int)init_issue.code]++; }
 
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
                 "[%s] completion-infeasible within the requested budget%s: "
@@ -6133,7 +6240,10 @@ static void process_line(const char *config_id_str, long long field2, long long 
     if (initial_feasible && !soft_completion &&
         g_hall_mode != HALL_OFF && n_seq > 0)
         hall_prune(&root_fc, seq, n_seq, INT_MAX, &root_deficiency);
-    int k_start = input_breaks + root_deficiency;
+    /* --edge_supply: its root deficit bounds the levels the same way, and the
+     * DFS relies on it (it checks the deficit only where it can move). */
+    int k_start = input_breaks + (root_edge_deficit > root_deficiency
+                                  ? root_edge_deficit : root_deficiency);
     bool hall_impossible = (!soft_completion && k_start > total_budget);
     if (root_deficiency > 0) {
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
@@ -6141,6 +6251,14 @@ static void process_line(const char *config_id_str, long long field2, long long 
                 ">= %d additional broken edge(s); first admissible total k=%d%s.\n",
                 tag, root_deficiency, root_deficiency, k_start,
                 hall_impossible ? " (outside the requested budget)" : "");
+        #pragma omp critical(stdout_print)
+        { fputs(rec_buf, stdout); fflush(stdout); rec_off = 0; rec_buf[0] = '\0'; }
+    }
+    if (root_edge_deficit > root_deficiency) {
+        appendf(rec_buf, sizeof(rec_buf), &rec_off,
+                "[%s] root edge supply deficit=%d: any completion needs "
+                ">= %d additional broken edge(s); first admissible total k=%d.\n",
+                tag, root_edge_deficit, root_edge_deficit, k_start);
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); rec_off = 0; rec_buf[0] = '\0'; }
     }
@@ -6444,6 +6562,10 @@ static void process_line(const char *config_id_str, long long field2, long long 
                 TOTAL(fc_rejects,   &stats, n_seq),
                 TOTAL(hall_rejects, &stats, n_seq),
                 TOTAL(recursed,     &stats, n_seq));
+        if (g_edge_supply)
+            appendf(rec_buf, sizeof(rec_buf), &rec_off,
+                    "  edge_supply_rejects=%" PRIu64 "\n",
+                    TOTAL(edge_rejects, &stats, n_seq));
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
                 "  Fit rejects: zero_rule=%" PRIu64 " left=%" PRIu64
                 " bottom=%" PRIu64 " top=%" PRIu64 " right=%" PRIu64 "\n",
@@ -6710,6 +6832,11 @@ static void usage(const char *prog) {
         "  --no_colour_count      Skip the colour/type count at the root and after each\n"
         "                         placement (the no-exact-fit cut stays): for regions\n"
         "                         whose last cells will take breaks anyway.\n"
+        "  --edge_supply          Cut a path once the open frame cells facing placed\n"
+        "                         pieces need more breaks than are left: per colour,\n"
+        "                         more of them demand it than unused edge pieces carry\n"
+        "                         it on their inner face.  Not with --jump,\n"
+        "                         2sides/4sides or the greedy dives.\n"
         "  --hall_stride N        Adaptive Hall period in placements (default 8; 0=off).\n"
         "  --hall_min N           Adaptive Hall always-on threshold (default 32 cells).\n\n",
         stderr);
@@ -7051,6 +7178,8 @@ int main(int argc, char **argv) {
             else fatal("--hall expects off|root|adaptive|always, got '%s'", m);
         } else if (strcmp(argv[i], "--no_colour_count") == 0) {
             g_colour_count = false;
+        } else if (strcmp(argv[i], "--edge_supply") == 0) {
+            g_edge_supply = true;
         } else if (strcmp(argv[i], "--no_hall") == 0) {
             g_hall_mode = HALL_OFF;
         } else if (strcmp(argv[i], "--hall_stride") == 0 && i+1 < argc) {
@@ -7148,6 +7277,10 @@ int main(int argc, char **argv) {
             fatal("--early_release R,C needs a static --order: under mrv the cell "
                   "order changes as the search runs, so the cell has no fixed place");
     }
+    if (g_edge_supply && (order_uses_soft_completion(g_order_mode) ||
+                          (g_break_mode == BREAK_STUCK && g_max_mismatch > 0)))
+        fatal("--edge_supply is a completion cut of the backtracking search: --jump, "
+              "2sides/4sides and the greedy dives run no completion cuts");
     if (g_frame_last) {
         if (order_is_side_growth(g_order_mode))
             fatal("--frame_last does not apply to --order %s: side growth walks its "
@@ -7280,7 +7413,8 @@ int main(int argc, char **argv) {
         printf("  side_sweep=left/right/bottom/top ring layers; the exterior ring is processed first\n");
         printf("  side_policy=exact-only; FC/color/Hall completion prunes are bypassed by invariant\n");
     }
-    printf("  hall=%s%s", effective_hall_name(), g_colour_count ? "" : "  colour_count=off");
+    printf("  hall=%s%s%s", effective_hall_name(), g_colour_count ? "" : "  colour_count=off",
+           g_edge_supply ? "  edge_supply=on" : "");
     if (!order_uses_soft_completion(g_order_mode) && g_hall_mode == HALL_ADAPTIVE)
         printf("  stride=%d  small=%d", g_hall_stride, g_hall_small);
     printf("\n");
@@ -7741,9 +7875,10 @@ int main(int argc, char **argv) {
 
     if (g_cnt_infeasible > 0) {
         printf("\n  Initial infeasibility breakdown:\n");
-        const char *fnames[5] = { "ok", "type_mismatch", "color_deficit",
-                                  "color_odd_surplus", "empty_exact_domain" };
-        for (int k = 0; k < 5; k++) {
+        const char *fnames[6] = { "ok", "type_mismatch", "color_deficit",
+                                  "color_odd_surplus", "empty_exact_domain",
+                                  "edge_supply" };
+        for (int k = 0; k < 6; k++) {
             if (g_feas_code_cnt[k])
                 printf("    %-22s = %" PRIu64 "\n", fnames[k], g_feas_code_cnt[k]);
         }

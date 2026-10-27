@@ -1944,6 +1944,10 @@ counters rather than a scan.
 - **`any` / `lds`**: exhaustive, iterative deepening over
   `k = input breaks .. --breaks`. An exhausted level proves no completion with
   at most k breaks exists. `--lds_max` caps voluntary mismatches per path.
+  While breaks are left, lds under `mrv` and `frontier` takes a cell with no
+  exact fit first (frontier: from any layer), so the forced break goes where the
+  search is stuck; otherwise such a cell waited behind every cell with fewer
+  candidates, and the time limit usually came first.
 
 `--order` (default `mrv`, the most constrained cell) also offers `rowmajor`,
 `colmajor`, `snake`, `spiral`, `centerout`, `spiralout`, and the side modes
@@ -1995,6 +1999,15 @@ every prune. With N the open frame cells, `--early_release N` stops at the first
 board that places every inner cell, leaving the edges to place last.
 `--no_colour_count` (like `--no_hall`) drops a start-of-record check that sees
 the cells to be released too; neither is recorded by `--resume`.
+`--edge_supply` cuts a path once the open frame cells facing placed pieces need
+more breaks than are left: per colour, more of them demand it than unused edge
+pieces carry it on their inner face. It is Hall's bound on those cells alone,
+cheap enough for every placement near the frame; at the record root it also
+lifts the first break level, like Hall's root deficiency. On 400 halo boards
+(0.5 s each) without it, 374 of the 400 deepest prefixes already forced frame
+breaks (4.1 per board on average); with it none did, at 152 inner cells
+placed instead of 156. Not recorded by `--resume`; refused with `--jump`,
+2sides/4sides and the greedy dives.
 
 **Resume.** `--resume` splits one exact search over many short runs. Every
 output row carries a resume identifier as field 3 (515 fields): where the
@@ -2007,7 +2020,7 @@ the best over all runs, never worse.
   a skipped duplicate is not written.
 - Each record runs on one thread; records still run in parallel.
 - `--order`, `--reverse`, `--rotate`, `--early_release` and `--frame_last` must
-  match the identifier (a row without `frame_last=` was searched without it); `--threads`, `--time_limit` and `--hall` may change between runs.
+  match the identifier (a row without `frame_last=` was searched without it); `--threads`, `--time_limit`, `--hall` and `--edge_supply` may change between runs.
 - Requires `--breaks 0` and `--max_emitted 1`. Refused with 2sides/4sides,
   `--jump`, a stop band and `--all_for_one`.
 - `--resume_score S` skips, and does not write, the rows scoring below S.
@@ -2044,6 +2057,7 @@ node rate).
 | `--order`, `--reverse`, `--jump` | mrv, off, off | cell order |
 | `--frame_last` | off | the frame cells only once every inner cell is placed |
 | `--no_colour_count` | off | skip the colour/type count (root and per placement); the no-fit cut stays |
+| `--edge_supply` | off | cut on the frame's inward edges: per colour, demand above the unused edge pieces' supply |
 | `--hall MODE`, `--hall_stride N`, `--hall_min N` | root, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record; SIGINT/SIGTERM stop every running record the same way (rows not started: copied under `--resume`, else not written), a second signal kills |
