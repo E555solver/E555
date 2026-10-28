@@ -112,9 +112,10 @@ instead. The database cache depends on the clue flags, hence its own file.
 
 `examples/` holds one small script per tool (start with
 `examples/01_beamer_quickstart.sh`); `pipeline/` holds long unattended runs
-(`run_pipeline.sh`, the board farm `run_farm.py`, the whirlpool, the topper
-sweeps and `slurm_wrapper.sh`). Scripts take their settings as `NAME=value`
-arguments and pass `--print_cmd`, so logs record the exact commands.
+(`run_pipeline.sh`, the board farm `run_farm.py`, the whirlpool, the halo loop
+`run_halo.sh`, the topper sweeps and `slurm_wrapper.sh`). Scripts take their
+settings as `NAME=value` arguments and pass `--print_cmd`, so logs record the
+exact commands.
 
 ---
 
@@ -1943,6 +1944,10 @@ counters rather than a scan.
 - **`any` / `lds`**: exhaustive, iterative deepening over
   `k = input breaks .. --breaks`. An exhausted level proves no completion with
   at most k breaks exists. `--lds_max` caps voluntary mismatches per path.
+  While breaks are left, lds under `mrv` and `frontier` takes a cell with no
+  exact fit first (frontier: from any layer), so the forced break goes where the
+  search is stuck; otherwise such a cell waited behind every cell with fewer
+  candidates, and the time limit usually came first.
 
 `--order` (default `mrv`, the most constrained cell) also offers `rowmajor`,
 `colmajor`, `snake`, `spiral`, `centerout`, `spiralout`, and the side modes
@@ -1986,8 +1991,23 @@ unfinished layer first, fewest fits first: it grows outward from the placed
 pieces, and `--early_release R,C` then releases after that cell's whole layer.
 The run prints the first row's layer map (`#` placed, digits the layers, `*` the
 release cell) with the cells per layer.
+`--frame_last` searches the frame (rows and columns 0 and 15) last: no frame cell
+is chosen while an inner cell is open, in any order but 2sides/4sides and the
+greedy dives (static orders sort the frame after the inner cells, frontier puts
+it in layers after the last inner one, mrv skips it). The frame cells stay in
+every prune. With N the open frame cells, `--early_release N` stops at the first
+board that places every inner cell, leaving the edges to place last.
 `--no_colour_count` (like `--no_hall`) drops a start-of-record check that sees
 the cells to be released too; neither is recorded by `--resume`.
+`--edge_supply` cuts a path once the open frame cells facing placed pieces need
+more breaks than are left: per colour, more of them demand it than unused edge
+pieces carry it on their inner face. It is Hall's bound on those cells alone,
+cheap enough for every placement near the frame; at the record root it also
+lifts the first break level, like Hall's root deficiency. On 400 halo boards
+(0.5 s each) without it, 374 of the 400 deepest prefixes already forced frame
+breaks (4.1 per board on average); with it none did, at 152 inner cells
+placed instead of 156. Not recorded by `--resume`; refused with `--jump`,
+2sides/4sides and the greedy dives.
 
 **Resume.** `--resume` splits one exact search over many short runs. Every
 output row carries a resume identifier as field 3 (515 fields): where the
@@ -1999,8 +2019,8 @@ the best over all runs, never worse.
   them only, and dedup skips those identical after `--holes`; under `--resume`
   a skipped duplicate is not written.
 - Each record runs on one thread; records still run in parallel.
-- `--order`, `--reverse`, `--rotate` and `--early_release` must match the
-  identifier; `--threads`, `--time_limit` and `--hall` may change between runs.
+- `--order`, `--reverse`, `--rotate`, `--early_release` and `--frame_last` must
+  match the identifier (a row without `frame_last=` was searched without it); `--threads`, `--time_limit`, `--hall` and `--edge_supply` may change between runs.
 - Requires `--breaks 0` and `--max_emitted 1`. Refused with 2sides/4sides,
   `--jump`, a stop band and `--all_for_one`.
 - `--resume_score S` skips, and does not write, the rows scoring below S.
@@ -2035,7 +2055,9 @@ node rate).
 | `--break_mode`, `--breaks K` | stuck, 0 | engine; break ceiling |
 | `--restarts N`, `--no_lcv` | 50000, off | dives; value ordering off |
 | `--order`, `--reverse`, `--jump` | mrv, off, off | cell order |
+| `--frame_last` | off | the frame cells only once every inner cell is placed |
 | `--no_colour_count` | off | skip the colour/type count (root and per placement); the no-fit cut stays |
+| `--edge_supply` | off | cut on the frame's inward edges: per colour, demand above the unused edge pieces' supply |
 | `--hall MODE`, `--hall_stride N`, `--hall_min N` | root, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record; SIGINT/SIGTERM stop every running record the same way (rows not started: copied under `--resume`, else not written), a second signal kills |

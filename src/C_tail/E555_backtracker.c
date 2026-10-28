@@ -267,6 +267,7 @@ static uint8_t g_piece_spin_mask[NUM_PIECES]; /* one bit per distinct orientatio
 /* Pre-classified by frame-degree: g_pieces_by_zero[d][i] = pid for degree d */
 static int g_pieces_by_zero[3][NUM_PIECES];
 static int g_pieces_by_zero_n[3];
+static int8_t g_edge_inner[NUM_PIECES];  /* an edge piece's face opposite its grey one; -1 otherwise */
 
 /* -- Holes -------------------------------------------------------------------- */
 
@@ -363,6 +364,9 @@ static bool        g_resume             = false;
  * For runs whose last cells are meant to take breaks; not recorded in the
  * resume identifier, like --hall, so it may change between runs. */
 static bool        g_colour_count       = true;
+/* --edge_supply: cut a path once the frame's inward edges need more breaks than
+ * are left (edge_supply_deficit).  Like --hall, not recorded by --resume. */
+static bool        g_edge_supply        = false;
 static int         g_resume_score       = -1;
 /* Test hook, from the environment variable E555_BT_NODE_BUDGET: a record's
  * search stops as if its --time_limit had run out once it has visited this
@@ -515,6 +519,15 @@ typedef enum {
 } OrderMode;
 static OrderMode g_order_mode = ORD_MRV;
 static bool g_reverse = false;   /* --reverse: reversed traversal; mrv tie-break -> column-major */
+/* --frame_last: no frame cell (row or column 0 or 15) is searched while an inner
+ * cell is still open.  Static orders sort the frame cells after the inner ones,
+ * frontier puts them in layers after the last inner layer, mrv skips them; the
+ * order within each part is unchanged.  The frame cells stay in every prune, so
+ * a frame cell left without a fitting edge still ends the path. */
+static bool g_frame_last = false;
+static inline bool is_frame_cell(int r, int c) {
+    return r == 0 || c == 0 || r == PUZZLE_SIDE - 1 || c == PUZZLE_SIDE - 1;
+}
 
 /* -- Stop band (--stop_row / --stop_column) ----------------------------------- *
  * The beamer stops at --stop_row R and emits every board that fills rows 0..R,
@@ -605,6 +618,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_verbose)      printf(" --verbose");
     if (g_print_cmd)    printf(" --print_cmd");
     if (g_reverse)      printf(" --reverse");
+    if (g_frame_last)   printf(" --frame_last");
     if (g_jump)         printf(" --jump");
     if (g_with_frame)   printf(" --with_frame");
     if (g_write_status) printf(" --status");
@@ -631,6 +645,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     printf(" --restarts %lld", (long long)g_stuck_restarts);
     if (!g_lcv) printf(" --no_lcv");
     if (!g_colour_count) printf(" --no_colour_count");
+    if (g_edge_supply)   printf(" --edge_supply");
     if (g_hall_mode == HALL_OFF) printf(" --no_hall");
     else                         printf(" --hall %s", hall_mode_name(g_hall_mode));
     printf(" --hall_stride %d --hall_min %d", g_hall_stride, g_hall_small);
@@ -671,7 +686,7 @@ static uint64_t g_cnt_solution_cutoff= 0;
 static uint64_t g_cnt_no_solution    = 0;
 static uint64_t g_cnt_cutoff         = 0;
 static uint64_t g_cnt_release_closed = 0;   /* --early_release R,C: cell not open */
-static uint64_t g_feas_code_cnt[5]   = {0};
+static uint64_t g_feas_code_cnt[6]   = {0};
 
 /* -- Best-partial-board tracking ---------------------------------------------- */
 
@@ -1225,6 +1240,9 @@ static void load_seed(const char *path) {
         int z = (g_seed_top[i]==0) + (g_seed_right[i]==0)
               + (g_seed_bottom[i]==0) + (g_seed_left[i]==0);
         g_piece_zero_count[i] = z;
+        g_edge_inner[i] = -1;
+        for (int k = 0; k < 4 && z == 1; k++)
+            if (e[k] == 0) g_edge_inner[i] = (int8_t)e[(k + 2) & 3];
         if      (z == 0) { n_inner++; g_pieces_by_zero[0][g_pieces_by_zero_n[0]++] = i; }
         else if (z == 1) { n_edge++;  g_pieces_by_zero[1][g_pieces_by_zero_n[1]++] = i; }
         else if (z == 2) { n_corner++; g_pieces_by_zero[2][g_pieces_by_zero_n[2]++] = i; }
@@ -1600,18 +1618,20 @@ static bool board_cells_equal(const Board *a, const Board *b) {
  *
  * FORMAT bt1.  One CSV field without commas or spaces, for example
  *
- *     bt1;order=spiralout;reverse=0;rotate=0;early_release=60;open=<64 hex>;start=<8 hex>;at=812.33.1020.7+
+ *     bt1;order=spiralout;reverse=0;rotate=0;early_release=60;frame_last=0;open=<64 hex>;start=<8 hex>;at=812.33.1020.7+
  *
  * "bt1", then ';'-separated items in any order, each key=value or the bare word
  * "done":
  *
- *   order, reverse, rotate, early_release
+ *   order, reverse, rotate, early_release, frame_last
  *       The run settings that shape the search tree, named and valued like
- *       their command-line flags (reverse is 0 or 1; early_release is K, or R.C
- *       for --early_release R,C -- a dot, as the field holds no commas).  A resuming run must be
+ *       their command-line flags (reverse and frame_last are 0 or 1;
+ *       early_release is K, or R.C for --early_release R,C -- a dot, as the
+ *       field holds no commas).  frame_last came later: a row without it was
+ *       searched without --frame_last.  A resuming run must be
  *       given the same values; any difference is fatal at load and names the
  *       setting.  Settings that do not change the tree (--threads,
- *       --time_limit, --hall, --no_colour_count, --best_n, ...) are not
+ *       --time_limit, --hall, --no_colour_count, --edge_supply, --best_n, ...) are not
  *       recorded and may change from run to run; the region before the
  *       position keeps the cuts that were in force when it was searched.  --hall only ever prunes subtrees holding no
  *       completion, so it cannot change what lies before a point.
@@ -1662,7 +1682,7 @@ static bool board_cells_equal(const Board *a, const Board *b) {
 #define RESUME_EMPTY    1024   /* start= value of an empty cell */
 
 typedef struct {
-    int      order, reverse, rotate, early_release;
+    int      order, reverse, rotate, early_release, frame_last;
     uint8_t  open[NUM_PIECES];      /* 1 = cell the search fills, CSV frame */
     uint32_t start;                 /* resume_start_sum() of the start board */
     bool     done;
@@ -1709,9 +1729,10 @@ static bool resume_parse(const char *s, ResumeId *id, char *why, size_t why_sz) 
     }
     char buf[RESUME_ID_MAX];
     memcpy(buf, s, len + 1);
-    enum { K_ORDER, K_REVERSE, K_ROTATE, K_EARLY, K_OPEN, K_START, K_STATE, K_N };
+    enum { K_ORDER, K_REVERSE, K_ROTATE, K_EARLY, K_OPEN, K_START, K_STATE, K_FRAME, K_N };
     static const char *const kname[K_N] = { "order", "reverse", "rotate",
-                                            "early_release", "open", "start", "at|done" };
+                                            "early_release", "open", "start", "at|done",
+                                            "frame_last" };
     bool seen[K_N] = { false };
     char *save = NULL;
     strtok_r(buf, ";", &save);                          /* the version */
@@ -1733,6 +1754,7 @@ static bool resume_parse(const char *s, ResumeId *id, char *why, size_t why_sz) 
             else if (!strcmp(it, "open"))          k = K_OPEN;
             else if (!strcmp(it, "start"))         k = K_START;
             else if (!strcmp(it, "at"))            k = K_STATE;
+            else if (!strcmp(it, "frame_last"))    k = K_FRAME;
             else {
                 snprintf(why, why_sz, "resume identifier key '%s' is unknown to this build", it);
                 return false;
@@ -1764,15 +1786,16 @@ static bool resume_parse(const char *s, ResumeId *id, char *why, size_t why_sz) 
                 break;
             }
             /* fall through */
-        case K_REVERSE: case K_ROTATE:
+        case K_REVERSE: case K_ROTATE: case K_FRAME:
             errno = 0; v = strtol(val, &end, 10);
             if (errno || end == val || *end ||
-                v < 0 || v > (k == K_REVERSE ? 1 : k == K_ROTATE ? 3 : NUM_PIECES)) {
+                v < 0 || v > (k == K_REVERSE || k == K_FRAME ? 1 : k == K_ROTATE ? 3 : NUM_PIECES)) {
                 snprintf(why, why_sz, "resume identifier: bad %s value '%s'", kname[k], val);
                 return false;
             }
             if (k == K_REVERSE) id->reverse = (int)v;
             else if (k == K_ROTATE) id->rotate = (int)v;
+            else if (k == K_FRAME) id->frame_last = (int)v;
             else id->early_release = (int)v;
             break;
         case K_OPEN:
@@ -1822,7 +1845,7 @@ static bool resume_parse(const char *s, ResumeId *id, char *why, size_t why_sz) 
         }
     }
     for (int k = 0; k < K_N; k++)
-        if (!seen[k]) {
+        if (!seen[k] && k != K_FRAME) {                 /* frame_last: optional */
             snprintf(why, why_sz, "resume identifier lacks %s", kname[k]);
             return false;
         }
@@ -1854,6 +1877,9 @@ static bool resume_settings_match(const ResumeId *id, char *why, size_t why_sz) 
         snprintf(why, why_sz, "it was searched with --early_release %s, this run has "
                  "--early_release %s", a, b);
     }
+    else if (id->frame_last != (int)g_frame_last)
+        snprintf(why, why_sz, "it was searched %s --frame_last, this run %s",
+                 id->frame_last ? "with" : "without", g_frame_last ? "has it" : "does not");
     else
         return true;
     return false;
@@ -1868,9 +1894,9 @@ static void resume_format(char *out, size_t cap, const uint8_t open[NUM_PIECES],
     char rel[16];
     release_text(release_code(), rel, sizeof(rel));
     for (char *q = rel; *q; q++) if (*q == ',') *q = '.';    /* no commas in a CSV field */
-    appendf(out, cap, &off, "%s;order=%s;reverse=%d;rotate=%d;early_release=%s;open=",
-            RESUME_VERSION, order_name(g_order_mode), g_reverse ? 1 : 0,
-            g_rotation, rel);
+    appendf(out, cap, &off, "%s;order=%s;reverse=%d;rotate=%d;early_release=%s;"
+            "frame_last=%d;open=", RESUME_VERSION, order_name(g_order_mode),
+            g_reverse ? 1 : 0, g_rotation, rel, g_frame_last ? 1 : 0);
     for (int i = 0; i < NUM_PIECES / 4; i++) {
         int d = 0;
         for (int j = 0; j < 4; j++) d |= open[4 * i + j] << j;
@@ -3066,7 +3092,9 @@ static void build_search_sequence_ordered(const Board *b, Cell *seq, int *n_seq,
             if (b->cell[r][c].piece_id == EMPTY_PIECE && cell_in_band_search(r, c)) {
                 if (n >= MAX_SEQ_LEN)
                     fatal("search sequence overflow (MAX_SEQ_LEN=%d)", MAX_SEQ_LEN);
-                items[n].key  = order_key(mode, r, c);
+                /* --frame_last: past every key order_key() gives (< 2^20) */
+                items[n].key  = order_key(mode, r, c) +
+                                (g_frame_last && is_frame_cell(r, c) ? (1L << 40) : 0);
                 items[n].cell = (Cell){(int8_t)r, (int8_t)c};
                 n++;
             }
@@ -3096,7 +3124,8 @@ typedef enum {
     FEAS_TYPE_MISMATCH,
     FEAS_COLOR_DEFICIT,
     FEAS_COLOR_ODD,
-    FEAS_EMPTY_DOMAIN
+    FEAS_EMPTY_DOMAIN,
+    FEAS_EDGE_SUPPLY
 } FeasCode;
 
 typedef struct {
@@ -3113,6 +3142,7 @@ static const char *feas_code_name(FeasCode c) {
         case FEAS_COLOR_DEFICIT: return "color_deficit";
         case FEAS_COLOR_ODD:     return "color_odd_surplus";
         case FEAS_EMPTY_DOMAIN:  return "empty_exact_domain";
+        case FEAS_EDGE_SUPPLY:   return "edge_supply";
         default:                 return "unknown";
     }
 }
@@ -3130,8 +3160,51 @@ static void describe_feas(const FeasIssue *x, char *buf, size_t cap) {
                  x->required, x->available);
         return;
     }
+    if (x->code == FEAS_EDGE_SUPPLY) {
+        snprintf(buf, cap, "edge_supply deficit=%d remaining_break_budget=%d",
+                 x->required, x->available);
+        return;
+    }
     snprintf(buf, cap, "%s color=%d available=%d required=%d surplus=%d",
              feas_code_name(x->code), x->color, x->available, x->required, x->remainder);
+}
+
+/*
+ * --edge_supply.  An open frame cell other than a corner whose inward neighbour
+ * is placed takes an edge piece, and its inward edge matches only if that
+ * piece's inner face (g_edge_inner) has the neighbour's colour.  Each unused
+ * edge piece serves one cell, so at least sum over colours x of
+ * max(0, cells demanding x - unused edge pieces with inner face x) of these
+ * edges break.  It is Hall's bound on just these cells, cheap enough for every
+ * placement; it changes only when a frame or ring-1 cell is placed.
+ */
+static inline bool near_frame_cell(int r, int c) {
+    return r <= 1 || c <= 1 || r >= PUZZLE_SIDE - 2 || c >= PUZZLE_SIDE - 2;
+}
+
+static int edge_supply_deficit(const Board *b) {
+    int need[NUM_COLORS] = {0}, n = 0;
+    for (int i = 1; i < PUZZLE_SIDE - 1; i++) {
+        const int L = PUZZLE_SIDE - 1;
+        /* (cell, its inward neighbour, the neighbour's face toward it) */
+        if (b->cell[0][i].piece_id == EMPTY_PIECE && b->cell[1][i].piece_id != EMPTY_PIECE)
+            { need[b->cell[1][i].bottom]++; n++; }
+        if (b->cell[L][i].piece_id == EMPTY_PIECE && b->cell[L-1][i].piece_id != EMPTY_PIECE)
+            { need[b->cell[L-1][i].top]++; n++; }
+        if (b->cell[i][0].piece_id == EMPTY_PIECE && b->cell[i][1].piece_id != EMPTY_PIECE)
+            { need[b->cell[i][1].left]++; n++; }
+        if (b->cell[i][L].piece_id == EMPTY_PIECE && b->cell[i][L-1].piece_id != EMPTY_PIECE)
+            { need[b->cell[i][L-1].right]++; n++; }
+    }
+    if (n == 0) return 0;
+    for (int j = 0; j < g_pieces_by_zero_n[1]; j++) {
+        int pid = g_pieces_by_zero[1][j];
+        if (!used_test(b->used, pid)) need[g_edge_inner[pid]]--;
+    }
+    int deficit = 0;
+    for (int x = 0; x < NUM_COLORS; x++)
+        if (need[x] > 0) deficit += need[x];
+    return deficit;
 }
 
 /*
@@ -3268,6 +3341,7 @@ typedef struct {
     uint64_t parity_rejects[MAX_SEQ_LEN+1];
     uint64_t fc_rejects[MAX_SEQ_LEN+1];    /* global empty-domain lower bound */
     uint64_t hall_rejects[MAX_SEQ_LEN+1];  /* Hall/deficiency matching prune */
+    uint64_t edge_rejects[MAX_SEQ_LEN+1];  /* --edge_supply */
     uint64_t hall_calls[MAX_SEQ_LEN+1];
     uint64_t recursed[MAX_SEQ_LEN+1];
     uint64_t dead_nodes[MAX_SEQ_LEN+1];
@@ -3314,6 +3388,7 @@ static void stats_merge(DfsStats *dst, const DfsStats *src) {
     MERGE_FIELD(parity_rejects);
     MERGE_FIELD(fc_rejects);
     MERGE_FIELD(hall_rejects);
+    MERGE_FIELD(edge_rejects);
     MERGE_FIELD(hall_calls);
     MERGE_FIELD(recursed);
     MERGE_FIELD(dead_nodes);
@@ -4174,13 +4249,16 @@ static int count_break_candidates_scan(const Board *b, const FcState *fc,
 /* Exact MRV in strict mode.  In BREAK_ANY mode the break candidates are part
  * of the branching factor and must be counted too; v9 ignored them whenever
  * one exact fit existed, which could select a nominally 1-way cell having
- * hundreds of actual children. */
+ * hundreds of actual children.  In BREAK_LDS mode a cell with no exact fit
+ * counts 0 while breaks are left: its forced break is placed at once, where it
+ * is stuck, rather than after every cell with fewer break candidates (often
+ * never, the search ending first; a dead cell never regains a fit). */
 static int mrv_cell_count(const Board *b, const FcState *fc, int r, int c, int budget) {
     int ex = fc_exact_count(fc, r, c);
     if (budget <= 0) return ex;
     if (g_break_mode == BREAK_ANY)
         return ex + count_break_candidates_scan(b, fc, r, c, budget);
-    if (ex > 0) return ex;
+    if (ex > 0 || g_break_mode == BREAK_LDS) return ex;
     return count_break_candidates_scan(b, fc, r, c, budget);
 }
 
@@ -4322,8 +4400,9 @@ static inline int placed_neighbor_count(const Board *b, int r, int c);
  * unfinished layer first, and within it the cell with the fewest fits, so it
  * grows from the placed pieces outward and a layer is complete before the next
  * opens -- which is what lets --early_release R,C mean "after that cell's
- * layer".  A pure function of the start board: --resume rebuilds it exactly.
- * With no placed piece every cell is layer 1, i.e. plain fail-first.
+ * layer".  A pure function of the start board and --frame_last: --resume
+ * rebuilds it exactly.  With no placed piece every cell is layer 1, i.e. plain
+ * fail-first (inner cells 1 and frame cells 2 under --frame_last).
  */
 static void frontier_layers(const Board *b, int8_t layer[PUZZLE_SIDE][PUZZLE_SIDE]) {
     int q[NUM_PIECES], h = 0, t = 0;
@@ -4335,7 +4414,8 @@ static void frontier_layers(const Board *b, int8_t layer[PUZZLE_SIDE][PUZZLE_SID
         }
     if (t == 0) {
         for (int r = 0; r < PUZZLE_SIDE; r++)
-            for (int c = 0; c < PUZZLE_SIDE; c++) layer[r][c] = 1;
+            for (int c = 0; c < PUZZLE_SIDE; c++)
+                layer[r][c] = (int8_t)(g_frame_last && is_frame_cell(r, c) ? 2 : 1);
         return;
     }
     while (h < t) {
@@ -4348,6 +4428,18 @@ static void frontier_layers(const Board *b, int8_t layer[PUZZLE_SIDE][PUZZLE_SID
                 layer[nr][nc] = (int8_t)(layer[r][c] + 1);
                 q[t++] = nr * PUZZLE_SIDE + nc;
             }
+    }
+    /* --frame_last: the open frame cells come after the last inner layer, in
+     * their own distance order (each part is at most 15 layers deep). */
+    if (g_frame_last) {
+        int inner_top = 0;
+        for (int r = 0; r < PUZZLE_SIDE; r++)
+            for (int c = 0; c < PUZZLE_SIDE; c++)
+                if (!is_frame_cell(r, c) && layer[r][c] > inner_top) inner_top = layer[r][c];
+        for (int r = 0; r < PUZZLE_SIDE; r++)
+            for (int c = 0; c < PUZZLE_SIDE; c++)
+                if (is_frame_cell(r, c) && layer[r][c] > 0)
+                    layer[r][c] = (int8_t)(layer[r][c] + inner_top);
     }
 }
 
@@ -4399,6 +4491,27 @@ static int pick_next_cell(const Board *b, const FcState *fc,
                           OrderMode mode, int remaining_budget,
                           const int8_t (*layer)[PUZZLE_SIDE]) {
     if (mode == ORD_FRONTIER) {
+        /* lds with breaks left: a cell with no exact fit first, in any layer
+         * (see mrv_cell_count), innermost then row-major; under --frame_last
+         * the frame still waits for the inner cells. */
+        if (g_break_mode == BREAK_LDS && remaining_budget > 0 && fc->zero_domains > 0) {
+            bool inner_open = false;
+            if (g_frame_last)
+                for (int j = pos; j < n_rem && !inner_open; j++)
+                    inner_open = !is_frame_cell((int)rem[j].row, (int)rem[j].col);
+            int dead = -1, dead_l = INT_MAX;
+            long dead_key = LONG_MAX;
+            for (int j = pos; j < n_rem; j++) {
+                int r = (int)rem[j].row, c = (int)rem[j].col;
+                if (inner_open && is_frame_cell(r, c)) continue;
+                if (fc_exact_count(fc, r, c) > 0) continue;
+                long key = g_reverse ? (long)c * PUZZLE_SIDE + r : (long)r * PUZZLE_SIDE + c;
+                if (layer[r][c] < dead_l || (layer[r][c] == dead_l && key < dead_key)) {
+                    dead = j; dead_l = layer[r][c]; dead_key = key;
+                }
+            }
+            if (dead >= 0) return dead;
+        }
         /* The innermost unfinished layer only; in it, fewest fits, then more
          * placed neighbours (the board edge does not count), then row-major
          * (column-major with --reverse). */
@@ -4429,9 +4542,15 @@ static int pick_next_cell(const Board *b, const FcState *fc,
     int best_eff = INT_MAX;
     int best_fixed = -1;
     long best_key = LONG_MAX;
+    /* --frame_last: the frame waits while any inner cell is open. */
+    bool inner_open = false;
+    if (g_frame_last)
+        for (int j = pos; j < n_rem && !inner_open; j++)
+            inner_open = !is_frame_cell((int)rem[j].row, (int)rem[j].col);
 
     for (int j = pos; j < n_rem; j++) {
         int r = (int)rem[j].row, c = (int)rem[j].col;
+        if (inner_open && is_frame_cell(r, c)) continue;
         int effective = mrv_cell_count(b, fc, r, c, remaining_budget);
         int fixed = fixed_side_score(b, r, c);
         /* MRV tie-break axis: row-major by default, column-major with --reverse
@@ -5056,6 +5175,14 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
                 st->fc_rejects[depth]++;
                 viable = false;
             }
+            /* The deficit moves only near the frame, the budget only on a
+             * break; the record root (and k_start) covers the rest. */
+            if (viable && g_edge_supply &&
+                (cand[i].breaks > 0 || near_frame_cell(row, col)) &&
+                edge_supply_deficit(b) > cx->k_budget - new_breaks) {
+                st->edge_rejects[depth]++;
+                viable = false;
+            }
             if (viable && g_colour_count) {
                 FeasIssue issue;
                 if (!remaining_feasibility_ex(b, fc, &issue,
@@ -5378,6 +5505,14 @@ static void afo_build_frontier(Board *b, FcState *fc, Cell *rem, int n_rem, int 
         if (!soft_completion) {
             if (fc->zero_domains > cx->k_budget - new_breaks) {
                 st->fc_rejects[depth]++;
+                viable = false;
+            }
+            /* The deficit moves only near the frame, the budget only on a
+             * break; the record root (and k_start) covers the rest. */
+            if (viable && g_edge_supply &&
+                (cand[i].breaks > 0 || near_frame_cell(row, col)) &&
+                edge_supply_deficit(b) > cx->k_budget - new_breaks) {
+                st->edge_rejects[depth]++;
                 viable = false;
             }
             if (viable && g_colour_count) {
@@ -6032,13 +6167,25 @@ static void process_line(const char *config_id_str, long long field2, long long 
         init_issue.remainder = init_issue.available - init_issue.required;
         initial_feasible = false;
     }
+    int root_edge_deficit = 0;
+    if (initial_feasible && g_edge_supply) {
+        root_edge_deficit = edge_supply_deficit(&base);
+        if (root_edge_deficit > total_budget - input_breaks) {
+            memset(&init_issue, 0, sizeof(init_issue));
+            init_issue.code = FEAS_EDGE_SUPPLY;
+            init_issue.required = root_edge_deficit;
+            init_issue.available = total_budget - input_breaks;
+            init_issue.remainder = init_issue.available - init_issue.required;
+            initial_feasible = false;
+        }
+    }
 
     if (!initial_feasible) {
         char desc[256]; describe_feas(&init_issue, desc, sizeof(desc));
         #pragma omp atomic
         g_cnt_infeasible++;
         #pragma omp critical(feas_cnt_update)
-        { if (init_issue.code < 5) g_feas_code_cnt[(int)init_issue.code]++; }
+        { if (init_issue.code < 6) g_feas_code_cnt[(int)init_issue.code]++; }
 
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
                 "[%s] completion-infeasible within the requested budget%s: "
@@ -6093,7 +6240,10 @@ static void process_line(const char *config_id_str, long long field2, long long 
     if (initial_feasible && !soft_completion &&
         g_hall_mode != HALL_OFF && n_seq > 0)
         hall_prune(&root_fc, seq, n_seq, INT_MAX, &root_deficiency);
-    int k_start = input_breaks + root_deficiency;
+    /* --edge_supply: its root deficit bounds the levels the same way, and the
+     * DFS relies on it (it checks the deficit only where it can move). */
+    int k_start = input_breaks + (root_edge_deficit > root_deficiency
+                                  ? root_edge_deficit : root_deficiency);
     bool hall_impossible = (!soft_completion && k_start > total_budget);
     if (root_deficiency > 0) {
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
@@ -6101,6 +6251,14 @@ static void process_line(const char *config_id_str, long long field2, long long 
                 ">= %d additional broken edge(s); first admissible total k=%d%s.\n",
                 tag, root_deficiency, root_deficiency, k_start,
                 hall_impossible ? " (outside the requested budget)" : "");
+        #pragma omp critical(stdout_print)
+        { fputs(rec_buf, stdout); fflush(stdout); rec_off = 0; rec_buf[0] = '\0'; }
+    }
+    if (root_edge_deficit > root_deficiency) {
+        appendf(rec_buf, sizeof(rec_buf), &rec_off,
+                "[%s] root edge supply deficit=%d: any completion needs "
+                ">= %d additional broken edge(s); first admissible total k=%d.\n",
+                tag, root_edge_deficit, root_edge_deficit, k_start);
         #pragma omp critical(stdout_print)
         { fputs(rec_buf, stdout); fflush(stdout); rec_off = 0; rec_buf[0] = '\0'; }
     }
@@ -6404,6 +6562,10 @@ static void process_line(const char *config_id_str, long long field2, long long 
                 TOTAL(fc_rejects,   &stats, n_seq),
                 TOTAL(hall_rejects, &stats, n_seq),
                 TOTAL(recursed,     &stats, n_seq));
+        if (g_edge_supply)
+            appendf(rec_buf, sizeof(rec_buf), &rec_off,
+                    "  edge_supply_rejects=%" PRIu64 "\n",
+                    TOTAL(edge_rejects, &stats, n_seq));
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
                 "  Fit rejects: zero_rule=%" PRIu64 " left=%" PRIu64
                 " bottom=%" PRIu64 " top=%" PRIu64 " right=%" PRIu64 "\n",
@@ -6659,12 +6821,22 @@ static void usage(const char *prog) {
         "                         opposite chirality (border-first preserved); mrv uses\n"
         "                         a column-major tie-break instead of row-major.  No\n"
         "                         effect on 2sides/4sides.\n"
+        "  --frame_last           Search the frame (rows and columns 0 and 15) last: no\n"
+        "                         frame cell is chosen while an inner cell is open; the\n"
+        "                         order within each part is unchanged.  With N the open\n"
+        "                         frame cells, --early_release N stops at the first\n"
+        "                         board that places every inner cell.\n"
         "  --jump                 Best-partial mode: skip a dead cell and continue.\n"
         "  --hall MODE            off, root (default), adaptive, or always.\n"
         "  --no_hall              Alias for --hall off.\n"
         "  --no_colour_count      Skip the colour/type count at the root and after each\n"
         "                         placement (the no-exact-fit cut stays): for regions\n"
         "                         whose last cells will take breaks anyway.\n"
+        "  --edge_supply          Cut a path once the open frame cells facing placed\n"
+        "                         pieces need more breaks than are left: per colour,\n"
+        "                         more of them demand it than unused edge pieces carry\n"
+        "                         it on their inner face.  Not with --jump,\n"
+        "                         2sides/4sides or the greedy dives.\n"
         "  --hall_stride N        Adaptive Hall period in placements (default 8; 0=off).\n"
         "  --hall_min N           Adaptive Hall always-on threshold (default 32 cells).\n\n",
         stderr);
@@ -6856,6 +7028,8 @@ int main(int argc, char **argv) {
             g_parallel_mode = PAR_SEARCH;
         } else if (strcmp(argv[i], "--reverse") == 0) {
             g_reverse = true;
+        } else if (strcmp(argv[i], "--frame_last") == 0) {
+            g_frame_last = true;
         } else if (strcmp(argv[i], "--jump") == 0) {
             g_jump = true;
         } else if (strcmp(argv[i], "--restarts") == 0 && i+1 < argc) {
@@ -7004,6 +7178,8 @@ int main(int argc, char **argv) {
             else fatal("--hall expects off|root|adaptive|always, got '%s'", m);
         } else if (strcmp(argv[i], "--no_colour_count") == 0) {
             g_colour_count = false;
+        } else if (strcmp(argv[i], "--edge_supply") == 0) {
+            g_edge_supply = true;
         } else if (strcmp(argv[i], "--no_hall") == 0) {
             g_hall_mode = HALL_OFF;
         } else if (strcmp(argv[i], "--hall_stride") == 0 && i+1 < argc) {
@@ -7100,6 +7276,18 @@ int main(int argc, char **argv) {
         if (g_release_row >= 0 && g_order_mode == ORD_MRV)
             fatal("--early_release R,C needs a static --order: under mrv the cell "
                   "order changes as the search runs, so the cell has no fixed place");
+    }
+    if (g_edge_supply && (order_uses_soft_completion(g_order_mode) ||
+                          (g_break_mode == BREAK_STUCK && g_max_mismatch > 0)))
+        fatal("--edge_supply is a completion cut of the backtracking search: --jump, "
+              "2sides/4sides and the greedy dives run no completion cuts");
+    if (g_frame_last) {
+        if (order_is_side_growth(g_order_mode))
+            fatal("--frame_last does not apply to --order %s: side growth walks its "
+                  "own layers from the sides inward", order_name(g_order_mode));
+        if (g_break_mode == BREAK_STUCK && g_max_mismatch > 0)
+            fatal("--frame_last orders the backtracking search; the greedy dives "
+                  "(--break_mode stuck with --breaks > 0) choose their cells themselves");
     }
     /* --resume continues ONE serial exact DFS per record from a recorded path.
      * Everything that would make that path mean something else, or would split
@@ -7211,8 +7399,9 @@ int main(int argc, char **argv) {
                g_stop_isrow ? "row" : "column", g_stop_n,
                g_reverse ? " (far side)" : "", g_with_frame ? "on" : "off");
     const bool side_growth = order_is_side_growth(g_order_mode);
-    printf("  order=%s%s  jump=%s  completion_feasibility=%s\n",
-           order_name(g_order_mode), g_reverse ? " (reverse)" : "", g_jump ? "on" : "off",
+    printf("  order=%s%s%s  jump=%s  completion_feasibility=%s\n",
+           order_name(g_order_mode), g_reverse ? " (reverse)" : "",
+           g_frame_last ? " (frame last)" : "", g_jump ? "on" : "off",
            g_jump ? "soft-for-partials" :
            (side_growth ? "soft-side-growth" : "hard-prune"));
     if (g_order_mode == ORD_2SIDES) {
@@ -7224,7 +7413,8 @@ int main(int argc, char **argv) {
         printf("  side_sweep=left/right/bottom/top ring layers; the exterior ring is processed first\n");
         printf("  side_policy=exact-only; FC/color/Hall completion prunes are bypassed by invariant\n");
     }
-    printf("  hall=%s%s", effective_hall_name(), g_colour_count ? "" : "  colour_count=off");
+    printf("  hall=%s%s%s", effective_hall_name(), g_colour_count ? "" : "  colour_count=off",
+           g_edge_supply ? "  edge_supply=on" : "");
     if (!order_uses_soft_completion(g_order_mode) && g_hall_mode == HALL_ADAPTIVE)
         printf("  stride=%d  small=%d", g_hall_stride, g_hall_small);
     printf("\n");
@@ -7248,7 +7438,7 @@ int main(int argc, char **argv) {
         double el = g_time_limit_sec;
         if (el < 0.0) el = (g_max_mismatch > 0) ? TIME_LIMIT_DEFAULT : 0.0;
         printf("  time_limit=");
-        if (el > 0.0) printf("%.0fs/record", el); else printf("unlimited");
+        if (el > 0.0) printf("%gs/record", el); else printf("unlimited");
     }
     printf("\n");
     printf("  max_emitted=");
@@ -7685,9 +7875,10 @@ int main(int argc, char **argv) {
 
     if (g_cnt_infeasible > 0) {
         printf("\n  Initial infeasibility breakdown:\n");
-        const char *fnames[5] = { "ok", "type_mismatch", "color_deficit",
-                                  "color_odd_surplus", "empty_exact_domain" };
-        for (int k = 0; k < 5; k++) {
+        const char *fnames[6] = { "ok", "type_mismatch", "color_deficit",
+                                  "color_odd_surplus", "empty_exact_domain",
+                                  "edge_supply" };
+        for (int k = 0; k < 6; k++) {
             if (g_feas_code_cnt[k])
                 printf("    %-22s = %" PRIu64 "\n", fnames[k], g_feas_code_cnt[k]);
         }
