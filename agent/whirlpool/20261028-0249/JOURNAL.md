@@ -39,3 +39,11 @@
 - Not better than v02 (22.4/h over 32 min). Jewel attempts took ~100 s (v02 ~70 s): 5:2 fails more often on unselected lap-1 boards than on the 10 boards of the sweep (which came from jewel chains grown with 3:4), and a failed 5:2 adds ~17 s.
 - Time split: 43 attempts end in ~1 s (no lap-1 band), 25 run ~36 s and get no lap-1 board (~900 s, 25% of the run), 24 run 50-180 s.
 - Next: lap 1 keeps the 10-column wedge that killed v01's lap 2. Sweep the lap-1 cut on 16 fresh beamer boards.
+
+## 06:20 lap-1 cut sweep (16 fresh beamer boards from the v00 produce test, 1 lap, keep_ring, width 20000)
+| band_row:keep_cols | re-grew | mean s |
+|---|---|---|
+| 5:full slab (v02 lap 1, 4 bands) | 6/16 | 27 |
+| 3:4 (2 bands) | 14/16 | 37 |
+| 4:3 (2 bands) | 9/16 | 23 |
+- v05 = v02 with lap 1 cut 3:4 too. Test board f1: jewel at 102 s.

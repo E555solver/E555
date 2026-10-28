@@ -194,3 +194,8 @@ unix,run,attempt,candidate,board,seconds,exit,chains,laps,frame,jewels,new,archi
 1793166885,r20261028-045604,91,v04_fallback@af5e549c+none,rndb0l0,117,ok,4,3,held,1,1,1,117,10
 1793166887,r20261028-045604,92,v04_fallback@af5e549c+none,rndb0l0,1,ok,1,0,none,0,0,0,,
 1793167060,r20261028-045604,93,v04_fallback@af5e549c+none,rndb0l0,173,ok,5,2,held,0,0,0,,
+1793168759,r20261028-062332,1,v05_lap1_cut@f95290b0+none,rndb0l0,103,ok,4,3,held,1,1,1,103,10
+1793168838,r20261028-062332,2,v05_lap1_cut@f95290b0+none,rndb0l0,79,ok,4,3,held,1,1,1,79,10
+1793168918,r20261028-062332,3,v05_lap1_cut@f95290b0+none,rndb0l0,80,ok,4,3,held,1,1,1,80,10
+1793168998,r20261028-062332,4,v05_lap1_cut@f95290b0+none,rndb0l0,80,ok,4,3,held,1,0,1,80,
+1793169102,r20261028-062332,5,v05_lap1_cut@f95290b0+none,rndb0l0,104,ok,4,3,held,1,1,1,104,10
