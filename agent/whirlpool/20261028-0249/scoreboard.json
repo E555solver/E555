@@ -1,10 +1,10 @@
 {
  "kit": "whirlpool",
  "goal_start_unix": 1793155822,
- "last_checkpoint_unix": 1793160370,
+ "last_checkpoint_unix": 1793163374,
  "best": "v02_low_band@906dc346+none",
  "best_unix": 1793160355,
- "harness_runs": 3,
+ "harness_runs": 4,
  "candidates": {
   "v00_baseline@aa1982a8+none": {
    "file": "candidates/v00_baseline.sh",
@@ -47,6 +47,20 @@
    "frame_held": 9,
    "jewels": 8,
    "depth_max": 10
+  },
+  "v04_fallback@af5e549c+none": {
+   "file": "candidates/v04_fallback.sh",
+   "sha": "af5e549c",
+   "patches": "none",
+   "runs": 1,
+   "minutes": 61.6,
+   "attempts": 93,
+   "laps1": 26,
+   "laps2": 23,
+   "laps3": 21,
+   "frame_held": 26,
+   "jewels": 21,
+   "depth_max": 10
   }
  },
  "best_dived": null,
@@ -54,7 +68,7 @@
  "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
  "arch": "v3",
  "threads": 4,
- "ram_gb": 13,
+ "ram_gb": 12,
  "disk_gb": 23,
  "stage_b_ok": true,
  "db_on_disk": true,

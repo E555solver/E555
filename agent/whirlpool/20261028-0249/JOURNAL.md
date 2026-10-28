@@ -34,3 +34,8 @@
 | 5:2 | 6/10 | 13.2 | 22.0 |
 - So the kept-block width, not the band row, was v01's problem (5:5 gave 0/16). DB build+sort: 24 s at row 3, 14 s at row 4, 8 s at row 5.
 - v04 = v02 with laps 2-3 trying 5:2 first, then 3:4. Test board: jewel at 63 s.
+
+## 06:00 v04 (run r20261028-045604, 61.6 min): 21 jewels, 20.45/h, funnel lap1 26/93, lap2 23, lap3 21
+- Not better than v02 (22.4/h over 32 min). Jewel attempts took ~100 s (v02 ~70 s): 5:2 fails more often on unselected lap-1 boards than on the 10 boards of the sweep (which came from jewel chains grown with 3:4), and a failed 5:2 adds ~17 s.
+- Time split: 43 attempts end in ~1 s (no lap-1 band), 25 run ~36 s and get no lap-1 board (~900 s, 25% of the run), 24 run 50-180 s.
+- Next: lap 1 keeps the 10-column wedge that killed v01's lap 2. Sweep the lap-1 cut on 16 fresh beamer boards.
