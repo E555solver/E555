@@ -87,7 +87,7 @@ MAX_BOARDS=10000        # distinct boards searched per round, the same share fro
 
 # B. backtracker
 HOLES=data/holes_halo.csv   # must lift the whole frame up to STOP_ROW
-BT_ORDER=frontier       # --order, with --frame_last
+BT_ORDER=spiralout      # --order, with --frame_last; ahead of frontier and mrv with --edge_supply
 BT_TIME=0.1             # seconds per board, the first look
 BT_EXTRA=               # more backtracker flags, e.g. BT_EXTRA="--reverse"
 
