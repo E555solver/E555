@@ -15,3 +15,11 @@ Decision: the 465 is hard-polished. Next: F5 rebuild top:6 on the 465 and the 46
 - F8 finalizer (new family: lock bottom of the 465, regrow): from=7 width 1 (one completion, 465 itself); from=5 --free_sides 20 repeats: 465 x20 (one near-duplicate alt p0r0l1), 463, 462; from=3 BW=100000 BTR=8: best 457. The 465's tail is not beaten from its own bottom.
 - F4 beam seed 203: 4316 boards, raw best 463 (rndb0l0). F1 reopen 60 s x8 distinct top boards: one 461->462 only. F2 ender deep 420 s on the 463: +0.
 Decision: beam boards come out polished; the gain source is new beams. Keep cycling F4 with new seeds; try wider beam / different BACKTRACK_ROW / STOP_ROW 12; F2 only on >=463.
+
+## 21:40-22:50
+- F4 seed 204 ED=2000 EP=10000: 3 configs, 13488 boards, best 462 (14 at 461). Lighter dives cover more borders, no better max.
+- F3 distiller on beams 203+204 (top 5): 463 (the same board), +1 on one probe. No gain.
+- F4 with annealed borders (Stage A 16 restarts, seed 11; beamer tb6 tc12 tau0.1 xn0 ED=2000): 3 configs -> 460; 68 configs over 2 borders -> 461. Worse than random edges; abandoned.
+- F4 random edges BW=20000 seed 207: 462. Maha10 (--lambda_Mahalanobis 10) seed 208: 462 x2, 461 x19 from 4203 boards (better tail density). Maha10 BR=5 seed 209: 86k boards, wall hit before writing anything (lost run; never BR=5 with full dives).
+- 22:25 worker restart, CPU changed (2.10 -> 2.30 GHz Xeon), lab kept. Seed 210 killed (logged lost). Rerun stalled 8 min at row 4: the 6.8 GB E555.db was cold in page cache. `cat E555.db > /dev/null` (91 s) fixed it; rerun seed 210 BW=20000 Maha10: 461 x29.
+Rule: after any restart, warm E555.db before F4.

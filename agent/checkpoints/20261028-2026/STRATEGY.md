@@ -14,3 +14,5 @@ Measured before this campaign (PROJECT_E555.md 9.2, 9.3); re-test only with a ne
 - F2 ender deep 420 s on the 465 and a fresh 463: +0.
 - F5 rebuild top:6 SR=11 on elites: loses 2-7 edges. Exhausted.
 - F8 finalizer on the 465: from 7 (1 completion), from 5 free_sides (465 max), from 3 (457 max). Exhausted for the 465.
+- F4 annealed borders (tb6 tc12): worse than random edges (461 max). F4 BR=5 with ED=10000: too many boards, nothing written in 480 s.
+- F4 random edges, BR=6 SR=11, ED=10000 EP=20000: raw bests 461-463 per 480 s run; Maha10 raises tail density.
