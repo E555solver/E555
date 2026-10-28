@@ -36,6 +36,8 @@ BEAM_TAU_BOTTOMS=2      # sample the borders instead of taking the best-ranked:
 BEAM_TAU_COLUMNS=4      # yield is a property of the PAIR, so this costs nothing
 BEAM_FRAC_RAND=0.10     # and spreads the run over many more frames
 BC_WINDOW=3,3           # score up to nB x nC completions per segment-A record
+RNG_SEED=0              # fix the beam's seed to repeat a run; 0 = a fresh one
+                        # from the clock
 
 # the whirlpool: one target row per lap. Ten, not twelve -- twelve is not
 # reachable from a five-row lock, measured against a perfect 480 board on its
