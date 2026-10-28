@@ -3,3 +3,4 @@ unix,iso,run,candidate,sha,patches,minutes,standard,produced,attempted,laps1,lap
 1793160355,2026-10-28T04:05:55Z,r20261028-033346,v02_low_band@906dc346+none,906dc346,none,32.1,yes,2063,55,16,14,12,16,12,12,22.40,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,"keep_ring all laps, CW, DFS; laps 2-3 band rows 0..3 kept cols 1..4"
 1793162464,2026-10-28T04:41:04Z,r20261028-040924,v03_many_rings@3c875863+none,3c875863,none,31.7,yes,2155,16,9,7,6,9,8,8,15.16,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,"v02 + lap-1 bands one at a time, continue after a jewel"
 1793167060,2026-10-28T05:57:40Z,r20261028-045604,v04_fallback@af5e549c+none,af5e549c,none,61.6,yes,2062,93,26,23,21,26,21,21,20.45,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,"v02 + laps 2-3 cut 5:2 first, then 3:4"
+1793172306,2026-10-28T07:25:06Z,r20261028-062332,v05_lap1_cut@f95290b0+none,f95290b0,none,61.6,yes,20935,68,37,37,37,37,26,37,25.34,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,v02 + lap 1 cut 3:4 like laps 2-3
