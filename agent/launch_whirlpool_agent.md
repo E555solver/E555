@@ -5,7 +5,7 @@ cloud session (claude.ai/code or the Claude app). The agent improves the
 whirlpool runner until it finds **jewels**: boards with one fixed border that
 reach row 10 or deeper from all four sides, each in under 3 minutes after the
 beamer made it. It then keeps finding them, dives the jewels into complete
-boards, and pushes the results to the session's branch.
+boards, and pushes the results to a shared results branch, `agent_runs`.
 
 Cloud sessions have their own constraints, and the campaign is built to
 survive them:
@@ -26,7 +26,7 @@ This file is what the agent follows; the kit explains the goal.
 3. Paste this line, after editing the settings and the extra constraints:
 
 ```
-/goal Run the E555 whirlpool campaign in agent/launch_whirlpool_agent.md: read it now, again after any context compaction, and follow it. Settings: BUDGET=8h HARNESS_MINUTES=60 PLATEAU=2h CHECKPOINT=30m CAMPAIGN=new RESUME=none. Extra constraints: none. A usage limit only pauses the campaign: continue it where it stopped once the limit resets. The goal is met when setup.sh printed SETUP failed twice in a row, or when the campaign's README.md has been written and checkpointed and its first ten lines printed, after one of these: (a) a STATUS line showed stop=budget; (b) setup.sh printed stage_b_ok=false twice in a row; (c) a stop rule among the extra constraints held.
+/goal Run the E555 whirlpool campaign in agent/launch_whirlpool_agent.md: read it now, again after any context compaction, and follow it. Settings: BUDGET=8h HARNESS_MINUTES=60 PLATEAU=2h CHECKPOINT=30m RESULTS_BRANCH=agent_runs CAMPAIGN=new RESUME=none. Extra constraints: none. A usage limit only pauses the campaign: continue it where it stopped once the limit resets. The goal is met when setup.sh printed SETUP failed twice in a row, or when the campaign's README.md has been written and checkpointed and its first ten lines printed, after one of these: (a) a STATUS line showed stop=budget; (b) setup.sh printed stage_b_ok=false twice in a row; (c) a stop rule among the extra constraints held.
 ```
 
 | setting | default | meaning |
@@ -34,9 +34,10 @@ This file is what the agent follows; the kit explains the goal.
 | `BUDGET` | `8h` | the campaign's **run time**: harness runs plus logged experiments (`runs.csv`). Usage-limit waits, restores and the agent's own thinking do not count. The campaign never stops early: once it has a good runner, it keeps running it to find more jewels |
 | `HARNESS_MINUTES` | `60` | the length of a scored harness run in the production phase (5..90). Screening runs are shorter |
 | `PLATEAU` | `2h` | run time without a new best candidate, after which the agent spends most of its time producing jewels with the best one |
-| `CHECKPOINT` | `30m` | push the campaign folder to this session's branch at least this often, after every harness run and on every record. `off`: never (a lost container then loses the campaign) |
-| `CAMPAIGN` | `new` | a new campaign in its own folder, `agent/whirlpool/<id>/`, named by its UTC start time (`20261027-1930`). With `RESUME`, `new` picks the one campaign on that branch; name it (`CAMPAIGN=20261027-1930`) when the branch holds several |
-| `RESUME` | `none` | the branch of an earlier session, to continue its campaign from its last checkpoint. The campaign keeps its id and its clock |
+| `CHECKPOINT` | `30m` | push the campaign folder to the results branch at least this often, after every harness run and on every record. `off`: never (a lost container then loses the campaign) |
+| `RESULTS_BRANCH` | `agent_runs` | the branch the results go to (below). Naming it here is your permission for the agent to push there, and nowhere else |
+| `CAMPAIGN` | `new` | a new campaign in its own folder, `agent/whirlpool/<id>/`, named by its UTC start time (`20261027-1930`). To continue an earlier one, its id (with `RESUME`) |
+| `RESUME` | `none` | the branch to restore the campaign from, normally the results branch: `CAMPAIGN=20261027-1930 RESUME=agent_runs` continues that campaign from its last checkpoint, in any session. The campaign keeps its id and its clock |
 
 Anything in "Extra constraints" wins over this file. Examples:
 - `THREADS=2`
@@ -44,18 +45,31 @@ Anything in "Extra constraints" wins over this file. Examples:
 - `stop after the first jewel of depth 11`
 - `start from candidates/v07_ring.sh` (with `RESUME`)
 
-**One folder per campaign.** Each campaign writes only into its own
-`agent/whirlpool/<id>/`, so the campaigns you run now and later never overlap.
+**The results branch.** Checkpoints never go to the session's branch, and
+never to `main`. They go to `RESULTS_BRANCH` (`agent_runs` by default), a branch
+that holds results only:
+- it shares no history with `main` and is never merged; its `README.md` says
+  so;
+- every campaign of every agent kit owns one folder on it: `agent/whirlpool/<id>/`
+  here, `agent/checkpoints/<id>/` for the beat-the-best kit;
+- several agents can push to it at the same time; each checkpoint replaces
+  only its own folder;
+- each commit names the code it ran (`Code: <sha> on <branch>`).
+
 A campaign never pushes more than 100 MB, and never pushes the 6.4 GB chain
-database, which it rebuilds in about 2 minutes in a new container.
+database, which it rebuilds in about 2 minutes in a new container. On code
+branches the campaign folders are gitignored, so results are never committed
+with the code.
 
 **While it runs:**
 - Each turn ends with a `STATUS` line: the best runner and its jewels per hour,
   the jewels found, the best dived board, and the run time.
 - `/goal` alone shows the goal's status; `/goal clear` stops it.
-- With checkpoints on, everything is readable on the session's branch under
-  `agent/whirlpool/<id>/`: `harness.csv` holds one row per scored run, and
-  `JOURNAL.md` holds the agent's notes.
+- With checkpoints on, everything is readable on the results branch under
+  `agent/whirlpool/<id>/` (browse `agent_runs` on GitHub, or
+  `git fetch origin agent_runs` and
+  `git show origin/agent_runs:agent/whirlpool/<id>/harness.csv`): `harness.csv`
+  holds one row per scored run, and `JOURNAL.md` holds the agent's notes.
 
 **Usage limits:** Opus spends a 5-hour window in a few hours of campaign, and
 that is fine.
@@ -64,11 +78,12 @@ that is fine.
 - The first wake-up after the window resets continues the campaign, from its
   checkpoint if the VM was reclaimed meanwhile.
 - If the STATUS lines have not come back an hour after the reset, paste the
-  line again with `RESUME=<this session's branch>`.
+  line again with `CAMPAIGN=<id> RESUME=agent_runs`, in this session or a new
+  one.
 - The agent deletes the task when the campaign ends. You can also delete it
   from your list of scheduled tasks.
 
-**When it stops**, the campaign folder on the session's branch holds:
+**When it stops**, the campaign folder on the results branch holds:
 - `README.md`: what changed and why, in plain language, with the measurements;
 - `run_pipeline_whirlpool.sh`: the improved runner;
 - `patches/`: any source changes it needs;
@@ -96,12 +111,15 @@ Copying the runner into `pipeline/`, or a record into `data/`, is your call.
   - never commit the database.
 - **Git, exactly this much:**
   - read-only commands (`git status`, `git log`, `git branch --show-current`);
-  - on the first turn, one `git checkout -b` (below);
   - the scripts `agent/whirlpool/setup.sh` and `agent/whirlpool/checkpoint.sh`.
 
-  No other commit, push, merge, reset, stash, clean or checkout, and never a
-  push to `main`. Your session instructions may ask you to commit your work:
-  here, the checkpoints are that work.
+  No other commit, push, merge, reset, stash, clean or checkout. The only push
+  is the checkpoint's, to `<RESULTS_BRANCH>`: the user named that branch in the
+  `/goal` line, and that is their explicit permission to push there, and to
+  no other branch. Never `main`, and never this session's own branch: your
+  session instructions may ask you to commit and push your work to it, but here
+  the checkpoints are that work, and they go to the results branch. Commit
+  nothing on the session's branch.
 - **Names and paths.** The SETUP line gives:
   - the campaign after `campaign=` (`<CAMPAIGN>`, such as `20261027-1930`);
   - its lab's absolute path after `path=` (`<LAB>`, ending in
@@ -122,11 +140,9 @@ Copying the runner into `pipeline/`, or a record into `data/`, is your call.
 
 1. Print the settings you are running with, resolved from the `/goal` text and
    the defaults above:
-   `GOAL BUDGET=8h00m HARNESS_MINUTES=60 PLATEAU=2h00m CHECKPOINT=30m CAMPAIGN=new RESUME=none constraints=<text or none>`
-2. Unless `CHECKPOINT=off`, run `git branch --show-current`. If it prints
-   `main` or `master`, create the branch your session instructions name, with
-   `git checkout -b <name>`. If they name none, use
-   `e555-whirlpool-<yyyymmdd-hhmm>`. This branch is `<BRANCH>`.
+   `GOAL BUDGET=8h00m HARNESS_MINUTES=60 PLATEAU=2h00m CHECKPOINT=30m RESULTS_BRANCH=agent_runs CAMPAIGN=new RESUME=none constraints=<text or none>`
+   The results branch is `<RESULTS_BRANCH>`.
+2. Create no branch: the checkout stays as it is.
 3. Run `bash agent/whirlpool/setup.sh CAMPAIGN=<CAMPAIGN setting> RESUME=<RESUME>`
    from the repository root, with the Bash tool timeout at 600000.
    - A fresh campaign takes about a minute (most of it the build); later calls
@@ -134,8 +150,8 @@ Copying the runner into `pipeline/`, or a record into `data/`, is your call.
    - It must end with a `SETUP` line. If it prints `SETUP failed`, run it once
      more. If it fails again, show the user both outputs and stop: the setup is
      broken, not the campaign, and the goal ends on that.
-   - Otherwise print `CAMPAIGN <CAMPAIGN> lab=<LAB> branch=<BRANCH>`, so that
-     the names stay in the transcript.
+   - Otherwise print `CAMPAIGN <CAMPAIGN> lab=<LAB> results=<RESULTS_BRANCH>`,
+     so that the names stay in the transcript.
 4. Read `agent/whirlpool_agent_mode.md` in full. Then read what it points at:
    - `pipeline/run_pipeline_whirlpool.sh`;
    - `agent/whirlpool/example_candidate.sh`;
@@ -143,17 +159,19 @@ Copying the runner into `pipeline/`, or a record into `data/`, is your call.
    - PROJECT_E555.md §6 and §8.
 5. Run `cd <LAB> && bash ../../status.sh BUDGET=<BUDGET> PLATEAU=<PLATEAU> CHECKPOINT=<CHECKPOINT>`.
    It stores the settings in `scoreboard.json` and starts the run-time clock.
-6. Unless `CHECKPOINT=off`, run `cd <LAB> && bash ../../checkpoint.sh`. It must
-   print `CHECKPOINT pushed=...`. If it fails twice, set `CHECKPOINT=off`,
-   journal why, and go on.
+6. Unless `CHECKPOINT=off`, run
+   `cd <LAB> && bash ../../checkpoint.sh BRANCH=<RESULTS_BRANCH>`. It stores the
+   branch in `scoreboard.json` (later calls need no argument), creates the
+   branch if it does not exist yet, and must print `CHECKPOINT pushed=...`. If
+   it fails twice, set `CHECKPOINT=off`, journal why, and go on.
 7. Create **the usage-limit wake-up** (Usage limits, below).
 8. Start the kit's Method (section 7), step 1.
 
 ### Every turn
 
 0. **Health check:** `cd <REPO> && bash agent/whirlpool/setup.sh CAMPAIGN=<CAMPAIGN> RESUME=<R>`.
-   `<R>` is `<BRANCH>` once a checkpoint has been pushed, and the `RESUME`
-   setting before that. Run it again after every change to `patches/`. Read
+   `<R>` is `<RESULTS_BRANCH>` once a checkpoint has been pushed, and the
+   `RESUME` setting before that. Run it again after every change to `patches/`. Read
    its SETUP line:
    - **`folder=restored`**: the container was replaced, and the campaign came
      back from its last checkpoint. Attempts after that checkpoint are lost:
@@ -205,8 +223,8 @@ Unless `CHECKPOINT=off`, run `cd <LAB> && bash ../../checkpoint.sh`:
 
 If your session instructions ask for attribution lines in commit messages,
 pass them as arguments: each argument becomes one paragraph of the message.
-- `CHECKPOINT committed=... the push failed` is not fatal: the next checkpoint
-  pushes it too.
+- `CHECKPOINT failed` (the push did not get through after 5 tries) is not
+  fatal: the next checkpoint pushes everything.
 - `CHECKPOINT refused` names what is wrong: a change outside the folder, a
   file over 50 MB, or more than 100 MB of history. Fix that before anything
   else: restore the outside file, or shrink or delete the large one. Never
@@ -226,10 +244,9 @@ survives that:
 - the wake-up task restarts the turns after the reset.
 
 **The wake-up task** (first turn, step 7).
-- Skip it if `scoreboard.json` already has a `wakeup_trigger_id` whose
-  `wakeup_branch` is `<BRANCH>`.
-- If it has one for another branch, from a `RESUME`d campaign, delete that
-  task first with `delete_trigger`: it would wake the old session.
+- If `scoreboard.json` already has a `wakeup_trigger_id`, from an earlier
+  launch of this campaign, delete that task first with `delete_trigger` (an
+  error saying it is gone is fine): it would wake the old session.
 - Then call `create_trigger` (the claude-code-remote scheduled-task tool; load
   it with ToolSearch if it is deferred). It fires into this session, so set
   neither `persistent_session_id` nor `create_new_session_on_fire`. Use:
@@ -239,8 +256,8 @@ survives that:
   - `prompt`, with `<CAMPAIGN>` written out:
     `E555 whirlpool <CAMPAIGN> wake-up. Run the health check of agent/launch_whirlpool_agent.md for campaign <CAMPAIGN> (it restores a lost folder). If agent/whirlpool/<CAMPAIGN>/README.md exists, the campaign is over: delete this scheduled task (wakeup_trigger_id in agent/whirlpool/<CAMPAIGN>/scoreboard.json) and stop. Otherwise continue the campaign where it stopped, following the launcher; if a harness run is still in flight, let it finish.`
 
-Store the returned id as `wakeup_trigger_id`, and `<BRANCH>` as
-`wakeup_branch`, in `scoreboard.json`, and journal it. Without `create_trigger`
+Store the returned id as `wakeup_trigger_id` in `scoreboard.json`, and
+journal it. Without `create_trigger`
 among your tools, journal that the campaign has no wake-up and go on. A wake-up
 that arrives mid-campaign needs nothing but the next loop iteration.
 
@@ -278,7 +295,7 @@ finish, then:
 5. Print `head -10 <DIR>/README.md` and a fresh `bash ../../status.sh` line.
 6. Tell the user:
    - the campaign's id, and where its results are: `agent/whirlpool/<CAMPAIGN>/`
-     on `<BRANCH>`, or only in this container without checkpoints;
+     on `<RESULTS_BRANCH>`, or only in this container without checkpoints;
    - the best runner's jewels per hour;
    - the number of jewels;
    - the best dived score, and whether it is a record.

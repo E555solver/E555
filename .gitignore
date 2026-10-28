@@ -28,8 +28,10 @@ sweep_checkpoint.txt
 *.status.csv
 runs/
 agent/labs/
-# whirlpool campaigns: the lab inside each campaign folder
-agent/whirlpool/*/lab/
+# agent results: pushed to the results branch (agent_runs) by the kits'
+# checkpoint scripts, never committed with the code
+agent/checkpoints/
+agent/whirlpool/[0-9]*/
 under_development/
 old/
 .claude/
