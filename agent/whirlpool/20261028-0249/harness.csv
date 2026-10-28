@@ -10,3 +10,4 @@ unix,iso,run,candidate,sha,patches,minutes,standard,produced,attempted,laps1,lap
 1793188588,2026-10-28T11:56:28Z,r20261028-105623,v08_cheapcut@0d5e25e5+c3b1573d,0d5e25e5,c3b1573d,60.1,yes,5286,148,100,96,96,100,96,96,95.87,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,production 1
 1793192207,2026-10-28T12:56:47Z,r20261028-115642,v08_cheapcut@0d5e25e5+c3b1573d,0d5e25e5,c3b1573d,60.1,yes,3029,141,99,95,95,99,94,95,93.87,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,production 2
 1793195994,2026-10-28T13:59:54Z,r20261028-125940,v08_cheapcut@0d5e25e5+c3b1573d,0d5e25e5,c3b1573d,60.2,yes,2091,130,91,78,78,91,78,78,77.70,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,production 3
+1793199864,2026-10-28T15:04:24Z,r20261028-140011,v08_cheapcut@0d5e25e5+c3b1573d,0d5e25e5,c3b1573d,64.2,yes,4042,167,98,94,93,98,93,93,86.89,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,production 4 (last)
