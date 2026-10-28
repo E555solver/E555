@@ -47,3 +47,10 @@
 | 3:4 (2 bands) | 14/16 | 37 |
 | 4:3 (2 bands) | 9/16 | 23 |
 - v05 = v02 with lap 1 cut 3:4 too. Test board f1: jewel at 102 s.
+
+## 07:30 v05 (run r20261028-062332, 61.6 min): 26 jewels, 25.3/h, funnel lap1 37/68, lap2 37, lap3 37 -> new best
+- Lap-1 cut 3:4 removed the lap-1 failures: 29 attempts end in ~1 s (no band at all), 2 fail later, 37 go all three laps.
+- But only 26 of the 37 completed chains had a new frame. The repeats are neighbouring attempts (27/28/23, 45/46/42, ...): consecutive beamer boards differ in a few cells and the lap-1 cut finds the same ring.
+- v06 = v05 + produce keeps one board per frame-cell signature, shuffled (1868 of 3079 boards in one call).
+- First dive round started: 67 new-frame jewels, 201 lap boards (s2-s4), diver 10000/20000, 900 s.
+- Dive round 1: 201 boards dived in 34 s, best 458; reopen top 8 (13 s): 459. best_boards.csv: REFEREE VALID 459 (r20261028-062332-a54-t4_s2).

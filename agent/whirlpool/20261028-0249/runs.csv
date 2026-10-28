@@ -15,3 +15,6 @@ unix,iso,kind,label,runtime_s,exit
 1793168488,2026-10-28T06:21:28Z,timed,lap1 cut sweep 5:14/3:4/4:3 x16,1396.6,0
 1793168605,2026-10-28T06:23:25Z,timed,test v05 whirl,101.7,0
 1793172306,2026-10-28T07:25:06Z,harness,r20261028-062332 v05_lap1_cut@f95290b0+none,3694,0
+1793172351,2026-10-28T07:25:51Z,timed,v05 produce for frame stats,8.3,0
+1793172436,2026-10-28T07:27:16Z,timed,"dive jewels round 1 (67 jewels, 201 boards)",34.1,0
+1793172459,2026-10-28T07:27:39Z,timed,reopen top 8 round 1,13.4,0
