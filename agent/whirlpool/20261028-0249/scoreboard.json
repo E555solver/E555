@@ -1,0 +1,25 @@
+{
+ "kit": "whirlpool",
+ "goal_start_unix": 1793155822,
+ "last_checkpoint_unix": null,
+ "best": null,
+ "best_unix": null,
+ "harness_runs": 0,
+ "candidates": {},
+ "best_dived": null,
+ "campaign": "20261028-0249",
+ "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+ "arch": "v3",
+ "threads": 4,
+ "ram_gb": 15,
+ "disk_gb": 29,
+ "stage_b_ok": true,
+ "db_on_disk": true,
+ "patches": "none",
+ "settings": {
+  "BUDGET": "12h",
+  "PLATEAU": "2h",
+  "CHECKPOINT": "30m"
+ },
+ "results_branch": "agent_runs"
+}
