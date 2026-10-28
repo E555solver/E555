@@ -1,0 +1,30 @@
+{
+ "puzzle": "seed_Edge5",
+ "perfect_score": 480,
+ "baseline_score": 465,
+ "best_score": 465,
+ "best_breaks": 15,
+ "best_source": "data/best_465.csv (shipped baseline)",
+ "best_file": "frontier/frontier.csv",
+ "total_runs": 0,
+ "goal_start_unix": 1793219234,
+ "last_best_unix": null,
+ "last_checkpoint_unix": null,
+ "families_since_best": [],
+ "history": [],
+ "campaign": "20261028-2026",
+ "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+ "arch": "v3",
+ "threads": 4,
+ "ram_gb": 15,
+ "disk_gb": 29,
+ "ortools_ok": true,
+ "stage_b_ok": true,
+ "db_on_disk": true,
+ "settings": {
+  "BUDGET": "24h",
+  "PLATEAU": "24h/99",
+  "CHECKPOINT": "30m"
+ },
+ "results_branch": "agent_runs"
+}
