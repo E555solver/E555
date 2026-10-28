@@ -4,3 +4,4 @@ unix,iso,run,candidate,sha,patches,minutes,standard,produced,attempted,laps1,lap
 1793162464,2026-10-28T04:41:04Z,r20261028-040924,v03_many_rings@3c875863+none,3c875863,none,31.7,yes,2155,16,9,7,6,9,8,8,15.16,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,"v02 + lap-1 bands one at a time, continue after a jewel"
 1793167060,2026-10-28T05:57:40Z,r20261028-045604,v04_fallback@af5e549c+none,af5e549c,none,61.6,yes,2062,93,26,23,21,26,21,21,20.45,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,"v02 + laps 2-3 cut 5:2 first, then 3:4"
 1793172306,2026-10-28T07:25:06Z,r20261028-062332,v05_lap1_cut@f95290b0+none,f95290b0,none,61.6,yes,20935,68,37,37,37,37,26,37,25.34,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,v02 + lap 1 cut 3:4 like laps 2-3
+1793176145,2026-10-28T08:29:05Z,r20261028-072750,v06_spread@782cfe5b+none,782cfe5b,none,61.2,yes,1543,53,33,32,31,33,31,31,30.37,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,"v05 + produce one board per frame signature, shuffled"

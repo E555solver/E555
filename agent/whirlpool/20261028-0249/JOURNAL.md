@@ -54,3 +54,7 @@
 - v06 = v05 + produce keeps one board per frame-cell signature, shuffled (1868 of 3079 boards in one call).
 - First dive round started: 67 new-frame jewels, 201 lap boards (s2-s4), diver 10000/20000, 900 s.
 - Dive round 1: 201 boards dived in 34 s, best 458; reopen top 8 (13 s): 459. best_boards.csv: REFEREE VALID 459 (r20261028-062332-a54-t4_s2).
+
+## 08:30 v06 (run r20261028-072750, 61.2 min): 31 jewels, 30.4/h, funnel lap1 33/53, lap2 32, lap3 31 -> new best
+- 31 of 31 completed chains new frames (v05: 26 of 37). 31 vs 26 is not significant (needs > 2*sqrt(57) = 15), but the repeats are gone, as designed.
+- Time: 15 attempts ~1 s (no band), 5 at 15-53 s (no lap 1), 33 at 77-177 s. A jewel costs ~95 s; next: profile one.
