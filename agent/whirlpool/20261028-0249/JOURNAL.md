@@ -89,3 +89,7 @@
 - Dive round 4: 190 jewels (570 boards) in 98 s; reopen top 16 (52 s): best still 461.
 - 14:10 production 3 (v08): run=r20261028-125940 jewels=78 per_hour=77.70 
 - 15:00 production 4 (v08, last): run=r20261028-140011 jewels=93 per_hour=86.89 
+
+## 15:20 done (stop=budget at 12h00m)
+- Smoke test of run_pipeline_whirlpool.sh MODE=all WALL=600 DIVE=1: 21 boards, 15 jewels in 628 s; the final rank step lacked --out (fixed, verified on its dived.csv: VALID 458).
+- The 171 jewels of production runs 3-4 were not dived (budget). README.md written.

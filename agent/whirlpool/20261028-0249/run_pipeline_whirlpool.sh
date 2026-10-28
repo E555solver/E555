@@ -35,7 +35,8 @@
 #   chains.csv   every chain written (ids b<board>_t<n>_s<k>)
 #   jewels.csv   the jewels' four boards, judged by agent/whirlpool/judge.py
 #   jewels.log   one CHAIN line per jewel
-#   dived.csv    with DIVE=1: the jewels' s2..s4 dived and polished (E555_diver)
+#   dived.csv    with DIVE=1: the jewels' s2..s4 dived and polished (E555_diver),
+#                and best.csv, its 20 best boards
 # MODE=produce and MODE=whirl are the whirlpool kit's candidate contract
 # (agent/whirlpool_agent_mode.md, section 3).
 set -euo pipefail
@@ -134,7 +135,7 @@ if [ "$MODE" = all ]; then
         grep -E '_s[234],' jewels.csv > to_dive.csv || true
         "$BIN/E555_diver" "$SEED" to_dive.csv dived.csv --end_dive 10000 --end_polish 20000 \
             --emit_score 0 --threads "$THREADS" --wall_time 900 --print_cmd > dive.log 2>&1 || true
-        python3 "$TOOLS/E555_rank.py" dived.csv --seed_file "$SEED" --top 5 --rescore || true
+        python3 "$TOOLS/E555_rank.py" dived.csv --seed_file "$SEED" --top 20 --out best.csv --rescore || true
     fi
     exit 0
 fi
