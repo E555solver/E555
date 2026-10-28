@@ -1182,6 +1182,8 @@ printed. With a seed, a run repeats on the same build and thread count; the beam
 partitions work by thread, so a different thread count explores a different
 beam. The beam can also rarely differ between identical runs at several threads
 (observed: 1 run in 6 at 4 threads took a different row-7 beam). The
+finalizer's `--no_fanout_sort` gives that up: the in-cell order then follows the
+database build's thread scheduling, so its runs do not repeat. The
 backtracker, the extension and the dives are exact: given the same stop-row
 boards or roots they write the same file at any thread count.
 
@@ -1423,6 +1425,7 @@ enumeration grows explosively as rows are freed; 7 is a practical value.
 | `--finalize_repeats N` | 1 | sweeps per input line |
 | `--free_edges` | auto | free every edge above the lock |
 | `--free_top`, `--keep_ring`, `--free_sides` | off | top-lock modes (6.4) |
+| `--no_fanout_sort` | off | skip the fan-out sort of each rebuilt database: much faster rebuilds at a low lock; a parent no longer finds its most promising completions first when its quota or budget runs out, and a run no longer repeats (5.15) |
 | `--clue_center`, `--clue_corners` | off | hold the clues (6.5) |
 | `--clue_orient LIST`, `--pin_clue N` | auto, 0 | orientations for a clue-less line |
 | `--incomplete_top` | off | also write two-segment stop-row boards |
