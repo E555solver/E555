@@ -193,6 +193,10 @@ because a lost container takes `<LAB>` with it.
    - the READMEs in `<LAB>/ref/`. The whirlpool campaign's README explains its
      87-jewels-per-hour runner and its `--no_fanout_sort` patch.
 
+   A `patches/` file in `ref/` is a whole source file from an older tree. Never
+   copy one over the lab: port the change into the lab's own file, if the lab
+   lacks it.
+
    Read more of PROJECT_E555.md, and each tool's usage text (run the binary
    with no arguments), whenever a lead needs it.
 4. Run `cd <LAB> && bash ../../lab.sh status BUDGET=<BUDGET> CHECKPOINT=<CHECKPOINT> RUN_CAP=<RUN_CAP>`.
@@ -356,7 +360,8 @@ scored 949 exact partials, the best exact 321 (174 placed), with no jackpot.
 - Its v08 runner makes 87 jewels per hour: boards whose fixed 60-cell frame
   re-grows to row 10 from all four sides. The jewels dived to 461.
 - Its patch `--no_fanout_sort` makes a lap's finalizer call nearly 3 times
-  faster (13.6 s against 37 s).
+  faster (13.6 s against 37 s). The flag is now in the repository's finalizer,
+  and so in your lab.
 - It was run without clues.
 
 *Fixed references.*
@@ -373,8 +378,8 @@ scored 949 exact partials, the best exact 321 (174 placed), with no jackpot.
    reach per CPU-hour in exact and score, with the clue. For example:
    - the beamer at a few widths, with and without end dives;
    - the halo;
-   - the whirlpool v08 from `ref/` (patched to the clue, its patch applied in
-     the lab);
+   - the whirlpool v08 from `ref/` (changed to hold the clue; its finalizer
+     flag is already in the lab);
    - one farm iteration.
 
    These numbers are the bar for "breakthrough". Write them into METHODS.md
