@@ -19,3 +19,8 @@ unix,iso,kind,label,runtime_s,exit
 1793172436,2026-10-28T07:27:16Z,timed,"dive jewels round 1 (67 jewels, 201 boards)",34.1,0
 1793172459,2026-10-28T07:27:39Z,timed,reopen top 8 round 1,13.4,0
 1793176145,2026-10-28T08:29:05Z,harness,r20261028-072750 v06_spread@782cfe5b+none,3675,0
+1793176284,2026-10-28T08:31:24Z,timed,profile v06 whirl,114.5,0
+1793176565,2026-10-28T08:36:05Z,timed,no_fanout_sort sweep 3:4 lap2 x10 + lap1 x16,220.0,0
+1793176586,2026-10-28T08:36:26Z,timed,finalizer checks for the patch,12.2,1
+1793176749,2026-10-28T08:39:09Z,timed,finalizer checks generic,155.6,0
+1793176826,2026-10-28T08:40:26Z,timed,test v07 whirl,29.2,0

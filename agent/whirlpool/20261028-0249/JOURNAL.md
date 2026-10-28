@@ -58,3 +58,10 @@
 ## 08:30 v06 (run r20261028-072750, 61.2 min): 31 jewels, 30.4/h, funnel lap1 33/53, lap2 32, lap3 31 -> new best
 - 31 of 31 completed chains new frames (v05: 26 of 37). 31 vs 26 is not significant (needs > 2*sqrt(57) = 15), but the repeats are gone, as designed.
 - Time: 15 attempts ~1 s (no band), 5 at 15-53 s (no lap 1), 33 at 77-177 s. A jewel costs ~95 s; next: profile one.
+
+## 09:00 profile and patch
+- Profile of one v06 jewel (114 s): the finalizer is all of it; per band DB build ~8 s + fan-out sort ~17 s at band row 3.
+- Patch patches/src/B_beam/E555_finalizer.c: new flag --no_fanout_sort (off by default; without it the code path is unchanged) skips sort_db_by_fanout() after a rebuild. Usage text, print_cmd, parser updated.
+- Lab checks: `ARCH=generic bash tests/run_tests.sh finalizer` 13/13 passed. With ARCH=v3 the compile check fails on 15 -Wmaybe-uninitialized warnings in E555_beamer.c (untouched by the patch; pre-existing with this compiler at -march v3).
+- Lap 1 cut 3:4 on the 16 fresh boards: with --no_fanout_sort 14/16 re-grew (the same two fail) in 13.6 s mean, vs 37 s with the sort.
+- v07 = v06 + --no_fanout_sort. Test board: jewel at 29 s (v06: 114 s on the same board).
