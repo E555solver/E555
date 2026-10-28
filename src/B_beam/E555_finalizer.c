@@ -180,6 +180,14 @@ static bool     g_free_sides = false;
    a board -- a witness's classic sides, a --with_frame band -- is one random
    trail order, and pinned it killed 4 of 8 witnesses at row 1. */
 static bool     g_keep_ring  = false;
+/* --no_fanout_sort: skip the inner database's fan-out sort after each rebuild.
+   The sort orders records inside a cell, which is the order a parent finds its
+   (A, B, C) completions in -- what fills its quota, and the prefix phase 1
+   walks before its budget runs out; at a low lock it is most of a rebuild,
+   which a run over many small locked sets pays per line. The build fills a
+   cell from several threads, so without the sort the in-cell order, and the
+   search, follow their scheduling: a run does not repeat. */
+static bool     g_no_fanout_sort = false;
 static bool     g_ring_kept = false;       /* this line: ring pinned in place */
 static bool     g_sides_from_ring = false; /* this line: --free_sides took effect */
 static int      g_top_T     = PUZZLE_SIDE; /* this line */
@@ -3516,7 +3524,8 @@ static void fin_build_db(void) {
         memcpy(g_db_exclude, excl, sizeof g_db_exclude);
         build_db_inner();
         build_fanout_inner();
-        sort_db_by_fanout();
+        if (g_no_fanout_sort) { printf("[init] DB inner left unsorted (--no_fanout_sort)\n"); fflush(stdout); }
+        else sort_db_by_fanout();
         memcpy(built_mask, excl, sizeof built_mask);
         have_db = true;
         g_fin_la_inner_stale = true;
@@ -4129,6 +4138,11 @@ static void usage(const char *a0) {
 "                         part of a board; a witness's or a --with_frame band's sides\n"
 "                         are one random trail order, and pinned they often cannot be\n"
 "                         completed at all\n"
+"  --no_fanout_sort       skip the fan-out sort of each rebuilt database: much faster\n"
+"                         rebuilds at a low --finalize_from. A parent no longer finds\n"
+"                         its most promising completions first when its quota or\n"
+"                         budget runs out, and the build's thread scheduling sets the\n"
+"                         order instead: runs do not repeat\n"
 "  --free_sides           keep the clean top rows locked, but below them treat the\n"
 "                         ring as the sides' piece sets only: right edges from the\n"
 "                         side's pool, the left column sampled (--top_columns) as for\n"
@@ -4348,6 +4362,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     printf(" --start_row %u --num_rows %u", g_start_row, g_num_rows);
     printf(" --finalize_from %u --finalize_repeats %u", g_finalize_from, g_finalize_repeats);
     if (g_keep_ring)      printf(" --keep_ring");
+    if (g_no_fanout_sort) printf(" --no_fanout_sort");
     if (g_opt_free_edges) printf(" --free_edges");
     if (g_free_top)       printf(" --free_top");
     if (g_free_sides)     printf(" --free_sides");
@@ -4410,6 +4425,7 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--free_top"))                  g_free_top = true;
         else if (!strcmp(argv[i], "--free_sides"))                g_free_sides = true;
         else if (!strcmp(argv[i], "--keep_ring"))                 g_keep_ring = true;
+        else if (!strcmp(argv[i], "--no_fanout_sort"))            g_no_fanout_sort = true;
         else if (!strcmp(argv[i], "--backtrack_row") && i+1 < argc) {
             int v = atoi(argv[++i]);
             if (v < 0) fatal("--backtrack_row must be >= 0");

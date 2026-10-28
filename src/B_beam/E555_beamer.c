@@ -2581,7 +2581,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     uint8_t best_flags = 0;
     bool have_best = false;
     /* The runner-up, for --bc_window_accept F < 1. */
-    RowChoice sec_mv; float sec_score = 0.0f; uint64_t sec_sig = 0;
+    RowChoice sec_mv = {0}; float sec_score = 0.0f; uint64_t sec_sig = 0;
     uint8_t sec_flags = 0;
     bool have_sec = false;
     const bool track_sec = window && g_bc_accept < 1.0;
