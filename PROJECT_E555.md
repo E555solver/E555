@@ -1630,6 +1630,14 @@ Four laps are one full turn. At `T = 11` a lap keeps 72 cells in place (rows
 - Stage C runs once at the end on the survivors: the roundhouse
   (`--rotate -1 --rounds 3 --strip_width 4`), then the backtracker's dives.
 
+`pipeline/run_whirlpool_jewels.sh` runs the whirlpool one board at a time under
+one fixed frame. A **jewel** is a beamer board s1 and three clockwise laps
+s2..s4, each re-grown to row 10, all holding the same complete 60-cell frame.
+Each lap keeps only rows 1..BR x columns 1..KC of the turned board (cut 3:4 on
+lap 1; 4:3, then 3:4 on laps 2-3), cuts rows 0..BR with `--with_frame`, and
+re-grows with `--keep_ring --no_fanout_sort`; depth-first, one board per frame.
+Measured: 87 jewels per hour on 4 cores (pipeline/README.md).
+
 ---
 
 ## 9. Stage C -- the tail

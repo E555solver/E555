@@ -12,6 +12,7 @@ settings here will make far more sense afterwards.
 |---|---|---|
 | `run_pipeline.sh` | the whole pipeline, borders to a finished board. `BORDERS=random` samples borders from the seed; `BORDERS=annealed` searches for them with Stage A first | 30-60 min per pass |
 | `run_pipeline_whirlpool.sh` | turns the board 90 degrees between every re-grow, so the buried bottom rows get re-searched too | hours, or one lap in minutes |
+| `run_whirlpool_jewels.sh` | the whirlpool as a jewel finder: one beamer board at a time, turned and re-grown three times under one fixed frame | an hour |
 | `run_board_farm.sh` | runs a pipeline pass in a loop forever, keeps only the best boards, and periodically re-attacks them | days |
 | `run_farm.py` | the same idea with a different chain, and boards that graduate: built, endered once, then deeply endered into `elite.csv` and never searched again | days |
 | `run_halo.sh` | beam to row 10, lift the halo (rows 0-2, columns 0, 1, 14, 15) and search for a board with every inner piece placed, the frame last; the best boards climb a ladder of longer resumed searches | hours |
@@ -23,6 +24,7 @@ bash pipeline/run_pipeline.sh                       # annealed borders
 bash pipeline/run_pipeline.sh BORDERS=random        # sampled borders, start here
 bash pipeline/run_pipeline_whirlpool.sh             # four laps around the board
 bash pipeline/run_pipeline_whirlpool.sh WHIRL_ROWS=10   # just one lap
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db   # jewels for an hour
 bash pipeline/run_board_farm.sh MAX_HOURS=48        # the farm, two days
 python3 pipeline/run_farm.py DB=/tmp/E555.db THREADS=10   # the graduating farm
 bash pipeline/run_halo.sh TOTAL_TIME=4h             # the halo loop, four hours
@@ -327,6 +329,63 @@ it made; `GIVE_UP_AFTER` consecutive failures end the run (`0` never gives up);
 files are written atomically; `SIGINT`/`SIGTERM` finish the current iteration and
 exit 0. Per-iteration logs are kept only for records and failures, which is what
 keeps a multi-day run to kilobytes.
+
+## The jewel whirlpool: `run_whirlpool_jewels.sh`
+
+The runner above carries a population of boards through its laps, and the
+frame changes from lap to lap. This one follows a single board through three
+laps under **one fixed frame**, and keeps the chains that make it -- the jewels:
+
+```
+s1  beamer board, rows 0..10            -> turn clockwise, cut, re-grow -> s2
+s2  rows 0..10 from the next side       -> turn clockwise, cut, re-grow -> s3
+s3                                      -> turn clockwise, cut, re-grow -> s4
+```
+
+s1..s4 hold the same complete 60-cell frame. So a jewel's interior was grown
+from all four sides under one border, and none of its sides is a leftover of
+the beamer's early guesses.
+
+```bash
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                 # an hour
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1 # then dive the jewels
+bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                # whirl your own boards
+```
+
+One lap: turn the board clockwise; keep only a small block of the old bottom
+rows (rows 1..BR, columns 1..KC); let `E555_backtracker --stop_row BR
+--with_frame` fill rows 0..BR and the frame exactly; re-grow rows BR+1..10 with
+`E555_finalizer --keep_ring --no_fanout_sort`. `--keep_ring` holds the frame in
+place, so the ring lap 1 completed is the ring every later lap keeps.
+
+What it measured (whirlpool campaign 20261028-0249, 4 vCPUs, an hour per run;
+the campaign README on the `agent_runs` branch has the details):
+
+* **87 jewels per hour** over five hours (78 to 96 per run). The population
+  runner above found none: its frame never survived a second lap.
+* **The rate depends on the beamer batch.** An hour is spent on one produce
+  call's boards, and how many of them survive lap 1 varies: this script made
+  60 per hour on one batch (31% through lap 1), and on another 36 jewels in
+  20 minutes where the campaign's runner made 29 on the same batch (a tie
+  within counting noise).
+* **Keep a small block, not the slab.** Keeping the parent's whole six-row slab
+  leaves the cut a 4-wide wedge against the fixed frame, and 0 of 16 such bands
+  re-grew. Cut 3:4 (rows 0..3, 4 columns kept) re-grew 10 of 10.
+* **Cut 4:3 first on laps 2 and 3**, then 3:4: 4:3 rebuilds a smaller database
+  (7.8 s against 13.2 s) and re-grows 7 of 10. On lap 1 it re-grew only 8 of 16
+  against 14 of 16, so lap 1 keeps 3:4. Cut 5:2 is cheap but re-grew too few.
+* **One board per frame.** Consecutive beamer boards share their ring, and in
+  one hour 11 of 37 chains repeated a frame; produce now keeps one board per
+  frame and shuffles them.
+* **`--no_fanout_sort`** took a finalizer call from 35.6 s to 11.3 s with 13 of
+  16 boards re-grown against 14; it costs the run's reproducibility.
+* **One ring per board.** Trying the other rings of a board's lap-1 bands
+  after a jewel cost ~100 s each; a fresh board is cheaper.
+
+Before the first produce the script reads `DB_FILE` once (1.5 to 8 min,
+depending on the disk; it counts against `WALL`): from a
+cold disk, the beamer's memory-mapped reads kept one produce call busy for 10
+minutes without a board.
 
 ## The halo: `run_halo.sh`
 
