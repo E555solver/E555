@@ -87,3 +87,4 @@
 - ISA: AVX-512 (incl. FP16, BF16, VNNI) and AMX present -> Sapphire Rapids generation or newer; the 260 MiB L3 points to Emerald or Granite Rapids. Only 4 vCPUs of it, at 2.1 GHz nominal.
 - 13:06 production 2 (v08): run=r20261028-115642 jewels=94 per_hour=93.87 
 - Dive round 4: 190 jewels (570 boards) in 98 s; reopen top 16 (52 s): best still 461.
+- 14:10 production 3 (v08): run=r20261028-125940 jewels=78 per_hour=77.70 
