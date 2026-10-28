@@ -65,3 +65,7 @@
 - Lab checks: `ARCH=generic bash tests/run_tests.sh finalizer` 13/13 passed. With ARCH=v3 the compile check fails on 15 -Wmaybe-uninitialized warnings in E555_beamer.c (untouched by the patch; pre-existing with this compiler at -march v3).
 - Lap 1 cut 3:4 on the 16 fresh boards: with --no_fanout_sort 14/16 re-grew (the same two fail) in 13.6 s mean, vs 37 s with the sort.
 - v07 = v06 + --no_fanout_sort. Test board: jewel at 29 s (v06: 114 s on the same board).
+
+## 09:45 v07 (run r20261028-084040, 60.5 min, patch c3b1573d): 74 jewels, 73.4/h, funnel lap1 85/152, lap2 78, lap3 75 -> new best
+- vs v06 31 jewels in 61.2 min: 74 - 31 = 43 > 2*sqrt(105) = 20.5, significant.
+- 75 three-lap chains at 39 s mean; 21 failures cost 609 s; 56 boards end in ~1 s.

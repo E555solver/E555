@@ -1,10 +1,10 @@
 {
  "kit": "whirlpool",
  "goal_start_unix": 1793155822,
- "last_checkpoint_unix": 1793176170,
- "best": "v06_spread@782cfe5b+none",
- "best_unix": 1793176145,
- "harness_runs": 6,
+ "last_checkpoint_unix": 1793176839,
+ "best": "v07_nosort@ea8eb1b0+c3b1573d",
+ "best_unix": 1793180469,
+ "harness_runs": 7,
  "candidates": {
   "v00_baseline@aa1982a8+none": {
    "file": "candidates/v00_baseline.sh",
@@ -88,6 +88,20 @@
    "laps3": 31,
    "frame_held": 33,
    "jewels": 31,
+   "depth_max": 10
+  },
+  "v07_nosort@ea8eb1b0+c3b1573d": {
+   "file": "candidates/v07_nosort.sh",
+   "sha": "ea8eb1b0",
+   "patches": "c3b1573d",
+   "runs": 1,
+   "minutes": 60.5,
+   "attempts": 152,
+   "laps1": 85,
+   "laps2": 78,
+   "laps3": 75,
+   "frame_held": 85,
+   "jewels": 74,
    "depth_max": 10
   }
  },
