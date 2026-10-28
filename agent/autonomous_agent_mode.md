@@ -62,9 +62,9 @@ These are non-negotiable. Section 8 repeats them inside the `/goal` condition.
   instead, so there this rule holds by instruction alone.
 - No git command that changes the repository (no commit, push, checkout, reset,
   stash or clean). `agent/labs/` is gitignored. The one exception is a cloud
-  session's checkpoint (section 11): `agent/checkpoint.sh` commits this
-  campaign's `agent/checkpoints/<id>/` alone and pushes it to the session's
-  own branch.
+  session's checkpoint (section 11): `agent/checkpoint.sh` publishes this
+  campaign's `agent/checkpoints/<id>/` alone to the shared results branch
+  (`agent_runs`), never to the code's branches.
 - **The chain database is never committed.** The beamer builds its 6.4 GB
   chain database at the start of an F4 run. When `db_on_disk` is true, F4 also
   writes it to the lab as `E555.db` (6.8 GB, local disk only), so that later F4
@@ -549,40 +549,49 @@ from a terminal, and how the launcher handles it:
 | The Bash tool stops a foreground command after 2 minutes by default and 10 at most, and `BASH_*_TIMEOUT_MS` cannot be set at launch | `RUN_CAP` (default 540 s) keeps each run in the foreground. A larger cap sends runs to the background, where the tool allows up to 2 hours |
 | Limited compute: the container this kit was measured in had 4 cores, 15 GB of RAM and a 30 GB disk allowance, and yours may have less | the health check at the start of every turn measures cores, free RAM and disk. F4 runs only with 8 GB of free RAM, and keeps its database in the lab only when the disk has room |
 | The session can move to another machine, with another CPU, where a `-march=native` binary dies with SIGILL | the lab builds for x86-64-v3 (AVX2), which runs on any current server and here ran as fast as native, and falls back to generic below that or after a SIGILL. A new CPU shows as `cpu_changed=yes`, and the agent takes the new `threads` |
-| The container can be replaced (idle, restarts). `agent/labs/` is gitignored, so the lab goes with the container, runs in flight included | `agent/checkpoint.sh` commits the campaign's `agent/checkpoints/<id>/` (scoreboard, logs, journal, strategy, frontier, elite, distilled pools) to the session's own branch, on every new best and every `CHECKPOINT` (30 min). The health check restores a lost lab from it. The chain database is never checkpointed or committed: a new container rebuilds it in its first F4 run, and `checkpoint.sh` refuses any file over 50 MB |
+| The container can be replaced (idle, restarts). `agent/labs/` is gitignored, so the lab goes with the container, runs in flight included | `agent/checkpoint.sh` publishes the campaign's `agent/checkpoints/<id>/` (scoreboard, logs, journal, strategy, frontier, elite, distilled pools) to the shared results branch, `agent_runs`, on every new best and every `CHECKPOINT` (30 min). The health check restores a lost lab from it. The chain database is never checkpointed or committed: a new container rebuilds it in its first F4 run, and `checkpoint.sh` refuses any file over 50 MB |
 | A fresh container has no OR-Tools | `setup_lab.sh` installs it. Without it, F2 and the topper are skipped |
 
 **Settings** go in the pasted line: `BUDGET` (8h of run time), `RUN_CAP` (540),
-`PLATEAU` (1h/3), `CHECKPOINT` (30m) and `RESUME` (none), plus free-text constraints such
+`PLATEAU` (1h/3), `CHECKPOINT` (30m), `RESULTS_BRANCH` (agent_runs), `CAMPAIGN` (new)
+and `RESUME` (none), plus free-text constraints such
 as `no Stage B`, `THREADS=2` or `stop at the first VALID board above 465`. The
 launcher's table explains each one.
 
 **Each campaign is its own folder.** A new session starts a new campaign,
 named by its UTC start time: its lab is `agent/labs/<id>/` and its checkpoint
 `agent/checkpoints/<id>/`. Campaigns you run later never write into an earlier
-one's folders, and their checkpoints can sit side by side on one branch.
+one's folders.
 
-**Resume in a new session:** paste the line with `RESUME=<the old session's
-branch>`, plus `CAMPAIGN=<id>` if that branch holds more than one campaign. The
-campaign keeps its id and continues from its last checkpoint with a fresh
-`BUDGET` (add `keep the clock` to keep the old one), and the new session
-checkpoints it to its own branch. If the STATUS lines stop for more than an hour
-after a usage limit has reset, the goal may have been lost with the VM. In that
-case, paste the line again in the same session with `RESUME=<this session's
-branch>` and `keep the clock`: a lab that is still there is kept, a lost one is
-restored, and no second wake-up task is created.
+**The results branch.** Checkpoints go to `RESULTS_BRANCH`, `agent_runs` by
+default, through `agent/publish.sh`. That branch holds results only: it
+shares no history with `main`, is never merged, and its `README.md` says so.
+Each campaign of every kit owns one folder on it; several agents can push at
+the same time, each replacing only its own folder; and each commit names the
+code it ran (`Code: <sha> on <branch>`). The session's own branch gets no
+commit, and code branches ignore `agent/checkpoints/`.
+
+**Resume in any session:** paste the line with `CAMPAIGN=<id>
+RESUME=agent_runs`. The campaign keeps its id and continues from its last
+checkpoint with a fresh `BUDGET` (add `keep the clock` to keep the old one).
+If the STATUS lines stop for more than an hour after a usage limit has reset,
+the goal may have been lost with the VM: paste the same line again in the same
+session, with `keep the clock`. A lab that is still there is kept, a lost one
+is restored, and the old wake-up task is replaced.
 
 **Keeping a result:** the best board is
-`agent/checkpoints/<id>/frontier/frontier.csv` on the session's branch. Confirm
-it with `bash agent/referee.sh FILE` and copy it into `data/` on `main` by hand.
-A campaign's checkpoint folder is also its record (journal, run log, strategy,
-summary). Because every campaign has its own folder, the records of several
-campaigns can be merged into one branch without overlapping.
+`agent/checkpoints/<id>/frontier/frontier.csv` on the results branch
+(`git fetch origin agent_runs`, then
+`git show origin/agent_runs:agent/checkpoints/<id>/frontier/frontier.csv`).
+Confirm it with `bash agent/referee.sh FILE` and copy it into `data/` on `main`
+by hand. A campaign's checkpoint folder is also its record (journal, run log,
+strategy, summary).
 
 **Tested so far,** in a cloud container:
 - `setup_lab.sh`: a fresh setup in 32 s, and a health check in under a second;
-- `checkpoint.sh`: a refusal on `main`, a pushed checkpoint, and a restore from
-  a branch;
+- `checkpoint.sh` through `publish.sh`: a refusal to publish to `main`, a
+  results branch created with its README, two campaigns of the two kits
+  pushing to it at the same time, and a restore from it;
 - two campaigns started in the same minute (`-2` added to the second), each
   with its own lab and checkpoint on one branch; a restore that asks which
   campaign when the branch holds two, and picks the only one otherwise;

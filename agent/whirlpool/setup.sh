@@ -3,18 +3,20 @@
 # (agent/whirlpool_agent_mode.md, agent/launch_whirlpool_agent.md). A campaign
 # is one launch of the whirlpool agent. It writes only into its own folder,
 # agent/whirlpool/<id>/, named by the UTC date and time it started
-# (20261027-1930), which agent/whirlpool/checkpoint.sh commits; it works in that
-# folder's lab/, which git ignores. Safe to run at any time: each step does only
+# (20261027-1930), which agent/whirlpool/checkpoint.sh pushes to the results
+# branch; it works in that folder's lab/. Code branches ignore the folder. Safe to run at any time: each step does only
 # what is missing, so a healthy campaign costs a few seconds.
 #
 #   bash agent/whirlpool/setup.sh                          # a new campaign
 #   bash ../../setup.sh                                    # inside a lab: that campaign's health check
 #   bash agent/whirlpool/setup.sh CAMPAIGN=20261027-1930   # the same, from anywhere
-#   bash agent/whirlpool/setup.sh RESUME=my-branch         # bring back the campaign checkpointed on my-branch
+#   bash agent/whirlpool/setup.sh CAMPAIGN=20261027-1930 RESUME=agent_runs
+#                                                          # bring back a campaign from the results branch
 #   SETUP campaign=20261027-1930 folder=fresh lab=fresh path=/.../agent/whirlpool/20261027-1930/lab arch=v3 ...
 #
-# 1. The folder: kept; restored from branch RESUME when this container has lost
-#    it; or created, with its empty logs (see the kit, "The campaign folder").
+# 1. The folder: kept; restored from branch RESUME (the results branch that
+#    checkpoint.sh pushes to, agent_runs by default) when this container has
+#    lost it; or created, with its empty logs (see the kit, "The campaign folder").
 # 2. The lab: a copy of Makefile, src, tools, examples, pipeline, data, tests
 #    and the two docs, then the folder's patches/ laid over it. patches/ holds
 #    full copies of changed src/ and tools/ files (and the Makefile) at their

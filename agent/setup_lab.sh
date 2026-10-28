@@ -10,7 +10,7 @@
 #   bash agent/setup_lab.sh                          # a new campaign
 #   bash ../../setup_lab.sh                          # inside a lab: that campaign's health check
 #   bash agent/setup_lab.sh CAMPAIGN=20261027-1930   # the same, from anywhere
-#   bash agent/setup_lab.sh RESUME=my-branch         # continue the campaign checkpointed on my-branch
+#   bash agent/setup_lab.sh CAMPAIGN=20261027-1930 RESUME=agent_runs   # continue it from the results branch
 #   SETUP campaign=20261027-1930 lab=fresh path=/.../agent/labs/20261027-1930 arch=v3 ...
 #
 # 1. Copies the toolchain into the lab when it is not there: Makefile, src,
@@ -23,7 +23,8 @@
 #    binary that still dies with SIGILL forces generic.
 # 3. Installs OR-Tools when Python lacks it (the ender and the topper need it).
 # 4. Without a scoreboard.json: restores the campaign from its
-#    agent/checkpoints/<id>/ on branch RESUME (written by agent/checkpoint.sh),
+#    agent/checkpoints/<id>/ on branch RESUME (the results branch, agent_runs,
+#    that agent/checkpoint.sh publishes to),
 #    or starts a fresh one from data/best_465.csv. FRESH_CLOCK=1 gives a
 #    restored campaign a new budget.
 # 5. Writes this machine's facts into scoreboard.json (cpu, arch, threads,

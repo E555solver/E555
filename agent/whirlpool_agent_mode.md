@@ -40,7 +40,8 @@ side. Your job, on this machine:
    of the budget, finding more jewels. Dive and polish them into complete
    boards, and keep the best-scoring ones.
 3. **Report.** Explain every change that worked, in plain language, in the
-   campaign's `README.md`, and push it all to the session's branch.
+   campaign's `README.md`, and push it all to the shared results branch
+   (`agent_runs`; the launcher, "The results branch").
 
 A board above 465 (the repository's best, `data/best_465.csv`) would be a
 record. It would be welcome, but it is not the goal.
@@ -194,8 +195,9 @@ naive on purpose and finds no jewel, because its frame breaks at `s2`.
    any file over 50 MB, and any commit that takes the folder's history over
    100 MB.
 5. **No clues.** Leave the clue flags off.
-6. **Git:** see the launcher. Only `setup.sh` and `checkpoint.sh` write. Never
-   push to `main`.
+6. **Git:** see the launcher. Only `setup.sh` and `checkpoint.sh` write, and
+   the only push is `checkpoint.sh`'s, to the results branch. Never push to
+   `main` or to the session's branch.
 7. **Report honestly.** Report what failed as well as what worked. A setting
    you did not measure is labelled as such.
 
