@@ -28,6 +28,8 @@ sweep_checkpoint.txt
 *.status.csv
 runs/
 agent/labs/
+# whirlpool campaigns: the lab inside each campaign folder
+agent/whirlpool/*/lab/
 under_development/
 old/
 .claude/
