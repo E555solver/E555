@@ -80,3 +80,10 @@
 - vs v07 74: +9 < 2*sqrt(157) = 25, not significant; the direction matches the sweep. From here: production with v08 (3 h of budget left after dives), dives between runs.
 - Dive round 3: 83 jewels (249 boards) in 43 s; reopen top 16 (52 s): best still 461.
 - 12:05 production 1 (v08): run=r20261028-105623 jewels=96 per_hour=95.87 
+
+## Machine (for the README; the user asked for it to extrapolate to bigger workstations)
+- Cloud VM: "Intel(R) Xeon(R) Processor @ 2.10GHz" (model name masked by the hypervisor), 4 vCPUs = 4 cores x 1 thread, 1 socket, L2 8 MiB (4 x 2 MiB), L3 260 MiB reported, 15 GB RAM, arch v3 build (-march x86-64-v3). Same CPU for the whole campaign (cpu_changed=no at every health check).
+- Scaling notes: a lap is one finalizer call whose time is the reduced-DB build (~8 s at band row 3 on these 4 cores, OpenMP); the band cut and the scripts ~1 s. Produce is ~10 s per 1500-5000 boards, so the whirl dominates; jewels/h should scale roughly with the DB build's thread scaling. Not measured beyond 4 threads.
+- ISA: AVX-512 (incl. FP16, BF16, VNNI) and AMX present -> Sapphire Rapids generation or newer; the 260 MiB L3 points to Emerald or Granite Rapids. Only 4 vCPUs of it, at 2.1 GHz nominal.
+- 13:06 production 2 (v08): run=r20261028-115642 jewels=94 per_hour=93.87 
+- Dive round 4: 190 jewels (570 boards) in 98 s; reopen top 16 (52 s): best still 461.
