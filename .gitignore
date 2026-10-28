@@ -33,6 +33,7 @@ agent/labs/
 # checkpoint scripts, never committed with the code
 agent/checkpoints/
 agent/whirlpool/[0-9]*/
+agent/explorer/[0-9]*/
 under_development/
 old/
 .claude/
