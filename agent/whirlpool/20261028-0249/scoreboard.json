@@ -1,11 +1,26 @@
 {
  "kit": "whirlpool",
  "goal_start_unix": 1793155822,
- "last_checkpoint_unix": null,
- "best": null,
- "best_unix": null,
- "harness_runs": 0,
- "candidates": {},
+ "last_checkpoint_unix": 1793155825,
+ "best": "v00_baseline@aa1982a8+none",
+ "best_unix": 1793157985,
+ "harness_runs": 1,
+ "candidates": {
+  "v00_baseline@aa1982a8+none": {
+   "file": "candidates/v00_baseline.sh",
+   "sha": "aa1982a8",
+   "patches": "none",
+   "runs": 1,
+   "minutes": 30.7,
+   "attempts": 31,
+   "laps1": 30,
+   "laps2": 7,
+   "laps3": 2,
+   "frame_held": 0,
+   "jewels": 0,
+   "depth_max": 0
+  }
+ },
  "best_dived": null,
  "campaign": "20261028-0249",
  "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
@@ -21,5 +36,6 @@
   "PLATEAU": "2h",
   "CHECKPOINT": "30m"
  },
- "results_branch": "agent_runs"
+ "results_branch": "agent_runs",
+ "wakeup_trigger_id": "trig_01V9B7FYbZdtwh6ctsBiJCEr"
 }

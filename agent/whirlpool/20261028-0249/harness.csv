@@ -1,1 +1,2 @@
 unix,iso,run,candidate,sha,patches,minutes,standard,produced,attempted,laps1,laps2,laps3,frame_held,jewels,archived,per_hour,depth_max,cpu,threads,note
+1793157985,2026-10-28T03:26:25Z,r20261028-025542,v00_baseline@aa1982a8+none,aa1982a8,none,30.7,yes,16087,31,30,7,2,0,0,66,0.00,,Intel(R) Xeon(R) Processor @ 2.10GHz,4,baseline: current runner unchanged
