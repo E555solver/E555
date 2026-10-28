@@ -1,12 +1,12 @@
 #!/bin/bash
 # harness.sh -- run a whirlpool candidate and score it, for the whirlpool kit
 # (agent/whirlpool_agent_mode.md, section 3). The only source of a campaign's
-# results: it alone writes jewels.csv, jewel_index.csv, attempts.csv,
+# results: it alone writes whirlpools/, whirlpool_index.csv, attempts.csv,
 # harness.csv and the candidates' totals in scoreboard.json. Run it from the
 # campaign's lab, agent/whirlpool/<id>/lab/.
 #
 #   bash ../../harness.sh CANDIDATE=../candidates/v03_keep_ring.sh MINUTES=60 NOTE="ring held from lap 2"
-#   HARNESS run=r20261027-201500 candidate=v03_keep_ring@1a2b3c4d+none minutes=60.4 standard=yes produced=812 attempted=19 funnel=lap1:15/lap2:9/lap3:6 frame_held=4 jewels=3 per_hour=3.0 depth_max=11 ...
+#   HARNESS run=r20261027-201500 candidate=v03_keep_ring@1a2b3c4d+none minutes=60.4 standard=yes produced=812 attempted=19 funnel=lap1:15/lap2:9/lap3:6 frame_held=4 jewels=3 archived=7 per_hour=3.0 depth_max=11 ...
 #
 # The loop, until MINUTES of wall time have passed:
 #   produce  when the queue is empty: CANDIDATE MODE=produce writes beamer
@@ -16,8 +16,12 @@
 #   whirl    the next queued board: CANDIDATE MODE=whirl INPUT=<that board>
 #            appends chains to OUT as its laps complete. Killed after CAP
 #            seconds, or once its run directory passes DISK_CAP_MB. The judge
-#            then scores the chains; a jewel whose frame is new to the campaign
-#            goes to jewels.csv and jewel_index.csv.
+#            then scores the chains and archives every completed whirlpool
+#            (3 laps, jewel or not) as it was grown, before any dive:
+#            whirlpools/<run>.csv.gz gets its four boards, appended after each
+#            attempt, and whirlpool_index.csv a line. A jewel counts only when
+#            its frame is new to the campaign (frames_seen.txt). A run's file is
+#            never written again once the run ends, so git keeps each jewel once.
 # The candidate is called with NAME=value settings (the contract, kit section 3):
 #   MODE=produce REPO=<lab> SEED=<lab>/data/seed_Edge5.txt RUN_DIR=<dir> THREADS=<n>
 #                RNG_SEED=<s> DB_FILE=<lab>/E555.db or empty TIME_LIMIT=<PRODUCE_CAP> OUT=<dir>/queue.csv
@@ -118,7 +122,7 @@ db_ok=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("db
 [ "$db_ok" = True ] && DB="$LAB/E555.db"
 RUNID=r$(date -u +%Y%m%d-%H%M%S)
 RUN="$LAB/harness/$RUNID"
-mkdir -p "$RUN"
+mkdir -p "$RUN" "$DIR/whirlpools"
 TOTALS="$RUN/totals.json"
 echo '{"produced": 0, "attempted": 0, "laps1": 0, "laps2": 0, "laps3": 0, "frame_held": 0, "jewels": 0, "depth_max": 0, "produce_s": 0}' > "$TOTALS"
 echo "[harness] run=$RUNID candidate=$KEY minutes=$MINUTES cap=$CAP threads=$THREADS db_file=${DB:-<in memory>} standard=$standard"
@@ -220,10 +224,10 @@ EOF
     elif [ "$RC" != 0 ]; then exit_kind=error; fi
     [ -f "$A/chains.csv" ] || : > "$A/chains.csv"
     if ! "${JUDGE[@]}" "$A/chains.csv" --input "$A/board.csv" --frames_seen "$DIR/frames_seen.txt" \
-            --jewels_out "$DIR/jewels.csv" --id_prefix "$RUNID-a$natt-" \
+            --whirls_out "$DIR/whirlpools/$RUNID.csv.gz" --id_prefix "$RUNID-a$natt-" \
             --mark_seen "$DIR/seen_boards.txt" > "$A/judge.txt" 2> "$A/judge.err"; then
         echo "[harness] the judge failed on attempt $natt (see $A/judge.err); it counts as nothing"
-        echo "JUDGE chains=0 best_laps=0 laps1=0 laps2=0 laps3=0 frame_held=0 jewels=0 new_frames=0 first_jewel_line=0" > "$A/judge.txt"
+        echo "JUDGE chains=0 best_laps=0 laps1=0 laps2=0 laps3=0 frame_held=0 jewels=0 new_frames=0 archived=0 first_jewel_line=0" > "$A/judge.txt"
     fi
     python3 - "$TOTALS" "$A" "$DIR" "$RUNID" "$natt" "$KEY" "$board_id" "$SECS" "$exit_kind" <<'EOF'
 import csv, json, sys, time
@@ -243,15 +247,17 @@ now = int(time.time())
 new = [c for c in chains if c.get("new") == "yes"]
 depth = max((int(c["depth"]) for c in new), default=0)
 first = min((when(int(c["line"])) for c in chains if c["jewel"] == "yes"), default="")
-with open(f"{d}/jewel_index.csv", "a", newline="") as fh:
+archived = [c for c in chains if c.get("archived") == "yes"]
+with open(f"{d}/whirlpool_index.csv", "a", newline="") as fh:
     w = csv.writer(fh, lineterminator="\n")
-    for c in new:
-        w.writerow([f"{run}-a{n}-{c['tag']}", c["frame_id"], c["depth"], c["depths"].replace(",", " "),
-                    c["dir"], key, run, n, when(int(c["line"])), now])
+    for c in archived:
+        w.writerow([f"{run}-a{n}-{c['tag']}", c["laps"], c["jewel"], c["frame"], c.get("frame_id", ""),
+                    c.get("new", ""), c["depth"], c["depths"].replace(",", " "), c["dir"], key, run, n,
+                    when(int(c["line"])), now])
 with open(f"{d}/attempts.csv", "a", newline="") as fh:
     csv.writer(fh, lineterminator="\n").writerow(
         [now, run, n, key, board, secs, kind, judge["chains"], best["laps"], best["frame"],
-         judge["jewels"], len(new), first, depth or ""])
+         judge["jewels"], len(new), len(archived), first, depth or ""])
 t = json.load(open(totals))
 t["attempted"] += 1
 laps = int(judge["best_laps"])
@@ -259,10 +265,12 @@ for k in (1, 2, 3):
     t[f"laps{k}"] += laps >= k
 t["frame_held"] += int(judge["frame_held"]) > 0
 t["jewels"] += len(new)
+t["archived"] = t.get("archived", 0) + len(archived)
 t["depth_max"] = max(t["depth_max"], depth)
 json.dump(t, open(totals, "w"))
 print(f"ATTEMPT n={n} board={board} seconds={secs} exit={kind} chains={judge['chains']} "
-      f"laps={best['laps']} frame={best['frame']} jewels={judge['jewels']} new={len(new)}"
+      f"laps={best['laps']} frame={best['frame']} jewels={judge['jewels']} new={len(new)} "
+      f"archived={len(archived)}"
       + (f" first_jewel_s={first}" if first != "" else "")
       + (f" reason={best['reason']}" if best.get("reason") else ""))
 EOF
@@ -283,7 +291,8 @@ cpu = s.get("cpu", "")
 with open(f"{d}/harness.csv", "a", newline="") as fh:
     csv.writer(fh, lineterminator="\n").writerow(
         [now, iso, run, key, sha, patches, f"{minutes:.1f}", standard, t["produced"], t["attempted"],
-         t["laps1"], t["laps2"], t["laps3"], t["frame_held"], t["jewels"], f"{per_hour:.2f}",
+         t["laps1"], t["laps2"], t["laps3"], t["frame_held"], t["jewels"], t.get("archived", 0),
+         f"{per_hour:.2f}",
          t["depth_max"] or "", cpu, threads, note])
 with open(f"{d}/runs.csv", "a", newline="") as fh:
     csv.writer(fh, lineterminator="\n").writerow([now, iso, "harness", f"{run} {key}", wall, 0])
@@ -310,10 +319,10 @@ if standard == "yes":
         if best != s.get("best"):
             s["best"], s["best_unix"] = best, now
 json.dump(s, open(f"{d}/scoreboard.json", "w"), indent=1)
-a = max(t["attempted"], 1)
 print(f"HARNESS run={run} candidate={key} minutes={minutes:.1f} standard={standard} "
       f"produced={t['produced']} attempted={t['attempted']} "
       f"funnel=lap1:{t['laps1']}/lap2:{t['laps2']}/lap3:{t['laps3']} frame_held={t['frame_held']} "
-      f"jewels={t['jewels']} per_hour={per_hour:.2f} depth_max={t['depth_max'] or '-'} "
+      f"jewels={t['jewels']} archived={t.get('archived', 0)} per_hour={per_hour:.2f} "
+      f"depth_max={t['depth_max'] or '-'} "
       f"produce_share={100 * t['produce_s'] / max(wall, 1):.0f}% cap={cap} best={s.get('best') or 'none'}")
 EOF

@@ -1,7 +1,7 @@
 #!/bin/bash
 # status.sh -- the STATUS line of a whirlpool campaign
 # (agent/launch_whirlpool_agent.md), from its scoreboard.json, runs.csv,
-# frames_seen.txt, jewel_index.csv and best_boards.csv. Run it from the
+# frames_seen.txt, whirlpool_index.csv and best_boards.csv. Run it from the
 # campaign's lab, agent/whirlpool/<id>/lab/.
 # The clocks count run time, the runtime_s column of runs.csv (harness.sh and
 # timed.sh write it), not wall time: a usage-limit wait, a replaced container
@@ -105,11 +105,12 @@ else:
 frames = [l for l in (d / "frames_seen.txt").read_text().split() if l] \
     if (d / "frames_seen.txt").exists() else []
 depth = 0
-if (d / "jewel_index.csv").exists():
-    with open(d / "jewel_index.csv", newline="") as f:
+if (d / "whirlpool_index.csv").exists():
+    with open(d / "whirlpool_index.csv", newline="") as f:
         for row in csv.DictReader(f):
             try:
-                depth = max(depth, int(row["depth"]))
+                if row["jewel"] == "yes":
+                    depth = max(depth, int(row["depth"]))
             except (KeyError, TypeError, ValueError):
                 pass
 stop = "budget" if run_time >= budget else "none"
