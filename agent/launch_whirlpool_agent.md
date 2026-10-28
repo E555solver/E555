@@ -72,7 +72,9 @@ that is fine.
 - `README.md`: what changed and why, in plain language, with the measurements;
 - `run_pipeline_whirlpool.sh`: the improved runner;
 - `patches/`: any source changes it needs;
-- `jewels.csv`: every jewel found;
+- `whirlpools/*.csv.gz`: every board that completed the whirlpool, as it was
+  grown and before any dive, compressed (`zcat` reads them), with one line per
+  chain in `whirlpool_index.csv` (`jewel=yes` marks the jewels);
 - `best_boards.csv`: the best complete boards. Check them with
   `bash agent/referee.sh FILE`.
 
@@ -189,14 +191,14 @@ minutes at most. Always pass it a timeout.
     tool timeout at 600000.
   - Longer: in the background, as for a harness run.
 - **Lost runs.** A container restart kills runs, background ones included. A
-  harness run that died leaves its attempts in `attempts.csv` and its jewels in
-  `jewels.csv`, but no `harness.csv` row; its minutes are not counted. Journal
-  it and run again.
+  harness run that died leaves its attempts in `attempts.csv` and its
+  completed whirlpools in `whirlpools/`, but no `harness.csv` row; its minutes
+  are not counted. Journal it and run again.
 
 ### Checkpoints
 
 Unless `CHECKPOINT=off`, run `cd <LAB> && bash ../../checkpoint.sh`:
-- after every harness run;
+- after every harness run, so that its whirlpools are pushed;
 - after a new best candidate, a new patch, or a record;
 - when the STATUS line shows `checkpoint=...(due)`;
 - after writing README.md.
@@ -209,6 +211,10 @@ pass them as arguments: each argument becomes one paragraph of the message.
   file over 50 MB, or more than 100 MB of history. Fix that before anything
   else: restore the outside file, or shrink or delete the large one. Never
   commit around it.
+- Never delete or shrink anything in `whirlpools/`, not even to get a
+  checkpoint through. If the archive itself is what is too large, set
+  `CHECKPOINT=off`, journal it, and tell the user at once: the jewels are then
+  only in this container.
 
 ### Usage limits
 

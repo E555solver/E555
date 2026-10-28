@@ -9,7 +9,7 @@ to check a file.
 
     python3 judge.py --boards queue.csv [--seen F] [--good_out F]
     python3 judge.py chains.csv --input board.csv [--frames_seen F]
-                     [--jewels_out F] [--id_prefix P] [--mark_seen F]
+                     [--whirls_out F.csv.gz] [--id_prefix P] [--mark_seen F]
     python3 judge.py --self_test
 
 BEAMER BOARD (--boards): exactly matched, every piece legal on its cell (grey
@@ -36,16 +36,21 @@ R(k) = s(k) turned (k-1)(4-d) quarter turns:
              beyond from all four sides. depth = the lowest of the four depths,
              a board's depth being the highest row r with rows 0..r complete.
 The direction is whichever of 1 and 3 explains the chain best. One line per tag:
-    CHAIN tag=t1 laps=3 frame=held jewel=yes dir=1 depth=10 depths=10,10,11,10 kept=50,48,52 frame_id=3f2a... new=yes line=12
+    CHAIN tag=t1 laps=3 frame=held jewel=yes dir=1 depth=10 depths=10,10,11,10 kept=50,48,52 frame_id=3f2a... new=yes archived=yes line=12
     CHAIN tag=t2 laps=1 frame=incomplete:s2 jewel=no dir=1 ... reason=s3:breaks=2
-    JUDGE chains=2 best_laps=3 laps1=2 laps2=1 laps3=1 frame_held=1 jewels=1 new_frames=1 first_jewel_line=12
+    JUDGE chains=2 best_laps=3 laps1=2 laps2=1 laps3=1 frame_held=1 jewels=1 new_frames=1 archived=1 first_jewel_line=12
 line is the file line of the chain's last row, which the harness maps to a
 time. frame_id is the frame's hash, the same whichever way the board is turned.
 --frames_seen F counts a jewel as new only if its frame_id is not in F, and
-appends the new ones; --jewels_out F appends each new jewel's four boards with
-ids <id_prefix><tag>_s<k> and their matched-edge count as the score;
---mark_seen F appends the input board's hash (the harness's record of what it
-has whirled).
+appends the new ones. --mark_seen F appends the input board's hash (the
+harness's record of what it has whirled).
+--whirls_out F archives the completed whirlpools, as they were grown, before
+any dive: the four boards of every chain with 3 laps, jewel or not, with ids
+<id_prefix><tag>_s<k> and their matched-edge count as the score. Every new-frame
+jewel is archived; of the other completed chains, at most --archive_max (50)
+per call, jewels first, so a candidate that writes thousands of chains cannot
+flood the campaign's history. A name ending in .gz is written gzip-compressed,
+one gzip member per call appended to the file (zcat reads them all).
 
 Exit status 0, also when nothing passes; 2 on bad usage or an unreadable file.
 """
@@ -53,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import hashlib
 import re
 import sys
@@ -242,6 +248,16 @@ def write_board(writer, cid, pos, rot, seed):
     writer.writerow([cid, score_of(pos, rot, seed)] + [str(v) for v in pos + rot])
 
 
+def archive(path, prefix, chains, seed):
+    """Append the four boards of each (tag, boards) to path, gzip if .gz."""
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "at", newline="") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        for tag, boards in chains:
+            for k in range(1, 5):
+                write_board(w, f"{prefix}{tag}_s{k}", *boards[k], seed)
+
+
 def run_chains(args, seed):
     inputs = {board_hash(pos, rot) for _i, _c, _s, pos, rot in V.iter_records(args.input)}
     if not inputs:
@@ -250,7 +266,7 @@ def run_chains(args, seed):
     seen = read_lines(args.frames_seen) if args.frames_seen else set()
     counts = dict(chains=0, laps1=0, laps2=0, laps3=0, frame_held=0, jewels=0, new_frames=0)
     best_laps, first_jewel = 0, 0
-    new_frames, jewel_rows = [], []
+    new_frames, results = [], []
     for tag in sorted(tags, key=lambda t: last[t]):
         v = judge_chain(tags[tag], seed, inputs)
         if tag in faults:
@@ -260,35 +276,41 @@ def run_chains(args, seed):
             counts[f"laps{n}"] += v["laps"] >= n
         counts["frame_held"] += v["laps"] >= 1 and v["frame"] == "held"
         best_laps = max(best_laps, v["laps"])
-        new = ""
+        v["new"] = ""
         if v["jewel"]:
             counts["jewels"] += 1
             first_jewel = first_jewel or last[tag]
-            new = "no" if v["frame_id"] in seen else "yes"
-            if new == "yes":
+            v["new"] = "no" if v["frame_id"] in seen else "yes"
+            if v["new"] == "yes":
                 seen.add(v["frame_id"])
                 new_frames.append(v["frame_id"])
                 counts["new_frames"] += 1
-                jewel_rows.append((tag, v))
+        results.append((tag, v))
+    # the archive: every new-frame jewel, then up to --archive_max other
+    # completed chains, the jewels among them first
+    done = {t: v for t, v in results if v["laps"] == 3}
+    keep = {t for t, v in done.items() if v["new"] == "yes"}
+    others = sorted((t for t in done if t not in keep), key=lambda t: not done[t]["jewel"])
+    keep.update(others[:args.archive_max])
+    for tag, v in results:
         depth = min(v["depths"]) if v["jewel"] else ""
         line = (f"CHAIN tag={tag} laps={v['laps']} frame={v['frame']} "
                 f"jewel={'yes' if v['jewel'] else 'no'} dir={v['dir']} depth={depth} "
                 f"depths={','.join(map(str, v['depths']))} kept={','.join(map(str, v['kept']))}")
         if v["jewel"]:
-            line += f" frame_id={v['frame_id']} new={new}"
+            line += f" frame_id={v['frame_id']} new={v['new']}"
+        if v["laps"] == 3:
+            line += f" archived={'yes' if args.whirls_out and tag in keep else 'no'}"
         line += f" line={last[tag]}"
         if v["reason"]:
             line += f" reason={v['reason']}"
         print(line)
+    archived = [(t, tags[t]) for t, _v in results if t in keep] if args.whirls_out else []
+    if archived:
+        archive(args.whirls_out, args.id_prefix, archived, seed)
     if args.frames_seen and new_frames:
         with open(args.frames_seen, "a") as fh:
             fh.writelines(f + "\n" for f in new_frames)
-    if args.jewels_out and jewel_rows:
-        with open(args.jewels_out, "a", newline="") as fh:
-            w = csv.writer(fh, lineterminator="\n")
-            for tag, _v in jewel_rows:
-                for k in range(1, 5):
-                    write_board(w, f"{args.id_prefix}{tag}_s{k}", *tags[tag][k], seed)
     if args.mark_seen:
         with open(args.mark_seen, "a") as fh:
             fh.writelines(h + "\n" for h in sorted(inputs))
@@ -296,7 +318,7 @@ def run_chains(args, seed):
           ("best_laps", best_laps), ("laps1", counts["laps1"]), ("laps2", counts["laps2"]),
           ("laps3", counts["laps3"]), ("frame_held", counts["frame_held"]),
           ("jewels", counts["jewels"]), ("new_frames", counts["new_frames"]),
-          ("first_jewel_line", first_jewel)]))
+          ("archived", len(archived)), ("first_jewel_line", first_jewel)]))
 
 
 # -- queued boards ------------------------------------------------------------
@@ -420,8 +442,53 @@ def self_test():
         print(f"{'ok  ' if got == want else 'FAIL'} queue board: {got or 'valid'} (want {want or 'valid'})")
         if got != want:
             fails.append(f"queue {want}")
+    fails += archive_test(seed, s1, good, lap_board, right_top)
     print(f"SELF_TEST {'passed' if not fails else 'FAILED: ' + ', '.join(fails)}")
     return 1 if fails else 0
+
+
+def archive_test(seed, s1, good, lap_board, right_top):
+    """run_chains end to end: what --whirls_out keeps, compressed, across calls."""
+    import contextlib, io, tempfile
+    fails = []
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        rows = {"j1": good, "j2": good, "n1": {**good, 2: lap_board(1, drop=right_top)},
+                "p1": {k: good[k] for k in (1, 2, 3)}}
+        with open(tmp / "chains.csv", "w", newline="") as fh:
+            w = csv.writer(fh, lineterminator="\n")
+            for tag, chain in rows.items():
+                for k, (pos, rot) in chain.items():
+                    w.writerow([f"{tag}_s{k}", 0] + pos + rot)
+        with open(tmp / "board.csv", "w", newline="") as fh:
+            csv.writer(fh, lineterminator="\n").writerow(["b", 0] + s1[0] + s1[1])
+
+        def call(frames, cap, prefix):
+            a = argparse.Namespace(chains=str(tmp / "chains.csv"), input=str(tmp / "board.csv"),
+                                   frames_seen=str(tmp / frames), whirls_out=str(tmp / "w.csv.gz"),
+                                   archive_max=cap, id_prefix=prefix, mark_seen=None)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                run_chains(a, seed)
+            return out.getvalue()
+
+        def stored():
+            with gzip.open(tmp / "w.csv.gz", "rt") as fh:
+                return [V.parse_row(r)[0] for r in csv.reader(fh)]
+
+        cases = [("all completed chains archived, the 2-lap one not", "f1.txt", 50, "A-",
+                  ["A-j1", "A-j2", "A-n1"]),
+                 ("a known frame and a cap of 0 archive nothing", "f1.txt", 0, "B-", []),
+                 ("a cap of 0 still archives a new-frame jewel", "f2.txt", 0, "C-", ["C-j1"])]
+        seen = []
+        for name, frames, cap, prefix, want in cases:
+            text = call(frames, cap, prefix)
+            seen += [f"{t}_s{k}" for t in want for k in range(1, 5)]
+            ok = stored() == seen and f"archived={len(want)}" in text
+            print(f"{'ok  ' if ok else 'FAIL'} archive: {name} ({len(stored())} rows in w.csv.gz)")
+            if not ok:
+                fails.append(f"archive: {name}")
+    return fails
 
 
 def main():
@@ -433,8 +500,10 @@ def main():
     ap.add_argument("--seen", help="--boards: drop the boards whose hash is in this file")
     ap.add_argument("--good_out", help="--boards: write the boards that pass here")
     ap.add_argument("--frames_seen", help="frame ids already counted; new ones are appended")
-    ap.add_argument("--jewels_out", help="append each new jewel's four boards here")
-    ap.add_argument("--id_prefix", default="", help="prefix for the ids written to --jewels_out")
+    ap.add_argument("--whirls_out", help="archive the completed whirlpools here (.gz: compressed)")
+    ap.add_argument("--archive_max", type=int, default=50,
+                    help="completed chains archived per call besides the new-frame jewels")
+    ap.add_argument("--id_prefix", default="", help="prefix for the ids written to --whirls_out")
     ap.add_argument("--mark_seen", help="append the input board's hash here")
     ap.add_argument("--seed_file", default=str(REPO / "data" / "seed_Edge5.txt"))
     ap.add_argument("--self_test", action="store_true", help="run the built-in checks")

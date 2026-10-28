@@ -113,13 +113,13 @@ JSON
     fi
 fi
 cd "$DIR"
-mkdir -p candidates patches
+mkdir -p candidates patches whirlpools
 [ -f JOURNAL.md ] || printf '# Journal, whirlpool campaign %s\n\n' "$CAMPAIGN" > JOURNAL.md
 [ -f runs.csv ] || printf 'unix,iso,kind,label,runtime_s,exit\n' > runs.csv
-[ -f harness.csv ] || printf 'unix,iso,run,candidate,sha,patches,minutes,standard,produced,attempted,laps1,laps2,laps3,frame_held,jewels,per_hour,depth_max,cpu,threads,note\n' > harness.csv
-[ -f attempts.csv ] || printf 'unix,run,attempt,candidate,board,seconds,exit,chains,laps,frame,jewels,new,first_jewel_s,depth\n' > attempts.csv
-for f in jewels.csv jewel_index.csv seen_boards.txt frames_seen.txt; do [ -f "$f" ] || : > "$f"; done
-[ -s jewel_index.csv ] || printf 'jewel,frame_id,depth,depths,dir,candidate,run,attempt,seconds,unix\n' > jewel_index.csv
+[ -f harness.csv ] || printf 'unix,iso,run,candidate,sha,patches,minutes,standard,produced,attempted,laps1,laps2,laps3,frame_held,jewels,archived,per_hour,depth_max,cpu,threads,note\n' > harness.csv
+[ -f attempts.csv ] || printf 'unix,run,attempt,candidate,board,seconds,exit,chains,laps,frame,jewels,new,archived,first_jewel_s,depth\n' > attempts.csv
+for f in seen_boards.txt frames_seen.txt; do [ -f "$f" ] || : > "$f"; done
+[ -f whirlpool_index.csv ] || printf 'chain,laps,jewel,frame,frame_id,new_frame,depth,depths,dir,candidate,run,attempt,seconds,unix\n' > whirlpool_index.csv
 
 # 2. the lab and the patches over it
 lab=kept

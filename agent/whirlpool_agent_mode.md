@@ -103,8 +103,12 @@ wall time:
    has never whirled. A produce call is killed after `PRODUCE_CAP` (600 s).
 2. **whirl.** It calls `MODE=whirl` on the next queued board. The candidate
    appends chain rows to `OUT` as each lap completes. A whirl is killed at
-   `CAP` = 180 s. The judge then scores the chains, and each jewel with a new
-   frame goes to `jewels.csv` and `jewel_index.csv`.
+   `CAP` = 180 s. The judge then scores the chains. It **archives** every
+   completed whirlpool, as it was grown and before any dive: a chain with 3
+   laps, jewel or not, frame held or not. Its four boards go to
+   `whirlpools/<run>.csv.gz`, and one line to `whirlpool_index.csv`. A jewel
+   counts towards the score only when its frame is new to the campaign; it is
+   archived either way.
 3. **Summary.** At the end it prints the `HARNESS` line, appends one row to
    `harness.csv`, and updates the candidate's totals and the campaign's best
    in `scoreboard.json`.
@@ -136,7 +140,7 @@ naive on purpose and finds no jewel, because its frame breaks at `s2`.
   They may also read data files in `candidates/` (a screening table you
   derived, for example). Those files are part of the candidate: never change
   them after its first run; make a new version instead. Never read earlier
-  results such as `jewels.csv` or old attempts.
+  results such as `whirlpools/` or old attempts.
 
 **Rules the harness enforces:**
 - The candidate must live in `candidates/` (or be `run_pipeline_whirlpool.sh`).
@@ -177,13 +181,14 @@ naive on purpose and finds no jewel, because its frame breaks at `s2`.
    - After a patch, run the lab's own checks for the tools it touches, for
      example `ARCH=<arch> bash tests/run_tests.sh finalizer` from the lab.
 3. **Results come from the harness alone.** Never edit any of these by hand:
-   - `jewels.csv`, `jewel_index.csv`, `attempts.csv`, `harness.csv`;
+   - `whirlpools/`, `whirlpool_index.csv`, `attempts.csv`, `harness.csv`;
    - `seen_boards.txt`, `frames_seen.txt`;
    - `best`, `candidates` and `harness_runs` in `scoreboard.json`.
 
-   A candidate file never changes after its first harness run; a new idea is a
-   new file, `candidates/vNN_<name>.sh`. Every number in the README comes from
-   these files.
+   **Never delete or rewrite anything in `whirlpools/`:** it is the only copy
+   of the jewels as they were grown. A candidate file never changes after its
+   first harness run; a new idea is a new file, `candidates/vNN_<name>.sh`.
+   Every number in the README comes from these files.
 4. **Size.** The chain database `lab/E555.db` (6.4 GB) stays in the lab and is
    never committed; `*.db` and the lab are gitignored. `checkpoint.sh` refuses
    any file over 50 MB, and any commit that takes the folder's history over
@@ -376,9 +381,13 @@ Diving, polishing and scoring take at most 25% of the run time. Run them
 through `timed.sh`. Do them between harness runs, never during one.
 
 A jewel's `s2`, `s3` and `s4` boards each hold the full frame and 11 rows from
-one side, so the diver fills the rest (PROJECT_E555.md §9.2). From the lab:
+one side, so the diver fills the rest (PROJECT_E555.md §9.2). The archive is
+never touched: dive copies of it. `whirlpool_index.csv` says which chains are
+jewels (`jewel=yes`) and new (`new_frame=yes`). Dive those first, and the
+completed chains whose frame broke when there is time. From the lab, for the
+runs not dived yet:
 ```
-grep -E '_s[234],' ../jewels.csv > runs/to_dive.csv
+zcat ../whirlpools/<run>.csv.gz | grep -E '_s[234],' > runs/to_dive.csv
 bash ../../timed.sh "dive jewels" -- bin/E555_diver data/seed_Edge5.txt runs/to_dive.csv runs/dived.csv \
     --end_dive 10000 --end_polish 20000 --emit_score 0 --threads <T> --wall_time 900
 python3 tools/E555_rank.py runs/dived.csv --seed_file data/seed_Edge5.txt --top 8 --out runs/top.csv --rescore
@@ -413,7 +422,8 @@ commits all of it except `lab/`.
 | `JOURNAL.md` | you | dated notes: plans, findings, results with run ids, restores |
 | `best_boards.csv` | you, from the diver | the 20 best complete boards (section 8) |
 | `harness.csv`, `attempts.csv` | harness | one row per run, one per attempt |
-| `jewels.csv`, `jewel_index.csv` | harness | every new-frame jewel: its four boards; its frame, depths and source |
+| `whirlpools/<run>.csv.gz` | harness | **the archive**: the four boards of every completed whirlpool, as grown, before any dive. One gzip-compressed CSV per harness run, appended after each attempt and never written again; `zcat whirlpools/*.csv.gz` gives them all. Every new-frame jewel is kept, plus up to 50 other completed chains per attempt, jewels first |
+| `whirlpool_index.csv` | harness | one line per archived chain: `chain` (its boards are `<chain>_s1`..`_s4`), laps, jewel, frame, frame_id, new_frame, depth, depths, direction, candidate, run, attempt, seconds |
 | `seen_boards.txt`, `frames_seen.txt` | harness | hashes: boards already whirled, frames already counted |
 | `runs.csv` | harness, `timed.sh` | the run-time log the budget counts |
 | `scoreboard.json` | scripts | settings, clocks, machine, candidates' totals, the best |
