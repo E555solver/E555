@@ -1,7 +1,7 @@
 {
  "kit": "whirlpool",
  "goal_start_unix": 1793155822,
- "last_checkpoint_unix": 1793176839,
+ "last_checkpoint_unix": 1793180495,
  "best": "v07_nosort@ea8eb1b0+c3b1573d",
  "best_unix": 1793180469,
  "harness_runs": 7,
@@ -110,7 +110,7 @@
  "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
  "arch": "v3",
  "threads": 4,
- "ram_gb": 14,
+ "ram_gb": 13,
  "disk_gb": 23,
  "stage_b_ok": true,
  "db_on_disk": true,

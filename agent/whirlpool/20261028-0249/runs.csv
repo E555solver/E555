@@ -25,3 +25,8 @@ unix,iso,kind,label,runtime_s,exit
 1793176749,2026-10-28T08:39:09Z,timed,finalizer checks generic,155.6,0
 1793176826,2026-10-28T08:40:26Z,timed,test v07 whirl,29.2,0
 1793180469,2026-10-28T09:41:09Z,harness,r20261028-084040 v07_nosort@ea8eb1b0+c3b1573d,3629,0
+1793180550,2026-10-28T09:42:30Z,timed,dive jewels round 2,54.7,0
+1793180612,2026-10-28T09:43:32Z,timed,reopen top 16 round 2,54.6,0
+1793180648,2026-10-28T09:44:08Z,timed,profile v07 whirl,29.4,0
+1793181195,2026-10-28T09:53:15Z,timed,nosort cut sweep,535.1,0
+1793181244,2026-10-28T09:54:04Z,timed,test v08 whirl,21.6,0

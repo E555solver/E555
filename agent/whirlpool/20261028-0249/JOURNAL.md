@@ -69,3 +69,9 @@
 ## 09:45 v07 (run r20261028-084040, 60.5 min, patch c3b1573d): 74 jewels, 73.4/h, funnel lap1 85/152, lap2 78, lap3 75 -> new best
 - vs v06 31 jewels in 61.2 min: 74 - 31 = 43 > 2*sqrt(105) = 20.5, significant.
 - 75 three-lap chains at 39 s mean; 21 failures cost 609 s; 56 boards end in ~1 s.
+
+## 10:05 dive round 2 and cut sweep without the sort
+- Dive round 2: 105 new jewels (315 boards) dived in 55 s, best 458; reopen top 16 of both rounds (8 rounds, 55 s): 461. best_boards.csv REFEREE VALID 461 (r20261028-072750-a47-t4_s3).
+- v07 profile: a 29 s jewel is three finalizer calls of ~9-10 s, each ~8 s of DB build; the rest of the script ~1 s.
+- Cuts with --no_fanout_sort: lap 1 (16 fresh boards) 3:4 14/16 13.6 s, 4:3 8/16 8.6 s, 5:2 1/16 7.8 s; lap 2 (10 s2 boards of v07 jewels) 3:4 9/10 13.2 s, 4:3 7/10 7.8 s, 5:2 2/10 6.3 s.
+- v08 = v07 + laps 2-3 try 4:3 then 3:4. Test board: jewel at 21.6 s (v07 29 s).
