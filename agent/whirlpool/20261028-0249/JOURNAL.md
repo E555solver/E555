@@ -75,3 +75,6 @@
 - v07 profile: a 29 s jewel is three finalizer calls of ~9-10 s, each ~8 s of DB build; the rest of the script ~1 s.
 - Cuts with --no_fanout_sort: lap 1 (16 fresh boards) 3:4 14/16 13.6 s, 4:3 8/16 8.6 s, 5:2 1/16 7.8 s; lap 2 (10 s2 boards of v07 jewels) 3:4 9/10 13.2 s, 4:3 7/10 7.8 s, 5:2 2/10 6.3 s.
 - v08 = v07 + laps 2-3 try 4:3 then 3:4. Test board: jewel at 21.6 s (v07 29 s).
+
+## 11:00 v08 (run r20261028-095414, 60.1 min): 83 jewels, 82.9/h, funnel lap1 93/159, lap2 86, lap3 83 -> new best (harness rule)
+- vs v07 74: +9 < 2*sqrt(157) = 25, not significant; the direction matches the sweep. From here: production with v08 (3 h of budget left after dives), dives between runs.
