@@ -1,1 +1,13 @@
 unix,iso,family,tool,params,input,output,score,breaks,verdict,runtime_s,note
+1793219751,2026-10-28T20:35:51Z,F1,diver_reopen,REOPEN=auto+1 SPB=480 seed=101,frontier/frontier.csv,runs/20261028_202747_reopen/out.csv,465,15,VALID,480,465 root
+1793220251,2026-10-28T20:44:11Z,F4,beamer,BW=10000 BR=6 SR=11 ED=10000 EP=20000 seed=202 random_edges,none,runs/20261028_203600_beam/beam_completions_random_11.csv,461,19,VALID,480,first run built DB
+1793220740,2026-10-28T20:52:20Z,F1,diver_reopen,REOPEN=auto SPB=120 seed=303 4 diverse,runs/20261028_204416_reopen/roots.csv,runs/20261028_204416_reopen/out.csv,461,19,VALID,481,beam 202 roots
+1793221168,2026-10-28T20:59:28Z,F2,ender,deep btl=420 seed=404,frontier/frontier.csv,runs/20261028_205227_ender/out.csv,465,15,VALID,421,465 root
+1793221178,2026-10-28T20:59:38Z,F5,diver_rebuild,holes top:6 SR=11 ED=10000 EP=20000 wall=480 seed=505,runs/20261028_205938_rebuild/roots.csv,runs/20261028_205938_rebuild/out.csv,462,18,VALID,0,elite top4
+1793221673,2026-10-28T21:07:53Z,F1,diver_reopen,reopen auto/auto+1/top:5 alternating rounds plateau copies8 wall480 seed=606,elite#2(464),runs/20261028_205953_reopen/out.csv,464,16,VALID,480,464 rnd2027_w16
+1793221707,2026-10-28T21:08:27Z,F8,finalizer,from=7 SR=11 BTR=9 BW=50000 rep4 seed=707 (width 1),frontier/frontier.csv,runs/20261028_210812_final/beam_completions_finalized_11.csv,465,15,VALID,4,too constrained
+1793221741,2026-10-28T21:09:01Z,F8,finalizer,from=5 free_sides SR=11 BTR=9 BW=50000 rep20 seed=708,frontier/frontier.csv,runs/20261028_210827_final/beam_completions_finalized_11.csv,465,15,VALID,27,465 root
+1793222193,2026-10-28T21:16:33Z,F8,finalizer,from=3 free_sides SR=11 BTR=8 BW=100000 rep40 seed=709,frontier/frontier.csv,runs/20261028_210901_final/beam_completions_finalized_11.csv,457,23,VALID,446,465 root
+1793222692,2026-10-28T21:24:52Z,F4,beamer,BW=10000 BR=6 SR=11 ED=10000 EP=20000 seed=203,none,/home/user/E555/agent/labs/20261028-2026/runs/20261028_211648_beam/beam_completions_random_11.csv,463,17,VALID,480,
+1793223183,2026-10-28T21:33:03Z,F1,diver_reopen,REOPEN=auto SPB=60 seed=304 top8 agree0.9,runs/20261028_212459_reopen/roots.csv,runs/20261028_212459_reopen/out.csv,463,17,VALID,482,beam 203 roots
+1793223610,2026-10-28T21:40:10Z,F2,ender,deep btl=420 seed=405,runs/20261028_213309_ender/roots.csv,runs/20261028_213309_ender/out.csv,463,17,VALID,421,beam203 463

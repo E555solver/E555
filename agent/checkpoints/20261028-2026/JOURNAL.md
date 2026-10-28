@@ -1,0 +1,17 @@
+
+## 2026-10-28 20:27 UTC — bootstrap
+Settings: BUDGET=24h RUN_CAP=540 PLATEAU=24h/99 CHECKPOINT=30m RESULTS_BRANCH=agent_runs. Lab fresh, 4 threads, ortools yes, stage_b_ok, db_on_disk. First checkpoint 04f8377. Wake-up task trig_01CjgZWc4PiRcUCPFd5Au1dK (hourly at :27).
+
+## 20:28-21:00 — first sweep
+- F1 reopen auto+1, 480 s on the 465 (seed 101): 465 -> 465. Polished; no gain.
+- F4 beam BW=10000 BR=6 SR=11 ED=10000 EP=20000 seed 202, 480 s (built E555.db): 3866 boards, best 461, all one random border (rndb0l0).
+- F1 reopen auto 120 s x4 diverse roots from that beam (seed 303): 457->460, 459->460; best stays 461.
+- F2 ender deep 420 s on the 465 (seed 404): +0.
+Decision: the 465 is hard-polished. Next: F5 rebuild top:6 on the 465 and the 464s; more F4 seeds for new borders.
+
+## 21:00-21:40
+- F5 rebuild top:6 SR=11 on elite top 4 (seed 505): runs in 0.6 s, best 462 (all worse than inputs). Lifting 6 rows of polished boards loses.
+- F1 diver direct, alternating reopen auto/auto+1/top:5, --plateau, copies 8, 480 s on the 464 rnd2027_w16 (seed 606): 1194 rounds, +0.
+- F8 finalizer (new family: lock bottom of the 465, regrow): from=7 width 1 (one completion, 465 itself); from=5 --free_sides 20 repeats: 465 x20 (one near-duplicate alt p0r0l1), 463, 462; from=3 BW=100000 BTR=8: best 457. The 465's tail is not beaten from its own bottom.
+- F4 beam seed 203: 4316 boards, raw best 463 (rndb0l0). F1 reopen 60 s x8 distinct top boards: one 461->462 only. F2 ender deep 420 s on the 463: +0.
+Decision: beam boards come out polished; the gain source is new beams. Keep cycling F4 with new seeds; try wider beam / different BACKTRACK_ROW / STOP_ROW 12; F2 only on >=463.

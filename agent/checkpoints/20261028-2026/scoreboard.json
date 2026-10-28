@@ -6,11 +6,17 @@
  "best_breaks": 15,
  "best_source": "data/best_465.csv (shipped baseline)",
  "best_file": "frontier/frontier.csv",
- "total_runs": 0,
+ "total_runs": 12,
  "goal_start_unix": 1793219234,
  "last_best_unix": null,
- "last_checkpoint_unix": null,
- "families_since_best": [],
+ "last_checkpoint_unix": 1793219238,
+ "families_since_best": [
+  "F1",
+  "F4",
+  "F2",
+  "F5",
+  "F8"
+ ],
  "history": [],
  "campaign": "20261028-2026",
  "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
@@ -26,5 +32,6 @@
   "PLATEAU": "24h/99",
   "CHECKPOINT": "30m"
  },
- "results_branch": "agent_runs"
+ "results_branch": "agent_runs",
+ "wakeup_trigger_id": "trig_01CjgZWc4PiRcUCPFd5Au1dK"
 }
