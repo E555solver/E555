@@ -7,3 +7,4 @@ unix,iso,run,candidate,sha,patches,minutes,standard,produced,attempted,laps1,lap
 1793176145,2026-10-28T08:29:05Z,r20261028-072750,v06_spread@782cfe5b+none,782cfe5b,none,61.2,yes,1543,53,33,32,31,33,31,31,30.37,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,"v05 + produce one board per frame signature, shuffled"
 1793180469,2026-10-28T09:41:09Z,r20261028-084040,v07_nosort@ea8eb1b0+c3b1573d,ea8eb1b0,c3b1573d,60.5,yes,1723,152,85,78,75,85,74,75,73.41,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,v06 + finalizer --no_fanout_sort (patch)
 1793184859,2026-10-28T10:54:19Z,r20261028-095414,v08_cheapcut@0d5e25e5+c3b1573d,0d5e25e5,c3b1573d,60.1,yes,1618,159,93,86,83,93,83,83,82.88,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,"v07 + laps 2-3 cut 4:3 first, then 3:4"
+1793188588,2026-10-28T11:56:28Z,r20261028-105623,v08_cheapcut@0d5e25e5+c3b1573d,0d5e25e5,c3b1573d,60.1,yes,5286,148,100,96,96,100,96,96,95.87,10,Intel(R) Xeon(R) Processor @ 2.10GHz,4,production 1

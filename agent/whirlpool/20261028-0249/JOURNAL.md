@@ -78,3 +78,5 @@
 
 ## 11:00 v08 (run r20261028-095414, 60.1 min): 83 jewels, 82.9/h, funnel lap1 93/159, lap2 86, lap3 83 -> new best (harness rule)
 - vs v07 74: +9 < 2*sqrt(157) = 25, not significant; the direction matches the sweep. From here: production with v08 (3 h of budget left after dives), dives between runs.
+- Dive round 3: 83 jewels (249 boards) in 43 s; reopen top 16 (52 s): best still 461.
+- 12:05 production 1 (v08): run=r20261028-105623 jewels=96 per_hour=95.87 
