@@ -70,3 +70,4 @@ Decision: the 465 cannot be improved without changing rows <= 9. Next: bigger ex
 - Cycles 28-31 (seeds 244-247): 463 463 463 462 
 - Cycles 32-33 (seeds 248-249): 463, 463.
 - Cycles 34-35 (seeds 250-251): 463, 463.
+- Cycles 36-38 (seeds 252-254): 463, 463, 462.
