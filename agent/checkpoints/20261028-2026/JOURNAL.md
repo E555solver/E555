@@ -62,3 +62,5 @@ Decision: the 465 cannot be improved without changing rows <= 9. Next: bigger ex
 - Wide distiller cycles: seed 226 -> 463 x3; seed 227 -> 463 x5; seed 228 -> 463; seed 229 with BW=20000 -> 462 (no gain from width).
 - btdrive K=16 on the five 463s of distilled_11 (90 s each): 51 proofs, 12 cutoffs, no find. Fresh 463s are locally optimal too.
 - seed 230 -> distilled_14: 463 x3. 09:45: background loop tools/cycles.sh 15 18 (seeds 231-234), each step logged.
+- Cycles 15-18 (seeds 231-234): 463, 462, 462, **464** (distilled_18). On that 464: btdrive K=15 470 s: 51 proofs, 6 cutoffs, no find; F1 reopen auto+1/auto+2/auto plateau 480 s: +0. 11:47: cycles 19-22 in background.
+- Cycles 19-20 (seeds 235-236): 462, **464** (distilled_20).
