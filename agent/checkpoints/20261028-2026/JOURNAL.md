@@ -61,3 +61,4 @@ Decision: the 465 cannot be improved without changing rows <= 9. Next: bigger ex
 - Big cluster (cluster 0) + dilate 1 + donors 6 (100 cells), lds lds_max 2, K=14: k=9 exhausted at 171 s, k=10 not. Exact search cannot reach the depth the 465 needs.
 - Wide distiller cycles: seed 226 -> 463 x3; seed 227 -> 463 x5; seed 228 -> 463; seed 229 with BW=20000 -> 462 (no gain from width).
 - btdrive K=16 on the five 463s of distilled_11 (90 s each): 51 proofs, 12 cutoffs, no find. Fresh 463s are locally optimal too.
+- seed 230 -> distilled_14: 463 x3. 09:45: background loop tools/cycles.sh 15 18 (seeds 231-234), each step logged.
