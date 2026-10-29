@@ -32,3 +32,17 @@ unix,iso,family,tool,params,input,output,score,breaks,verdict,runtime_s,note
 1793231309,2026-10-28T23:48:29Z,F4,beamer,random_edges BW=10000 BR=6 SR=11 ED=10000 EP=20000 seed=215 --lambda_Mahalanobis 10,none,/home/user/E555/agent/labs/20261028-2026/runs/20261028_234024_beam/beam_completions_random_11.csv,461,19,VALID,480,
 1793231361,2026-10-28T23:49:21Z,F1,diver_reopen,elite 6-7 SPB=240 auto/auto+1 plateau copies8 seed=609,frontier/elite.csv,runs/20261028_234832_reopen/out_1.csv,463,17,VALID,28,lost: worker restart after board 1 (elite 6: 463)
 1793231846,2026-10-28T23:57:26Z,F1,diver_reopen,elite 7-8 SPB=240 auto/auto+1 plateau copies8 seed=610,frontier/elite.csv,runs/20261028_234926_reopen/out.csv,463,17,VALID,480,
+1793232826,2026-10-29T00:13:46Z,F4,beamer,random_edges BW=10000 BR=6 SR=11 ED=10000 EP=20000 seed=216 --lambda_Mahalanobis 10,none,/home/user/E555/agent/labs/20261028-2026/runs/20261029_000541_beam/beam_completions_random_11.csv,461,19,VALID,480,
+1793233315,2026-10-29T00:21:55Z,F1,diver_reopen,elite 9-10 SPB=240 auto/auto+1 plateau copies8 seed=611,frontier/elite.csv,runs/20261029_001355_reopen/out.csv,463,17,VALID,480,
+1793233798,2026-10-29T00:29:58Z,F1,diver_reopen,elite 11-12 SPB=240 auto/auto+1 plateau copies8 seed=612,frontier/elite.csv,runs/20261029_002157_reopen/out.csv,463,17,VALID,481,
+1793234281,2026-10-29T00:38:01Z,F1,diver_reopen,elite 13-14 SPB=240 auto/auto+1 plateau copies8 seed=613,frontier/elite.csv,runs/20261029_003000_reopen/out.csv,463,17,VALID,480,
+1793234768,2026-10-29T00:46:08Z,F1,diver_reopen,elite 15-16 SPB=240 bands=auto+1 --reopen auto+2 plateau copies8 seed=614,frontier/elite.csv,runs/20261029_003807_reopen/out.csv,463,17,VALID,481,
+1793235252,2026-10-29T00:54:12Z,F1,diver_reopen,elite 17-18 SPB=240 bands=auto+1 --reopen auto+2 plateau copies8 seed=615,frontier/elite.csv,runs/20261029_004611_reopen/out.csv,463,17,VALID,481,
+1793235747,2026-10-29T01:02:27Z,F4,beamer,random_edges BW=256 BR=5 SR=11 ED=10000 EP=20000 seed=217 --lambda_Mahalanobis 10,none,/home/user/E555/agent/labs/20261028-2026/runs/20261029_005421_beam/beam_completions_random_11.csv,461,19,VALID,481,
+1793236117,2026-10-29T01:08:37Z,F4,beamer,random_edges samples4 tc4 BW=10000 BR=6 SR=11 xn0 no dives Maha10 wall300 seed=218,none,runs/20261029_010236_beam/beam_completions_random_11.csv,356,480,INVALID,300,partials for F3
+1793236666,2026-10-29T01:17:46Z,F3,distiller,top10 rc=124,runs/20261029_010236_beam/beam_completions_random_11.csv,pool/distilled_2.csv,0,480,INVALID,540,piece
+1793237206,2026-10-29T01:26:46Z,F3,distiller,top10 rc=124,runs/20261029_010236_beam/beam_completions_random_11.csv,pool/distilled_2.csv,0,480,INVALID,540,piece
+1793237749,2026-10-29T01:35:49Z,F3,distiller,top10 rc=124,runs/20261029_010236_beam/beam_completions_random_11.csv,pool/distilled_2.csv,0,480,INVALID,540,piece
+1793237842,2026-10-29T01:37:22Z,F3,distiller,top10 rc=0,runs/20261029_010236_beam/beam_completions_random_11.csv,pool/distilled_2.csv,464,16,VALID,90,done
+1793238329,2026-10-29T01:45:29Z,F1,diver_reopen,auto/auto+1 plateau copies8 wall480 seed=616,pool/distilled_2.csv#1,runs/20261029_013729_reopen/out.csv,464,16,VALID,480,fresh 464
+1793238763,2026-10-29T01:52:43Z,F2,ender,deep btl=420 seed=407,runs/20261029_014536_ender/roots.csv,runs/20261029_014536_ender/out.csv,464,16,VALID,426,fresh 464 (distilled_2 #1)

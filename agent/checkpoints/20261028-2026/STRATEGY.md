@@ -16,3 +16,5 @@ Measured before this campaign (PROJECT_E555.md 9.2, 9.3); re-test only with a ne
 - F8 finalizer on the 465: from 7 (1 completion), from 5 free_sides (465 max), from 3 (457 max). Exhausted for the 465.
 - F4 annealed borders (tb6 tc12): worse than random edges (461 max). F4 BR=5 with ED=10000: too many boards, nothing written in 480 s.
 - F4 random edges, BR=6 SR=11, ED=10000 EP=20000: raw bests 461-463 per 480 s run; Maha10 raises tail density.
+- Elite reopen, 240 s/board with auto/auto+1 (elites 3-14) or auto+1/auto+2 (15-18): +0 everywhere except the 465's own root (rediscovers it). Exhausted.
+- Best pipeline so far: F4 partials (samples4 tc4 xn0 Maha10, 300 s) + F3 distiller top 10 -> 464.

@@ -29,3 +29,10 @@ Rule: after any restart, warm E555.db before F4.
 - F4 Maha10 seeds 211 (461), 213 (+lambda_J 0.5: 462), 214 (Maha 20: 462), 215 (461). BR=7 SR=12 seed 212: row 12 unreachable (r11 457 boards, r12 0).
 - New tools/f1e.sh: elite reopen, 240 s/board, auto/auto+1 alternating, plateau, copies 8. Elites 3-4 (464s): +0. Elite 5 (463, the 465's root): -> 465, the known 465 again (dedupe merges it). Elites 6,7,8: +0.
 - 23:48 second worker restart (CPU 2.30 -> 2.10 GHz); elite 6-7 run killed 28 s in (logged lost). DB warm-up took 491 s on this machine.
+
+## 00:05-01:55
+- F4 seed 216 (Maha10): 461. Elite reopen (f1e, 240 s/board): elites 9-14 auto/auto+1, 15-18 auto+1/auto+2: all +0. Elite reopen is exhausted.
+- F4 BR=5 BW=256 seed 217: 9061 boards, 461.
+- NEW: F4 partials (no dives) + F3 distiller. Beamer --random_edges --samples 4 --top_columns 4 BW=10000 BR=6 SR=11 xn0 Maha10, wall 300, seed 218: 57980 row-11 partials over 15 configs. Distiller top 10 (4 pieces, ~33 min): screen 300 dives -> finish 4000 -> probe 40: best **464** (rndb0l1, screen 457, finish 461, probe 464), plus 463 x2. Best fresh board of the campaign.
+- F1 reopen 480 s on that 464 (seed 616): +0. F2 ender deep 420 s (seed 407): +0.
+Decision: the partials+distiller pipeline gives a better tail than full-dive beams (spreads over 15 configs, focuses dives). Repeat it with new seeds; feed >=463 to elite and the 464s to F1/F2.
