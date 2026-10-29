@@ -2,9 +2,9 @@
 Final: REFEREE verdict=VALID score=465 breaks=15 placed=256 frame_violations=0 id=lowB_free_Maha10_1568_redive0_465 file=frontier/frontier.csv
 Stop rule: budget (run_time 24h01m of 24h00m; 220 runs; no new best, so the frontier is still the shipped 465).
 Best board: frontier/frontier.csv = data/best_465.csv (unchanged). Nothing beat 465; no board scored above it.
-Best fresh boards of this campaign: four 464s (distilled_2, FixCorners23 r3c122, distilled_18, distilled_20, distilled_23), all from
+Best fresh boards of this campaign: five 464s (distilled_2, FixCorners23 r3c122, distilled_18, distilled_20, distilled_23), all from
 the F4-partials + F3 distiller pipeline; frontier/elite.csv holds 1x465, 8x464, 41x463.
-Winning family: none (no new best). Most productive: F4 partial beam (no dives) + lab wide distiller (finish 5000/2000, probe 12N): 40 distillates, best 464 x4, 463 x26, 462 x10.
+Winning family: none (no new best). Most productive: F4 partial beam (no dives) + lab wide distiller (finish 5000/2000, probe 12N): 40 distillates, best 464 x4, 463 x26, 462 x10 (plus the FixCorners23 464).
 Key finding: the 465 is a strong local optimum. Every designed exact hole up to 62 cells is proven unimprovable,
 and its top 6 rows lifted, re-solved by E555_soft and reopened all return to the identical 465.
 
