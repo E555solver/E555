@@ -61,3 +61,16 @@ unix,iso,family,tool,params,input,output,score,breaks,verdict,runtime_s,note
 1793244861,2026-10-29T03:34:21Z,F3,distiller,top20 rc=124,runs/20261029_030127_beam/beam_completions_random_11.csv,pool/distilled_5.csv,0,480,INVALID,540,piece
 1793245403,2026-10-29T03:43:23Z,F3,distiller,top20 rc=124,runs/20261029_030127_beam/beam_completions_random_11.csv,pool/distilled_5.csv,0,480,INVALID,540,piece
 1793245672,2026-10-29T03:47:52Z,F3,distiller,top20 rc=0,runs/20261029_030127_beam/beam_completions_random_11.csv,pool/distilled_5.csv,463,17,VALID,265,done
+1793246049,2026-10-29T03:54:09Z,F4,beamer,partials samples4 tc4 BW=10000 BR=6 SR=11 xn0 Maha10 wall300 seed=222 ,none,/home/user/E555/agent/labs/20261028-2026/runs/20261029_034822_beam/beam_completions_random_11.csv,356,480,INVALID,300,partials for F3
+1793246592,2026-10-29T04:03:12Z,F3,distiller,top10 rc=124,runs/20261029_034822_beam/beam_completions_random_11.csv,pool/distilled_6.csv,0,480,INVALID,540,piece
+1793247134,2026-10-29T04:12:14Z,F3,distiller,top10 rc=124,runs/20261029_034822_beam/beam_completions_random_11.csv,pool/distilled_6.csv,0,480,INVALID,540,piece
+1793247620,2026-10-29T04:20:20Z,F3,distiller,top10 rc=0,runs/20261029_034822_beam/beam_completions_random_11.csv,pool/distilled_6.csv,463,17,VALID,483,done
+1793247976,2026-10-29T04:26:16Z,F4,beamer,partials samples4 tc4 BW=10000 BR=6 SR=11 xn0 Maha10 wall300 seed=223 ,none,/home/user/E555/agent/labs/20261028-2026/runs/20261029_042026_beam/beam_completions_random_11.csv,356,480,INVALID,301,partials for F3
+1793248519,2026-10-29T04:35:19Z,F3,distiller,top10 rc=124,runs/20261029_042026_beam/beam_completions_random_11.csv,pool/distilled_7.csv,0,480,INVALID,540,piece
+1793249062,2026-10-29T04:44:22Z,F3,distiller,top10 rc=124,runs/20261029_042026_beam/beam_completions_random_11.csv,pool/distilled_7.csv,0,480,INVALID,540,piece
+1793249541,2026-10-29T04:52:21Z,F3,distiller,top10 rc=0,runs/20261029_042026_beam/beam_completions_random_11.csv,pool/distilled_7.csv,463,17,VALID,476,done
+1793249897,2026-10-29T04:58:17Z,F4,beamer,partials samples4 tc4 BW=10000 BR=6 SR=11 xn0 Maha10 wall300 seed=224 ,none,/home/user/E555/agent/labs/20261028-2026/runs/20261029_045232_beam/beam_completions_random_11.csv,356,480,INVALID,300,partials for F3
+1793250441,2026-10-29T05:07:21Z,F3,distiller,E555_distiller_wide top10 rc=124,runs/20261029_045232_beam/beam_completions_random_11.csv,pool/distilled_8.csv,0,480,INVALID,540,piece
+1793250925,2026-10-29T05:15:25Z,F3,distiller,E555_distiller_wide top10 rc=0,runs/20261029_045232_beam/beam_completions_random_11.csv,pool/distilled_8.csv,463,17,VALID,480,done
+1793251275,2026-10-29T05:21:15Z,F4,beamer,partials samples4 tc4 BW=10000 BR=6 SR=11 xn0 Maha10 wall300 seed=225 ,none,/home/user/E555/agent/labs/20261028-2026/runs/20261029_051532_beam/beam_completions_random_11.csv,356,480,INVALID,299,partials for F3
+1793251819,2026-10-29T05:30:19Z,F3,distiller,E555_distiller_wide top10 rc=124,runs/20261029_051532_beam/beam_completions_random_11.csv,pool/distilled_9.csv,0,480,INVALID,540,piece
