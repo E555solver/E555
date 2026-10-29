@@ -23,3 +23,9 @@ Decision: beam boards come out polished; the gain source is new beams. Keep cycl
 - F4 random edges BW=20000 seed 207: 462. Maha10 (--lambda_Mahalanobis 10) seed 208: 462 x2, 461 x19 from 4203 boards (better tail density). Maha10 BR=5 seed 209: 86k boards, wall hit before writing anything (lost run; never BR=5 with full dives).
 - 22:25 worker restart, CPU changed (2.10 -> 2.30 GHz Xeon), lab kept. Seed 210 killed (logged lost). Rerun stalled 8 min at row 4: the 6.8 GB E555.db was cold in page cache. `cat E555.db > /dev/null` (91 s) fixed it; rerun seed 210 BW=20000 Maha10: 461 x29.
 Rule: after any restart, warm E555.db before F4.
+
+## 22:50-00:05
+- F2 ender deep 225 s x2 on harvested 462s (seed 406): +0. pool/harvest.csv (tools/harvest.sh) collects distinct >=462 beam boards; consumed hashes in pool/consumed.txt.
+- F4 Maha10 seeds 211 (461), 213 (+lambda_J 0.5: 462), 214 (Maha 20: 462), 215 (461). BR=7 SR=12 seed 212: row 12 unreachable (r11 457 boards, r12 0).
+- New tools/f1e.sh: elite reopen, 240 s/board, auto/auto+1 alternating, plateau, copies 8. Elites 3-4 (464s): +0. Elite 5 (463, the 465's root): -> 465, the known 465 again (dedupe merges it). Elites 6,7,8: +0.
+- 23:48 second worker restart (CPU 2.30 -> 2.10 GHz); elite 6-7 run killed 28 s in (logged lost). DB warm-up took 491 s on this machine.
