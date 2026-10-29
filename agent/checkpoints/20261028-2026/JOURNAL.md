@@ -69,3 +69,4 @@ Decision: the 465 cannot be improved without changing rows <= 9. Next: bigger ex
 - Cycles 26-27 (seeds 242-243): 462, 462. Loop 23-27 hit the 2 h background limit inside a cycle-27 piece (logged lost); 4 cycles per loop from now.
 - Cycles 28-31 (seeds 244-247): 463 463 463 462 
 - Cycles 32-33 (seeds 248-249): 463, 463.
+- Cycles 34-35 (seeds 250-251): 463, 463.
