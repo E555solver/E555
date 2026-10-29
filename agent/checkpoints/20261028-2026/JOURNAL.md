@@ -64,3 +64,4 @@ Decision: the 465 cannot be improved without changing rows <= 9. Next: bigger ex
 - seed 230 -> distilled_14: 463 x3. 09:45: background loop tools/cycles.sh 15 18 (seeds 231-234), each step logged.
 - Cycles 15-18 (seeds 231-234): 463, 462, 462, **464** (distilled_18). On that 464: btdrive K=15 470 s: 51 proofs, 6 cutoffs, no find; F1 reopen auto+1/auto+2/auto plateau 480 s: +0. 11:47: cycles 19-22 in background.
 - Cycles 19-20 (seeds 235-236): 462, **464** (distilled_20).
+- Cycles 21-22 (seeds 237-238): 463 x2 each. 13:30: cycles 23-27 in background.

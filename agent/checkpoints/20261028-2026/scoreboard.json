@@ -6,10 +6,10 @@
  "best_breaks": 15,
  "best_source": "data/best_465.csv (shipped baseline)",
  "best_file": "frontier/frontier.csv",
- "total_runs": 140,
+ "total_runs": 148,
  "goal_start_unix": 1793219234,
  "last_best_unix": null,
- "last_checkpoint_unix": 1793273424,
+ "last_checkpoint_unix": 1793277595,
  "families_since_best": [
   "F1",
   "F4",
