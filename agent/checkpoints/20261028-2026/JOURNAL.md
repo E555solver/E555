@@ -56,3 +56,8 @@ Decision: keep cycling (top 10, ~35 min); every 463 joins elite.csv.
 - btdrive on the four 464 elites (K=15, 120 s each): 44 proofs, 9 cutoffs, no find.
 - E555_soft built in the lab (apt libnlopt-dev): --core 0 whole boards: 427 (88 s/start). 465 with top:6 lifted -> soft 16 starts: 449-453 -> reopen auto+1 55 s each: all 8 return to **the same 465** (agreement > 0.95). Given its bottom 10 rows, the 465's top is a strong attractor. top:8 -> soft (447) -> reopen auto+2/top:8 270 s: 458.
 Decision: the 465 cannot be improved without changing rows <= 9. Next: bigger exact holes reaching into rows 8-10 (lds mode to find, not prove), and keep the distiller cycles for new bottoms.
+
+## 07:35-09:10
+- Big cluster (cluster 0) + dilate 1 + donors 6 (100 cells), lds lds_max 2, K=14: k=9 exhausted at 171 s, k=10 not. Exact search cannot reach the depth the 465 needs.
+- Wide distiller cycles: seed 226 -> 463 x3; seed 227 -> 463 x5; seed 228 -> 463; seed 229 with BW=20000 -> 462 (no gain from width).
+- btdrive K=16 on the five 463s of distilled_11 (90 s each): 51 proofs, 12 cutoffs, no find. Fresh 463s are locally optimal too.
