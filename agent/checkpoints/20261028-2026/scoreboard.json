@@ -6,17 +6,19 @@
  "best_breaks": 15,
  "best_source": "data/best_465.csv (shipped baseline)",
  "best_file": "frontier/frontier.csv",
- "total_runs": 75,
+ "total_runs": 95,
  "goal_start_unix": 1793219234,
  "last_best_unix": null,
- "last_checkpoint_unix": 1793245685,
+ "last_checkpoint_unix": 1793251891,
  "families_since_best": [
   "F1",
   "F4",
   "F2",
   "F5",
   "F8",
-  "F3"
+  "F3",
+  "F6",
+  "F7"
  ],
  "history": [],
  "campaign": "20261028-2026",

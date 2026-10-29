@@ -18,3 +18,5 @@ Measured before this campaign (PROJECT_E555.md 9.2, 9.3); re-test only with a ne
 - F4 random edges, BR=6 SR=11, ED=10000 EP=20000: raw bests 461-463 per 480 s run; Maha10 raises tail density.
 - Elite reopen, 240 s/board with auto/auto+1 (elites 3-14) or auto+1/auto+2 (15-18): +0 everywhere except the 465's own root (rediscovers it). Exhausted.
 - Best pipeline so far: F4 partials (samples4 tc4 xn0 Maha10, 300 s) + F3 distiller top 10 -> 464.
+- F6 backtracker on designed holes (tools/holemaker.py + btdrive.py), 465 K=14, 464s K=15: ~150 holes, every finished one a proof; local optimum up to 62-cell holes.
+- F7 soft (experiments/soft, lab build): top:6 refill + reopen returns to the identical 465; top:8 refill + reopen 458; core 0 427. Not a source of better boards here.

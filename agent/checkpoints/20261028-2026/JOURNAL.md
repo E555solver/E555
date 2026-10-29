@@ -47,3 +47,12 @@ Decision: keep cycling (top 10, ~35 min); every 463 joins elite.csv.
 ## 04:15-05:30
 - seed 223 -> distilled_7 (top 10): 463.
 - F7-ish: tools/E555_distiller_wide.py (lab copy): finish 5000/2000 instead of 20000/5000, probe 12 N instead of 4 N. seed 224 -> distilled_8: 463, 27 of 120 probes improved, cycle ~22 min instead of ~35. Kept as the default cycle.
+
+## 05:30-07:35 — user pointers: backtracker holes, E555_soft
+- distilled_9 (seed 225, wide): 463. Starter corpora: lowB baseline (wide, top 10): 462; FixCorners23 (wide, top 10): **464** (r3c122, finish 461 -> probe 464); F1 reopen 480 s prior1/nogo1 +0; F2 ender deep +0. tools/probe.sh on finish ranks 121-180: 460 -> 462 max (default probe cut is right).
+- User suggested experiments/soft/E555_soft.c and the backtracker's --order frontier on purpose-built holes.
+- NEW tools/holemaker.py: mask = cells on broken junctions (8-connected clusters; --cluster, --focus r around one break cell), + donor cells holding pieces that fit a break cell on all its non-hole sides (--donors), + --extra random adjacent cells, --dilate. Checked: its scorer gives 465 on the frontier. tools/btdrive.py samples designs and runs `E555_backtracker --holes M --order frontier --break_mode any --breaks K` until a find or the wall.
+- On the 465 (K=14): whole break set (57 cells, 15 breaks inside): k=9 not exhausted in 240 s. Clusters: 19 cells/12 breaks and 6 cells/3 breaks. Small cluster + donors + dilate (70 cells): PROOF no fill <= 14 (288 s). btdrive seeds 1-4: ~115 holes, ~100 PROOFS (up to 62 cells, most in < 1 s), cutoffs only on holes covering most of the big cluster. The 465 is locally optimal for every focused hole tried.
+- btdrive on the four 464 elites (K=15, 120 s each): 44 proofs, 9 cutoffs, no find.
+- E555_soft built in the lab (apt libnlopt-dev): --core 0 whole boards: 427 (88 s/start). 465 with top:6 lifted -> soft 16 starts: 449-453 -> reopen auto+1 55 s each: all 8 return to **the same 465** (agreement > 0.95). Given its bottom 10 rows, the 465's top is a strong attractor. top:8 -> soft (447) -> reopen auto+2/top:8 270 s: 458.
+Decision: the 465 cannot be improved without changing rows <= 9. Next: bigger exact holes reaching into rows 8-10 (lds mode to find, not prove), and keep the distiller cycles for new bottoms.
