@@ -71,3 +71,7 @@ Decision: the 465 cannot be improved without changing rows <= 9. Next: bigger ex
 - Cycles 32-33 (seeds 248-249): 463, 463.
 - Cycles 34-35 (seeds 250-251): 463, 463.
 - Cycles 36-38 (seeds 252-254): 463, 463, 462.
+- Cycle 39 (seed 255): 463. Final cycles 40-41 started.
+- Cycles 40-41 (seeds 256-257): 463, 462. Final run: btdrive K=15 on the cycle-23 464.
+
+## 21:40 — stop=budget (24h01m). SUMMARY.md written.
