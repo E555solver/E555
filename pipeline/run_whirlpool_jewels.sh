@@ -84,8 +84,9 @@ DIVE=0                  # 1 = dive the jewels at the end
 CLUES=center            # none | center | all: the Eternity II clues every tool
                         # holds (all = the centre and the four corner clues)
 FREEZE=auto             # 1 = the band cut also fills the five 2x2 clue blocks and
-                        # every lap keeps them, like the frame; auto = 1 with
-                        # CLUES=all, else 0
+                        # every lap keeps them, like the frame; corners = the four
+                        # corner blocks only, the centre one is re-grown each lap;
+                        # auto = 1 with CLUES=all, else 0
 
 # board supply: the beamer, then one board per frame, shuffled
 BEAM_WIDTH=10000
@@ -129,7 +130,12 @@ case "$CLUES" in
 esac
 [ "$FREEZE" != auto ] || { [ "$CLUES" = all ] && FREEZE=1 || FREEZE=0; }
 [ "$BEAM_COLUMNS" != auto ] || { [ "$CLUES" = all ] && BEAM_COLUMNS=16 || BEAM_COLUMNS=4; }
-case "$FREEZE" in 0|1) ;; *) die "FREEZE must be 0, 1 or auto (got: $FREEZE)" ;; esac
+FREEZE_MODE=$FREEZE     # FREEZE is 0 or 1 below; FROZEN_CENTRE says whether the
+case "$FREEZE" in       # centre block is held too
+    0|1)    FROZEN_CENTRE=$FREEZE ;;
+    corners) FREEZE=1; FROZEN_CENTRE=0 ;;
+    *) die "FREEZE must be 0, 1, corners or auto (got: $FREEZE)" ;;
+esac
 # Frozen blocks: the cut fills them (--with_clue_regions) and the finalizer
 # holds them (--freeze_clues). Only the finalizer's backtrack sees them, so it
 # starts at row 5 and searches row 6 against the centre block; from row 6, the
@@ -242,19 +248,19 @@ function key_of(s,   d, t, best) {                         # the same for all 4 
     for (d = 15; d < 60; d += 15) { t = shift(s, d); if (t < best) best = t }
     gsub(/ /, ".", best); return best
 }
-# The pieces on the five 2x2 clue blocks (rows and columns 1-2 and 13-14, and
-# rows/columns 7-8), in piece order, or "" unless all 20 cells are placed. A
-# turn moves the blocks onto each other, so a held set reads the same on
-# every board of a chain.
+# The pieces on the frozen 2x2 clue blocks (rows and columns 1-2 and 13-14,
+# and, if the awk variable centre is set, rows/columns 7-8), in piece order, or
+# "" unless all their cells are placed. A turn moves the blocks onto each
+# other, so a held set reads the same on every board of a chain.
 function region_set(line,   x, n, p, c, r, k, s, m) {
     n = split(line, x, ",") - 512; s = ""; m = 0
     for (p = 0; p < 256; p++) {
         c = x[n + 1 + p]; if (c == 999) continue
         r = int(c / 16); k = c % 16
         if (((r == 1 || r == 2 || r == 13 || r == 14) && (k == 1 || k == 2 || k == 13 || k == 14)) ||
-            ((r == 7 || r == 8) && (k == 7 || k == 8))) s = s (m++ ? "." : "") p
+            (centre && (r == 7 || r == 8) && (k == 7 || k == 8))) s = s (m++ ? "." : "") p
     }
-    return m == 20 ? s : ""
+    return m == (centre ? 20 : 16) ? s : ""
 }
 BEGIN { ring_cells() }'
 
@@ -274,13 +280,13 @@ one_per_frame() {
 # jewel_key CHAIN -- the frame key if the four boards in CHAIN (s1..s4) make a
 # jewel, else nothing. s2..s4 must each hold all 60 frame cells, the same frame
 # turned with the board; s1 must agree with it wherever s1 has a frame piece.
-# Under FREEZE, s2..s4 must also hold the same 20 clue-block pieces, and the
-# key is the frame's and theirs. Not re-tested here, because each lap
+# Under FREEZE, s2..s4 must also hold the same frozen clue-block pieces, and
+# the key is the frame's and theirs. Not re-tested here, because each lap
 # guarantees it: every board is exactly matched (no breaks), rows
 # 0..FIN_STOP_ROW are complete, the turns are clockwise, and each lap keeps the
 # parent's block of at least 12 interior cells.
 jewel_key() {
-    awk -v freeze="$FREEZE" "$RING"' !/^[#%]/ && NF { R[++k] = ring_of($0); Q[k] = region_set($0) }
+    awk -v freeze="$FREEZE" -v centre="$FROZEN_CENTRE" "$RING"' !/^[#%]/ && NF { R[++k] = ring_of($0); Q[k] = region_set($0) }
         END {
             if (k != 4) exit
             for (j = 2; j <= 4; j++) if (R[j] ~ /-/) exit           # frame complete
@@ -293,9 +299,25 @@ jewel_key() {
         }' "$1"
 }
 
-# held_blocks IN OUT -- the boards of IN that hold all five clue blocks
+# held_blocks IN OUT -- the boards of IN that hold all the frozen clue blocks
 held_blocks() {
-    awk "$RING"' !/^[#%]/ && NF && region_set($0) != ""' "$1" > "$2"
+    awk -v centre="$FROZEN_CENTRE" "$RING"' !/^[#%]/ && NF && region_set($0) != ""' "$1" > "$2"
+}
+
+# free_centre FILE -- FREEZE=corners: clear the centre 2x2 block of the bands,
+# but for the centre clue (piece 138), so the finalizer re-grows the block
+# instead of freezing it
+free_centre() {
+    awk -F, -v keep="$([ "$CLUES" = none ] && echo -1 || echo 138)" 'BEGIN {OFS = ","}
+        !/^[#%]/ && NF {
+            n = NF - 512
+            for (p = 1; p <= 256; p++) {
+                c = $(n + p); if (c == 999 || p - 1 == keep) continue
+                r = int(c / 16); k = c % 16
+                if ((r == 7 || r == 8) && (k == 7 || k == 8)) $(n + p) = 999
+            }
+        }
+        { print }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
 # ---- produce: beamer boards, one per frame, shuffled ------------------------------
@@ -344,6 +366,7 @@ run_lap() {
     [ -n "$band" ] && [ "$(count_boards "$band")" -gt 0 ] || { WHY="lap $k cut $br:$kc found no band"; return 1; }
     python3 "$TOOLS/E555_rank.py" "$band" --seed_file "$SEED" --diverse "$BANDS_GROWN" \
         --out "$d/bands.csv" > /dev/null 2>&1 || cp "$band" "$d/bands.csv"
+    [ "$FREEZE" = 0 ] || [ "$FROZEN_CENTRE" = 1 ] || free_centre "$d/bands.csv"
 
     t=$(cap "$LAP_TIME"); [ "$t" -gt 5 ] || { WHY="out of time"; return 1; }
     timeout -k 5 "$(left)" "$BIN/E555_finalizer" "$SEED" "$d/bands.csv" --out_dir "$d/fin" \
@@ -420,7 +443,7 @@ whirl_board() {
 
 # ---- main loop -----------------------------------------------------------------------
 log "[cfg] run_dir=$RUN_DIR threads=$THREADS wall=$WALL board_time=$BOARD_TIME rng_seed=$RNG_SEED db_file=${DB_FILE:-<rebuilt each call>}"
-log "[cfg] clues=$CLUES freeze=$FREEZE beam: stop_row=$BEAM_STOP_ROW columns=$BEAM_COLUMNS tau=$BEAM_TAU min_col=$BEAM_MIN_COL; finalizer: stop_row=$FIN_STOP_ROW"
+log "[cfg] clues=$CLUES freeze=$FREEZE_MODE beam: stop_row=$BEAM_STOP_ROW columns=$BEAM_COLUMNS tau=$BEAM_TAU min_col=$BEAM_MIN_COL; finalizer: stop_row=$FIN_STOP_ROW"
 T0=$SECONDS; NB=0; NJ=0; NP=0; EMPTY=0
 # The beamer maps the database file into memory and reads only the pages it
 # touches, in random order. From a cold disk (after a reboot) that kept one
