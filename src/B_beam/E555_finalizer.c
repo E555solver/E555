@@ -192,6 +192,32 @@ static bool     g_ring_kept = false;       /* this line: ring pinned in place */
 static bool     g_sides_from_ring = false; /* this line: --free_sides took effect */
 static int      g_top_T     = PUZZLE_SIDE; /* this line */
 
+/* --freeze_clues: the five 2x2 clue regions -- the centre block and the inner
+   corner blocks, each corner clue on its block's inner diagonal. A region the
+   input holds whole and clean is frozen for the line (fin_freeze_line): its
+   pieces are reserved, the backtrack pins them on their cells (bt_row) and every
+   written board carries them (board_arrays). Only the backtrack sees the pins,
+   so --backtrack_row must stay below the centre block (FRZ_MAX_BT_ROW); the
+   beam just finds the pieces spent. */
+#define FRZ_N          5
+#define FRZ_MAX_BT_ROW 6
+#define FRZ_TOP        ((1u << 3) | (1u << 4))   /* TL, TR */
+static const struct { const char *name; int r0, c0; } k_frz_region[FRZ_N] = {
+    {"centre", 7, 7}, {"BL", 1, 1}, {"BR", 1, 13}, {"TL", 13, 1}, {"TR", 13, 13},
+};
+static bool     g_freeze_clues = false;
+static uint8_t  g_frz_mask = 0;                          /* this line: frozen regions */
+static bool     g_frz[PUZZLE_SIDE][PUZZLE_SIDE];         /* this line: cells to pin or attach */
+static uint16_t g_frz_ci[PUZZLE_SIDE][PUZZLE_SIDE];      /* ... and their catalog index */
+static int      g_line_orient = -1;                      /* this line's committed clue frame */
+
+static inline bool fin_in_clue_region(int r, int c) {
+    for (int k = 0; k < FRZ_N; k++)
+        if (r >= k_frz_region[k].r0 && r <= k_frz_region[k].r0 + 1 &&
+            c >= k_frz_region[k].c0 && c <= k_frz_region[k].c0 + 1) return true;
+    return false;
+}
+
 /* Optional Stage A rotations CSV (3rd positional): every data row is a candidate
    piece->side assignment. A partial whose LOCKED border agrees with one of them
    came from that border, so the row's assignment can be reimposed even though the
@@ -486,6 +512,11 @@ static void fin_init_entry(BeamEntry *p, const LeftOrder *lft) {
        the one this pass would build anyway -- and it no longer depends on which
        orientation the pass happens to be searching. */
     if (g_clue_mask) fin_clue_reserve(p->used);
+    /* --freeze_clues: the frozen pieces are spoken for. Like the clues they stay
+       unbooked here, and the backtrack books each one when its row commits. */
+    for (int r = 0; r < PUZZLE_SIDE && g_frz_mask; r++)
+        for (int c = 0; c < PUZZLE_SIDE; c++)
+            if (g_frz[r][c]) used_set(p->used, g_grid[r][c].piece_id);
 
     for (int r = 1; r <= EDGE_LEN; r++) {
         if (r > (int)g_finalize_from && r < g_top_T) continue;   /* the searched rows */
@@ -824,6 +855,15 @@ static void board_arrays(const RowChoice rows[EDGE_LEN + 1], int row, uint16_t c
             occ[x] = true;
         }
     }
+    /* --freeze_clues: the frozen cells above the written rows (those in them were
+       placed by their pins). */
+    for (int r = row + 1; r < PUZZLE_SIDE && g_frz_mask; r++)
+        for (int c = 0; c < PUZZLE_SIDE; c++) {
+            if (!g_frz[r][c]) continue;
+            const Oriented *o = &g_grid[r][c];
+            pos[o->piece_id] = (uint32_t)(r * PUZZLE_SIDE + c); rot_arr[o->piece_id] = o->rotation;
+            occ[r * PUZZLE_SIDE + c] = true;
+        }
     /* --clue_corners: also show the two row-13 clue pieces the search never
        places, on their own cells when those are empty -- as the beamer does.
        There is no choice of orientation here: the board committed to one. */
@@ -2475,6 +2515,19 @@ static void bt_row(BtCtx *x, int row) {
                 x->pin_kind[row][c] = PIN_TOPCOLOR;
                 x->pin_val[row][c]  = g_grid[g_top_T][c].bottom;
             }
+    /* --freeze_clues: a frozen cell takes its own piece, and the cell under one
+       shows that piece's bottom. A frozen region agrees with the clue frame and
+       the locked rows (fin_freeze_line), so neither override can contradict a
+       pin set above. */
+    for (int c = 1; c <= EDGE_LEN && g_frz_mask; c++) {
+        if (g_frz[row][c]) {
+            x->pin_kind[row][c] = PIN_PIECE;
+            x->pin_val[row][c]  = g_frz_ci[row][c];
+        } else if (g_frz[row + 1][c]) {          /* row <= 14: row + 1 is a board row */
+            x->pin_kind[row][c] = PIN_TOPCOLOR;
+            x->pin_val[row][c]  = g_grid[row + 1][c].bottom;
+        }
+    }
     memcpy(x->used[row], p->used, sizeof x->used[row]);
     x->flags[row] = p->flags;
     bt_cell(x, row, 1, L);
@@ -3073,7 +3126,8 @@ static uint64_t fin_partial_hash(const int pos[NUM_PIECES], const int rot[NUM_PI
         uint64_t v;
         if (r < 0)                          v = 1;   /* unpositioned: free pool  */
         else if (r < (int)g_finalize_from)  v = 2;   /* locked below: order-free */
-        else if ((uint32_t)r == g_finalize_from || (!free_mode && border) || r >= T)
+        else if ((uint32_t)r == g_finalize_from || (!free_mode && border) || r >= T ||
+                 (g_freeze_clues && fin_in_clue_region(r, c)))   /* may be frozen */
             v = 4u + ((uint64_t)pos[pid] << 2) + (uint64_t)(rot[pid] & 3);
         else                                v = 1;   /* freed above: free pool   */
         h = splitmix64(h ^ ((uint64_t)pid << 40) ^ v);
@@ -3233,6 +3287,7 @@ static int fin_load_partial(const char *path, uint32_t want, char id_out[64]) {
        UNCLUED lines with the same state do still merge, which is right -- they
        would expand to the same candidate set and search it twice. */
     int orient = g_clue_mask ? fin_clue_orient_of(pos, rot) : -1;
+    g_line_orient = orient;
 
     /* Input dedup: a line seeding a search state already seen (earlier in the
        file or in this window) is skipped -- see fin_partial_hash. */
@@ -3389,6 +3444,108 @@ static bool fin_border_complete(void) {
         if (!g_grid_has[0][k] || !g_grid_has[PUZZLE_SIDE-1][k] ||
             !g_grid_has[k][0] || !g_grid_has[k][PUZZLE_SIDE-1]) return false;
     return true;
+}
+
+/* -- --freeze_clues: which clue regions this line holds --------------------- */
+
+/* A cell this line keeps fixed whatever the search does: the locked rows, the
+   locked top, the ring when kept, the left column when the partial fixes it. */
+static bool fin_cell_held(int r, int c) {
+    if (r <= (int)g_finalize_from || r >= g_top_T) return true;
+    if (g_ring_kept && (c == 0 || c == PUZZLE_SIDE - 1 || r == 0 || r == PUZZLE_SIDE - 1))
+        return true;
+    return c == 0 && !g_free_edges && !g_sides_from_rot;
+}
+
+/* Why region k cannot be frozen (written to why), or NULL when it can: its four
+   cells placed and matched, every edge to a held cell matched, none of its cells
+   a beam row, and under the clue flags agreeing with the line's clue frame -- a
+   line carrying no clue has none, so a region holding a clue cell waits for the
+   clue machinery instead. Clue flags win: a mismatch only unfreezes the region. */
+static const char *fin_freeze_why(int k, char *why, size_t n) {
+    const int r0 = k_frz_region[k].r0, c0 = k_frz_region[k].c0;
+    static const int dr[4] = {1, 0, -1, 0}, dc[4] = {0, 1, 0, -1};
+    for (int r = r0; r <= r0 + 1; r++)
+        for (int c = c0; c <= c0 + 1; c++) {
+            if (!g_grid_has[r][c]) { snprintf(why, n, "cell (%d,%d) empty", r, c); return why; }
+            if (r > (int)g_finalize_from && r < g_top_T && r <= (int)g_backtrack_row) {
+                snprintf(why, n, "row %d is a beam row", r); return why;
+            }
+        }
+    for (int r = r0; r <= r0 + 1; r++)
+        for (int c = c0; c <= c0 + 1; c++)
+            for (int d = 0; d < 4; d++) {
+                const int nr = r + dr[d], nc = c + dc[d];
+                const bool inside = nr >= r0 && nr <= r0 + 1 && nc >= c0 && nc <= c0 + 1;
+                if (!inside && !fin_cell_held(nr, nc)) continue;
+                const Oriented *a = &g_grid[r][c], *b = &g_grid[nr][nc];
+                const int fa = d == 0 ? a->top : d == 1 ? a->right : d == 2 ? a->bottom : a->left;
+                const int fb = d == 0 ? b->bottom : d == 1 ? b->left : d == 2 ? b->top : b->right;
+                if (fa != fb) {
+                    snprintf(why, n, "edge (%d,%d)-(%d,%d) breaks", r, c, nr, nc); return why;
+                }
+            }
+    if (!g_clue_mask) return NULL;
+    for (int r = r0; r <= r0 + 1; r++)
+        for (int c = c0; c <= c0 + 1; c++) {
+            const Oriented *g = &g_grid[r][c];
+            bool clue_cell = false, clue_piece = false;
+            int need = -1, need_spin = 0;        /* the clue the line's frame puts here */
+            for (int o = 0; o < 4; o++)
+                for (int kk = 0; kk < CLUE_N; kk++) {
+                    if (!clue_on(kk)) continue;
+                    const ClueCell *cc = &g_clue[o][kk];
+                    const bool here = cc->row == r && cc->col == c;
+                    clue_cell  |= here;
+                    clue_piece |= cc->piece == g->piece_id;
+                    if (here && o == g_line_orient) { need = cc->piece; need_spin = cc->spin; }
+                }
+            const bool home = need == (int)g->piece_id && need_spin == g->rotation;
+            if (clue_cell && g_line_orient < 0)
+                snprintf(why, n, "the line carries no clue, and (%d,%d) is a clue cell", r, c);
+            else if (need >= 0 && !home)
+                snprintf(why, n, "(%d,%d) must hold clue piece %d", r, c, need);
+            else if (clue_piece && !home)
+                snprintf(why, n, "clue piece %u off its cell at (%d,%d)", g->piece_id, r, c);
+            else continue;
+            return why;
+        }
+    return NULL;
+}
+
+/* Decide the line's frozen regions and say which they are. Runs once the side
+   mode is known, since the ring and the left column count as held only then. */
+static void fin_freeze_line(uint32_t line) {
+    memset(g_frz, 0, sizeof g_frz);
+    g_frz_mask = 0;
+    if (!g_freeze_clues) return;
+    char frozen[96] = "", locked[96] = "", missed[512] = "", why[96];
+    size_t nf = 0, nl = 0, nm = 0;
+    for (int k = 0; k < FRZ_N; k++) {
+        const int r0 = k_frz_region[k].r0, c0 = k_frz_region[k].c0;
+        const char *bad = fin_freeze_why(k, why, sizeof why);
+        if (bad) {
+            nm += (size_t)snprintf(missed + nm, sizeof missed - nm, "%s%s (%s)",
+                                   nm ? ", " : "", k_frz_region[k].name, bad);
+            continue;
+        }
+        g_frz_mask |= (uint8_t)(1u << k);
+        bool all_locked = true;
+        for (int r = r0; r <= r0 + 1; r++)
+            for (int c = c0; c <= c0 + 1; c++) {
+                if (r <= (int)g_finalize_from || r >= g_top_T) continue;
+                all_locked = false;
+                g_frz[r][c] = true;
+                g_frz_ci[r][c] = fin_cat_index_of(g_grid[r][c].piece_id, g_grid[r][c].rotation);
+            }
+        if (all_locked) nl += (size_t)snprintf(locked + nl, sizeof locked - nl, " %s", k_frz_region[k].name);
+        else            nf += (size_t)snprintf(frozen + nf, sizeof frozen - nf, " %s", k_frz_region[k].name);
+    }
+    printf("[freeze] line %u: frozen%s", line, nf || nl ? "" : " none");
+    if (nf) printf("%s", frozen);
+    if (nl) printf("%s%s (locked)", nf ? "," : "", locked);
+    if (nm) printf("; not frozen %s", missed);
+    printf("\n");
 }
 
 /* -- Optional rotations CSV (Stage A borders) ---------------------------------- */
@@ -4200,6 +4357,17 @@ static void usage(const char *a0) {
 "                             the pinned cell, exactly as in the beamer\n"
 "                           carries no clue, lock already covers the centre row -- a\n"
 "                             lock that contradicts the pinned frame is skipped\n"
+"  --freeze_clues         hold the input's clue regions in place: the 2x2 blocks at\n"
+"                         rows 7-8 x cols 7-8 (centre) and rows 1-2/13-14 x cols\n"
+"                         1-2/13-14 (inner corners). A region is frozen when its 4\n"
+"                         cells are placed and matched, it meets every cell the line\n"
+"                         holds (lock, top lock, kept ring, fixed left column), and\n"
+"                         under --clue_* it agrees with the line's clue frame. Its\n"
+"                         pieces are reserved, the backtrack pins them on their cells\n"
+"                         and every written board carries them; one [freeze] line per\n"
+"                         input line says which regions froze and why the others did\n"
+"                         not. Needs --backtrack_row N <= 6, so the beam never sees a\n"
+"                         pin; N <= 5 also searches row 6 under the centre block\n"
 "  --incomplete_top       also emit boards that reach --stop_row with only TWO of its\n"
 "                         three 5-piece segments -- 11 of the row's 16 pieces -- to a\n"
 "                         separate <...>_<stop_row>_partial.csv. All three shapes are\n"
@@ -4383,6 +4551,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
                 on += (size_t)snprintf(oz + on, sizeof oz - on, "%s%d", on ? "," : "", o);
         printf(" --clue_orient %s", on ? oz : "auto");
     }
+    if (g_freeze_clues) printf(" --freeze_clues");
     printf(" --beam_width %u --beam_expand %u --beam_expand_row %u",
            g_beam_width, g_beam_expand, g_beam_expand_row);
     printf(" --pool_factor %u --parent_cap %u --frac_rand %g",
@@ -4462,6 +4631,7 @@ int main(int argc, char *argv[]) {
         }
         else if (!strcmp(argv[i], "--clue_center"))               g_clue_mask |= CLUE_CENTER;
         else if (!strcmp(argv[i], "--clue_corners"))              g_clue_mask |= CLUE_CORNERS;
+        else if (!strcmp(argv[i], "--freeze_clues"))              g_freeze_clues = true;
         else if (!strcmp(argv[i], "--lambda_corners")) {
             /* The value is optional: taken only when the next token is a number
                in its entirety, so a bare flag followed by another flag works. */
@@ -4539,6 +4709,9 @@ int main(int argc, char *argv[]) {
     if (g_bt_factor_set && !g_backtrack_row_set)
         fatal("--backtrack_row_factor sets how many roots the backtracker gets: "
               "add --backtrack_row N");
+    if (g_freeze_clues && (!g_backtrack_row_set || g_backtrack_row > FRZ_MAX_BT_ROW))
+        fatal("--freeze_clues pins the clue regions in the backtrack only, so it needs "
+              "--backtrack_row N with N <= %d, below the centre block (rows 7-8)", FRZ_MAX_BT_ROW);
     if (g_emit_score < 0 || g_emit_score > 480) fatal("--emit_score must be in 0..480");
     if (g_end_polish >= 0 && !g_end_dive)
         fprintf(stderr, "[warn] --end_polish has no effect without --end_dive\n");
@@ -4674,6 +4847,10 @@ int main(int argc, char *argv[]) {
     if (g_clue_orient_req != 0xF && !g_clue_mask)
         fatal("--clue_orient needs --clue_center or --clue_corners: with clues off "
               "there is no orientation to choose");
+    if (g_freeze_clues)
+        printf("[cfg] freeze_clues: valid clue regions (centre rows 7-8 x cols 7-8, inner "
+               "corners rows 1-2/13-14 x cols 1-2/13-14) held in the backtrack above row %u\n",
+               g_backtrack_row);
     if (rot_path && g_opt_free_edges)
         printf("[note] --free_edges given: the rotations file '%s' is ignored\n", rot_path);
     fflush(stdout);
@@ -4793,12 +4970,19 @@ int main(int argc, char *argv[]) {
             printf("[note] line %u: the border has a broken edge, so no top row is locked "
                    "(sides only, as with --free_top)\n", line);
         fflush(stdout);
+        fin_freeze_line(line);
         /* The corner term measures blocks still to be built. A lock reaching row
-           14 has built them already, from the input. */
+           14 has built them already, from the input, and so has a frozen top
+           corner region. */
         g_corners_on = g_corners_req && g_top_T > EDGE_LEN;
         if (g_corners_req && !g_corners_on)
             printf("[corner] line %u: rows 14-15 are locked from the input, so the corner "
                    "blocks' pieces there are fixed -- --lambda_corners is off for this line\n", line);
+        else if (g_corners_on && (g_frz_mask & FRZ_TOP)) {
+            g_corners_on = false;
+            printf("[corner] line %u: a top corner clue region is frozen, so its block is "
+                   "fixed -- --lambda_corners is off for this line\n", line);
+        }
         if (g_corners_req && g_free_edges) {
             printf("[corner] line %u: free mode, so the sides are unknown and no corner "
                    "catalog exists -- skipped (--lambda_corners)\n", line);

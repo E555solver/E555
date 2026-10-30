@@ -1397,14 +1397,43 @@ board is the single root, split over the threads by the hand-off queue.
 board with the shared dive engine (5.11). `--stop_row` may be 14 (row 15 is
 never searched). The finalizer has no column-major extension.
 
+**`--freeze_clues`** holds the input's **clue regions** in place: the 2x2 blocks
+at rows 7-8 x cols 7-8 (the centre, wherever the clue is or is not) and at rows
+1-2 / 13-14 x cols 1-2 / 13-14 (the inner corners, each corner clue on its
+block's inner diagonal). With a fixed frame a frozen corner region fixes the
+whole 3x3 corner. Per line, a region is frozen when its 4 cells are placed and
+matched, every edge to a cell the line holds (the lock, the locked top, the kept
+ring, a left column fixed from the partial) matches, none of its cells is a beam
+row, and, under `--clue_*`, it agrees with the line's clue frame (a line carrying
+no clue freezes no region holding a clue cell). Its pieces are reserved, the
+backtrack pins each on its cell and the colour under it, and every written board
+carries them, above the stop row too; the dives never move them. One
+`[freeze] line N: frozen ...; not frozen REGION (why)` line per input line; a
+line that freezes nothing runs as without the flag. Only the backtrack sees the
+pins, so `--backtrack_row N` is required with `N <= 6`, below the centre block:
+the beam only finds the frozen pieces spent. `N <= 5` searches row 6 against the
+centre block; at `N = 6` row 6 is the beam's root row and only roots that
+already meet it survive. A frozen TL or TR turns `--lambda_corners` off for the
+line. The backtracker's `--with_clue_regions` (9.5) cuts bands that carry the
+regions: on a top-open board, with `--with_frame`, it completes the border and
+the top corner blocks for this flag.
+
+```bash
+E555_backtracker seed beams.csv bt.csv --stop_row 5 --with_frame --with_clue_regions \
+    --order rowmajor --break_mode any --breaks 0 --max_emitted 20
+E555_finalizer seed bt.csv.stop_row5.csv --finalize_from 5 --backtrack_row 5 \
+    --stop_row 12 --keep_ring --freeze_clues
+```
+
 ### 6.8 Output
 
 Boards are appended to `<out_dir>/beam_completions_finalized_<stop_row>.csv`
 with ids `p<line>r<repeat>l<column>`; each line is one atomic append, so several
 processes may share the file. A board carries rows `0..stop_row`, the locked top
 rows, the ring under `--keep_ring`, and (known sides) the left column and the
-top-right corner. `--max_emitted` stops the run after N boards (the stop-row
-beam in flight is written in full).
+top-right corner, and the frozen clue regions under `--freeze_clues`.
+`--max_emitted` stops the run after N boards (the stop-row beam in flight is
+written in full).
 
 ### 6.9 Choosing `--finalize_from`
 
@@ -1428,6 +1457,7 @@ enumeration grows explosively as rows are freed; 7 is a practical value.
 | `--no_fanout_sort` | off | skip the fan-out sort of each rebuilt database: much faster rebuilds at a low lock; a parent no longer finds its most promising completions first when its quota or budget runs out, and a run no longer repeats (5.15) |
 | `--clue_center`, `--clue_corners` | off | hold the clues (6.5) |
 | `--clue_orient LIST`, `--pin_clue N` | auto, 0 | orientations for a clue-less line |
+| `--freeze_clues` | off | hold the input's valid 2x2 clue regions in the backtrack; needs `--backtrack_row` <= 6 (6.7) |
 | `--incomplete_top` | off | also write two-segment stop-row boards |
 | `--beam_width K`, `--stop_row R` | 250000, 11 | width; last row, up to 14 |
 | `--backtrack_row N` | off | exhaustive search (6.7) |
