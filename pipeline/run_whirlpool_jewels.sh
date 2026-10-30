@@ -138,15 +138,16 @@ case "$FREEZE" in       # centre block is held too
 esac
 # Frozen blocks: the cut fills them (--with_clue_regions) and the finalizer
 # holds them (--freeze_clues). Only the finalizer's backtrack sees them, so it
-# starts at row 5 and searches row 6 against the centre block; from row 6, the
-# beam's row 6 had to fit under the block by chance, and on the synthetic
-# solution's own band none did.
+# searches exhaustively from its lock (--backtrack_row BR, set per lap), each
+# band with an equal share of LAP_TIME: a beam row below the centre block had to
+# fit it by chance (on the synthetic solution's own band, from row 6, none did),
+# and the search from the lock settles a band for good.
 # The cut's order: rowmajor was measured for the plain cut; with the blocks, most
 # cuts have no filling, and mrv proves that in a second where rowmajor ran out
 # its BAND_TIME (the same 4 of 20 boards cut either way).
 REGION_ARG=(); FREEZE_ARG=(); CUT_ORDER=rowmajor
 if [ "$FREEZE" = 1 ]; then
-    REGION_ARG=(--with_clue_regions); FREEZE_ARG=(--freeze_clues --backtrack_row 5)
+    REGION_ARG=(--with_clue_regions); FREEZE_ARG=(--freeze_clues)
     CUT_ORDER=mrv
 fi
 # Checked here, because a bad value would otherwise fail every lap quietly.
@@ -162,7 +163,7 @@ for cut in $LAP1_CUT $LATER_CUTS; do
     [[ $cut =~ ^([1-9][0-9]*):([1-9][0-9]*)$ ]] || die "a cut is BR:KC (got: $cut)"
     br=${BASH_REMATCH[1]}
     [ "$br" -lt "$FIN_STOP_ROW" ] || die "cut $cut: BR must be below FIN_STOP_ROW ($FIN_STOP_ROW)"
-    [ "$FREEZE" = 0 ] || [ "$br" -le 5 ] || die "cut $cut: with FREEZE=1, BR is at most 5 (the finalizer backtracks from row 5)"
+    [ "$FREEZE" = 0 ] || [ "$br" -le 6 ] || die "cut $cut: with FREEZE, BR is at most 6 (--freeze_clues backtracks from row 6 or lower)"
 done
 BIN=$REPO/bin; TOOLS=$REPO/tools
 case "$SEED" in /*) ;; *) SEED=$REPO/$SEED ;; esac
@@ -369,9 +370,11 @@ run_lap() {
     [ "$FREEZE" = 0 ] || [ "$FROZEN_CENTRE" = 1 ] || free_centre "$d/bands.csv"
 
     t=$(cap "$LAP_TIME"); [ "$t" -gt 5 ] || { WHY="out of time"; return 1; }
+    local lock=()
+    [ "$FREEZE" = 0 ] || lock=(--backtrack_row "$br" --time_limit "$(( t / BANDS_GROWN > 1 ? t / BANDS_GROWN : 1 ))")
     timeout -k 5 "$(left)" "$BIN/E555_finalizer" "$SEED" "$d/bands.csv" --out_dir "$d/fin" \
         --finalize_from "$br" --stop_row "$FIN_STOP_ROW" --keep_ring --no_fanout_sort \
-        "${CLUE_ARG[@]}" "${FREEZE_ARG[@]}" \
+        "${CLUE_ARG[@]}" "${FREEZE_ARG[@]}" "${lock[@]}" \
         --beam_width "$FIN_WIDTH" --lambda_Mahalanobis 0 \
         --frac_rand 0.0 --max_emitted 1 --wall_time "$t" --rng_seed "$((RNG_SEED + NB))" \
         --threads "$THREADS" --print_cmd > "$d/fin.log" 2>&1 || true
