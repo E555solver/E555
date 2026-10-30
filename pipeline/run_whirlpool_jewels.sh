@@ -91,8 +91,9 @@ FREEZE=auto             # 1 = the band cut also fills the five 2x2 clue blocks a
 BEAM_WIDTH=10000
 BEAM_STOP_ROW=10        # s1 is complete up to this row
 BEAM_BACKTRACK=6        # exhaustive from this row (--backtrack_row)
-BEAM_MIN_COL=4          # keep only boards whose columns 1..N then grow whole up to
-                        # row 14; this also completes s1's top-left 2x2 block. 0 = off
+BEAM_MIN_COL=4          # keep only boards whose columns 0..N then grow whole up to
+                        # row 14 (0 = off); boards whose column 0 then cannot
+                        # take a corner are dropped
 BEAM_COLUMNS=auto       # left border columns tried per bottom; auto = 4, or 16 with
                         # CLUES=all (the corner clues leave few columns that work)
 BEAM_TAU=0.1            # randomness in picking those columns; 0 = the best-ranked
@@ -134,9 +135,13 @@ case "$FREEZE" in 0|1) ;; *) die "FREEZE must be 0, 1 or auto (got: $FREEZE)" ;;
 # starts at row 5 and searches row 6 against the centre block; from row 6, the
 # beam's row 6 had to fit under the block by chance, and on the synthetic
 # solution's own band none did.
-REGION_ARG=(); FREEZE_ARG=()
+# The cut's order: rowmajor was measured for the plain cut; with the blocks, most
+# cuts have no filling, and mrv proves that in a second where rowmajor ran out
+# its BAND_TIME (the same 4 of 20 boards cut either way).
+REGION_ARG=(); FREEZE_ARG=(); CUT_ORDER=rowmajor
 if [ "$FREEZE" = 1 ]; then
     REGION_ARG=(--with_clue_regions); FREEZE_ARG=(--freeze_clues --backtrack_row 5)
+    CUT_ORDER=mrv
 fi
 # Checked here, because a bad value would otherwise fail every lap quietly.
 for v in BEAM_STOP_ROW BEAM_BACKTRACK BEAM_MIN_COL BEAM_COLUMNS FIN_STOP_ROW; do
@@ -176,16 +181,31 @@ nth_board()    { awk -v n="$2" '!/^[#%]/ && NF && ++k == n {print; exit}' "$1"; 
 
 # keep_block IN OUT BR KC -- clear the interior cells of rows 1..BR right of
 # column KC; the block in columns 1..KC stays as the band cut's anchor. Under
-# FREEZE the 2x2 clue blocks on rows 1-2 stay too: the turn brought the
-# parent's top-right block to columns 13-14 there.
+# FREEZE the 2x2 corner clue blocks are kept, rows 1-2 included (the turn
+# brought the parent's top-right block to columns 13-14 there), but only where
+# the five frame cells of their 3x3 corner are placed too: on s1, the column
+# extension fills the top-left block, and where its frame cap stopped short no
+# edge piece may fit beside it (160 of 170 boards in one batch); the cut then
+# fills that block again, around the frame.
 keep_block() {
     awk -F, -v br="$3" -v kc="$4" -v spare="$FREEZE" 'BEGIN {OFS = ","}
+        function framed(r, c,   R, C, i, j) {
+            R = r <= 2 ? 0 : 15; C = c <= 2 ? 0 : 15
+            i = R ? -1 : 1; j = C ? -1 : 1
+            return ((R * 16 + C) in at) && ((R * 16 + C + j) in at) && ((R * 16 + C + 2 * j) in at) &&
+                   (((R + i) * 16 + C) in at) && (((R + 2 * i) * 16 + C) in at)
+        }
         !/^[#%]/ && NF {
-            n = NF - 512
+            n = NF - 512; split("", at)
+            for (p = 1; p <= 256; p++) if ($(n + p) != 999) at[$(n + p) + 0] = 1
             for (p = 1; p <= 256; p++) {
                 c = $(n + p); if (c == 999) continue
                 r = int(c / 16); col = c % 16
-                if (spare && r <= 2 && (col <= 2 || col >= 13)) continue
+                if (spare && (r == 1 || r == 2 || r == 13 || r == 14) &&
+                    (col == 1 || col == 2 || col == 13 || col == 14)) {
+                    if (!framed(r, col)) $(n + p) = 999
+                    continue
+                }
                 if (r >= 1 && r <= br && col > kc && col <= 14) $(n + p) = 999
             }
             print
@@ -238,9 +258,17 @@ function region_set(line,   x, n, p, c, r, k, s, m) {
 }
 BEGIN { ring_cells() }'
 
-# one_per_frame IN OUT -- keep the first board of each distinct frame
+# one_per_frame IN OUT -- keep the first board of each distinct frame, if its
+# top-left corner can close: with BEAM_MIN_COL the column extension lays
+# column 0 up to row 14, and where no unused corner fits on top of it (the
+# extension's top cap stopped at once) no cut can ever close the frame there
+# -- 110 of 170 boards in one batch
 one_per_frame() {
-    awk "$RING"' !/^[#%]/ && NF { r = ring_of($0); if (!(r in seen)) { seen[r] = 1; print } }' "$1" > "$2"
+    awk "$RING"' !/^[#%]/ && NF {
+        n = NF - 512; c14 = c15 = 0
+        for (p = 1; p <= 256; p++) { c14 += $(n + p) == 224; c15 += $(n + p) == 240 }
+        if (c14 && !c15) next
+        r = ring_of($0); if (!(r in seen)) { seen[r] = 1; print } }' "$1" > "$2"
 }
 
 # jewel_key CHAIN -- the frame key if the four boards in CHAIN (s1..s4) make a
@@ -285,6 +313,7 @@ produce() {    # produce N -> queue.csv
         > "$d.log" 2>&1 || log "[produce] the beamer exited non-zero (see $d.log)"
     xargs -r cat < "$d/outputs.txt" > "$d/all.csv" 2> /dev/null || : > "$d/all.csv"
     one_per_frame "$d/all.csv" "$d/one.csv"
+    PRODUCED=$(count_boards "$d/all.csv")
     shuf --random-source=<(yes "$RNG_SEED.$1") "$d/one.csv" > queue.csv
     rm -rf "$d"
 }
@@ -308,7 +337,7 @@ run_lap() {
     t=$(cap "$BAND_TIME"); [ "$t" -gt 2 ] || { WHY="out of time"; return 1; }
     timeout -k 5 "$(left)" "$BIN/E555_backtracker" "$SEED" "$d/cut.csv" "$d/bt.csv" \
         --stop_row "$br" --with_frame "${REGION_ARG[@]}" "${CLUE_ARG[@]}" \
-        --order rowmajor --break_mode any --breaks 0 \
+        --order "$CUT_ORDER" --break_mode any --breaks 0 \
         --max_emitted "$BANDS_ENUMERATED" --time_limit "$t" --threads "$THREADS" \
         --print_cmd > "$d/bt.log" 2>&1 || true
     band=$(grep -s "stop_row$br\.csv$" "$d/bt.csv.outputs.txt" | head -n 1 || true)
@@ -410,7 +439,8 @@ while [ $((SECONDS - T0)) -lt "$WALL" ]; do
         produce "$NP"
     fi
     NP=$((NP + 1)); nq=$(count_boards queue.csv)
-    log "[produce $NP] $nq boards, one per frame ($((SECONDS - T0)) s)"
+    if [ -n "$INPUT" ]; then log "[input] $nq boards ($((SECONDS - T0)) s)"
+    else log "[produce $NP] $nq of the $PRODUCED boards written: one per frame, top-left corner closable ($((SECONDS - T0)) s)"; fi
     if [ "$nq" = 0 ]; then
         EMPTY=$((EMPTY + 1)); [ "$EMPTY" -lt 2 ] && continue
         log "two empty produce calls in a row: stopping"; break
