@@ -286,8 +286,8 @@ BEGIN { ring_cells() }'
 # -- 110 of 170 boards in one batch
 one_per_frame() {
     awk "$RING"' !/^[#%]/ && NF {
-        n = NF - 512; c14 = c15 = 0
-        for (p = 1; p <= 256; p++) { c14 += $(n + p) == 224; c15 += $(n + p) == 240 }
+        n = split($0, x, ",") - 512; c14 = c15 = 0
+        for (p = 1; p <= 256; p++) { c14 += x[n + p] + 0 == 224; c15 += x[n + p] + 0 == 240 }
         if (c14 && !c15) next
         r = ring_of($0); if (!(r in seen)) { seen[r] = 1; print } }' "$1" > "$2"
 }

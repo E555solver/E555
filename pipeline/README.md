@@ -359,29 +359,64 @@ rows (rows 1..BR, columns 1..KC); let `E555_backtracker --stop_row BR
 `E555_finalizer --keep_ring --no_fanout_sort`. `--keep_ring` holds the frame in
 place, so the ring lap 1 completed is the ring every later lap keeps.
 
-**Clues and frozen blocks.** Every tool holds the centre clue by default
-(`CLUES=center`); `CLUES=all` adds the four corner clues and `CLUES=none` runs
-unclued. A clue keeps its own cell through every lap, and a clued run keeps its
-own database cache (`E555.db.center`, `E555.db.all`). With `CLUES=all` the
-runner also **freezes the five 2x2 clue blocks** (the centre and the inner
-corners, rows and columns 1-2 and 13-14; `FREEZE=0` opts out, `FREEZE=1` turns
-it on without the corner clues): lap 1's cut fills them with
-`--with_clue_regions`, and every lap's finalizer holds them with
-`--freeze_clues --backtrack_row 5`, as `--keep_ring` holds the frame. The four
-boards of such a jewel share 80 pieces, the frame and the 20 block pieces, and
-differ only where they were re-grown. Far fewer boards get through; each is a
-strong target for a long tail search.
+**Clues.** Every tool holds the centre clue by default (`CLUES=center`);
+`CLUES=all` adds the four corner clues and `CLUES=none` runs unclued. A clue
+keeps its own cell through every lap, and a clued run keeps its own database
+cache (`E555.db.center`, `E555.db.all`).
 
-The beamer's settings: `BEAM_STOP_ROW` and `FIN_STOP_ROW` (both 10) set how far
-s1 and s2..s4 are grown; `BEAM_MIN_COL=4` keeps only boards whose columns 1..4
-then grow whole to row 14, which also completes s1's top-left block (the turn
-makes it lap 1's top-right one); `BEAM_COLUMNS` left columns are tried per
-bottom (4, or 16 with `CLUES=all`), picked with a little randomness
-(`BEAM_TAU=0.1`).
+**Frozen blocks** (`FREEZE`, on by default with `CLUES=all`; `FREEZE=1` turns it
+on without the corner clues, `FREEZE=corners` freezes the four corner blocks
+only). The cut also fills the five 2x2 clue blocks (`--with_clue_regions`: the
+centre and the inner corners, rows and columns 1-2 and 13-14), and every lap's
+finalizer holds them (`--freeze_clues`), as `--keep_ring` holds the frame, searching
+exhaustively from its lock with an equal share of `LAP_TIME` per band. The four
+boards of a jewel then share 80 pieces, the frame and the 20 block pieces, and
+all five clues. Freezing switches the `auto` settings to cuts 2:4 then 2:3, 8
+bands a lap, re-grown to row 9 (`LAP_TIME=480`, `BOARD_TIME=1800`), because:
 
-What it measured (whirlpool campaign 20261028-0249, 4 vCPUs, an hour per run;
-the campaign README on the `agent_runs` branch has the details). These runs were
-unclued, without `BEAM_MIN_COL` and `BEAM_TAU`:
+* **Row 10 is out of reach, row 9 is not.** With every block frozen, a lock at
+  row 3 took none of 56 lap-1 bands past row 8; a lock at row 2 took 33 of
+  them to row 9 and none to row 10. Every one of those searches was exhaustive
+  (37-83 s a band), and none of the row-9 boards admits a row 10 even with the
+  frozen top-block pieces handed back. Freezing the corner blocks only, 33 of
+  56 reached row 9 and 1 row 10 at the row-3 lock; unfrozen, 8 reached row 10.
+* **Most boards fail at once, the rest mostly make jewels.** On a saved batch of
+  60 boards (4 cores, `INPUT=`), 41 cuts had no filling (the corner clue, its
+  block and the frame cannot close a corner; settled in a second with `--order
+  mrv`), 2 boards did not re-grow, 2 stopped in lap 2, and **15 became jewels in
+  33 minutes**, 49-243 s each, all checked: rows 0..9 full, no break, the five
+  clues home, one frame and block set on s2..s4. At row 8 with 3:4 cuts the same
+  hour made 1.
+* **s1 needs a top-left corner that can close.** `BEAM_MIN_COL` lays column 0
+  up to row 14, and on 110 of 170 frames of one batch no corner fits on top of
+  it; produce drops those boards (in every mode). A corner block is kept from
+  the parent only inside a closed 3x3 corner; otherwise the cut fills it again.
+
+The beamer's settings: `BEAM_STOP_ROW` and `FIN_STOP_ROW` set how far s1 and
+s2..s4 are grown; `BEAM_MIN_COL=4` keeps only boards whose columns 0..4 then grow
+whole to row 14; `BEAM_COLUMNS` left columns are tried per bottom (4, or 16 with
+`CLUES=all`), picked with a little randomness (`BEAM_TAU=0.1`). A `CLUES=all`
+beamer call wrote 207 to 2000 boards in 570 s, 60 to 166 of them distinct frames
+whose corner can close.
+
+**Many cores.** The runner works on one board at a time, so on a big machine
+run several copies, each with its own `RUN_DIR`, a few threads and an
+`RNG_SEED` far from the others' (its n-th beamer call uses seed RNG_SEED + n),
+sharing one `DB_FILE` (read-only once written, so the copies share it in the
+page cache). Let the first copy write the cache before starting the others,
+since two first calls would build it at the same time:
+
+```bash
+run() { bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db CLUES=all THREADS=4 \
+            RUN_DIR=jewels_$1 RNG_SEED=${1}000000 WALL=216000 > jewels_$1.out 2>&1; }
+run 1 &
+until [ -s E555.db.all ]; do sleep 30; done     # CLUES=all appends .all
+for i in 2 3 4 5; do run $i & done; wait
+```
+
+What the unfrozen runner measured (whirlpool campaign 20261028-0249, 4 vCPUs,
+an hour per run; the campaign README on the `agent_runs` branch has the
+details). These runs were unclued, without `BEAM_MIN_COL` and `BEAM_TAU`:
 
 * **87 jewels per hour** over five hours (78 to 96 per run). The population
   runner above found none: its frame never survived a second lap.
