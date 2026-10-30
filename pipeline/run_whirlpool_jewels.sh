@@ -28,8 +28,10 @@
 # clue blocks -- the centre and the four inner corners, rows/columns 1-2 and
 # 13-14 -- and every later lap keeps them in place, as it keeps the frame. The
 # four boards of such a jewel share 80 pieces: the frame and the 20 block
-# pieces. Fewer boards get through, but each one is a strong target for a long
-# tail search.
+# pieces. Most boards fail at once (no cut closes their corners), and a frozen
+# lap reaches row 9, not 10, so FREEZE switches the auto settings to cuts 2:4
+# and 2:3 re-grown to row 9; each jewel is a strong target for a long tail
+# search. FREEZE=corners freezes the four corner blocks only.
 #
 # One lap (s_k -> s_k+1):
 #
@@ -42,7 +44,8 @@
 #   re-grow rows BR+1..     E555_finalizer --keep_ring, up to FIN_STOP_ROW: the
 #                           frame is held in place, so every lap keeps the ring
 #                           lap 1 completed (FREEZE: --freeze_clues holds the
-#                           clue blocks the same way)
+#                           clue blocks the same way, searched exhaustively
+#                           from the lock)
 #
 # A cut is written BR:KC. Lap 1 uses LAP1_CUT; laps 2 and 3 try each of
 # LATER_CUTS in turn. The search is depth-first: the first boards a lap
@@ -77,7 +80,8 @@ RUN_DIR=whirlpool_jewels
 THREADS=$(nproc)
 DB_FILE=                # the beamer's chain database cache; strongly recommended
 WALL=3600               # seconds to run
-BOARD_TIME=180          # seconds at most per board (its three laps)
+BOARD_TIME=auto         # seconds at most per board (its three laps); auto = 180,
+                        # or 1800 with FREEZE
 RNG_SEED=0              # 0 = from the clock
 INPUT=                  # whirl these boards instead of producing them
 DIVE=0                  # 1 = dive the jewels at the end
@@ -102,17 +106,20 @@ BEAM_BOARDS=2000        # boards per beamer call
 BEAM_TIME=570           # seconds per beamer call
 
 # the band cut
-LAP1_CUT=3:4            # BR:KC for lap 1
-LATER_CUTS="4:3 3:4"    # laps 2 and 3: tried in this order
+LAP1_CUT=auto           # BR:KC for lap 1; auto = 3:4, or 2:4 with FREEZE
+LATER_CUTS=auto         # laps 2 and 3, tried in this order; auto = "4:3 3:4",
+                        # or "2:4 2:3" with FREEZE
 BANDS_ENUMERATED=60     # each cut finds up to this many exact fillings (bands)
-BANDS_GROWN=2           # the finalizer re-grows the BANDS_GROWN most different
-                        # ones; more gives a lap more chances, ~10 s per extra band
+BANDS_GROWN=auto        # the finalizer re-grows the BANDS_GROWN most different
+                        # ones; more gives a lap more chances, ~10 s per extra
+                        # band; auto = 2, or 8 with FREEZE
 BAND_TIME=15            # seconds per cut
 
 # the re-grow
-FIN_STOP_ROW=10         # s2..s4 are re-grown up to this row
+FIN_STOP_ROW=auto       # s2..s4 are re-grown up to this row; auto = 10, or 9
+                        # with FREEZE
 FIN_WIDTH=20000
-LAP_TIME=90             # seconds per finalizer call
+LAP_TIME=auto           # seconds per finalizer call; auto = 90, or 480 with FREEZE
 CHILDREN=2              # re-grown boards of a lap tried in the next one
 # -----------------------------------------------------------------------------
 for arg in "$@"; do
@@ -136,6 +143,13 @@ case "$FREEZE" in       # centre block is held too
     corners) FREEZE=1; FROZEN_CENTRE=0 ;;
     *) die "FREEZE must be 0, 1, corners or auto (got: $FREEZE)" ;;
 esac
+# auto: the measured settings of each mode. Frozen, a lock at row 2 took 33 of
+# 56 lap-1 bands to row 9 and none to row 10, a lock at row 3 none past row 8;
+# a lap then needs 1 to 8 bands of up to a minute each.
+auto() { [ "${!1}" != auto ] || { [ "$FREEZE" = 1 ] && declare -g "$1=$3" || declare -g "$1=$2"; }; }
+auto LAP1_CUT 3:4 2:4;      auto LATER_CUTS "4:3 3:4" "2:4 2:3"
+auto FIN_STOP_ROW 10 9;     auto BANDS_GROWN 2 8
+auto LAP_TIME 90 480;       auto BOARD_TIME 180 1800
 # Frozen blocks: the cut fills them (--with_clue_regions) and the finalizer
 # holds them (--freeze_clues). Only the finalizer's backtrack sees them, so it
 # searches exhaustively from its lock (--backtrack_row BR, set per lap), each
@@ -151,7 +165,7 @@ if [ "$FREEZE" = 1 ]; then
     CUT_ORDER=mrv
 fi
 # Checked here, because a bad value would otherwise fail every lap quietly.
-for v in BEAM_STOP_ROW BEAM_BACKTRACK BEAM_MIN_COL BEAM_COLUMNS FIN_STOP_ROW; do
+for v in BEAM_STOP_ROW BEAM_BACKTRACK BEAM_MIN_COL BEAM_COLUMNS FIN_STOP_ROW BANDS_GROWN LAP_TIME BOARD_TIME; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
 done
 [[ $BEAM_TAU =~ ^[0-9]+([.][0-9]+)?$ ]] || die "BEAM_TAU must be a number, 0 or more (got: $BEAM_TAU)"
@@ -446,7 +460,7 @@ whirl_board() {
 
 # ---- main loop -----------------------------------------------------------------------
 log "[cfg] run_dir=$RUN_DIR threads=$THREADS wall=$WALL board_time=$BOARD_TIME rng_seed=$RNG_SEED db_file=${DB_FILE:-<rebuilt each call>}"
-log "[cfg] clues=$CLUES freeze=$FREEZE_MODE beam: stop_row=$BEAM_STOP_ROW columns=$BEAM_COLUMNS tau=$BEAM_TAU min_col=$BEAM_MIN_COL; finalizer: stop_row=$FIN_STOP_ROW"
+log "[cfg] clues=$CLUES freeze=$FREEZE_MODE beam: stop_row=$BEAM_STOP_ROW columns=$BEAM_COLUMNS tau=$BEAM_TAU min_col=$BEAM_MIN_COL; cuts: $LAP1_CUT, then $LATER_CUTS, $BANDS_GROWN bands; finalizer: stop_row=$FIN_STOP_ROW lap_time=$LAP_TIME"
 T0=$SECONDS; NB=0; NJ=0; NP=0; EMPTY=0
 # The beamer maps the database file into memory and reads only the pages it
 # touches, in random order. From a cold disk (after a reboot) that kept one
