@@ -1668,7 +1668,14 @@ s2..s4, each re-grown to row 10, all holding the same complete 60-cell frame.
 Each lap keeps only rows 1..BR x columns 1..KC of the turned board (cut 3:4 on
 lap 1; 4:3, then 3:4 on laps 2-3), cuts rows 0..BR with `--with_frame`, and
 re-grows with `--keep_ring --no_fanout_sort`; depth-first, one board per frame.
-Measured: 87 jewels per hour on 4 cores (pipeline/README.md).
+Measured: 87 jewels per hour on 4 cores (pipeline/README.md), unclued.
+`CLUES` (default `center`; `all`, `none`) passes the clue flags to all three
+tools. With `CLUES=all` (or `FREEZE=1`) the cut adds `--with_clue_regions` and
+the finalizer `--freeze_clues --backtrack_row 5`, and the runner drops boards
+that lost a block, so a jewel's four boards share the frame and the five 2x2
+clue blocks, 80 pieces. The row is 5, not 6: at 6 the beam's row 6 must meet
+the frozen centre block by chance, and on the synthetic solution's own band no
+root did, while 5 found the solution in 1 s.
 
 ---
 

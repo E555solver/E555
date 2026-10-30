@@ -349,6 +349,7 @@ the beamer's early guesses.
 ```bash
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                 # an hour
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1 # then dive the jewels
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db CLUES=all       # all five clues, blocks frozen
 bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                # whirl your own boards
 ```
 
@@ -358,8 +359,29 @@ rows (rows 1..BR, columns 1..KC); let `E555_backtracker --stop_row BR
 `E555_finalizer --keep_ring --no_fanout_sort`. `--keep_ring` holds the frame in
 place, so the ring lap 1 completed is the ring every later lap keeps.
 
+**Clues and frozen blocks.** Every tool holds the centre clue by default
+(`CLUES=center`); `CLUES=all` adds the four corner clues and `CLUES=none` runs
+unclued. A clue keeps its own cell through every lap, and a clued run keeps its
+own database cache (`E555.db.center`, `E555.db.all`). With `CLUES=all` the
+runner also **freezes the five 2x2 clue blocks** (the centre and the inner
+corners, rows and columns 1-2 and 13-14; `FREEZE=0` opts out, `FREEZE=1` turns
+it on without the corner clues): lap 1's cut fills them with
+`--with_clue_regions`, and every lap's finalizer holds them with
+`--freeze_clues --backtrack_row 5`, as `--keep_ring` holds the frame. The four
+boards of such a jewel share 80 pieces, the frame and the 20 block pieces, and
+differ only where they were re-grown. Far fewer boards get through; each is a
+strong target for a long tail search.
+
+The beamer's settings: `BEAM_STOP_ROW` and `FIN_STOP_ROW` (both 10) set how far
+s1 and s2..s4 are grown; `BEAM_MIN_COL=4` keeps only boards whose columns 1..4
+then grow whole to row 14, which also completes s1's top-left block (the turn
+makes it lap 1's top-right one); `BEAM_COLUMNS` left columns are tried per
+bottom (4, or 16 with `CLUES=all`), picked with a little randomness
+(`BEAM_TAU=0.1`).
+
 What it measured (whirlpool campaign 20261028-0249, 4 vCPUs, an hour per run;
-the campaign README on the `agent_runs` branch has the details):
+the campaign README on the `agent_runs` branch has the details). These runs were
+unclued, without `BEAM_MIN_COL` and `BEAM_TAU`:
 
 * **87 jewels per hour** over five hours (78 to 96 per run). The population
   runner above found none: its frame never survived a second lap.
