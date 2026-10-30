@@ -1670,17 +1670,10 @@ lap 1; 4:3, then 3:4 on laps 2-3), cuts rows 0..BR with `--with_frame`, and
 re-grows with `--keep_ring --no_fanout_sort`; depth-first, one board per frame.
 Measured: 87 jewels per hour on 4 cores (pipeline/README.md), unclued.
 `CLUES` (default `center`; `all`, `none`) passes the clue flags to all three
-tools. `FREEZE` (on with `CLUES=all`; `1`, `corners`, `0`) cuts with
-`--with_clue_regions` and re-grows with `--freeze_clues`, searching
-exhaustively from the lock, and drops boards that lost a block: a jewel's four
-boards then share the frame and the five 2x2 clue blocks, 80 pieces. Frozen,
-the `auto` settings become cuts 2:4 then 2:3 re-grown to row 9 with 8 bands a
-lap. Measured, all five blocks frozen: from a row-3 lock no lap-1 band passed
-row 8, from a row-2 lock 33 of 56 reached row 9 and none row 10 (each search
-complete); on 60 saved `CLUES=all` boards, 15 jewels in 33 minutes on 4 cores,
-most boards failing at once because no cut closes their corners. Produce drops
-s1 boards whose column 0 reaches row 14 with no corner able to close it
-(`BEAM_MIN_COL`), and the cut keeps a corner block only inside a closed corner.
+tools. `FREEZE` (on with `CLUES=all`) cuts with `--with_clue_regions` and
+re-grows with `--freeze_clues`, exhaustively from the lock, so a jewel also
+holds the five 2x2 clue blocks; frozen laps reach row 9, not 10 (every search
+complete), so the cuts become 2:4 then 2:3, grown to row 9.
 
 ---
 
