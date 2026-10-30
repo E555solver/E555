@@ -374,8 +374,7 @@ Frozen laps reach row 9 but not row 10, so the `auto` settings switch to cuts
 keeps beamer boards whose left columns grow whole to row 14 (those whose
 top-left corner then cannot close are dropped); `BEAM_COLUMNS` left columns
 per bottom are picked with a little randomness (`BEAM_TAU`). On a big machine,
-run several copies, each with its own `RUN_DIR` and an `RNG_SEED` far from the
-others' (the n-th beamer call uses `RNG_SEED + n`).
+run several copies, each with its own `RUN_DIR`; every run draws its own seed.
 
 What the unfrozen runner measured (whirlpool campaign 20261028-0249, 4 vCPUs,
 an hour per run; the campaign README on the `agent_runs` branch has the

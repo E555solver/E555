@@ -82,7 +82,7 @@ DB_FILE=                # the beamer's chain database cache; strongly recommende
 WALL=3600               # seconds to run
 BOARD_TIME=auto         # seconds at most per board (its three laps); auto = 180,
                         # or 1800 with FREEZE
-RNG_SEED=0              # 0 = from the clock
+RNG_SEED=0              # 0 = random, different for every copy started
 INPUT=                  # whirl these boards instead of producing them
 DIVE=0                  # 1 = dive the jewels at the end
 CLUES=center            # none | center | all: the Eternity II clues every tool
@@ -184,7 +184,8 @@ case "$SEED" in /*) ;; *) SEED=$REPO/$SEED ;; esac
 [ -z "$INPUT" ] || INPUT=$(cd "$(dirname "$INPUT")" && pwd)/$(basename "$INPUT")
 [ -z "$DB_FILE" ] || DB_FILE=$(cd "$(dirname "$DB_FILE")" && pwd)/$(basename "$DB_FILE")
 [ -z "$DB_FILE" ] || [ "$CLUES" = none ] || DB_FILE=$DB_FILE.$CLUES   # one cache per clue setting
-[ "$RNG_SEED" != 0 ] || RNG_SEED=$(( $(date +%s) % 1000000007 ))
+# bash seeds RANDOM per process, so copies started together still differ
+[ "$RNG_SEED" != 0 ] || RNG_SEED=$(( (RANDOM << 15 | RANDOM) + 1 ))
 for t in beamer backtracker finalizer; do
     [ -x "$BIN/E555_$t" ] || { echo "no $BIN/E555_$t: run make in $REPO" >&2; exit 1; }
 done
