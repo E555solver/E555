@@ -1651,12 +1651,14 @@ Four laps are one full turn. At `T = 11` a lap keeps 72 cells in place (rows
   shrinks the finalizer's database at the cost of freeing less per lap.
 - `WHIRL_ROWS` should stay in 10..12: shallower floods the output, deeper leaves
   nothing for the beam.
-- Clues: the finalizer needs the clue flags on every lap. A band cut below row 7
-  carries no clue, and the finalizer then searches each orientation its lock
-  allows (measured: a rows-0..5 band grown to row 8 gave 33,536 boards over
-  three of the four orientations; grown to row 10, only one survived). The
-  backtracker is not clue-aware at the cut; the closing dive's `--holes` mask
-  must keep the centre cell shut (`data/holes_open_border_TR.csv` does).
+- Clues: the finalizer needs the clue flags on every lap. The runner does not
+  pass them to the cut, so a band cut below row 7 carries no clue, and the
+  finalizer then searches each orientation its lock allows (measured: a
+  rows-0..5 band grown to row 8 gave 33,536 boards over three of the four
+  orientations; grown to row 10, only one survived). Given the clue flags, the
+  cut keeps every clue on its own cell (9.5) and the finalizer reads the
+  orientation instead. The closing dive's `--holes` mask must keep the centre
+  cell shut (`data/holes_open_border_TR.csv` does).
 - Stage C runs once at the end on the survivors: the roundhouse
   (`--rotate -1 --rounds 3 --strip_width 4`), then the backtracker's dives.
 
@@ -2017,7 +2019,11 @@ blocks: 142 cells per band, ready for the finalizer's `--freeze_clues` (6.7).
 placeable and a break the clues cause counts as an input break. The orientation
 is read from a board that carries a clue; `--clue_orient` applies only to a board
 carrying none. A board whose clue cell is taken, or whose clue piece sits
-elsewhere, is reported and not written. Refused with a stop band.
+elsewhere, is reported and not written. With a stop band every clue sits on its
+own cell, inside the band or outside it: a clue already home stays through the
+cut and the missing ones are placed, so the band never spends a clue piece and
+each band line carries the clues, from which the finalizer reads the
+orientation. `--with_clue_regions` puts every clue cell inside the band.
 
 **Early release.** `--early_release N` stops the exact search at the first
 break-free board with only N of its searched cells still empty, the last N of

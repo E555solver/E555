@@ -1551,6 +1551,22 @@ static bool board_from_csv(Board *b,
  * by process_line and by the duplicate-detection pass in main, so the state
  * that is hashed for deduplication is exactly the state that gets searched.
  */
+/* Does (r,c) hold an enabled clue piece on its own cell, in its own spin, under
+ * any orientation?  The table serves the search board as it is: under --rotate
+ * the turned clue set is another orientation's entries (clue_selfcheck). */
+static bool cell_holds_home_clue(const Board *b, int r, int c) {
+    const Oriented *o = &b->cell[r][c];
+    if (!g_clue_mask || o->piece_id == EMPTY_PIECE) return false;
+    for (int q = 0; q < CLUE_ORIENTS; q++)
+        for (int k = 0; k < CLUE_N; k++) {
+            if (!clue_entry_enabled(k)) continue;
+            const ClueCell *cc = &g_clue[q][k];
+            if (cc->row == r && cc->col == c &&
+                o->piece_id == (int16_t)cc->piece && o->rotation == cc->spin) return true;
+        }
+    return false;
+}
+
 static bool build_initial_board(const int pos[NUM_PIECES], const int rot[NUM_PIECES],
                                 Board *b, int *n_placed, int *holes_applied,
                                 char *why, size_t why_sz) {
@@ -1573,11 +1589,14 @@ static bool build_initial_board(const int pos[NUM_PIECES], const int rot[NUM_PIE
      * above the band would starve the band of pieces it should be free to use,
      * and the enumeration would silently be of a smaller set than asked for.
      * Runs after holes and before the state hash, so deduplication still sees
-     * exactly the board that gets searched. */
+     * exactly the board that gets searched.  Under --clue_* a clue on its own
+     * cell stays: the board keeps its orientation, and clue_apply then puts the
+     * missing clues on their cells, inside the band or not, so no clue piece is
+     * ever free for the band to place elsewhere. */
     if (g_stop_active) {
         for (int r = 0; r < PUZZLE_SIDE; r++) {
             for (int c = 0; c < PUZZLE_SIDE; c++) {
-                if (cell_in_band_search(r, c)) continue;
+                if (cell_in_band_search(r, c) || cell_holds_home_clue(b, r, c)) continue;
                 if (b->cell[r][c].piece_id != EMPTY_PIECE) {
                     board_unplace(b, r, c);
                     (*n_placed)--;
@@ -6813,7 +6832,10 @@ static void usage(const char *prog) {
         "  they create counts as an input break, so --breaks governs it as usual.  A board\n"
         "  whose clue cell is taken, or whose clue piece is stranded elsewhere, is dropped\n"
         "  with a message and is NOT written to the output.\n"
-        "  Refused with --stop_row/--stop_column: the clue cells lie outside the band.\n\n",
+        "  With --stop_row/--stop_column every clue sits on its own cell, inside the band\n"
+        "  or outside it: the cut keeps it there, the band is searched around it and\n"
+        "  never spends a clue piece, and each band line carries the clues for\n"
+        "  E555_finalizer.  --with_clue_regions puts every clue cell inside the band.\n\n",
         stderr);
     fputs(
         "Search order and pruning:\n"
@@ -7240,17 +7262,12 @@ int main(int argc, char **argv) {
         if (g_jump)
             fatal("--stop_%s requires --jump off: jumping leaves dead cells empty, "
                   "so the band can never complete", g_stop_isrow ? "row" : "column");
-        /* A band line is written from the band cells alone and is fed straight to
-         * the finalizer.  Clue cells sit at rows 2, 7/8 and 13, so most of them
-         * fall outside any useful band: forcing them on would either put pieces
-         * into a band line that the finalizer does not expect there, or take them
-         * out of the pool the band is enumerated from.  Refuse rather than emit a
-         * band that quietly means something else. */
-        if (g_clue_mask)
-            fatal("--stop_%s cannot be combined with --clue_center/--clue_corners: "
-                  "the clue cells lie outside the band, so they would either "
-                  "contaminate the emitted band or be cut from it",
-                  g_stop_isrow ? "row" : "column");
+        /* The clue flags combine with a band: every enabled clue sits on its own
+         * cell, inside the band or outside it (build_initial_board keeps it there,
+         * clue_apply places the missing ones), so the band is cut around the clues
+         * and never spends one, and the band line carries them for the finalizer,
+         * which reads the orientation off them.  With --with_clue_regions every
+         * clue cell is inside the band. */
     } else if (g_with_frame || g_with_clue_regions) {
         fatal("%s widens a stop band, so it needs one: add --stop_row N "
               "or --stop_column N", g_with_frame ? "--with_frame" : "--with_clue_regions");
@@ -7578,14 +7595,15 @@ int main(int argc, char **argv) {
         if (fprintf(g_band_csv,
                     "# E555 backtracker -- every completed --stop_%s %d band%s%s%s "
                     "(original frame)\n"
-                    "# cells outside the band are unplaced (%d); feed to "
+                    "# cells outside the band are unplaced (%d)%s; feed to "
                     "E555_finalizer --finalize_from %d\n"
                     "# fields: config_id,score,pos_0,...,pos_255,rot_0,...,rot_255\n",
                     g_stop_isrow ? "row" : "column", g_stop_n,
                     g_reverse ? " (anchored at the far side)" : "",
                     g_with_frame ? " + the complete outer frame" : "",
                     g_with_clue_regions ? " + the five 2x2 clue blocks" : "",
-                    CSV_UNPLACED, g_stop_n) < 0)
+                    CSV_UNPLACED, g_clue_mask ? ", but for the clues on their own cells" : "",
+                    g_stop_n) < 0)
             fatal("cannot write header to %s", band_csv_path);
         checked_fflush(g_band_csv, band_csv_path);
         printf("  stop band       -> %s\n", band_csv_path);

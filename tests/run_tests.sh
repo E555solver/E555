@@ -2637,10 +2637,17 @@ sys.exit("no data row")
 PY
     done
 
-    # 6. The two argument refusals.
+    # 6. A stop band keeps the clues on their own cells, outside the band too;
+    #    and the argument refusal.
     bin/E555_backtracker $E $B "$OUT/clue_x1.csv" --stop_row 5 --breaks 0 --clue_center \
-        > "$OUT/clue_x1.log" 2>&1 && fail "--stop_row accepted --clue_center"
-    grep -q "cannot be combined" "$OUT/clue_x1.log" || fail "wrong error for --stop_row + clues"
+        --clue_orient 0 --threads 1 > "$OUT/clue_x1.log" 2>&1 || fail "--stop_row with --clue_center failed"
+    python3 - "$OUT/clue_x1.csv.stop_row5.csv" <<'PY' || fail "the band line lost the centre clue"
+import sys
+sys.path.insert(0, "tools"); import E555_viewer as V
+cell, piece, spin = V.clue_list(0, V.CLUE_CENTER)[0]
+f = [l for l in open(sys.argv[1]) if l.strip() and not l.startswith("#")][0].strip().split(",")[-512:]
+assert int(f[piece]) == cell and int(f[256 + piece]) == spin, "centre clue not on its cell"
+PY
     bin/E555_backtracker $E $B "$OUT/clue_x2.csv" --clue_orient 1 \
         > "$OUT/clue_x2.log" 2>&1 && fail "--clue_orient accepted without a clue flag"
     grep -q "only means something with" "$OUT/clue_x2.log" || fail "wrong error for a lone --clue_orient"
