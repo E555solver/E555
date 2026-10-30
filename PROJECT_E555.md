@@ -1975,6 +1975,11 @@ filling of the band to `<out>.stop_row<N>.csv` as a finalizer input
 11 GB in five minutes). `--with_frame` adds the 60 frame cells to the band:
 frame cells the input holds are kept, missing ones are searched, and a band only
 counts once its frame closes. Requires `--breaks 0` and no `--jump`.
+`--with_clue_regions` adds the five 2x2 clue regions the same way (rows 7-8 x
+cols 7-8, and rows 1-2 / 13-14 x cols 1-2 / 13-14; 20 cells). On a top-open
+beamer board, `--stop_row 5 --with_frame --with_clue_regions` keeps rows 0..5 and
+the centre block and searches the rest of the frame and the two top corner
+blocks: 142 cells per band, ready for the finalizer's `--freeze_clues` (6.7).
 
 **Clues.** `--clue_center`, `--clue_corners` (all four corner clues) and
 `--clue_orient N` put the clue pieces on their cells before the search, after
@@ -2073,7 +2078,7 @@ node rate).
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record; SIGINT/SIGTERM stop every running record the same way (rows not started: copied under `--resume`, else not written), a second signal kills |
 | `--max_emitted N` | 1 | completions per record (0 = all) |
-| `--stop_row N`, `--stop_column N`, `--with_frame` | -- | band enumeration |
+| `--stop_row N`, `--stop_column N`, `--with_frame`, `--with_clue_regions` | -- | band enumeration; widen the band by the frame, by the five 2x2 clue regions |
 | `--early_release N` or `R,C` | 0 | emit the break-free board N searched cells before the end, or right after cell (R,C) |
 | `--resume` | off | continue each row's search from its identifier; write one on every row |
 | `--resume_score S` | -- | with `--resume`: skip the rows scoring below S |

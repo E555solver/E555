@@ -547,6 +547,19 @@ static int  g_stop_n      = -1;      /* band size - 1; -1 = no stop option */
 static bool g_stop_isrow  = true;    /* true: --stop_row, false: --stop_column */
 static bool g_stop_active = false;
 static bool g_with_frame  = false;   /* --with_frame: the 60 frame cells join the band */
+static bool g_with_clue_regions = false;   /* --with_clue_regions: the five 2x2 clue blocks join it */
+
+/* --with_clue_regions widens the band by the five 2x2 clue blocks: the
+ * centre (rows 7-8 x cols 7-8, the four cells the centre clue takes) and the
+ * inner corners (rows 1-2 / 13-14 x cols 1-2 / 13-14, each holding its corner
+ * clue cell on the inner diagonal).  Held block cells survive the cut, missing
+ * ones are searched, and the band counts once they close -- so the blocks reach
+ * E555_finalizer --freeze_clues.  The set maps onto itself under a quarter turn. */
+static inline bool cell_in_clue_region(int r, int c) {
+    const bool rr = (r >= 1 && r <= 2) || (r >= 13 && r <= 14);
+    const bool cc = (c >= 1 && c <= 2) || (c >= 13 && c <= 14);
+    return (rr && cc) || ((r == 7 || r == 8) && (c == 7 || c == 8));
+}
 
 /* --with_frame widens the band to rows 0..N PLUS the whole outer frame, which is
  * what lets a fixed border survive a whirlpool lap.  Everything the band means
@@ -561,6 +574,7 @@ static inline bool cell_in_band(int r, int c) {
     if (!g_stop_active) return true;
     if (g_with_frame && (r == 0 || r == PUZZLE_SIDE - 1 ||
                          c == 0 || c == PUZZLE_SIDE - 1)) return true;
+    if (g_with_clue_regions && cell_in_clue_region(r, c)) return true;
     int v = g_stop_isrow ? r : c;
     return g_reverse ? (v >= PUZZLE_SIDE - 1 - g_stop_n) : (v <= g_stop_n);
 }
@@ -621,6 +635,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_frame_last)   printf(" --frame_last");
     if (g_jump)         printf(" --jump");
     if (g_with_frame)   printf(" --with_frame");
+    if (g_with_clue_regions) printf(" --with_clue_regions");
     if (g_write_status) printf(" --status");
     if (g_clue_mask & CLUE_CENTER)  printf(" --clue_center");
     if (g_clue_mask & CLUE_CORNERS) printf(" --clue_corners");
@@ -6932,7 +6947,16 @@ static void usage(const char *prog) {
         "                         emitted band then carries all 60 border cells, which\n"
         "                         is what E555_finalizer needs to run its fixed-sides\n"
         "                         mode rather than falling back to --free_edges.\n"
-        "                         Requires --stop_row or --stop_column.\n\n"
+        "                         Requires --stop_row or --stop_column.\n"
+        "  --with_clue_regions    Widen the band by the five 2x2 clue blocks (20 cells):\n"
+        "                         the centre, rows 7-8 x cols 7-8, and the inner corners,\n"
+        "                         rows 1-2 and 13-14 x cols 1-2 and 13-14.  As with\n"
+        "                         --with_frame, held block cells survive the cut, missing\n"
+        "                         ones are searched, and a band counts once they close,\n"
+        "                         ready for E555_finalizer --freeze_clues.  With\n"
+        "                         --with_frame on a top-open board it completes the\n"
+        "                         border and the two top corner blocks.  Requires\n"
+        "                         --stop_row or --stop_column.\n\n"
         "Auxiliary output:\n"
         "  output.csv.status.csv          Per-record diagnostics, with --status.\n"
         "  output.csv.checkpoint.csv      Crash recovery; removed on clean completion.\n"
@@ -7102,6 +7126,8 @@ int main(int argc, char **argv) {
             g_stop_n = (int)v; g_stop_isrow = false; g_stop_active = true;
         } else if (strcmp(argv[i], "--with_frame") == 0) {
             g_with_frame = true;
+        } else if (strcmp(argv[i], "--with_clue_regions") == 0) {
+            g_with_clue_regions = true;
         } else if (strcmp(argv[i], "--breaks") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
@@ -7225,9 +7251,9 @@ int main(int argc, char **argv) {
                   "the clue cells lie outside the band, so they would either "
                   "contaminate the emitted band or be cut from it",
                   g_stop_isrow ? "row" : "column");
-    } else if (g_with_frame) {
-        fatal("--with_frame widens a stop band, so it needs one: add --stop_row N "
-              "or --stop_column N");
+    } else if (g_with_frame || g_with_clue_regions) {
+        fatal("%s widens a stop band, so it needs one: add --stop_row N "
+              "or --stop_column N", g_with_frame ? "--with_frame" : "--with_clue_regions");
     }
 
     if (g_clue_orient >= 0 && !g_clue_mask)
@@ -7395,9 +7421,10 @@ int main(int argc, char **argv) {
         printf("  target_frontier=%d (auto)", nt * SPLIT_TASKS_PER_THREAD);
     printf("\n");
     if (g_stop_active)
-        printf("  stop_%s=%d%s  with_frame=%s\n",
+        printf("  stop_%s=%d%s  with_frame=%s  with_clue_regions=%s\n",
                g_stop_isrow ? "row" : "column", g_stop_n,
-               g_reverse ? " (far side)" : "", g_with_frame ? "on" : "off");
+               g_reverse ? " (far side)" : "", g_with_frame ? "on" : "off",
+               g_with_clue_regions ? "on" : "off");
     const bool side_growth = order_is_side_growth(g_order_mode);
     printf("  order=%s%s%s  jump=%s  completion_feasibility=%s\n",
            order_name(g_order_mode), g_reverse ? " (reverse)" : "",
@@ -7549,7 +7576,7 @@ int main(int argc, char **argv) {
         g_band_csv = fopen(band_csv_path, "w");
         if (!g_band_csv) fatal("cannot create %s: %s", band_csv_path, strerror(errno));
         if (fprintf(g_band_csv,
-                    "# E555 backtracker -- every completed --stop_%s %d band%s%s "
+                    "# E555 backtracker -- every completed --stop_%s %d band%s%s%s "
                     "(original frame)\n"
                     "# cells outside the band are unplaced (%d); feed to "
                     "E555_finalizer --finalize_from %d\n"
@@ -7557,6 +7584,7 @@ int main(int argc, char **argv) {
                     g_stop_isrow ? "row" : "column", g_stop_n,
                     g_reverse ? " (anchored at the far side)" : "",
                     g_with_frame ? " + the complete outer frame" : "",
+                    g_with_clue_regions ? " + the five 2x2 clue blocks" : "",
                     CSV_UNPLACED, g_stop_n) < 0)
             fatal("cannot write header to %s", band_csv_path);
         checked_fflush(g_band_csv, band_csv_path);
