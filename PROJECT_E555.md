@@ -118,6 +118,41 @@ the best partials: 40 such cycles gave 464 four times and 463 26 times, against
 461-463 from beams that dive every board. `pipeline/run_cycles.sh` runs these
 cycles in parallel; its settings block holds every option above.
 
+**Which partials to distil** (`STOP_ROW` x `MIN_COL` of `run_cycles.sh`,
+measured 2026-10-31 on 4 threads). Each arm ran whole cycles: a 300 s beam
+(`--random_edges --samples 4 --top_columns 4 --beam_width 10000
+--backtrack_row 6 --lambda_Mahalanobis 10`), capped at 40000 partials, then the
+distiller with `--top 10 --finish_dives 5000 --finish_polish 2000
+--probe_per_top 12`. Cycle k of every arm used seed 5000+k, so the arms
+sampled the same borders. Compared on the ~4000 complete boards each cycle
+finishes and the 120 it probes (one value per cycle):
+
+| STOP_ROW, MIN_COL | cycles | configs / beam | finished >= 460 | finished >= 461 | probed >= 462 | best |
+|---|---|---|---|---|---|---|
+| 11, 0 | 2 | 11 | 296, 263 | 48, 42 | 15, 15 | 463, 462 |
+| 11, 1 | 1 | 14 | 182 | 28 | 7 | 462 |
+| 11, 2 | 2 | 15-16 | 105, 97 | 16, 9 | 2, 2 | 462, 462 |
+| 10, 5 | 2 | 5 | 87, 69 | 9, 9 | 1, 2 | 463, 463 |
+| 10, 4 | 1 | 1 | 48 | 9 | 2 | 462 |
+| 9, 6 | 2 | 1 | 20, 26 | 2, 2 | 1, 0 | 462, 461 |
+
+- `STOP_ROW=11 MIN_COL=0`, the default, gave the best boards on every measure,
+  and the repeated arms agree between cycles far more closely than the arms
+  differ. At row 11 the column filter itself hurts: 11/1 and 11/2 covered more
+  borders per beam than 11/0 and still did worse. Below row 11 the gap mixes
+  the stop row with border diversity, since at the 40000 cap those beams get
+  through only 1-5 configurations.
+- The workable pairs are few. Partials per 90 s beam on 4 threads: 11/3 455,
+  10/6 403, 10/7 3, 9/7 1488, 9/8 27 (too few to distil); 10/3 1.2 M from 2
+  configurations, 9/4 388 k from 1 (too many). Stop row 12 is out of reach at
+  this width: 16804 boards reached row 11 in 90 s and none row 12.
+- The comparison is per 4-thread slot, and `run_cycles.sh` scales by adding
+  slots, so it holds on a bigger machine; a larger `THREADS_PER_SLOT` or
+  `BEAM_WALL` gives low stop rows more configurations and may close part of
+  their gap. To rerun the grid: one `RUN_DIR` per arm, `MAX_CYCLES=1`, the same
+  `RNG_SEED` for every arm, `KEEP_CORPUS=1`, then compare the scores in each
+  cycle's `distilled_work/finish.csv` and `probe.csv` (field 2).
+
 `examples/` holds one small script per tool (start with
 `examples/01_beamer_quickstart.sh`); `pipeline/` holds long unattended runs
 (`run_pipeline.sh`, the board farm `run_farm.py`, the whirlpool, the halo loop

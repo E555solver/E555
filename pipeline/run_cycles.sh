@@ -77,10 +77,12 @@ STOP_ROW=11             # --stop_row: the last row the boards fill
 MIN_COL=0               # --backtrack_min_col: > 0 extends every stop-row board
                         # column by column above STOP_ROW and keeps only those
                         # filling columns 1..MIN_COL whole; 0 = no extension,
-                        # every stop-row board kept. The measured setting is
-                        # STOP_ROW=11 MIN_COL=0. To try: STOP_ROW=9 MIN_COL=3..5
-                        # (PROJECT_E555.md 3.1, 5.10). STOP_ROW below 11 needs
+                        # every stop-row board kept. STOP_ROW below 11 needs
                         # MIN_COL > 0: a row-9 run writes millions of boards.
+                        # Swept (PROJECT_E555.md 3.1): STOP_ROW=11 MIN_COL=0 gave
+                        # the best boards to distil, ahead of 11/1, 11/2, 10/5,
+                        # 10/4 and 9/6 in that order; row 12 is out of reach at
+                        # BEAM_WIDTH 10000. Other workable pairs: 10/5, 9/6.
 EXTEND_NODES=100000     # --extend_nodes: node cap of each extension (MIN_COL > 0)
 LAMBDA_MAHA=10          # --lambda_Mahalanobis (beamer default 1; measured at 10)
 LAMBDA_J=1              # --lambda_J (beamer default)
