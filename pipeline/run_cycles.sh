@@ -57,6 +57,8 @@ THREADS_PER_SLOT=4      # threads of one cycle. 4 is the measured setting; more
 SLOTS=0                 # cycles at once; 0 = THREADS / THREADS_PER_SLOT
 TOTAL_TIME=24h          # seconds, or 90m, 4h, 2d. Cycles still running at the end
                         # are stopped and resume on a rerun.
+MAX_CYCLES=0            # new cycles this run at most; 0 = until TOTAL_TIME. With
+                        # 1, a run is one cycle: handy for sweeping settings
 DB_FILE=chain.db        # the chain database cache, ~6.5 GB, shared by every
                         # slot. A bare name lands in RUN_DIR; give an absolute
                         # path to share it between runs. Must not be empty.
@@ -126,7 +128,7 @@ case "${BASH_REMATCH[2]}" in
     m) TOTAL_S=$(( BASH_REMATCH[1] * 60 )) ;;
     *) TOTAL_S=${BASH_REMATCH[1]} ;;
 esac
-for v in THREADS THREADS_PER_SLOT SLOTS RNG_SEED SAMPLES COLUMNS BEAM_WIDTH BACKTRACK_ROW \
+for v in THREADS THREADS_PER_SLOT SLOTS MAX_CYCLES RNG_SEED SAMPLES COLUMNS BEAM_WIDTH BACKTRACK_ROW \
          STOP_ROW MIN_COL EXTEND_NODES BEAM_WALL MAX_EMITTED TOP SCREEN_DIVES FINISH_DIVES \
          FINISH_POLISH PROBE_PER_TOP BEST_KEEP KEEP_CORPUS KEEP_LOGS WARM_DB; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
@@ -345,7 +347,7 @@ echo "# $(date '+%F %T') start: slots=$SLOTS threads_per_slot=$THREADS_PER_SLOT 
 
 # -- the main loop: keep SLOTS cycles running; harvest each as it ends.
 declare -A RUNNING=()          # pid -> cycle directory
-STARTED=0 HARVESTED=0 SUM_S=0 FAILS=0
+STARTED=0 NEW=0 HARVESTED=0 SUM_S=0 FAILS=0
 # The timer wakes the wait below at the deadline even while every slot is busy.
 ( sleep $(( $(left) > 1 ? $(left) : 1 )) ) &
 TIMER=$!
@@ -358,6 +360,8 @@ while :; do
             dir=${PENDING[0]}; PENDING=("${PENDING[@]:1}")
         else
             [ "$(left)" -gt "$(mean_cycle)" ] || break
+            [ "$MAX_CYCLES" -eq 0 ] || [ "$NEW" -lt "$MAX_CYCLES" ] || break
+            NEW=$(( NEW + 1 ))
             dir=$(printf '%s/cycles/c_%04d' "$RUN_DIR" "$NEXT")
             mkdir "$dir" || die "cannot create $dir"
             echo $(( SEED_BASE + NEXT )) > "$dir/seed"
