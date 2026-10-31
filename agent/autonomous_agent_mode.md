@@ -33,7 +33,7 @@ The puzzle is the 16×16, 256-piece Eternity II board defined by
 `data/seed_Edge5.txt`. A board scores **matched internal edges out of 480**, and
 `breaks = 480 − score`. **480 = solved.** Nobody has solved it in public: the
 best public board since 2007 matches 470. This repo's best is **465/480**
-(`data/best_465.csv`, 15 breaks), followed by three 464s (`data/best_464.csv`)
+(`data/best_465.csv`, 15 breaks), followed by eight 464s (`data/best_464.csv`)
 and 38 463s (`data/best_463.csv`). The honest, measurable mission is:
 
 > **Find a referee-valid board above 465/480 and drive the break count as low
@@ -170,7 +170,7 @@ than 60.
 These come from measured runs on this seed (PROJECT_E555.md 9.2 and 9.3). Bake
 them in; they save hours.
 
-**H1: attack the breaks where they are.** On all 42 shipped boards (463–465) the
+**H1: attack the breaks where they are.** On all 47 shipped boards (463–465) the
 bottom 10–12 rows are clean and every break sits in the top 4–6 rows (`rank`:
 `clean_b`, `break_rows`). Open only the region that holds breaks. Opening clean
 sides wastes time and can spread a break into a clean row.
@@ -220,7 +220,7 @@ pipeline, data, the two docs, and this kit as `KIT.md`), builds the lab's
 `bin/`, installs OR-Tools when Python lacks it (the ender and the topper), and
 seeds the bookkeeping of section 6:
 - `frontier/frontier.csv`, from `data/best_465.csv`;
-- `frontier/elite.csv`, the 42 shipped boards;
+- `frontier/elite.csv`, the 47 shipped boards;
 - `scoreboard.json`, `run_log.csv`, `JOURNAL.md`;
 - `STRATEGY.md`, with what was measured before the campaign.
 
@@ -231,7 +231,7 @@ disk can hold it), `ortools_ok`, the CPU model and the build's arch.
 It ends with two lines:
 ```
 REFEREE verdict=VALID score=465 breaks=15 placed=256 frame_violations=0 ...
-SETUP campaign=20261027-1930 lab=fresh path=.../agent/labs/20261027-1930 arch=v3 cpu="..." ... ortools=yes stage_b_ok=true best=465 elite=42
+SETUP campaign=20261027-1930 lab=fresh path=.../agent/labs/20261027-1930 arch=v3 cpu="..." ... ortools=yes stage_b_ok=true best=465 elite=47
 ```
 If it fails, or `elite` is not 42, fix the setup before you start the goal.
 `ortools=no` means no F2 and no topper: install OR-Tools and rerun, or accept
