@@ -6304,7 +6304,8 @@ static int hole_spec_cmp(const void *pa, const void *pb) {
 }
 
 /* The plan for board b: up to max_plan holes, in search order. */
-static int hole_plan(const Board *b, HoleSpec *plan, int max_plan, int *n_units_out) {
+static int hole_plan(const Board *b, HoleSpec *plan, int max_plan, int *n_units_out,
+                     bool *full) {
     int nbreak[NUM_PIECES];
     CellSet units[NUM_PIECES];
     const int nu = hole_units(b, nbreak, units);
@@ -6370,6 +6371,7 @@ static int hole_plan(const Board *b, HoleSpec *plan, int max_plan, int *n_units_
         }
     }
     free(ulist);
+    *full = n == max_plan;      /* the holes generated last were not planned */
     qsort(plan, (size_t)n, sizeof(HoleSpec), hole_spec_cmp);
     return n;
 }
@@ -6614,11 +6616,21 @@ static void run_holes_auto(Board *inc, const SearchCtx *proto, RecStat *rstat,
     board_edge_counts(inc, &conn, &B);
     const int B0 = B;
     const double t0 = proto->record_start;
+    bool noted_full = false;
 
     while (B > 0) {
         int n_units = 0;
-        const int n = hole_plan(inc, plan, MAX_HOLES, &n_units);
+        bool full = false;
+        const int n = hole_plan(inc, plan, MAX_HOLES, &n_units, &full);
         rep->planned = n;
+        if (full && !noted_full) {
+            noted_full = true;
+            #pragma omp critical(stdout_print)
+            { printf("[%s] note: the hole plan stops at %d holes, so the units after the "
+                     "first ones get fewer; a smaller --hole_cells plans them all.\n",
+                     proto->tag, MAX_HOLES);
+              fflush(stdout); }
+        }
         if (draw && g_verbose) {
             #pragma omp critical(stdout_print)
             { printf("[%s] hole plan: %d broken, %d unit(s), %d hole(s) of %d-%d cells\n",
