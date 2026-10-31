@@ -62,8 +62,10 @@
  *     is a faster heuristic.  With --max_emitted 0, retained ties prefer fewer
  *     distinct pieces touched.  --break_mode selects where breaks may be
  *     spent: stuck (dead-end cells only), any (everywhere; complete but
- *     exponential), or lds (discrepancy-limited widening from stuck toward
- *     any, --lds_max caps the allowance).
+ *     exponential), lds (discrepancy-limited widening from stuck toward
+ *     any, --lds_max caps the allowance), or ratchet (exact search between
+ *     breaks, each break committed where that search got stuck; see
+ *     run_ratchet()).
  *   - --early_release N moves the DFS leaf N cells before the end of the
  *     search sequence: the exact search stops at the first break-free board
  *     with only N searched cells still empty and reports it as the record's
@@ -447,16 +449,33 @@ static double   g_time_limit_sec   = -1.0;
  *     0,1,2,... inside each budget level's time window (capped by --lds_max),
  *     and each D+1 widens toward any-mode completeness.
  *
+ *   ratchet: exact search between breaks, breaks never revisited - see
+ *     run_ratchet().  The exact search runs from the board until it is
+ *     exhausted or --ratchet_nodes is spent; its deepest board is committed,
+ *     every candidate at the cell where it is stuck gets its own exact search,
+ *     and the deepest of those is committed next, until the budget is spent.
+ *     A heuristic like stuck, but it backtracks between breaks.  The default
+ *     for 2sides/4sides with --breaks > 0, the only mode they accept there.
+ *
  * any and lds keep the iterative-deepening ladder (k = input_breaks .. budget),
  * so an exhausted level is a theorem: no completion exists with <= k broken
- * edges.  Use them for overnight runs.  stuck never enters that loop.
+ * edges.  Use them for overnight runs.  stuck and ratchet never enter that loop.
  *
- * Exact search (--breaks 0) is independent of all three: with a zero
+ * Exact search (--breaks 0) is independent of all four: with a zero
  * budget collect_candidates() never gathers break placements, so the mode
  * cannot influence it. */
-typedef enum { BREAK_STUCK = 0, BREAK_ANY, BREAK_LDS } BreakMode;
+typedef enum { BREAK_STUCK = 0, BREAK_ANY, BREAK_LDS, BREAK_RATCHET } BreakMode;
 static BreakMode g_break_mode = BREAK_STUCK;
+static bool      g_break_mode_given = false;  /* 2sides/4sides default to ratchet */
 static int       g_lds_max    = -1;   /* -1 = no cap beyond the break budget */
+/* ratchet: nodes per exact search between breaks (0 = until exhausted).  Each
+ * search runs on one thread and stops at exactly this many nodes, so which
+ * board is committed does not depend on the thread count or the load.
+ * Measured on eight open interiors (192 cells, rowmajor): mean breaks to
+ * complete 51 at 1M nodes, 45 at 10M (~5.5 s a board on one thread), 44.6 at
+ * 30M, 45 at 100M.  On jewel tails of 62 and 114 cells no search reached 1M. */
+#define RATCHET_NODES_DEFAULT 10000000ULL
+static unsigned long long g_ratchet_nodes = RATCHET_NODES_DEFAULT;
 
 /* Greedy-dive controls (stuck mode only). */
 /* Value ordering costs about 2.1x per dive, so the default restart count is
@@ -473,6 +492,7 @@ static const char *break_mode_name(BreakMode m) {
         case BREAK_STUCK: return "stuck";
         case BREAK_ANY:   return "any";
         case BREAK_LDS:   return "lds";
+        case BREAK_RATCHET: return "ratchet";
         default:          return "?";
     }
 }
@@ -652,6 +672,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
            break_mode_name(g_break_mode));
     printf(" --breaks %d", g_max_mismatch);
     if (g_lds_max >= 0) printf(" --lds_max %d", g_lds_max);
+    if (g_break_mode == BREAK_RATCHET) printf(" --ratchet_nodes %llu", g_ratchet_nodes);
     printf(" --max_emitted %" PRIu64, g_solution_limit);
     if (g_release_row >= 0) printf(" --early_release %d,%d", g_release_row, g_release_col);
     else if (g_early_release > 0) printf(" --early_release %d", g_early_release);
@@ -981,6 +1002,15 @@ typedef struct {
     const int8_t (*layer)[PUZZLE_SIDE]; /* --order frontier: this record's layers */
     ResumeCursor *resume;        /* --resume: this record's cursor; else NULL.
                                   * Mutated by the (serial) DFS that owns it. */
+    /* ratchet: one serial exact search between breaks (else all NULL/0).
+     * node_count counts its nodes exactly and stops it at node_cap; rec_live
+     * and rec_rstat are the record's, for the heartbeat; step counts the
+     * stuck cells broken through so far. */
+    unsigned long long *node_count;
+    unsigned long long  node_cap;
+    SearchLive  *rec_live;
+    RecStat     *rec_rstat;
+    int          step;
 } SearchCtx;
 static inline uint64_t piece_bit(int pid) { return 1ULL << (pid & 63); }
 static inline bool used_test(const uint64_t u[], int pid) { return (u[pid>>6] & piece_bit(pid)) != 0; }
@@ -3762,28 +3792,33 @@ static void write_checkpoint_line(const Board *b, const char *config_id_str) {
  * Also flushes a pending ("dirty") checkpoint whose 10 s throttle has expired.
  */
 static void heartbeat_maybe(const SearchCtx *cx, double now) {
+    /* A ratchet search reports for its record: one line per interval across
+     * all of the record's searches, with the record's committed best. */
+    SearchLive *hl = cx->rec_live ? cx->rec_live : cx->live;
+    RecStat    *rs = cx->rec_live ? cx->rec_rstat : cx->rstat;
     long long now_ms = (long long)((now - g_t_start_wall) * 1000.0);
-    long long nxt = atomic_load_explicit(&cx->live->hb_next_ms, memory_order_relaxed);
+    long long nxt = atomic_load_explicit(&hl->hb_next_ms, memory_order_relaxed);
     if (now_ms < nxt) return;
     long long claim = now_ms + (long long)(HEARTBEAT_SEC * 1000.0);
-    if (!atomic_compare_exchange_strong_explicit(&cx->live->hb_next_ms, &nxt, claim,
+    if (!atomic_compare_exchange_strong_explicit(&hl->hb_next_ms, &nxt, claim,
                                                  memory_order_relaxed, memory_order_relaxed))
         return;
 
     int bt = 0, bc = 0, bb = 0;
-    if (cx->rstat) {
+    if (rs) {
         omp_set_lock(&g_best_lock);
-        bt = atomic_load_explicit(&cx->rstat->best_total, memory_order_relaxed);
-        bc = cx->rstat->best_connected;
-        bb = cx->rstat->best_broken;
+        bt = atomic_load_explicit(&rs->best_total, memory_order_relaxed);
+        bc = rs->best_connected;
+        bb = rs->best_broken;
         omp_unset_lock(&g_best_lock);
     }
 
     unsigned long long nodes =
-        atomic_load_explicit(&cx->live->nodes, memory_order_relaxed);
+        atomic_load_explicit(&hl->nodes, memory_order_relaxed);
     char dstr[32] = "";
     if (g_break_mode == BREAK_LDS && cx->k_budget > cx->input_breaks)
         snprintf(dstr, sizeof(dstr), " D=%d", cx->lds_D);
+    if (cx->rec_live) snprintf(dstr, sizeof(dstr), " ratchet step=%d", cx->step);
     #pragma omp critical(stdout_print)
     {
         printf("[%s] progress k=%d%s t=%.0fs nodes=%.1fM "
@@ -3824,6 +3859,8 @@ static void search_node_tick(const SearchCtx *cx) {
     unsigned long long seen =
         atomic_fetch_add_explicit(&cx->live->nodes, NODE_TICK_BATCH, memory_order_relaxed)
         + NODE_TICK_BATCH;
+    if (cx->rec_live)
+        atomic_fetch_add_explicit(&cx->rec_live->nodes, NODE_TICK_BATCH, memory_order_relaxed);
     if (g_test_node_budget && seen >= g_test_node_budget) {
         search_request_stop(cx->live, STOP_TIMEOUT);
         return;
@@ -4286,13 +4323,15 @@ static int count_break_candidates_scan(const Board *b, const FcState *fc,
  * hundreds of actual children.  In BREAK_LDS mode a cell with no exact fit
  * counts 0 while breaks are left: its forced break is placed at once, where it
  * is stuck, rather than after every cell with fewer break candidates (often
- * never, the search ending first; a dead cell never regains a fit). */
+ * never, the search ending first; a dead cell never regains a fit).  So in
+ * BREAK_RATCHET mode, whose exact search ends a path at that cell, and which
+ * then takes it as the cell to break. */
 static int mrv_cell_count(const Board *b, const FcState *fc, int r, int c, int budget) {
     int ex = fc_exact_count(fc, r, c);
     if (budget <= 0) return ex;
     if (g_break_mode == BREAK_ANY)
         return ex + count_break_candidates_scan(b, fc, r, c, budget);
-    if (ex > 0 || g_break_mode == BREAK_LDS) return ex;
+    if (ex > 0 || g_break_mode == BREAK_LDS || g_break_mode == BREAK_RATCHET) return ex;
     return count_break_candidates_scan(b, fc, r, c, budget);
 }
 
@@ -4525,10 +4564,11 @@ static int pick_next_cell(const Board *b, const FcState *fc,
                           OrderMode mode, int remaining_budget,
                           const int8_t (*layer)[PUZZLE_SIDE]) {
     if (mode == ORD_FRONTIER) {
-        /* lds with breaks left: a cell with no exact fit first, in any layer
-         * (see mrv_cell_count), innermost then row-major; under --frame_last
-         * the frame still waits for the inner cells. */
-        if (g_break_mode == BREAK_LDS && remaining_budget > 0 && fc->zero_domains > 0) {
+        /* lds or ratchet with breaks left: a cell with no exact fit first, in
+         * any layer (see mrv_cell_count), innermost then row-major; under
+         * --frame_last the frame still waits for the inner cells. */
+        if ((g_break_mode == BREAK_LDS || g_break_mode == BREAK_RATCHET) &&
+            remaining_budget > 0 && fc->zero_domains > 0) {
             bool inner_open = false;
             if (g_frame_last)
                 for (int j = pos; j < n_rem && !inner_open; j++)
@@ -4970,12 +5010,18 @@ static void side_dfs(Board *b, FcState *fc, Cell *seq, int n_seq, int pos,
     if (!order_is_side_growth(cx->mode))
         fatal("internal error: dedicated side DFS called for order %s",
               order_name(cx->mode));
-    if (cx->k_budget != 0 || cx->input_breaks != 0)
+    /* ratchet: the board may carry the breaks committed so far; the search
+     * itself still places exact fits only. */
+    if ((cx->k_budget != 0 || cx->input_breaks != 0) && g_break_mode != BREAK_RATCHET)
         fatal("internal error: side growth requires an exact zero-break board");
     if (search_stop_requested(cx->live)) return;
     if (((++g_tls_nodes) & (NODE_TICK_BATCH - 1ULL)) == 0) {
         search_node_tick(cx);
         if (search_stop_requested(cx->live)) return;
+    }
+    if (cx->node_count && ++*cx->node_count > cx->node_cap) {
+        search_request_stop(cx->live, STOP_TIMEOUT);
+        return;
     }
 
     int depth = base_depth + pos;
@@ -5032,8 +5078,9 @@ static void side_dfs(Board *b, FcState *fc, Cell *seq, int n_seq, int pos,
         const int new_added = added_so_far + 1;
         const int n_total = cx->initial_n_placed + new_added;
         try_update_best(b, cx->initial_board, cx->initial_n_placed,
-                        n_total, new_added, new_connected, 0,
-                        row, col, cx->config_id, cx->row, cx->rstat, true);
+                        n_total, new_added, new_connected, cx->input_breaks,
+                        row, col, cx->config_id, cx->row, cx->rstat,
+                        cx->k_budget == 0);
 
         st->recursed[depth]++;
         children++;
@@ -5075,6 +5122,10 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
     if (((++g_tls_nodes) & (NODE_TICK_BATCH - 1ULL)) == 0) {
         search_node_tick(cx);
         if (search_stop_requested(cx->live)) { resume_capture(rc, b, rem, pos, false); return; }
+    }
+    if (cx->node_count && ++*cx->node_count > cx->node_cap) {   /* ratchet: no resume */
+        search_request_stop(cx->live, STOP_TIMEOUT);
+        return;
     }
 
     int depth = base_depth + pos;
@@ -5131,7 +5182,10 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
     bool want_breaks_if_exact =
         (g_break_mode == BREAK_ANY) ||
         (g_break_mode == BREAK_LDS && disc_used < cx->lds_D);
-    int n_cand = collect_candidates(b, fc, row, col, remaining_budget,
+    /* ratchet: between breaks the search is exact; the cell choice above and
+     * the cuts below still see the whole remaining budget (run_ratchet()). */
+    int n_cand = collect_candidates(b, fc, row, col,
+                                    g_break_mode == BREAK_RATCHET ? 0 : remaining_budget,
                                     want_breaks_if_exact,
                                     cand, MAX_CANDIDATES, &exact_count, st, depth);
 
@@ -5804,6 +5858,313 @@ static void run_search_at_k(Board *base, const SearchCtx *cx,
     }
 }
 
+/* -- Ratchet (--break_mode ratchet) ------------------------------------------- *
+ *
+ * Exact search between breaks, each break committed where the exact search got
+ * stuck and never revisited:
+ *
+ *   1. From the base board, the exact search of --order, on one thread, until
+ *      it is exhausted or --ratchet_nodes nodes are spent.  Its deepest board
+ *      (pieces, then connected edges, as the record's running best) is the
+ *      new base.
+ *   2. The base's stuck cell: the cell --order fills next.  mrv and frontier
+ *      take a cell with no exact fit first (pick_next_cell), a static order
+ *      its next cell, 2sides/4sides the first cell with no exact fit in the
+ *      outermost layer still open (else that layer's first open cell).
+ *   3. Every candidate at that cell -- exact fits, then one broken edge, two,
+ *      ... up to the budget left -- that passes tail_dfs's completion cuts gets
+ *      its own exact search as in 1.
+ *   4. The deepest of those boards is the next base (ties: the earlier
+ *      candidate, so the cheaper break).  Repeat from 2 until the board is
+ *      complete, the budget is spent, no candidate passes, or --time_limit.
+ *
+ * Every search is serial and stops at a node count, not a time, and the commit
+ * prefers the earlier candidate, so --threads 1 and 20 commit the same boards;
+ * when the record has the machine to itself (g_search_parallel) the threads
+ * share out a step's candidates.  --time_limit only ends the run.
+ *
+ * Breaks are counted in edges: one forced piece may break two or more, and a
+ * candidate that would pass --breaks is not tried.  The searches keep the full
+ * remaining budget in their cuts (empty domains, colour count, Hall,
+ * --edge_supply) and place exact fits only, so no committed base is one that
+ * provably cannot be completed within --breaks.  It proves nothing: a
+ * committed break is never reconsidered.
+ */
+
+typedef struct {
+    Board board;                     /* the search's best board */
+    int   total, connected, broken, break_pieces, row, col;
+} RatchetBest;
+
+typedef struct {
+    int         steps;               /* stuck cells broken through */
+    long long   searches;            /* exact searches run */
+    int         stuck_row, stuck_col;/* the last stuck cell; -1 = none */
+    const char *ended;               /* why the ratchet stopped */
+} RatchetReport;
+
+/* Steps 1 and 3: the exact search from `start` (search frame), serial and
+ * capped at g_ratchet_nodes nodes.  Its best board goes to *out; complete
+ * boards to mres, as any search's.  (row,col) is the cell the candidate took,
+ * the board's last piece until the search places one; -1 for step 1. */
+static void ratchet_search(const Board *start, const SearchCtx *proto, RatchetBest *out,
+                           int row, int col,
+                           uint64_t *solutions, DfsStats *st, MismatchResult *mres) {
+    Board b = *start;
+    int conn = 0, brk = 0, bp = 0;
+    board_edge_counts(&b, &conn, &brk);
+    if (brk > 0) board_break_stats(&b, NULL, &bp);
+    const int placed = board_count_placed(&b);
+
+    out->board = b;
+    RecStat prs;
+    atomic_init(&prs.best_total, placed);
+    prs.best_connected    = conn;
+    prs.best_broken       = brk;
+    prs.best_break_pieces = bp;
+    prs.deepest_row = row;
+    prs.deepest_col = col;
+    prs.best_board  = &out->board;
+    prs.ckpt_next   = HUGE_VAL;       /* the record checkpoints, not each search */
+    prs.ckpt_dirty  = false;
+
+    SearchLive live;
+    search_live_init(&live);
+    unsigned long long nodes = 0;
+    SearchCtx cx = *proto;
+    cx.initial_n_placed  = placed;
+    cx.initial_connected = conn;
+    cx.input_breaks      = brk;
+    cx.rstat             = &prs;
+    cx.live              = &live;
+    cx.node_count        = g_ratchet_nodes > 0 ? &nodes : NULL;
+    cx.node_cap          = g_ratchet_nodes;
+
+    Cell rem[MAX_SEQ_LEN]; int n_rem = 0;
+    build_search_sequence_ordered(&b, rem, &n_rem, cx.mode);
+    FcState fc;
+    fc_init(&fc, &b);
+    if (order_is_side_growth(cx.mode))
+        side_dfs(&b, &fc, rem, n_rem, 0, 0, conn, 0, &cx, solutions, st, mres);
+    else
+        tail_dfs(&b, &fc, rem, n_rem, 0, 0, brk, conn, 0, 0, &cx, solutions, st, mres);
+
+    out->total        = atomic_load_explicit(&prs.best_total, memory_order_relaxed);
+    out->connected    = prs.best_connected;
+    out->broken       = prs.best_broken;
+    out->break_pieces = prs.best_break_pieces;
+    out->row          = prs.deepest_row;
+    out->col          = prs.deepest_col;
+}
+
+/* A side-growth layer: the inset of build_side_sequence() holding (r,c). */
+static int side_layer(int r, int c) {
+    int d = c < PUZZLE_SIDE - 1 - c ? c : PUZZLE_SIDE - 1 - c;
+    if (g_order_mode == ORD_4SIDES) {
+        int dr = r < PUZZLE_SIDE - 1 - r ? r : PUZZLE_SIDE - 1 - r;
+        if (dr < d) d = dr;
+    }
+    return d;
+}
+
+/* Step 2: the index in rem of the cell the base is stuck at. */
+static int ratchet_stuck_cell(const Board *b, const FcState *fc, const Cell *rem, int n_rem,
+                              int left, const int8_t (*layer)[PUZZLE_SIDE]) {
+    if (!order_is_side_growth(g_order_mode))
+        return pick_next_cell(b, fc, rem, n_rem, 0, g_order_mode, left, layer);
+    int lo = INT_MAX, first = -1;
+    for (int j = 0; j < n_rem; j++) {
+        int l = side_layer(rem[j].row, rem[j].col);
+        if (l < lo) lo = l;
+    }
+    for (int j = 0; j < n_rem; j++) {
+        if (side_layer(rem[j].row, rem[j].col) != lo) continue;
+        if (fc_exact_count(fc, rem[j].row, rem[j].col) == 0) return j;
+        if (first < 0) first = j;
+    }
+    return first;
+}
+
+/* Step 3's filter: tail_dfs's completion cuts on the base plus candidate c at
+ * rem[at], with `left` breaks to spare after it.  Side growth runs no cuts.
+ * The board and fc are restored. */
+static bool ratchet_viable(Board *b, FcState *fc, const Cell *rem, int n_rem, int at,
+                           const Candidate *c, int left) {
+    if (order_uses_soft_completion(g_order_mode)) return true;
+    const int r = rem[at].row, col = rem[at].col;
+    dfs_place(b, fc, r, col, (int)c->pid, (int)c->spin);
+    bool ok = fc->zero_domains <= left;
+    if (ok && g_edge_supply) ok = edge_supply_deficit(b) <= left;
+    if (ok && g_colour_count) {
+        FeasIssue issue;
+        ok = remaining_feasibility_ex(b, fc, &issue, left);
+    }
+    if (ok) {
+        Cell open[MAX_SEQ_LEN]; int n = 0;
+        for (int j = 0; j < n_rem; j++) if (j != at) open[n++] = rem[j];
+        if (hall_should_run(fc, open, board_count_placed(b), n))
+            ok = !hall_prune(fc, open, n, left, NULL);
+    }
+    dfs_unplace(b, fc, r, col);
+    return ok;
+}
+
+/* The record's running best, as in try_update_best() but without the --best_n
+ * tracks: every board a search reaches was offered to those already. */
+static void ratchet_offer(RecStat *rs, const RatchetBest *x, const char *config_id_str) {
+    bool  do_ckpt = false;
+    Board ckpt_copy;
+    omp_set_lock(&g_best_lock);
+    if (partial_better(x->total, x->connected, x->broken, x->break_pieces,
+                       atomic_load_explicit(&rs->best_total, memory_order_relaxed),
+                       rs->best_connected, rs->best_broken, rs->best_break_pieces)) {
+        rs->best_connected    = x->connected;
+        rs->best_broken       = x->broken;
+        rs->best_break_pieces = x->break_pieces;
+        rs->deepest_row       = x->row;
+        rs->deepest_col       = x->col;
+        if (rs->best_board) *rs->best_board = x->board;
+        atomic_store_explicit(&rs->best_total, x->total, memory_order_relaxed);
+        if (g_ckpt_csv) {
+            double now = omp_get_wtime();
+            if (now >= rs->ckpt_next) {
+                rs->ckpt_next  = now + CKPT_MIN_INTERVAL_SEC;
+                rs->ckpt_dirty = false;
+                ckpt_copy = x->board;
+                do_ckpt = true;
+            } else {
+                rs->ckpt_dirty = true;
+            }
+        }
+    }
+    omp_unset_lock(&g_best_lock);
+    if (do_ckpt) write_checkpoint_line(&ckpt_copy, config_id_str);
+}
+
+static bool ratchet_out_of_time(double deadline) {
+    return g_stop || (deadline > 0.0 && omp_get_wtime() > deadline);
+}
+
+/* The ratchet over one record.  proto carries the record's search settings
+ * (k_budget = --breaks, deadline, collect, layer); rstat, live, mres, stats
+ * and solutions are the record's, as run_search_at_k() fills them. */
+static void run_ratchet(const Board *start, const SearchCtx *proto, RecStat *rstat,
+                        SearchLive *live, uint64_t *local_solutions, DfsStats *stats,
+                        MismatchResult *mres, RatchetReport *rep) {
+    const int nt = g_search_parallel
+                 ? (g_nthreads > 0 ? g_nthreads : omp_get_max_threads()) : 1;
+    SearchCtx cx = *proto;
+    cx.rec_live  = live;
+    cx.rec_rstat = rstat;
+    cx.step      = 0;
+    rep->steps = 0;
+    rep->searches = 1;
+    rep->stuck_row = rep->stuck_col = -1;
+    rep->ended = "time limit";
+
+    int cap = 64;
+    RatchetBest *res = xmalloc((size_t)cap * sizeof(RatchetBest));
+    Candidate *cand = xmalloc((size_t)MAX_CANDIDATES * sizeof(Candidate));
+    Candidate *adm  = xmalloc((size_t)MAX_CANDIDATES * sizeof(Candidate));
+
+    /* Step 1 from the record's board. */
+    ratchet_search(start, &cx, &res[0], -1, -1, local_solutions, stats, mres);
+    ratchet_offer(rstat, &res[0], cx.config_id);
+    Board base = res[0].board;
+    const double t0 = cx.record_start;
+
+    for (;;) {
+        if (board_count_placed(&base) == NUM_PIECES) { rep->ended = "complete"; break; }
+        if (ratchet_out_of_time(cx.deadline)) {
+            search_request_stop(live, STOP_TIMEOUT);
+            break;
+        }
+        int conn = 0, brk = 0;
+        board_edge_counts(&base, &conn, &brk);
+        const int left = cx.k_budget - brk;
+        if (left <= 0) { rep->ended = "budget spent"; break; }
+
+        /* Step 2. */
+        Cell rem[MAX_SEQ_LEN]; int n_rem = 0;
+        build_search_sequence_ordered(&base, rem, &n_rem, cx.mode);
+        FcState fc;
+        fc_init(&fc, &base);
+        const int at = n_rem > 0 ? ratchet_stuck_cell(&base, &fc, rem, n_rem, left, cx.layer) : -1;
+        if (at < 0) { rep->ended = "no open cell"; break; }
+        const int r = rem[at].row, c = rem[at].col;
+        rep->stuck_row = r;
+        rep->stuck_col = c;
+
+        /* Step 3: the candidates, cheapest break class first. */
+        int exact = 0;
+        const int n_cand = collect_candidates(&base, &fc, r, c, left, true, cand,
+                                              MAX_CANDIDATES, &exact, NULL, 0);
+        int n_adm = 0;
+        for (int i = 0; i < n_cand; i++)
+            if ((int)cand[i].breaks <= left &&
+                ratchet_viable(&base, &fc, rem, n_rem, at, &cand[i], left - (int)cand[i].breaks))
+                adm[n_adm++] = cand[i];
+        if (n_adm == 0) {
+            rep->ended = n_cand > 0 ? "no candidate passes the cuts"
+                                    : "no candidate within the breaks left";
+            break;
+        }
+        if (n_adm > cap) {
+            cap = n_adm;
+            res = xrealloc(res, (size_t)cap * sizeof(RatchetBest));
+        }
+
+        cx.step = rep->steps;
+        uint64_t sols = 0;
+        #pragma omp parallel num_threads(nt) if (nt > 1) reduction(+:sols)
+        {
+            DfsStats tst;
+            stats_init(&tst);
+            MismatchResult tm = {0};
+            mres_init(&tm);
+            #pragma omp for schedule(dynamic,1)
+            for (int i = 0; i < n_adm; i++) {
+                if (ratchet_out_of_time(cx.deadline)) { res[i].total = -1; continue; }
+                Board child = base;
+                board_place(&child, r, c, (int)adm[i].pid, (int)adm[i].spin);
+                ratchet_search(&child, &cx, &res[i], r, c, &sols, &tst, &tm);
+            }
+            #pragma omp critical(ratchet_merge)
+            { stats_merge(stats, &tst); mres_merge(mres, &tm); }
+            mres_free(&tm);
+        }
+        *local_solutions += sols;
+        rep->searches += n_adm;
+
+        /* Step 4, in candidate order whatever the threads did. */
+        int win = -1;
+        for (int i = 0; i < n_adm; i++) {
+            if (res[i].total < 0) continue;
+            ratchet_offer(rstat, &res[i], cx.config_id);
+            if (win < 0 || res[i].total > res[win].total) win = i;
+        }
+        if (win < 0) {                    /* the time ran out before any search */
+            search_request_stop(live, STOP_TIMEOUT);
+            break;
+        }
+        base = res[win].board;
+        rep->steps++;
+        if (g_verbose) {
+            #pragma omp critical(stdout_print)
+            {
+                printf("[%s] ratchet step %d: (r=%d,c=%d) %d of %d candidates searched; "
+                       "+%d broken -> %d pieces, broken=%d  t=%.1fs\n",
+                       cx.tag, rep->steps, r, c, n_adm, n_cand, (int)adm[win].breaks,
+                       res[win].total, res[win].broken, omp_get_wtime() - t0);
+                fflush(stdout);
+            }
+        }
+    }
+    free(adm);
+    free(cand);
+    free(res);
+}
+
 /* -- Per-record processing ---------------------------------------------------- */
 
 /* -- Forcing the clues on ------------------------------------------------------ */
@@ -6184,6 +6545,8 @@ static void process_line(const char *config_id_str, long long field2, long long 
      * an exact search, which is independent of break mode and must keep the full
      * backtracking DFS. */
     const bool greedy_mode = (g_break_mode == BREAK_STUCK && g_max_mismatch > 0);
+    /* ratchet + a nonzero budget: run_ratchet() instead of the ladder. */
+    const bool ratchet_mode = (g_break_mode == BREAK_RATCHET && g_max_mismatch > 0);
 
     /* Root FC state supplies both exact domains and the incrementally maintained
      * colour/type demand used by every later node. */
@@ -6378,7 +6741,36 @@ static void process_line(const char *config_id_str, long long field2, long long 
             search_request_stop(&live, STOP_TIMEOUT);
     }
 
-    for (int k = greedy_mode ? total_budget + 1 : k_start; k <= total_budget; k++) {
+    RatchetReport rrep;
+    memset(&rrep, 0, sizeof(rrep));
+    if (ratchet_mode) {
+        SearchCtx cx;
+        memset(&cx, 0, sizeof(cx));
+        cx.config_id        = config_id_str;
+        cx.row              = row;
+        cx.tag              = tag;
+        cx.initial_board    = &initial_board;
+        cx.mode             = g_order_mode;
+        cx.k_budget         = total_budget;
+        cx.record_start     = t0;
+        cx.deadline         = record_deadline;
+        cx.collect          = collect;
+        cx.layer            = (const int8_t (*)[PUZZLE_SIDE])layer;
+        run_ratchet(&base, &cx, &rstat, &live, &local_solutions, &total_stats, &mres, &rrep);
+
+        appendf(rec_buf, sizeof(rec_buf), &rec_off,
+                "[%s] ratchet: %d step(s), %lld exact search(es), broken %d -> %d; ended: %s",
+                tag, rrep.steps, rrep.searches, input_breaks, rstat.best_broken, rrep.ended);
+        if (rrep.stuck_row >= 0 && strcmp(rrep.ended, "complete") != 0)
+            appendf(rec_buf, sizeof(rec_buf), &rec_off, " (last stuck cell r=%d,c=%d)",
+                    rrep.stuck_row, rrep.stuck_col);
+        appendf(rec_buf, sizeof(rec_buf), &rec_off, "\n");
+        #pragma omp critical(stdout_print)
+        { fputs(rec_buf, stdout); fflush(stdout); rec_off = 0; rec_buf[0] = '\0'; }
+    }
+
+    for (int k = (greedy_mode || ratchet_mode) ? total_budget + 1 : k_start;
+         k <= total_budget; k++) {
         stats_init(&stats);
         search_stop_init(&live);
         mres_init(&mres);
@@ -6558,7 +6950,7 @@ static void process_line(const char *config_id_str, long long field2, long long 
     if (any_solution && release_on())
         appendf(extra, sizeof(extra), &xoff, "  left_open=%d",
                 n_seq - search_gate(n_seq, release_k));
-    if (!any_solution && !stopped && fd >= 0)
+    if (!any_solution && !stopped && fd >= 0 && !ratchet_mode)
         appendf(extra, sizeof(extra), &xoff, "  stuck=(r=%d,c=%d)",
                 stats.first_dead_row, stats.first_dead_col);
     appendf(rec_buf, sizeof(rec_buf), &rec_off,
@@ -6882,11 +7274,24 @@ static void usage(const char *prog) {
         "  --breaks K             Absolute completed-board broken-edge ceiling (0..480).\n"
         "                         0 = exact search.  In stuck mode every dive completes\n"
         "                         regardless, so K only filters what counts as a result.\n"
-        "  --break_mode MODE      stuck (default), any, or lds.\n"
+        "  --break_mode MODE      stuck (default), any, lds, or ratchet.\n"
         "                         stuck: greedy dives, no backtracking, always completes.\n"
         "                           Fast triage for ranking partials; proves nothing.\n"
         "                         any/lds: exhaustive, iterative deepening.  An exhausted\n"
         "                           level proves no completion exists at that break count.\n"
+        "                         ratchet: the exact search until stuck, then every\n"
+        "                           candidate at the stuck cell (cheapest break first)\n"
+        "                           gets its own exact search; the deepest is kept and\n"
+        "                           the next break goes where it is stuck.  Breaks are\n"
+        "                           never revisited; proves nothing.  The default (and\n"
+        "                           only mode) for 2sides/4sides with --breaks > 0.\n",
+        stderr);
+    fprintf(stderr,
+        "  --ratchet_nodes N      Nodes per exact search of the ratchet (default %llu;\n",
+        RATCHET_NODES_DEFAULT);
+    fputs(
+        "                         0 = each until exhausted).  A node count, not a time,\n"
+        "                         so the committed boards do not depend on --threads.\n"
         "  --restarts N           Independent randomized dives per record (default 50000,\n"
         "                         roughly 5-10 s on four cores).\n"
         "                         Dives are sub-millisecond; N in the millions is fine.\n"
@@ -7210,7 +7615,16 @@ int main(int argc, char **argv) {
             if      (!strcmp(m, "stuck")) g_break_mode = BREAK_STUCK;
             else if (!strcmp(m, "any"))   g_break_mode = BREAK_ANY;
             else if (!strcmp(m, "lds"))   g_break_mode = BREAK_LDS;
-            else fatal("--break_mode expects stuck|any|lds, got '%s'", m);
+            else if (!strcmp(m, "ratchet")) g_break_mode = BREAK_RATCHET;
+            else fatal("--break_mode expects stuck|any|lds|ratchet, got '%s'", m);
+            g_break_mode_given = true;
+        } else if (strcmp(argv[i], "--ratchet_nodes") == 0 && i+1 < argc) {
+            char *end = NULL; errno = 0;
+            unsigned long long v = strtoull(argv[++i], &end, 10);
+            if (errno || end == argv[i] || *end || argv[i][0] == '-')
+                fatal("--ratchet_nodes expects a node count (0 = until exhausted), got '%s'",
+                      argv[i]);
+            g_ratchet_nodes = v;
         } else if (strcmp(argv[i], "--lds_max") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
@@ -7284,8 +7698,13 @@ int main(int argc, char **argv) {
     if (g_order_mode == ORD_2SIDES || g_order_mode == ORD_4SIDES) {
         if (g_jump)
             fatal("--order %s requires --jump off", order_name(g_order_mode));
-        if (g_max_mismatch != 0)
-            fatal("--order %s requires --breaks 0", order_name(g_order_mode));
+        /* With breaks, side growth spends them through the ratchet: it grows
+         * exactly until stuck and breaks where it is stuck, as the sweep goes. */
+        if (g_max_mismatch != 0 && !g_break_mode_given)
+            g_break_mode = BREAK_RATCHET;
+        if (g_max_mismatch != 0 && g_break_mode != BREAK_RATCHET)
+            fatal("--order %s with --breaks > 0 requires --break_mode ratchet "
+                  "(the default there)", order_name(g_order_mode));
         /* Side growth maximizes an exact partial.  Hall/color/FC completion
          * proofs are intentionally irrelevant here and must never stop the
          * sweep, even when the caller supplied --hall adaptive/always. */
@@ -7377,6 +7796,12 @@ int main(int argc, char **argv) {
     }
     if (g_lds_max >= 0 && g_break_mode != BREAK_LDS)
         fprintf(stderr, "[warn] --lds_max has no effect unless --break_mode lds is selected.\n");
+    if (g_ratchet_nodes != RATCHET_NODES_DEFAULT && g_break_mode != BREAK_RATCHET)
+        fprintf(stderr, "[warn] --ratchet_nodes has no effect unless --break_mode ratchet "
+                        "is selected.\n");
+    if (g_break_mode == BREAK_RATCHET && g_max_mismatch > 0 && g_jump)
+        fatal("--break_mode ratchet breaks where the exact search is stuck; --jump would "
+              "skip that cell instead");
 
     /* mrv is the default order (see g_order_mode).  It is the right default
      * across the board: once breaks are allowed a static order lands on cells
@@ -7469,12 +7894,19 @@ int main(int argc, char **argv) {
             if (g_lds_max >= 0) printf("  lds_max=%d", g_lds_max);
             else                printf("  lds_max=auto(up to break budget)");
         }
+        if (g_break_mode == BREAK_RATCHET) {
+            if (g_ratchet_nodes > 0) printf("  ratchet_nodes=%llu", g_ratchet_nodes);
+            else                     printf("  ratchet_nodes=0 (each search until exhausted)");
+        }
     }
     printf("\n");
     if (greedy_run)
         printf("  engine=GREEDY DIVES (no backtracking, always completes)"
                "  restarts=%lld  lcv=%s  -- fast triage, proves nothing\n",
                g_stuck_restarts, g_lcv ? "on" : "off");
+    else if (g_break_mode == BREAK_RATCHET && g_max_mismatch > 0)
+        printf("  engine=RATCHET (exact search between breaks, each break committed where it "
+               "got stuck) -- proves nothing\n");
     else if (g_max_mismatch > 0)
         printf("  engine=exhaustive iterative deepening -- an exhausted level is a "
                "proof that no completion exists at that break count\n");

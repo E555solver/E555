@@ -1996,10 +1996,30 @@ counters rather than a scan.
   exact fit first (frontier: from any layer), so the forced break goes where the
   search is stuck; otherwise such a cell waited behind every cell with fewer
   candidates, and the time limit usually came first.
+- **`ratchet`**: exact search between breaks, each break committed and never
+  revisited. The exact search of `--order` runs from the board, on one thread,
+  until exhausted or `--ratchet_nodes N` nodes (default 10,000,000; 0 = no cap),
+  and its deepest board is kept. Every candidate at the cell where it is stuck,
+  cheapest break first, gets its own exact search, and the deepest result (ties:
+  the earlier candidate) is the next board. It stops when the board is
+  complete, the breaks are spent, or no candidate passes the cuts. The stuck
+  cell is the one `--order` fills next: under `mrv` and `frontier` a cell with no
+  exact fit first, under 2sides/4sides the first such cell of the outermost
+  open layer. Breaks count in edges, and the cuts keep the whole remaining
+  budget. It proves nothing. A node cap rather than a time limit makes the
+  output the same at any thread count; the threads share out a step's
+  candidates when one record has the machine. Measured completions (breaks):
+  - Four 114-cell jewel tails (rows 6..14 open), 0.01-0.5 s per board:
+    `rowmajor` 42-47, `spiral` 53-59, `mrv` 61-79, 2sides/4sides 76-100.
+    50,000 dives (~3 s) gave a best of 34-43, a median of 48-56.
+  - Eight open interiors (192 cells), one thread per board: `rowmajor` 38-57
+    (mean 45) in ~5.5 s. 50,000 dives (~23 s) gave a mean best of 42. The mean
+    was 51 at 1M nodes and no better than 45 at 30M or 100M.
 
 `--order` (default `mrv`, the most constrained cell) also offers `rowmajor`,
 `colmajor`, `snake`, `spiral`, `centerout`, `spiralout`, and the side modes
-`2sides`/`4sides` (exact layers from the sides inward, `--breaks 0`).
+`2sides`/`4sides` (exact layers from the sides inward; with `--breaks K` they
+spend the breaks through the ratchet, their default and only break mode).
 `--reverse` flips a static order's direction (for `mrv`, a column-major
 tie-break); it changes the visiting order, not the solution set. `--jump` skips a
 dead cell to build a large break-free partial.
@@ -2109,7 +2129,7 @@ node rate).
 | option | default | meaning |
 |---|---|---|
 | `--holes PATH`, `--rotate K` | --, 0 | reopen a masked region; turn K quarter-turns CCW first |
-| `--break_mode`, `--breaks K` | stuck, 0 | engine; break ceiling |
+| `--break_mode`, `--breaks K` | stuck, 0 | engine (`stuck`, `any`, `lds`, `ratchet`); break ceiling |
 | `--restarts N`, `--no_lcv` | 50000, off | dives; value ordering off |
 | `--order`, `--reverse`, `--jump` | mrv, off, off | cell order |
 | `--frame_last` | off | the frame cells only once every inner cell is placed |
@@ -2117,6 +2137,7 @@ node rate).
 | `--edge_supply` | off | cut on the frame's inward edges: per colour, demand above the unused edge pieces' supply |
 | `--hall MODE`, `--hall_stride N`, `--hall_min N` | root, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
+| `--ratchet_nodes N` | 10000000 | nodes per exact search of the ratchet; 0 = until exhausted |
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record; SIGINT/SIGTERM stop every running record the same way (rows not started: copied under `--resume`, else not written), a second signal kills |
 | `--max_emitted N` | 1 | completions per record (0 = all) |
 | `--stop_row N`, `--stop_column N`, `--with_frame`, `--with_clue_regions` | -- | band enumeration; widen the band by the frame, by the five 2x2 clue regions |
