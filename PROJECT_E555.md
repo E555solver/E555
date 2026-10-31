@@ -110,6 +110,14 @@ python3 src/C_tail/E555_ender.py data/seed_Edge5.txt best.csv closed.csv --profi
 and keep only boards that grow further, use `--stop_row 9 --backtrack_min_col 3`
 instead. The database cache depends on the clue flags, hence its own file.
 
+Measured since then (the agent kit's cloud campaign of 2026-10-28, 4 cores):
+dropping the end dives from the beam and handing its partials to the distiller
+does better at equal compute. Without the dives a beam covers ~15 border
+configurations in 300 s instead of one, and the distiller spends its dives on
+the best partials: 40 such cycles gave 464 four times and 463 26 times, against
+461-463 from beams that dive every board. `pipeline/run_cycles.sh` runs these
+cycles in parallel; its settings block holds every option above.
+
 `examples/` holds one small script per tool (start with
 `examples/01_beamer_quickstart.sh`); `pipeline/` holds long unattended runs
 (`run_pipeline.sh`, the board farm `run_farm.py`, the whirlpool, the halo loop

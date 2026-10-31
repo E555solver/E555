@@ -15,6 +15,7 @@ settings here will make far more sense afterwards.
 | `run_whirlpool_jewels.sh` | the whirlpool as a jewel finder: one beamer board at a time, turned and re-grown three times under one fixed frame | an hour |
 | `run_board_farm.sh` | runs a pipeline pass in a loop forever, keeps only the best boards, and periodically re-attacks them | days |
 | `run_farm.py` | the same idea with a different chain, and boards that graduate: built, endered once, then deeply endered into `elite.csv` and never searched again | days |
+| `run_cycles.sh` | fresh boards in parallel cycles: a beam that only grows row-11 partials over many border configurations (no end dives), then the distiller on them; every cycle's best boards collect in `best.csv`. The route that made the 464s of `data/best_464.csv` (rows 4-8) | 25 min a cycle on 4 threads, as many slots as the cores allow |
 | `run_halo.sh` | beam to row 10, lift the halo (rows 0-2, columns 0, 1, 14, 15) and search for a board with every inner piece placed, the frame last; the best boards climb a ladder of longer resumed searches | hours |
 | `topper_sweep.sh` | one plan of topper passes over a slice of a board file | minutes |
 | `slurm_wrapper.sh` | runs any of the above as a batch job | -- |
@@ -28,6 +29,7 @@ bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db   # jewels for an hour
 bash pipeline/run_board_farm.sh MAX_HOURS=48        # the farm, two days
 python3 pipeline/run_farm.py DB=/tmp/E555.db THREADS=10   # the graduating farm
 bash pipeline/run_halo.sh TOTAL_TIME=4h             # the halo loop, four hours
+bash pipeline/run_cycles.sh TOTAL_TIME=1d DB_FILE=/data/E555.db   # cycles on every core, a day
 ```
 
 ## How every runner works
