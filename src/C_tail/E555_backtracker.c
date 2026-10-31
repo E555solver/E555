@@ -474,8 +474,9 @@ static int       g_lds_max    = -1;   /* -1 = no cap beyond the break budget */
  * nodes, so which board is committed does not depend on the thread count or
  * the load.  Uncapped, the first search does not end before --time_limit for
  * 2sides/4sides even on a 62-cell tail (side growth runs no cuts: 1.6 G nodes
- * in 9 min), nor on a wide open region in any order; rowmajor and mrv tails
- * finish in well under 1M.  Measured on eight open interiors (192 cells,
+ * in 9 min), nor on a wide open region in any order.  rowmajor, mrv, frontier
+ * and spiral wrote the same boards uncapped as at 1M on the 62- and 114-cell
+ * tails, in under 0.1 s a board.  Measured on eight open interiors (192 cells,
  * rowmajor, depth commit), the mean breaks to complete were 51 at 1M nodes, 45
  * at 10M (~5.5 s a board on one thread), 44.6 at 30M, 45 at 100M. */
 #define RATCHET_NODES_DEFAULT 0ULL

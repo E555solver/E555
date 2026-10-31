@@ -2019,7 +2019,8 @@ counters rather than a scan.
     `--time_limit` for 2sides/4sides even on a 62-cell tail, nor for any order
     on a wide open region. The run then ends with no break placed. Cap those
     runs: `--ratchet_nodes 1000000` for the side sweeps, 10000000 for open
-    regions.
+    regions. `rowmajor`, `mrv`, `frontier` and `spiral` wrote the same boards
+    uncapped as at 1M on the 62- and 114-cell tails, in under 0.1 s a board.
 
   Measured mean breaks to complete, and time per board:
 
@@ -2027,7 +2028,11 @@ counters rather than a scan.
   |---|---|---|---|---|
   | 8 jewel tails, 62 cells open (rows 10..14), one thread | 44.8 (<0.1 s) | 34.4 (~5 s) | 33.1 (~17 s) | 50,000: 33.5 (~5.6 s); 150,000: 33.1 (~19 s) |
   | 4 tails, 114 cells open (rows 6..14), 4 threads | 44.0 (0.01 s) | 34.5 (~1.2 s) | 34.0 (~3.7 s) | 50,000: 38.5 (~3.2 s); 200,000: 37.8 (~12 s) |
-  | 8 open interiors, 192 cells, one thread, 10M nodes | 45.1 (~5.5 s) | 36.0 (~17 s) | -- | 50,000: 41.9 (~23 s) |
+  | 8 open interiors, 192 cells, one thread, 10M nodes | 45.1 (~5.5 s) | 36.0 (9-39 s) | -- | 50,000: 41.9 (~23 s) |
+
+  Two of the open interiors took 29 and 39 s at R=30 on one thread. Under the
+  default 30 s `--time_limit` they end early, with output that depends on
+  timing: give such boards more time, or more threads with one record each.
 
   - **Other orders on the 62-cell tails, R=30.** `mrv` averaged 34.6 (~9 s).
     At 1M nodes, 2sides completed 8 of 8 tails with 47-58 breaks and 4sides
