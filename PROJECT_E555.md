@@ -2105,8 +2105,9 @@ board with B breaks:
   border changes.
 
 The run ends when no hole gains or at `--time_limit` (30 s per row). The row
-written is never worse than the one read, and is byte-identical when nothing
-gains. Incomplete boards are written unchanged. The output does not depend on
+written is never worse than the one read; when nothing gains it is the same
+board, written as a canonical row. Incomplete boards are written the same
+way. The output does not depend on
 the thread count, unless `--time_limit` ends the run. A row with the machine to
 itself searches its holes in parallel.
 
@@ -2122,16 +2123,14 @@ Refused with:
 - `--max_emitted` other than 1.
 
 Measured:
-- **On dived boards** (452-454), every board gained:
-  - `--hole_cells 40`: +1 to +5 in about 10 s;
-  - `--hole_cells 64`: +3.5 on average in about 30 s.
-
-  Donors added a fifth to the gain. The ender's redive (9.3) still did better
-  there: +7 per board, at 40 s × 4 threads.
-- **On polished boards** (462-465):
-  - `--hole_cells 40` and 64 found nothing;
-  - 96 took about a minute a board and lifted one board of nine by +1.
-- **On the ender's output** it found nothing.
+- **Dived boards** (452-454, all from one partial): every board gained, a few
+  edges each, more with a larger `--hole_cells`. Donors helped there; they are
+  not yet measured more broadly. The ender's redive (9.3) gained about twice as
+  much, at several times the cost.
+- **Polished boards** (462-465): nothing at `--hole_cells` 40 or 64. At 96, one
+  board of nine gained +1. Such a row outlasts the default `--time_limit`, so
+  raise it.
+- **The ender's output:** nothing.
 
 Use it as a cheap first pass, or with a large `--hole_cells` and
 `--time_limit` on boards the ender has not touched.
