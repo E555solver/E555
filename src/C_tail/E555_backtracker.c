@@ -541,9 +541,11 @@ static OrderMode g_order_mode = ORD_MRV;
 static bool g_reverse = false;   /* --reverse: reversed traversal; mrv tie-break -> column-major */
 /* --frame_last: no frame cell (row or column 0 or 15) is searched while an inner
  * cell is still open.  Static orders sort the frame cells after the inner ones,
- * frontier puts them in layers after the last inner layer, mrv skips them; the
- * order within each part is unchanged.  The frame cells stay in every prune, so
- * a frame cell left without a fitting edge still ends the path. */
+ * frontier puts them in layers after the last inner layer, mrv skips them,
+ * 2sides/4sides sweep their inner layers and then the frame cells in sweep
+ * order; the order within each part is unchanged.  The frame cells stay in
+ * every prune, so a frame cell left without a fitting edge still ends the path
+ * (side growth runs no prunes: it defers the cell). */
 static bool g_frame_last = false;
 static inline bool is_frame_cell(int r, int c) {
     return r == 0 || c == 0 || r == PUZZLE_SIDE - 1 || c == PUZZLE_SIDE - 1;
@@ -3105,7 +3107,10 @@ static void side_sequence_add(const Board *b,
  * 4sides uses concentric insets and cycles left, right, bottom, top for each
  * coordinate along the current ring.  Duplicate corner visits are suppressed.
  * Thus every row receives its lateral cells and every column receives its
- * bottom/top cells before the search moves to the next inner ring. */
+ * bottom/top cells before the search moves to the next inner ring.
+ *
+ * --frame_last moves the open frame cells to the end, in the order the sweep
+ * visits them, after every inner cell. */
 static void build_side_sequence(const Board *b, Cell *seq, int *n_seq,
                                 OrderMode mode) {
     bool seen[PUZZLE_SIDE][PUZZLE_SIDE];
@@ -3132,6 +3137,16 @@ static void build_side_sequence(const Board *b, Cell *seq, int *n_seq,
                 side_sequence_add(b, seen, seq, &n, hi, i ); /* top    */
             }
         }
+    }
+
+    if (g_frame_last) {
+        Cell frame[MAX_SEQ_LEN];
+        int ni = 0, nf = 0;
+        for (int i = 0; i < n; i++) {
+            if (is_frame_cell(seq[i].row, seq[i].col)) frame[nf++] = seq[i];
+            else                                       seq[ni++] = seq[i];
+        }
+        memcpy(seq + ni, frame, (size_t)nf * sizeof(Cell));
     }
 
     int expected = board_count_searchable(b);
@@ -3169,7 +3184,8 @@ static void build_search_sequence_ordered(const Board *b, Cell *seq, int *n_seq,
 
 /* A short runtime trace makes stale binaries and accidental MRV routing
  * immediately obvious.  For 2sides the first layer must be the two lateral
- * border cells of each row; for 4sides it must be the outer L/R/B/T ring. */
+ * border cells of each row; for 4sides it must be the outer L/R/B/T ring
+ * (under --frame_last: the first inner layer, the frame coming last). */
 static void print_side_sequence_preview(const Cell *seq, int n_seq) {
     int show = n_seq < 32 ? n_seq : 32;
     printf("[side-order] exact deferred-growth sequence; first %d/%d empty targets:",
@@ -5870,7 +5886,8 @@ static void run_search_at_k(Board *base, const SearchCtx *cx,
  *   2. The base's stuck cell: the cell --order fills next.  mrv and frontier
  *      take a cell with no exact fit first (pick_next_cell), a static order
  *      its next cell, 2sides/4sides the first cell with no exact fit in the
- *      outermost layer still open (else that layer's first open cell).
+ *      outermost layer still open (else that layer's first open cell; under
+ *      --frame_last the frame's layers wait for every inner cell).
  *   3. Every candidate at that cell -- exact fits, then one broken edge, two,
  *      ... up to the budget left -- that passes tail_dfs's completion cuts gets
  *      its own exact search as in 1.
@@ -5973,12 +5990,19 @@ static int ratchet_stuck_cell(const Board *b, const FcState *fc, const Cell *rem
                               int left, const int8_t (*layer)[PUZZLE_SIDE]) {
     if (!order_is_side_growth(g_order_mode))
         return pick_next_cell(b, fc, rem, n_rem, 0, g_order_mode, left, layer);
+    /* --frame_last: the frame waits while any inner cell is open. */
+    bool inner_open = false;
+    if (g_frame_last)
+        for (int j = 0; j < n_rem && !inner_open; j++)
+            inner_open = !is_frame_cell(rem[j].row, rem[j].col);
     int lo = INT_MAX, first = -1;
     for (int j = 0; j < n_rem; j++) {
+        if (inner_open && is_frame_cell(rem[j].row, rem[j].col)) continue;
         int l = side_layer(rem[j].row, rem[j].col);
         if (l < lo) lo = l;
     }
     for (int j = 0; j < n_rem; j++) {
+        if (inner_open && is_frame_cell(rem[j].row, rem[j].col)) continue;
         if (side_layer(rem[j].row, rem[j].col) != lo) continue;
         if (fc_exact_count(fc, rem[j].row, rem[j].col) == 0) return j;
         if (first < 0) first = j;
@@ -7746,9 +7770,6 @@ int main(int argc, char **argv) {
         fatal("--edge_supply is a completion cut of the backtracking search: --jump, "
               "2sides/4sides and the greedy dives run no completion cuts");
     if (g_frame_last) {
-        if (order_is_side_growth(g_order_mode))
-            fatal("--frame_last does not apply to --order %s: side growth walks its "
-                  "own layers from the sides inward", order_name(g_order_mode));
         if (g_break_mode == BREAK_STUCK && g_max_mismatch > 0)
             fatal("--frame_last orders the backtracking search; the greedy dives "
                   "(--break_mode stuck with --breaks > 0) choose their cells themselves");

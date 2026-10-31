@@ -2077,10 +2077,10 @@ pieces, and `--early_release R,C` then releases after that cell's whole layer.
 The run prints the first row's layer map (`#` placed, digits the layers, `*` the
 release cell) with the cells per layer.
 `--frame_last` searches the frame (rows and columns 0 and 15) last: no frame cell
-is chosen while an inner cell is open, in any order but 2sides/4sides and the
-greedy dives (static orders sort the frame after the inner cells, frontier puts
-it in layers after the last inner one, mrv skips it). The frame cells stay in
-every prune. With N the open frame cells, `--early_release N` stops at the first
+is chosen while an inner cell is open, in any order but the greedy dives (static
+orders sort the frame after the inner cells, frontier puts it in layers after the
+last inner one, mrv skips it, 2sides/4sides sweep their inner layers and then the
+frame cells in sweep order). The frame cells stay in every prune. With N the open frame cells, `--early_release N` stops at the first
 board that places every inner cell, leaving the edges to place last.
 `--no_colour_count` (like `--no_hall`) drops a start-of-record check that sees
 the cells to be released too; neither is recorded by `--resume`.

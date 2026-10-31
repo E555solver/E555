@@ -114,7 +114,7 @@ ALL_STEPS=(
     "backtracker_dives|extra|backtracker|greedy dives on the example board, plus an own-output round-trip"
     "backtracker_exhaustive|core|backtracker|exhaustive enumeration identical at 1 and 4 threads"
     "backtracker_stop_band|extra|backtracker|--stop_row/--stop_column emit exact, finalizer-shaped bands"
-    "backtracker_release|extra|backtracker|--early_release stops N cells early in every order; --reverse moves the gate; --frame_last"
+    "backtracker_release|extra|backtracker|--early_release stops N cells early in every order; --reverse moves the gate; --frame_last, 2sides/4sides too"
     "backtracker_resume|extra|backtracker,finalizer|--resume: sessions add up to one run node for node; each run releases the next board; dedup, --resume_score, readers"
     "backtracker_breakcount|extra|backtracker|break classes agree with the per-candidate scan they replaced; --edge_supply keeps the minimum"
     "backtracker_clues|extra|backtracker|--clue_center/--clue_corners force the hints on, or drop the board"
@@ -2176,9 +2176,20 @@ PY
     bin/E555_backtracker data/synth_seed.txt "$OUT/fl_res.csv" "$OUT/fl_res2.csv" --order frontier \
         --early_release 60 --breaks 0 --resume > "$OUT/fl_res2.log" 2>&1 \
         && fail "a --frame_last row was resumed without --frame_last"
-    "${bt[@]}" "$OUT/fl_bad.csv" --frame_last --order 2sides > "$OUT/fl_bad.log" 2>&1 \
-        && fail "--frame_last accepted --order 2sides"
-    echo "ok: --frame_last releases the whole interior, frame open, in frontier, mrv and rowmajor; recorded by --resume; 2sides refused"
+    # 2sides/4sides sweep the open inner cells first, the frame cells after them:
+    # the 32 targets the side preview draws hold no frame cell (79 inner are open).
+    for o in 2sides 4sides; do
+        "${bt[@]}" "$OUT/fl_$o.csv" --holes data/holes_open_border_TBLR.csv --breaks 0 \
+            --frame_last --order "$o" --verbose --time_limit 2 --threads 1 > "$OUT/fl_$o.log" \
+            || fail "--frame_last --order $o failed"
+        python3 - "$OUT/fl_$o.log" <<'PY' || fail "--frame_last --order $o: a frame cell before an inner one"
+import re, sys
+line = [l for l in open(sys.argv[1]) if l.startswith("[side-order]")][0]
+cells = [(int(r), int(c)) for r, c in re.findall(r"\((\d+),(\d+)\)", line)]
+assert len(cells) == 32 and not any(r in (0, 15) or c in (0, 15) for r, c in cells)
+PY
+    done
+    echo "ok: --frame_last releases the whole interior, frame open, in frontier, mrv and rowmajor; recorded by --resume; 2sides/4sides sweep the frame last"
 }
 
 # --resume cuts one exact search into sessions.  The proof that nothing is
