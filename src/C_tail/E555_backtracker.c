@@ -453,7 +453,8 @@ static double   g_time_limit_sec   = -1.0;
  *     run_ratchet().  The exact search runs from the board until it is
  *     exhausted or --ratchet_nodes is spent; its deepest board is committed,
  *     every candidate at the cell where it is stuck gets its own exact search,
- *     and the deepest of those is committed next, until the budget is spent.
+ *     and the one whose --ratchet_rollouts dives complete with the fewest
+ *     breaks is committed next, until the budget is spent.
  *     A heuristic like stuck, but it backtracks between breaks.  The default
  *     for 2sides/4sides with --breaks > 0, the only mode they accept there.
  *
@@ -471,13 +472,24 @@ static int       g_lds_max    = -1;   /* -1 = no cap beyond the break budget */
 /* ratchet: nodes per exact search between breaks (0 = until exhausted, the
  * default).  Each search runs on one thread and stops at exactly this many
  * nodes, so which board is committed does not depend on the thread count or
- * the load.  Uncapped, the first search on a wide open region may not end
- * before --time_limit; measured on eight open interiors (192 cells, rowmajor),
- * the mean breaks to complete were 51 at 1M nodes, 45 at 10M (~5.5 s a board on
- * one thread), 44.6 at 30M, 45 at 100M.  On four 114-cell tails 100k and 1M
- * gave the same boards. */
+ * the load.  Uncapped, the first search does not end before --time_limit for
+ * 2sides/4sides even on a 62-cell tail (side growth runs no cuts: 1.6 G nodes
+ * in 9 min), nor on a wide open region in any order; rowmajor and mrv tails
+ * finish in well under 1M.  Measured on eight open interiors (192 cells,
+ * rowmajor, depth commit), the mean breaks to complete were 51 at 1M nodes, 45
+ * at 10M (~5.5 s a board on one thread), 44.6 at 30M, 45 at 100M. */
 #define RATCHET_NODES_DEFAULT 0ULL
 static unsigned long long g_ratchet_nodes = RATCHET_NODES_DEFAULT;
+/* ratchet: greedy dives from each candidate's continuation; the commit goes to
+ * the candidate whose dives complete with the fewest breaks (0 = the deepest
+ * continuation, the original rule).  See ratchet_rollout().  Mean breaks to
+ * complete, rowmajor: 62-cell tails 44.8 / 34.4 / 33.1 at R = 0 / 30 / 100
+ * (50,000 dives 33.5 in the time of R=30), 114-cell tails 44.0 / 34.5 / 34.0
+ * (dives 38.5 in the time of R=100), 192-cell open interiors 45.1 / 36.0 at
+ * R = 0 / 30 (dives 41.9 in more time).  30: R=100 gains about one break for
+ * three times the time, and overruns the default --time_limit on open boards. */
+#define RATCHET_ROLLOUTS_DEFAULT 30
+static int g_ratchet_rollouts = RATCHET_ROLLOUTS_DEFAULT;
 
 /* Greedy-dive controls (stuck mode only). */
 /* Value ordering costs about 2.1x per dive, so the default restart count is
@@ -676,7 +688,9 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
            break_mode_name(g_break_mode));
     printf(" --breaks %d", g_max_mismatch);
     if (g_lds_max >= 0) printf(" --lds_max %d", g_lds_max);
-    if (g_break_mode == BREAK_RATCHET) printf(" --ratchet_nodes %llu", g_ratchet_nodes);
+    if (g_break_mode == BREAK_RATCHET)
+        printf(" --ratchet_nodes %llu --ratchet_rollouts %d", g_ratchet_nodes,
+               g_ratchet_rollouts);
     printf(" --max_emitted %" PRIu64, g_solution_limit);
     if (g_release_row >= 0) printf(" --early_release %d,%d", g_release_row, g_release_col);
     else if (g_early_release > 0) printf(" --early_release %d", g_early_release);
@@ -5894,7 +5908,9 @@ static void run_search_at_k(Board *base, const SearchCtx *cx,
  *      ... up to the budget left -- that passes tail_dfs's completion cuts gets
  *      its own exact search as in 1.
  *   4. The deepest of those boards is the next base (ties: the earlier
- *      candidate, so the cheaper break).  Repeat from 2 until the board is
+ *      candidate, so the cheaper break).  With --ratchet_rollouts R, greedy
+ *      dives from each first score it, and the fewest breaks to complete wins,
+ *      then the deepest (ratchet_rollout()).  Repeat from 2 until the board is
  *      complete, the budget is spent, no candidate passes, or --time_limit.
  *
  * Every search is serial and stops at a node count, not a time, and the commit
@@ -5914,11 +5930,18 @@ static void run_search_at_k(Board *base, const SearchCtx *cx,
 typedef struct {
     Board board;                     /* the search's best board */
     int   total, connected, broken, break_pieces, row, col;
+    /* --ratchet_rollouts: the fewest total breaks the dives from `board`
+     * completed with (INT_MAX: none ran), how many ran, and the best of them
+     * when it is within --breaks (done_ok), a finished board in its own right. */
+    int   rollout, dives;
+    bool  done_ok;
+    Board done;
 } RatchetBest;
 
 typedef struct {
     int         steps;               /* stuck cells broken through */
     long long   searches;            /* exact searches run */
+    long long   dives;               /* rollout dives run */
     int         stuck_row, stuck_col;/* the last stuck cell; -1 = none */
     const char *ended;               /* why the ratchet stopped */
 } RatchetReport;
@@ -5975,6 +5998,50 @@ static void ratchet_search(const Board *start, const SearchCtx *proto, RatchetBe
     out->break_pieces = prs.best_break_pieces;
     out->row          = prs.deepest_row;
     out->col          = prs.deepest_col;
+}
+
+static bool ratchet_out_of_time(double deadline) {
+    return g_stop || (deadline > 0.0 && omp_get_wtime() > deadline);
+}
+
+/* --ratchet_rollouts R: R greedy dives -- the stuck engine, lcv_pick()
+ * included -- from the board a candidate's search reached.  Every dive fills
+ * the board, so the score is the fewest total breaks a completion took: what
+ * the commit leaves to finish, which depth alone does not see (it fills the
+ * easy cells first and leaves the frame's neighbours for when the budget is
+ * gone).  The dives are seeded from the board, not the clock, so the score is
+ * the same on every run and at any thread count. */
+static void ratchet_rollout(RatchetBest *x, int step, double deadline) {
+    x->rollout = INT_MAX;
+    x->dives   = 0;
+    x->done_ok = false;
+    const Board *b0 = &x->board;
+    if (board_count_placed(b0) == NUM_PIECES) { x->rollout = x->broken; return; }
+
+    Cell cells[MAX_SEQ_LEN]; int n = 0;
+    build_search_sequence_ordered(b0, cells, &n, g_order_mode);
+    FcState proto;
+    fc_init(&proto, b0);
+    const uint64_t master = splitmix64(board_state_hash(b0));
+    Board b;
+    FcState fc;
+    for (int d = 0; d < g_ratchet_rollouts; d++) {
+        if (ratchet_out_of_time(deadline)) break;
+        RNG rng = rng_for(master, (uint64_t)step, (uint64_t)d);
+        b  = *b0;
+        fc = proto;
+        greedy_dive(&b, &fc, cells, n, &rng);
+        if (board_count_placed(&b) != NUM_PIECES)
+            fatal("internal error: a ratchet rollout left %d cells empty",
+                  NUM_PIECES - board_count_placed(&b));
+        x->dives++;
+        int brk = 0;
+        board_break_stats(&b, &brk, NULL);
+        if (brk < x->rollout) {
+            x->rollout = brk;
+            if (brk <= g_max_mismatch) { x->done = b; x->done_ok = true; }
+        }
+    }
 }
 
 /* A side-growth layer: the inset of build_side_sequence() holding (r,c). */
@@ -6068,10 +6135,6 @@ static void ratchet_offer(RecStat *rs, const RatchetBest *x, const char *config_
     if (do_ckpt) write_checkpoint_line(&ckpt_copy, config_id_str);
 }
 
-static bool ratchet_out_of_time(double deadline) {
-    return g_stop || (deadline > 0.0 && omp_get_wtime() > deadline);
-}
-
 /* The ratchet over one record.  proto carries the record's search settings
  * (k_budget = --breaks, deadline, collect, layer); rstat, live, mres, stats
  * and solutions are the record's, as run_search_at_k() fills them. */
@@ -6086,6 +6149,7 @@ static void run_ratchet(const Board *start, const SearchCtx *proto, RecStat *rst
     cx.step      = 0;
     rep->steps = 0;
     rep->searches = 1;
+    rep->dives = 0;
     rep->stuck_row = rep->stuck_col = -1;
     rep->ended = "time limit";
 
@@ -6155,6 +6219,7 @@ static void run_ratchet(const Board *start, const SearchCtx *proto, RecStat *rst
                 Board child = base;
                 board_place(&child, r, c, (int)adm[i].pid, (int)adm[i].spin);
                 ratchet_search(&child, &cx, &res[i], r, c, &sols, &tst, &tm);
+                if (g_ratchet_rollouts > 0) ratchet_rollout(&res[i], rep->steps, cx.deadline);
             }
             #pragma omp critical(ratchet_merge)
             { stats_merge(stats, &tst); mres_merge(mres, &tm); }
@@ -6163,12 +6228,36 @@ static void run_ratchet(const Board *start, const SearchCtx *proto, RecStat *rst
         *local_solutions += sols;
         rep->searches += n_adm;
 
-        /* Step 4, in candidate order whatever the threads did. */
+        /* Step 4, in candidate order whatever the threads did: the deepest, or
+         * with rollouts the fewest breaks to complete, then the deepest.  A
+         * rollout completion within --breaks is a finished board of the record. */
         int win = -1;
         for (int i = 0; i < n_adm; i++) {
             if (res[i].total < 0) continue;
             ratchet_offer(rstat, &res[i], cx.config_id);
-            if (win < 0 || res[i].total > res[win].total) win = i;
+            if (g_ratchet_rollouts > 0) {
+                rep->dives += res[i].dives;
+                if (res[i].done_ok) {
+                    RatchetBest *f = &res[i];
+                    RatchetBest d;
+                    d.board = f->done;
+                    d.total = NUM_PIECES;
+                    board_edge_counts(&d.board, &d.connected, &d.broken);
+                    board_break_stats(&d.board, NULL, &d.break_pieces);
+                    d.row = d.col = -1;
+                    ratchet_offer(rstat, &d, cx.config_id);
+                    mres_add(mres, &d.board, d.broken, d.break_pieces);
+                    (*local_solutions)++;
+                    #pragma omp atomic
+                    g_total_solutions++;
+                }
+            }
+            if (win < 0 ||
+                (g_ratchet_rollouts > 0
+                   ? (res[i].rollout < res[win].rollout ||
+                      (res[i].rollout == res[win].rollout && res[i].total > res[win].total))
+                   : res[i].total > res[win].total))
+                win = i;
         }
         if (win < 0) {                    /* the time ran out before any search */
             search_request_stop(live, STOP_TIMEOUT);
@@ -6179,10 +6268,13 @@ static void run_ratchet(const Board *start, const SearchCtx *proto, RecStat *rst
         if (g_verbose) {
             #pragma omp critical(stdout_print)
             {
+                char rb[48] = "";
+                if (g_ratchet_rollouts > 0 && res[win].rollout != INT_MAX)
+                    snprintf(rb, sizeof(rb), "  rollout best=%d", res[win].rollout);
                 printf("[%s] ratchet step %d: (r=%d,c=%d) %d of %d candidates searched; "
-                       "+%d broken -> %d pieces, broken=%d  t=%.1fs\n",
+                       "+%d broken -> %d pieces, broken=%d%s  t=%.1fs\n",
                        cx.tag, rep->steps, r, c, n_adm, n_cand, (int)adm[win].breaks,
-                       res[win].total, res[win].broken, omp_get_wtime() - t0);
+                       res[win].total, res[win].broken, rb, omp_get_wtime() - t0);
                 fflush(stdout);
             }
         }
@@ -6786,8 +6878,10 @@ static void process_line(const char *config_id_str, long long field2, long long 
         run_ratchet(&base, &cx, &rstat, &live, &local_solutions, &total_stats, &mres, &rrep);
 
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
-                "[%s] ratchet: %d step(s), %lld exact search(es), broken %d -> %d; ended: %s",
-                tag, rrep.steps, rrep.searches, input_breaks, rstat.best_broken, rrep.ended);
+                "[%s] ratchet: %d step(s), %lld exact search(es), %lld rollout dive(s), "
+                "broken %d -> %d; ended: %s",
+                tag, rrep.steps, rrep.searches, rrep.dives, input_breaks, rstat.best_broken,
+                rrep.ended);
         if (rrep.stuck_row >= 0 && strcmp(rrep.ended, "complete") != 0)
             appendf(rec_buf, sizeof(rec_buf), &rec_off, " (last stuck cell r=%d,c=%d)",
                     rrep.stuck_row, rrep.stuck_col);
@@ -7313,11 +7407,18 @@ static void usage(const char *prog) {
         "                           never revisited; proves nothing.  The default (and\n"
         "                           only mode) for 2sides/4sides with --breaks > 0.\n"
         "  --ratchet_nodes N      Cap each exact search of the ratchet at N nodes\n"
-        "                         (default 0: each runs until exhausted).  On a wide\n"
-        "                         open region the first may not finish within\n"
-        "                         --time_limit; 10000000 suits those.  A node count, not\n"
-        "                         a time, so the committed boards do not depend on\n"
-        "                         --threads (unless --time_limit ends the run).\n"
+        "                         (default 0: each runs until exhausted).  Under\n"
+        "                         2sides/4sides, or on a wide open region, the first\n"
+        "                         may not finish within --time_limit: use 1000000 for\n"
+        "                         the side sweeps, 10000000 for open regions.  A node\n"
+        "                         count, not a time, so the committed boards do not\n"
+        "                         depend on --threads (unless --time_limit ends it).\n"
+        "  --ratchet_rollouts R   Greedy dives from each candidate's continuation; the\n"
+        "                         ratchet keeps the one whose dives complete with the\n"
+        "                         fewest breaks, then the deepest (default 30; 0 =\n"
+        "                         the deepest).  A dive completion within --breaks is\n"
+        "                         a finished board.  Seeded from the board: every run\n"
+        "                         commits the same.\n"
         "  --restarts N           Independent randomized dives per record (default 50000,\n"
         "                         roughly 5-10 s on four cores).\n"
         "                         Dives are sub-millisecond; N in the millions is fine.\n"
@@ -7651,6 +7752,13 @@ int main(int argc, char **argv) {
                 fatal("--ratchet_nodes expects a node count (0 = until exhausted), got '%s'",
                       argv[i]);
             g_ratchet_nodes = v;
+        } else if (strcmp(argv[i], "--ratchet_rollouts") == 0 && i+1 < argc) {
+            char *end = NULL; errno = 0;
+            long v = strtol(argv[++i], &end, 10);
+            if (errno || end == argv[i] || *end || v < 0 || v > 10000000)
+                fatal("--ratchet_rollouts expects a dive count in [0,10000000] "
+                      "(0 = commit the deepest), got '%s'", argv[i]);
+            g_ratchet_rollouts = (int)v;
         } else if (strcmp(argv[i], "--lds_max") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
@@ -7822,6 +7930,9 @@ int main(int argc, char **argv) {
     if (g_ratchet_nodes != RATCHET_NODES_DEFAULT && g_break_mode != BREAK_RATCHET)
         fprintf(stderr, "[warn] --ratchet_nodes has no effect unless --break_mode ratchet "
                         "is selected.\n");
+    if (g_ratchet_rollouts != RATCHET_ROLLOUTS_DEFAULT && g_break_mode != BREAK_RATCHET)
+        fprintf(stderr, "[warn] --ratchet_rollouts has no effect unless --break_mode ratchet "
+                        "is selected.\n");
     if (g_break_mode == BREAK_RATCHET && g_max_mismatch > 0 && g_jump)
         fatal("--break_mode ratchet breaks where the exact search is stuck; --jump would "
               "skip that cell instead");
@@ -7920,6 +8031,8 @@ int main(int argc, char **argv) {
         if (g_break_mode == BREAK_RATCHET) {
             if (g_ratchet_nodes > 0) printf("  ratchet_nodes=%llu", g_ratchet_nodes);
             else                     printf("  ratchet_nodes=0 (each search until exhausted)");
+            if (g_ratchet_rollouts > 0) printf("  ratchet_rollouts=%d", g_ratchet_rollouts);
+            else                        printf("  ratchet_rollouts=0 (commit the deepest)");
         }
     }
     printf("\n");

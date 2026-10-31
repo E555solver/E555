@@ -1998,32 +1998,42 @@ counters rather than a scan.
   candidates, and the time limit usually came first.
 - **`ratchet`**: exact search between breaks, each break committed and never
   revisited. The exact search of `--order` runs from the board, on one thread,
-  until exhausted, or for at most `--ratchet_nodes N` nodes (default 0: no cap),
-  and its deepest board is kept. Every candidate at the cell where it is stuck,
-  cheapest break first, gets its own exact search, and the deepest result (ties:
-  the earlier candidate) is the next board. It stops when the board is
-  complete, the breaks are spent, or no candidate passes the cuts. The stuck
-  cell is the one `--order` fills next: under `mrv` and `frontier` a cell with no
-  exact fit first, under 2sides/4sides the first such cell of the outermost
-  open layer. Breaks count in edges, and the cuts keep the whole remaining
-  budget. It proves nothing. A node cap rather than a time limit makes the
-  output the same at any thread count, unless `--time_limit` ends the run; the
-  threads share out a step's candidates when one record has the machine.
-  Measured completions (breaks):
-  - Eight 62-cell jewel tails (rows 10..14 open), `--breaks 60`, under 0.1 s
-    each: `rowmajor` completed all 8 with 42-47, `spiral` all with 42-54, `mrv`
-    7 with 50-60, 4sides 6 with 54-60, 2sides 4 with 48-54. 50,000 dives
-    completed all with 32-35.
-  - Four 114-cell tails (rows 6..14 open), 0.01-0.5 s: `rowmajor` 42-47,
-    `spiral` 53-59, `mrv` 61-79, 2sides/4sides 76-100. 50,000 dives (~3 s)
-    gave a best of 34-43 and a median of 48-56.
-  - Eight open interiors (192 cells), one thread per board: `rowmajor` 38-57
-    (mean 45) in ~5.5 s at `--ratchet_nodes 10000000`. 50,000 dives (~23 s) gave
-    a mean best of 42. The mean was 51 at 1M nodes and no better than 45 at 30M
-    or 100M. Uncapped, the first search on such a region may not finish within
-    `--time_limit`: the run then ends there, with output that depends on timing.
-  - The four synthetic swapped boards of the breakcount check, `mrv --breaks
-    12`: it solved 2 with 12 and 8 breaks, where lds finds the minimum (6, 8, 8,
+  until exhausted, or for at most `--ratchet_nodes N` nodes (default 0: no cap).
+  Its deepest board is kept. Every candidate at the cell where it is stuck,
+  cheapest break first, gets its own exact search. `--ratchet_rollouts R`
+  greedy dives (default 30) from each search's board then score the candidate:
+  the one whose dives complete with the fewest breaks is the next board (ties:
+  the deeper, then the earlier; R = 0 keeps the deepest). A dive completion
+  within `--breaks` is a finished board. It stops when the board is complete,
+  the breaks are spent, or no candidate passes the cuts.
+  - **Stuck cell.** The one `--order` fills next: under `mrv` and `frontier` a
+    cell with no exact fit first, under 2sides/4sides the first such cell of the
+    outermost open layer.
+  - **Breaks** count in edges, and the cuts keep the whole remaining budget. It
+    proves nothing.
+  - **Repeatability.** Node caps and dives seeded from the board make the output
+    the same at any thread count and on every run, unless `--time_limit` ends
+    it. The threads share out a step's candidates when one record has the
+    machine.
+  - **When to cap.** Uncapped, the first exact search does not finish within
+    `--time_limit` for 2sides/4sides even on a 62-cell tail, nor for any order
+    on a wide open region. The run then ends with no break placed. Cap those
+    runs: `--ratchet_nodes 1000000` for the side sweeps, 10000000 for open
+    regions.
+
+  Measured mean breaks to complete, and time per board:
+
+  | boards | ratchet `rowmajor`, R=0 | R=30 | R=100 | dives |
+  |---|---|---|---|---|
+  | 8 jewel tails, 62 cells open (rows 10..14), one thread | 44.8 (<0.1 s) | 34.4 (~5 s) | 33.1 (~17 s) | 50,000: 33.5 (~5.6 s); 150,000: 33.1 (~19 s) |
+  | 4 tails, 114 cells open (rows 6..14), 4 threads | 44.0 (0.01 s) | 34.5 (~1.2 s) | 34.0 (~3.7 s) | 50,000: 38.5 (~3.2 s); 200,000: 37.8 (~12 s) |
+  | 8 open interiors, 192 cells, one thread, 10M nodes | 45.1 (~5.5 s) | 36.0 (~17 s) | -- | 50,000: 41.9 (~23 s) |
+
+  - **Other orders on the 62-cell tails, R=30.** `mrv` averaged 34.6 (~9 s).
+    At 1M nodes, 2sides completed 8 of 8 tails with 47-58 breaks and 4sides
+    7 of 8 with 49-58; at R=0 they completed 4 and 6.
+  - **The four synthetic swapped boards** (`mrv --breaks 12`). R=30 solved 3,
+    with 10, 8 and 8 breaks, against 2 at R=0; lds finds the minimum (6, 8, 8,
     8) on all four.
 
 `--order` (default `mrv`, the most constrained cell) also offers `rowmajor`,
@@ -2147,7 +2157,8 @@ node rate).
 | `--edge_supply` | off | cut on the frame's inward edges: per colour, demand above the unused edge pieces' supply |
 | `--hall MODE`, `--hall_stride N`, `--hall_min N` | root, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
-| `--ratchet_nodes N` | 0 | node cap per exact search of the ratchet; 0 = until exhausted (10000000 for wide open regions) |
+| `--ratchet_nodes N` | 0 | node cap per exact search of the ratchet; 0 = until exhausted (1000000 for 2sides/4sides, 10000000 for wide open regions) |
+| `--ratchet_rollouts R` | 30 | ratchet: greedy dives scoring each candidate (fewest breaks to complete wins); 0 = the deepest |
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record; SIGINT/SIGTERM stop every running record the same way (rows not started: copied under `--resume`, else not written), a second signal kills |
 | `--max_emitted N` | 1 | completions per record (0 = all) |
 | `--stop_row N`, `--stop_column N`, `--with_frame`, `--with_clue_regions` | -- | band enumeration; widen the band by the frame, by the five 2x2 clue regions |
