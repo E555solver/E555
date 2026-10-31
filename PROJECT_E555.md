@@ -1687,9 +1687,8 @@ All Stage C tools read and write the canonical CSV. `--holes FILE` masks are
 python3 tools/E555_distiller.py partials*.csv.gz --top 25 --out distilled.csv
 ```
 
-Reads plain or gzip CSVs of partial or complete boards and keeps N = `--top`
-(default 25); `--out` (default `distilled.csv`) and `--seed_file` are its only
-other options. With P unique partials:
+Reads plain or gzip CSVs of partial or complete boards and keeps N = `--top`.
+With P unique partials, and the options' defaults:
 
 | stage | method | kept |
 |---|---|---|
@@ -1699,10 +1698,25 @@ other options. With P unique partials:
 | probe | the ender's redive at fixed work (`--reopen auto --rounds 8 --copies 8 --end_dive 3000 --end_polish 1000 --prior 1 --nogo 1`); complete inputs join here; clued boards skip it | 4 N |
 | select | best by probed score, then probe gain, finished score, screen score, closure; a board sharing > 80% of its cells with a better one is skipped | N |
 
+| option | default | meaning |
+|---|---|---|
+| `--top N` | 25 | boards kept |
+| `--out FILE` | `distilled.csv` | output; `FILE.plan.sh` and `FILE_work/` go next to it |
+| `--seed_file F` | `data/seed_Edge5.txt` | piece seed |
+| `--screen_dives D` | 300 | screen: dives per partial |
+| `--finish_dives D`, `--finish_polish R` | 20000, 5000 | finish: dives and kick-and-polish rounds per kept board (R = 0: none) |
+| `--probe_per_top M` | 4 | probe: M N boards |
+| `--threads T` | 0 (all) | threads of every diver call |
+
 Writes `FILE` (canonical rows, best first), `FILE.plan.sh` (the
 `E555_ender.py --profile deep` command for them) and `FILE_work/` (every stage's
-results; a rerun resumes from it). Every diver call is seeded and keyed on the
-board, so the output is independent of threads and interruptions. Cost per board
+results; a rerun resumes from it, and starts afresh when the inputs, `--top` or a
+stage option differ). Every diver call is seeded and keyed on the board, so the
+output is independent of `--threads` and of interruptions: SIGINT or SIGTERM
+stops the diver call in flight, drops its chunk and exits (130 or 143), and the
+same command resumes. A cheaper finish buys more probes:
+`pipeline/run_cycles.sh` notes the setting the cloud campaign of 2026-10-28 used
+(`--finish_dives 5000 --finish_polish 2000 --probe_per_top 12`). Cost per board
 on 4 threads: screen 0.037 s, finish 0.75 s, probe ~7 s.
 
 Calibration on 300 unique row-11 partials of `data/E565_FixCorners23.csv.gz`

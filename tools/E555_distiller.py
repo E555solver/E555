@@ -3,6 +3,8 @@
 E555_distiller.py -- distil a corpus of boards to the few worth the CP-SAT tail.
 
     python3 tools/E555_distiller.py BOARDS.csv[.gz] ... [--top N] [--out FILE]
+        [--screen_dives D] [--finish_dives D] [--finish_polish R]
+        [--probe_per_top M] [--threads T]
 
 Reads board CSVs (plain or gzip; partial or complete; any stop rows) and writes
 
@@ -11,26 +13,31 @@ Reads board CSVs (plain or gzip; partial or complete; any stop rows) and writes
     FILE.plan.sh    the E555_ender.py command that takes them on
     FILE_work/      every stage's scores and boards; a rerun resumes there
 
-N = --top (default 25), P = unique partial boards. Stages:
+N = --top (default 25), P = unique partial boards. Stages (defaults in
+brackets):
 
     0 read     parse every row; drop exact repeats; group partials by the
                number of placed cells
-    1 screen   every unique partial: the best of 300 seeded dives
-               (E555_diver --end_dive 300); keep K = min(ceil(P/2), 400 N),
+    1 screen   every unique partial: the best of --screen_dives [300] seeded
+               dives (E555_diver --end_dive); keep K = min(ceil(P/2), 400 N),
                split over the groups in proportion to their size, closure
                breaking ties
-    2 finish   the K kept: E555_diver --end_dive 20000 --end_polish 5000
-    3 probe    the best 4 N complete boards: the ender's redive at fixed work,
-               E555_diver --reopen auto --rounds 8 --copies 8 --end_dive 3000
-               --end_polish 1000 --prior 1 --nogo 1 (never a worse board;
-               boards carrying clue pieces skip it)
+    2 finish   the K kept: E555_diver --end_dive --finish_dives [20000]
+               --end_polish --finish_polish [5000]
+    3 probe    the best --probe_per_top [4] x N complete boards: the ender's
+               redive at fixed work, E555_diver --reopen auto --rounds 8
+               --copies 8 --end_dive 3000 --end_polish 1000 --prior 1 --nogo 1
+               (never a worse board; boards carrying clue pieces skip it)
     4 select   best first by probed score, probe gain, finished score, screen
                score, closure; skip a board sharing more than 80% of its
                cells with a better one; keep N
 
 Every diver call is seeded and keys each board's random streams on the board
-itself, so the output depends on neither the thread count nor where a run was
-interrupted. Calibration of the screen: PROJECT_E555.md, E555_distiller.py.
+itself, so the output depends on neither the thread count (--threads, default
+all) nor where a run was interrupted: on SIGINT or SIGTERM the diver call in
+flight is stopped and its chunk thrown away, so a rerun redoes it. A rerun with
+other stage settings starts its work directory afresh. Calibration of the
+screen: PROJECT_E555.md, E555_distiller.py.
 """
 from __future__ import annotations
 
@@ -42,6 +49,7 @@ import hashlib
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -60,19 +68,42 @@ NORTH, EAST, SOUTH, WEST = R.NORTH, R.EAST, R.SOUTH, R.WEST
 INNER_MIN, N_INNER = 6, 17
 
 RNG_SEED = "1"
-SCREEN = ["--end_dive", "300"]
-FINISH = ["--end_dive", "20000", "--end_polish", "5000"]
+SCREEN_DIVES = 300          # defaults of --screen_dives, --finish_dives,
+FINISH_DIVES = 20000        # --finish_polish and --probe_per_top
+FINISH_POLISH = 5000
+PROBE_PER_TOP = 4
 PROBE = ["--reopen", "auto", "--rounds", "8", "--copies", "8", "--end_dive", "3000",
          "--end_polish", "1000", "--prior", "1", "--nogo", "1"]
 KEEP_FRACTION = 0.5         # screen: keep this share of the unique partials,
 KEEP_PER_TOP = 400          # but at most this many per board asked for
-PROBE_PER_TOP = 4
 MAX_AGREE = 0.8             # select: max shared-cell fraction with a better board
 CHUNK = {"screen": 5000, "finish": 500, "probe": 50}   # boards per diver call
-# Seconds per board on one thread (measured on 4 threads, times 4): the report's
-# time estimates.
+# Seconds per board on one thread (measured on 4 threads, times 4) at the
+# default settings: the report's time estimates, scaled with the dives asked for.
 COST = {"screen": 0.15, "finish": 3.0, "probe": 28.0}
-VERSION = 2
+VERSION = 3
+
+# Set by SIGINT/SIGTERM (see on_signal): the diver call in flight is stopped and
+# its chunk is not written, so the stage files only ever hold whole results.
+STOP = {"sig": 0, "child": None}
+
+
+def on_signal(sig, _frame):
+    """Remember the signal and pass it on to the diver running now, if any. A
+    script's background job starts with SIGINT ignored, so this is installed
+    for SIGINT too, and Python's own KeyboardInterrupt never fires."""
+    STOP["sig"] = sig
+    child = STOP["child"]
+    if child is not None and child.poll() is None:
+        child.send_signal(sig)
+
+
+def stopped():
+    """Exit as a signalled process would (130 for SIGINT, 143 for SIGTERM)."""
+    name = signal.Signals(STOP["sig"]).name
+    print(f"[stop] {name}: the stage files hold every finished chunk; rerun the "
+          f"same command to resume", flush=True)
+    raise SystemExit(128 + STOP["sig"])
 
 
 # -- boards ------------------------------------------------------------------
@@ -183,8 +214,9 @@ class Diver:
     stage file already holds are skipped, so an interrupted stage resumes where
     it stopped and gives the same result."""
 
-    def __init__(self, exe, seed_path, work):
+    def __init__(self, exe, seed_path, work, threads=0):
         self.exe, self.seed, self.work = exe, seed_path, work
+        self.threads = threads      # --threads for every call; 0 = the diver's default
 
     def done(self, stage):
         """{k: (score, line or None)} of the boards a stage file already holds."""
@@ -210,6 +242,8 @@ class Diver:
                "--emit_score", "0", "--rng_seed", RNG_SEED]
         print(f"[{stage}] {todo} board(s): E555_diver {' '.join(cmd[4:])}"
               + (f" (resuming, {len(results)} done)" if results else ""), flush=True)
+        if self.threads:            # not in the message: the output does not depend on it
+            cmd += ["--threads", str(self.threads)]
         t0, n_done, chunk = time.time(), 0, []
         with open(self.work / f"{stage}.csv", "a", newline="") as sink:
             def dive(chunk):
@@ -219,10 +253,23 @@ class Diver:
                         for k, pos, rot in chunk:
                             fh.write(row_text(f"b{k}", 0, pos, rot))
                     cmd[2], cmd[3] = str(src), str(dst)
-                    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                                          stderr=subprocess.PIPE)
+                    if STOP["sig"]:
+                        stopped()
+                    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                            stderr=subprocess.PIPE)
+                    STOP["child"] = proc
+                    try:
+                        err = proc.communicate()[1]
+                    finally:
+                        STOP["child"] = None
+                    # A stopped diver writes the boards it got through and exits 0.
+                    # Going on would finish the run on a partial stage and write a
+                    # weaker distillate as if complete; the chunk is dropped instead
+                    # (a board in flight may be cut short) and the run stops.
+                    if STOP["sig"]:
+                        stopped()
                     if proc.returncode != 0 or not dst.exists():
-                        tail = proc.stderr.decode(errors="replace").strip().splitlines()[-1:]
+                        tail = err.decode(errors="replace").strip().splitlines()[-1:]
                         raise SystemExit(f"[{stage}] {self.exe} failed: "
                                          f"{'; '.join(tail) or proc.returncode}")
                     with open(dst, newline="") as fh:
@@ -253,8 +300,11 @@ class Diver:
 
 # -- the pipeline ----------------------------------------------------------------
 
-def manifest_of(paths, seed_path, top):
+def manifest_of(paths, seed_path, top, stages):
+    """What a work directory's results depend on: a rerun that differs in any
+    of it starts afresh. The thread count is not in it: it changes nothing."""
     return {"version": VERSION, "top": top, "seed": str(Path(seed_path).resolve()),
+            "stages": stages,
             "inputs": [[str(Path(p).resolve()), os.path.getsize(p), int(os.path.getmtime(p))]
                        for p in paths]}
 
@@ -286,9 +336,31 @@ def main():
                     help="output CSV (default distilled.csv); FILE.plan.sh and "
                          "FILE_work/ are written next to it")
     ap.add_argument("--seed_file", help="piece seed file (default data/seed_Edge5.txt)")
+    ap.add_argument("--screen_dives", type=int, default=SCREEN_DIVES,
+                    help=f"screen: dives per partial (default {SCREEN_DIVES})")
+    ap.add_argument("--finish_dives", type=int, default=FINISH_DIVES,
+                    help=f"finish: dives per kept board (default {FINISH_DIVES})")
+    ap.add_argument("--finish_polish", type=int, default=FINISH_POLISH,
+                    help=f"finish: kick-and-polish rounds, 0 = none (default {FINISH_POLISH})")
+    ap.add_argument("--probe_per_top", type=int, default=PROBE_PER_TOP,
+                    help=f"probe: boards probed per board kept (default {PROBE_PER_TOP})")
+    ap.add_argument("--threads", type=int, default=0,
+                    help="threads of every diver call (default 0 = all); the output "
+                         "does not depend on it")
     args = ap.parse_args()
     if args.top < 1:
         raise SystemExit("--top must be at least 1")
+    for name in ("screen_dives", "finish_dives", "probe_per_top"):
+        if getattr(args, name) < 1:
+            raise SystemExit(f"--{name} must be at least 1")
+    if args.finish_polish < 0 or args.threads < 0:
+        raise SystemExit("--finish_polish and --threads must be 0 or more")
+    screen_flags = ["--end_dive", str(args.screen_dives)]
+    finish_flags = ["--end_dive", str(args.finish_dives)]
+    if args.finish_polish:
+        finish_flags += ["--end_polish", str(args.finish_polish)]
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, on_signal)
 
     root = Path(__file__).resolve().parent.parent
     seed_path = Path(V.find_seed(args.seed_file)).resolve()
@@ -298,9 +370,12 @@ def main():
         raise SystemExit(f"{exe} not found: build it with `make diver` in {root}")
     out = Path(args.out)
     work = out.with_name(out.stem + "_work")
-    resumed = prepare_work(work, manifest_of(args.inputs, seed_path, args.top))
-    diver = Diver(exe, seed_path, work)
-    threads = os.cpu_count() or 1
+    resumed = prepare_work(work, manifest_of(
+        args.inputs, seed_path, args.top,
+        {"screen": screen_flags, "finish": finish_flags, "probe": PROBE,
+         "probe_per_top": args.probe_per_top}))
+    diver = Diver(exe, seed_path, work, args.threads)
+    threads = args.threads or os.cpu_count() or 1
     t_start = time.time()
 
     # -- 0 read ------------------------------------------------------------------
@@ -337,8 +412,11 @@ def main():
               f"{v} with {g} placed" if g < N_PIECES else f"{v} complete"
               for g, v in sorted(groups.items())), flush=True)
     keep = min(math.ceil(n_part * KEEP_FRACTION), KEEP_PER_TOP * args.top)
-    n_probe = PROBE_PER_TOP * args.top
-    est = (n_part * COST["screen"] + keep * COST["finish"]
+    n_probe = args.probe_per_top * args.top
+    cost_screen = COST["screen"] * args.screen_dives / SCREEN_DIVES
+    cost_finish = (COST["finish"] * (args.finish_dives + args.finish_polish)
+                   / (FINISH_DIVES + FINISH_POLISH))
+    est = (n_part * cost_screen + keep * cost_finish
            + n_probe * COST["probe"]) / threads / 60
     print(f"[plan] screen {n_part}, finish {keep}, probe {n_probe}, keep {args.top}: "
           f"about {est:.0f} min on {threads} thread(s)"
@@ -359,7 +437,7 @@ def main():
     if n_part:
         part = [k for k in range(unique) if meta[k][3] < N_PIECES]
         screen = {k: s for k, (s, _) in diver.run(
-            "screen", boards_where(lambda k: meta[k][3] < N_PIECES), SCREEN, n_part,
+            "screen", boards_where(lambda k: meta[k][3] < N_PIECES), screen_flags, n_part,
             keep_lines=False).items()}
         if len(screen) < n_part:
             print(f"[screen] {n_part - len(screen)} board(s) the diver could not finish "
@@ -373,10 +451,11 @@ def main():
             members = sorted((k for k in part if meta[k][3] == g and k in screen),
                              key=lambda k: (-screen[k], -meta[k][4], k))
             chosen.update(members[:quota])
-        print(f"[screen] kept {len(chosen)} of {n_part} (best of 300 dives; "
+        print(f"[screen] kept {len(chosen)} of {n_part} (best of {args.screen_dives} dives; "
               f"top score {max(screen.values(), default=0)})", flush=True)
         # -- 2 finish --------------------------------------------------------------
-        finished = diver.run("finish", boards_where(lambda k: k in chosen), FINISH, len(chosen))
+        finished = diver.run("finish", boards_where(lambda k: k in chosen), finish_flags,
+                              len(chosen))
         print(f"[finish] {len(finished)} board(s); best "
               f"{max((s for s, _ in finished.values()), default='-')}", flush=True)
     # Complete input boards join here, as they are.

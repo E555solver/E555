@@ -302,8 +302,10 @@ step_rank() {
 # solid count, transposed span. Four turns must return the original bytes.
 # The distiller: screen -> finish -> probe -> select, every diver call seeded.
 # A 12-board slice must give complete boards whose scores recount, and the same
-# bytes from a fresh run on gzip input and from a resumed run; complete input
-# boards must never come back worse; the plan must run the ender, without --holes.
+# bytes from a fresh run on gzip input and from a resumed run (which spells out
+# the default stage options and --threads 1: neither may force a fresh start);
+# complete input boards must never come back worse; the plan must run the
+# ender, without --holes.
 step_distiller() {
     head -12 data/E565_lowB_baseline.csv > "$OUT/dst_slice.csv"
     ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" dst_slice.csv --top 2 \
@@ -332,7 +334,9 @@ EOF
     cmp -s "$OUT/dst_a.csv" "$OUT/dst_b.csv" \
         || fail "a fresh run on the gzip copy wrote different boards"
     ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" dst_slice.csv --top 2 \
-        --out dst_a.csv > dst_r.log 2>&1 ) || fail "the resumed run exited nonzero"
+        --out dst_a.csv --threads 1 --screen_dives 300 --finish_dives 20000 \
+        --finish_polish 5000 --probe_per_top 4 > dst_r.log 2>&1 ) \
+        || fail "the resumed run exited nonzero"
     grep -q "resuming" "$OUT/dst_r.log" || fail "the rerun did not reuse its work directory"
     ! grep -q "E555_diver --" "$OUT/dst_r.log" || fail "the resumed run dived again"
     cmp -s "$OUT/dst_a.csv" "$OUT/dst_b.csv" || fail "the resumed run changed the boards"
