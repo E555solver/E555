@@ -30,6 +30,10 @@
  *     constrain it; a clue break counts as an input break.  The orientation is
  *     read off the board, else --clue_orient.  A board whose clue cell is taken,
  *     or whose clue piece sits elsewhere, is dropped and not written.
+ *   - --holes auto repairs complete boards: holes around their breaks (plus
+ *     donor pieces that fit them) refilled under the board's breaks minus one,
+ *     exhaustively for small holes, by the ratchet for larger ones; see
+ *     run_holes_auto().
  *   - --early_release N stops the exact search at the first break-free board
  *     with only the last N cells of --order open; the search above is unchanged.
  *   - --resume splits one exact search over many runs: each output row carries
@@ -372,6 +376,31 @@ static unsigned long long g_ratchet_nodes = RATCHET_NODES_DEFAULT;
 #define RATCHET_ROLLOUTS_DEFAULT 32
 static int g_ratchet_rollouts = RATCHET_ROLLOUTS_DEFAULT;
 
+/* --holes auto: repair complete boards hole by hole (run_holes_auto()).
+ * --hole_cells, the largest hole with its donors, is the one knob; the rest
+ * are constants (-D at build time to experiment): donors per hole, units
+ * merged per subset, the node cap of an exhaustive hole search (which keeps
+ * the output repeatable), the most breaks a hole may touch and still get the
+ * exhaustive search instead of the ratchet, and the batch size. */
+#define HOLE_CELLS_DEFAULT 40
+static bool g_holes_auto   = false;
+static int  g_hole_cells   = HOLE_CELLS_DEFAULT;
+static bool g_breaks_given = false;   /* --breaks is refused with --holes auto */
+#ifndef HOLE_DONORS
+#define HOLE_DONORS 8
+#endif
+#ifndef HOLE_UNITS
+#define HOLE_UNITS 3
+#endif
+#ifndef HOLE_NODES
+#define HOLE_NODES 10000000ULL
+#endif
+#ifndef HOLE_EXACT_BREAKS
+#define HOLE_EXACT_BREAKS 3
+#endif
+#define HOLE_BATCH 16
+#define MAX_HOLES  1024
+
 /* Greedy-dive controls (stuck mode; lcv also in the ratchet's rollouts).  A few
  * thousand dives a second per core; raise --restarts freely, the cost is
  * linear and the boards keep coming out distinct. */
@@ -537,16 +566,20 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     printf(g_dedup ? " --dedup" : " --no_dedup");
     if (g_parallel_mode == PAR_SEARCH) printf(" --all_for_one");
     if (holes_path)     printf(" --holes %s", holes_path);
+    if (g_holes_auto)   printf(" --hole_cells %d", g_hole_cells);
     printf(" --start_row %lld --num_rows %lld", g_row_start, g_count);
     if (g_best_output > 0) printf(" --best_n %d", g_best_output);
     if (g_stop_active)
         printf(" %s %d", g_stop_isrow ? "--stop_row" : "--stop_column", g_stop_n);
     printf(" --rotate %d", g_rotation);
-    printf(" --order %s --break_mode %s", order_name(g_order_mode),
-           break_mode_name(g_break_mode));
-    printf(" --breaks %d", g_max_mismatch);
+    /* --holes auto: no --breaks (each board sets its own ceiling), and no
+     * --break_mode unless given: the default picks an engine per hole. */
+    printf(" --order %s", order_name(g_order_mode));
+    if (!g_holes_auto || g_break_mode_given)
+        printf(" --break_mode %s", break_mode_name(g_break_mode));
+    if (!g_holes_auto) printf(" --breaks %d", g_max_mismatch);
     if (g_lds_max >= 0) printf(" --lds_max %d", g_lds_max);
-    if (g_break_mode == BREAK_RATCHET)
+    if (g_break_mode == BREAK_RATCHET || (g_holes_auto && !g_break_mode_given))
         printf(" --ratchet_nodes %llu --ratchet_rollouts %d", g_ratchet_nodes,
                g_ratchet_rollouts);
     printf(" --max_emitted %" PRIu64, g_solution_limit);
@@ -598,6 +631,13 @@ static uint64_t g_cnt_solution_cutoff= 0;
 static uint64_t g_cnt_no_solution    = 0;
 static uint64_t g_cnt_cutoff         = 0;
 static uint64_t g_cnt_release_closed = 0;   /* --early_release R,C: cell not open */
+/* --holes auto: rows improved, unchanged (no gain, or the time ran out first),
+ * written as read (not complete, or no break), and the breaks removed. */
+static uint64_t g_cnt_auto_improved  = 0;
+static uint64_t g_cnt_auto_unchanged = 0;
+static uint64_t g_cnt_auto_partial   = 0;
+static uint64_t g_cnt_auto_perfect   = 0;
+static uint64_t g_auto_removed       = 0;
 static uint64_t g_feas_code_cnt[6]   = {0};
 
 /* -- Best-partial-board tracking ---------------------------------------------- */
@@ -885,6 +925,11 @@ typedef struct {
     SearchLive  *rec_live;
     RecStat     *rec_rstat;
     int          step;
+    /* exact_only: candidates are exact fits only, though the cell choice and
+     * the cuts see the whole budget (the ratchet's searches).  hole: the
+     * --holes auto hole being searched, 1-based, for the heartbeat; 0 = none. */
+    bool         exact_only;
+    int          hole;
 } SearchCtx;
 static inline uint64_t piece_bit(int pid) { return 1ULL << (pid & 63); }
 static inline bool used_test(const uint64_t u[], int pid) { return (u[pid>>6] & piece_bit(pid)) != 0; }
@@ -3670,7 +3715,8 @@ static void heartbeat_maybe(const SearchCtx *cx, double now) {
     char dstr[32] = "";
     if (g_break_mode == BREAK_LDS && cx->k_budget > cx->input_breaks)
         snprintf(dstr, sizeof(dstr), " D=%d", cx->lds_D);
-    if (cx->rec_live) snprintf(dstr, sizeof(dstr), " ratchet step=%d", cx->step);
+    if (cx->hole > 0)        snprintf(dstr, sizeof(dstr), " hole %d", cx->hole);
+    else if (cx->rec_live)   snprintf(dstr, sizeof(dstr), " ratchet step=%d", cx->step);
     #pragma omp critical(stdout_print)
     {
         printf("[%s] progress k=%d%s t=%.0fs nodes=%.1fM "
@@ -4984,7 +5030,7 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
     /* ratchet: between breaks the search is exact; the cell choice above and
      * the cuts below still see the whole remaining budget (run_ratchet()). */
     int n_cand = collect_candidates(b, fc, row, col,
-                                    g_break_mode == BREAK_RATCHET ? 0 : remaining_budget,
+                                    cx->exact_only ? 0 : remaining_budget,
                                     want_breaks_if_exact,
                                     cand, MAX_CANDIDATES, &exact_count, st, depth);
 
@@ -5731,6 +5777,7 @@ static void ratchet_search(const Board *start, const SearchCtx *proto, RatchetBe
     cx.live              = &live;
     cx.node_count        = g_ratchet_nodes > 0 ? &nodes : NULL;
     cx.node_cap          = g_ratchet_nodes;
+    cx.exact_only        = true;
 
     Cell rem[MAX_SEQ_LEN]; int n_rem = 0;
     build_search_sequence_ordered(&b, rem, &n_rem, cx.mode);
@@ -5760,7 +5807,7 @@ static bool ratchet_out_of_time(double deadline) {
  * easy cells first and leaves the frame's neighbours for when the budget is
  * gone).  The dives are seeded from the board, not the clock, so the score is
  * the same on every run and at any thread count. */
-static void ratchet_rollout(RatchetBest *x, int step, double deadline) {
+static void ratchet_rollout(RatchetBest *x, int step, int ceiling, double deadline) {
     x->rollout = INT_MAX;
     x->dives   = 0;
     x->done_ok = false;
@@ -5788,7 +5835,7 @@ static void ratchet_rollout(RatchetBest *x, int step, double deadline) {
         board_break_stats(&b, &brk, NULL);
         if (brk < x->rollout) {
             x->rollout = brk;
-            if (brk <= g_max_mismatch) { x->done = b; x->done_ok = true; }
+            if (brk <= ceiling) { x->done = b; x->done_ok = true; }
         }
     }
 }
@@ -5885,16 +5932,19 @@ static void ratchet_offer(RecStat *rs, const RatchetBest *x, const char *config_
 }
 
 /* The ratchet over one record.  proto carries the record's search settings
- * (k_budget = --breaks, deadline, collect, layer); rstat, live, mres, stats
- * and solutions are the record's, as run_search_at_k() fills them. */
+ * (k_budget = the break ceiling, deadline, collect, layer); rstat, live, mres,
+ * stats and solutions are the record's, as run_search_at_k() fills them.  A
+ * step's candidates are shared out among nt threads.  --holes auto runs it on
+ * one hole with its own rstat and live, and sets proto's rec_live/rec_rstat to
+ * the record's for the heartbeat. */
 static void run_ratchet(const Board *start, const SearchCtx *proto, RecStat *rstat,
                         SearchLive *live, uint64_t *local_solutions, DfsStats *stats,
-                        MismatchResult *mres, RatchetReport *rep) {
-    const int nt = g_search_parallel
-                 ? (g_nthreads > 0 ? g_nthreads : omp_get_max_threads()) : 1;
+                        MismatchResult *mres, RatchetReport *rep, int nt) {
     SearchCtx cx = *proto;
-    cx.rec_live  = live;
-    cx.rec_rstat = rstat;
+    if (!cx.rec_live) {
+        cx.rec_live  = live;
+        cx.rec_rstat = rstat;
+    }
     cx.step      = 0;
     rep->steps = 0;
     rep->searches = 1;
@@ -5968,7 +6018,8 @@ static void run_ratchet(const Board *start, const SearchCtx *proto, RecStat *rst
                 Board child = base;
                 board_place(&child, r, c, (int)adm[i].pid, (int)adm[i].spin);
                 ratchet_search(&child, &cx, &res[i], r, c, &sols, &tst, &tm);
-                if (g_ratchet_rollouts > 0) ratchet_rollout(&res[i], rep->steps, cx.deadline);
+                if (g_ratchet_rollouts > 0)
+                    ratchet_rollout(&res[i], rep->steps, cx.k_budget, cx.deadline);
             }
             #pragma omp critical(ratchet_merge)
             { stats_merge(stats, &tst); mres_merge(mres, &tm); }
@@ -6014,7 +6065,7 @@ static void run_ratchet(const Board *start, const SearchCtx *proto, RecStat *rst
         }
         base = res[win].board;
         rep->steps++;
-        if (g_verbose) {
+        if (g_verbose && cx.hole == 0) {          /* not inside --holes auto */
             #pragma omp critical(stdout_print)
             {
                 char rb[48] = "";
@@ -6031,6 +6082,678 @@ static void run_ratchet(const Board *start, const SearchCtx *proto, RecStat *rst
     free(adm);
     free(cand);
     free(res);
+}
+
+/* -- Auto holes (--holes auto) ------------------------------------------------ *
+ *
+ * Repairs a complete board with B breaks, hole by hole:
+ *   1. Units: broken junctions that share a cell, ordered by lowest cell.
+ *   2. Plan: from each unit a subset grows by the nearest unit (Chebyshev
+ *      distance between their cells, ties to the lower cell), up to
+ *      HOLE_UNITS.  Each subset opens its break cells widened by a ring
+ *      r = 0, 1, ... while the hole fits --hole_cells, plus up to HOLE_DONORS
+ *      donors.  Smallest holes first, duplicates dropped.
+ *   3. Each hole is lifted and refilled under the ceiling B-1, starting at
+ *      that ceiling.  A hole touching at most HOLE_EXACT_BREAKS breaks gets
+ *      the exhaustive search: each completion lowers the ceiling, and an
+ *      exhausted level proves the hole cannot do better.  A larger one gets
+ *      the ratchet, which proves nothing.  --break_mode lds/any/ratchet forces
+ *      one engine.
+ *   4. Holes go in batches of HOLE_BATCH; after a batch with a gain the best
+ *      one is committed (fewest breaks, then plan order) and the plan rebuilt.
+ *   5. Until a whole plan gains nothing, B = 0, or --time_limit.
+ * A donor is a piece outside the hole that fits a hole cell with >= 2 locked
+ * sides (facing the board edge or a cell outside the hole) on all of them:
+ * one side lets dozens of pieces in, two a few.  Ranked by the cells it fits,
+ * then the sides, then cells that already carry breaks, then cell index.
+ * A hole's outcome depends only on its cells and their border (breaks add up,
+ * so the hole keeps h-1 breaks to spare whatever B is), so it is cached by
+ * that state and not searched again until it changes; a cached gain is
+ * re-applied.  Serial node-capped searches, a fixed batch and the plan-order
+ * commit keep the output independent of the thread count.
+ */
+
+typedef struct { uint64_t w[USED_WORDS]; } CellSet;
+static inline void cs_add(CellSet *s, int i) { s->w[i >> 6] |= 1ULL << (i & 63); }
+static inline bool cs_has(const CellSet *s, int i) { return (s->w[i >> 6] >> (i & 63)) & 1ULL; }
+static inline int cs_count(const CellSet *s) {
+    int n = 0;
+    for (int w = 0; w < USED_WORDS; w++) n += __builtin_popcountll(s->w[w]);
+    return n;
+}
+static int cs_list(const CellSet *s, int *out) {
+    int n = 0;
+    for (int i = 0; i < NUM_PIECES; i++) if (cs_has(s, i)) out[n++] = i;
+    return n;
+}
+
+typedef struct {
+    CellSet cells;            /* every cell lifted: the ring and the donors */
+    int     n_cells, n_donors, ring, n_units;
+    int     breaks;           /* broken junctions touching the hole */
+    int     first, seq;       /* lowest cell; creation order (sort tie-break) */
+} HoleSpec;
+
+enum { HOLE_UNFINISHED = 0, HOLE_PROVED, HOLE_NOGAIN, HOLE_GAIN };
+
+typedef struct {
+    int   outcome;
+    bool  proved;             /* the ceiling search finished: no better fill */
+    bool  ratchet;            /* searched by the ratchet */
+    bool  cached;             /* a cached gain, re-applied */
+    int   breaks;             /* HOLE_GAIN: the board's breaks */
+    Board board;              /* HOLE_GAIN: the board */
+} HoleResult;
+
+typedef struct {
+    uint64_t key;
+    int      outcome;
+    Board   *gain;            /* HOLE_GAIN: the board it reached (hole cells used) */
+} HoleCacheEntry;
+
+typedef struct {
+    int         planned, searched, better, proved, nogain, unfinished, gains, cached;
+    int         removed;      /* breaks removed */
+    const char *ended;
+} HoleReport;
+
+static inline bool hole_uses_ratchet(int breaks) {
+    if (g_break_mode == BREAK_RATCHET) return true;
+    if (g_break_mode_given) return false;          /* lds or any for every hole */
+    return breaks > HOLE_EXACT_BREAKS;
+}
+
+static int uf_find(int *par, int x) {
+    while (par[x] != x) x = par[x] = par[par[x]];
+    return x;
+}
+
+/* Broken junctions per cell, and the units: the cells joined by broken
+ * junctions, one set per connected group, in order of their lowest cell. */
+static int hole_units(const Board *b, int nbreak[NUM_PIECES], CellSet *units) {
+    int par[NUM_PIECES];
+    for (int i = 0; i < NUM_PIECES; i++) { par[i] = i; nbreak[i] = 0; }
+    for (int r = 0; r < PUZZLE_SIDE; r++)
+        for (int c = 0; c < PUZZLE_SIDE; c++) {
+            const Oriented *o = &b->cell[r][c];
+            if (o->piece_id == EMPTY_PIECE) continue;
+            const int a = r * PUZZLE_SIDE + c;
+            if (c + 1 < PUZZLE_SIDE && b->cell[r][c+1].piece_id != EMPTY_PIECE &&
+                o->right != b->cell[r][c+1].left) {
+                nbreak[a]++; nbreak[a+1]++;
+                par[uf_find(par, a)] = uf_find(par, a + 1);
+            }
+            if (r + 1 < PUZZLE_SIDE && b->cell[r+1][c].piece_id != EMPTY_PIECE &&
+                o->top != b->cell[r+1][c].bottom) {
+                nbreak[a]++; nbreak[a+PUZZLE_SIDE]++;
+                par[uf_find(par, a)] = uf_find(par, a + PUZZLE_SIDE);
+            }
+        }
+    int id[NUM_PIECES], n = 0;
+    for (int i = 0; i < NUM_PIECES; i++) id[i] = -1;
+    for (int i = 0; i < NUM_PIECES; i++) {
+        if (nbreak[i] == 0) continue;
+        int root = uf_find(par, i);
+        if (id[root] < 0) { id[root] = n; memset(&units[n], 0, sizeof(CellSet)); n++; }
+        cs_add(&units[id[root]], i);
+    }
+    return n;
+}
+
+/* Chebyshev distance between two cell lists. */
+static int cell_list_distance(const int *a, int na, const int *b, int nb) {
+    int best = INT_MAX;
+    for (int i = 0; i < na; i++)
+        for (int j = 0; j < nb; j++) {
+            int dr = abs(a[i] / PUZZLE_SIDE - b[j] / PUZZLE_SIDE);
+            int dc = abs(a[i] % PUZZLE_SIDE - b[j] % PUZZLE_SIDE);
+            int d = dr > dc ? dr : dc;
+            if (d < best) best = d;
+        }
+    return best;
+}
+
+/* Broken junctions with at least one end in the hole. */
+static int hole_breaks_touched(const Board *b, const CellSet *h) {
+    int n = 0;
+    for (int r = 0; r < PUZZLE_SIDE; r++)
+        for (int c = 0; c < PUZZLE_SIDE; c++) {
+            const int a = r * PUZZLE_SIDE + c;
+            const Oriented *o = &b->cell[r][c];
+            if (c + 1 < PUZZLE_SIDE && (cs_has(h, a) || cs_has(h, a + 1)) &&
+                o->right != b->cell[r][c+1].left) n++;
+            if (r + 1 < PUZZLE_SIDE && (cs_has(h, a) || cs_has(h, a + PUZZLE_SIDE)) &&
+                o->top != b->cell[r+1][c].bottom) n++;
+        }
+    return n;
+}
+
+typedef struct { int cell, fits, lock, damaged; } HoleDonor;
+
+static int hole_donor_cmp(const void *pa, const void *pb) {
+    const HoleDonor *a = pa, *b = pb;
+    if (a->fits != b->fits) return b->fits - a->fits;
+    if (a->lock != b->lock) return b->lock - a->lock;
+    if (a->damaged != b->damaged) return b->damaged - a->damaged;
+    return a->cell - b->cell;
+}
+
+/* Add up to max_d donors to the hole h (see the section comment); returns how
+ * many.  `keep` marks cells never opened (the clues under --clue_*). */
+static int hole_add_donors(const Board *b, CellSet *h, int max_d,
+                           const int nbreak[NUM_PIECES], const CellSet *keep) {
+    if (max_d <= 0) return 0;
+    int tr[NUM_PIECES], tcol[NUM_PIECES], tlock[NUM_PIECES], need[NUM_PIECES][4];
+    int nt = 0;
+    for (int i = 0; i < NUM_PIECES; i++) {
+        if (!cs_has(h, i)) continue;
+        const int r = i / PUZZLE_SIDE, c = i % PUZZLE_SIDE;
+        int nd[4], lock = 0;
+        /* top, right, bottom, left: grey on the board edge, the neighbour's
+         * facing colour when it stays, -1 when it is lifted too */
+        nd[0] = r == PUZZLE_SIDE - 1 ? 0 : cs_has(h, i + PUZZLE_SIDE) ? -1 : b->cell[r+1][c].bottom;
+        nd[1] = c == PUZZLE_SIDE - 1 ? 0 : cs_has(h, i + 1)           ? -1 : b->cell[r][c+1].left;
+        nd[2] = r == 0               ? 0 : cs_has(h, i - PUZZLE_SIDE) ? -1 : b->cell[r-1][c].top;
+        nd[3] = c == 0               ? 0 : cs_has(h, i - 1)           ? -1 : b->cell[r][c-1].right;
+        for (int d = 0; d < 4; d++) if (nd[d] >= 0) lock++;
+        if (lock < 2) continue;
+        tr[nt] = r; tcol[nt] = c; tlock[nt] = lock;
+        memcpy(need[nt], nd, sizeof(nd));
+        nt++;
+    }
+    if (nt == 0) return 0;
+
+    HoleDonor cand[NUM_PIECES];
+    int nc = 0;
+    for (int d = 0; d < NUM_PIECES; d++) {
+        if (cs_has(h, d) || (keep && cs_has(keep, d))) continue;
+        const int pid = b->cell[d / PUZZLE_SIDE][d % PUZZLE_SIDE].piece_id;
+        if (pid < 0) continue;
+        int fits = 0, lock = 0;
+        for (int t = 0; t < nt; t++) {
+            bool ok = false;
+            for (int s = 0; s < 4 && !ok; s++) {
+                if ((g_piece_spin_mask[pid] & (1u << s)) == 0) continue;
+                const Oriented *o = &g_oriented[pid][s];
+                if (!frame_zero_rule_ok(tr[t], tcol[t], o)) continue;
+                ok = (need[t][0] < 0 || o->top    == need[t][0]) &&
+                     (need[t][1] < 0 || o->right  == need[t][1]) &&
+                     (need[t][2] < 0 || o->bottom == need[t][2]) &&
+                     (need[t][3] < 0 || o->left   == need[t][3]);
+            }
+            if (ok) { fits++; if (tlock[t] > lock) lock = tlock[t]; }
+        }
+        if (fits > 0) {
+            cand[nc].cell = d; cand[nc].fits = fits; cand[nc].lock = lock;
+            cand[nc].damaged = nbreak[d] > 0;
+            nc++;
+        }
+    }
+    qsort(cand, (size_t)nc, sizeof(HoleDonor), hole_donor_cmp);
+    if (nc > max_d) nc = max_d;
+    for (int i = 0; i < nc; i++) cs_add(h, cand[i].cell);
+    return nc;
+}
+
+static int hole_spec_cmp(const void *pa, const void *pb) {
+    const HoleSpec *a = pa, *b = pb;
+    if (a->n_cells != b->n_cells) return a->n_cells - b->n_cells;
+    if (a->breaks  != b->breaks)  return a->breaks  - b->breaks;
+    if (a->first   != b->first)   return a->first   - b->first;
+    return a->seq - b->seq;
+}
+
+/* The plan for board b: up to max_plan holes, in search order. */
+static int hole_plan(const Board *b, HoleSpec *plan, int max_plan, int *n_units_out) {
+    int nbreak[NUM_PIECES];
+    CellSet units[NUM_PIECES];
+    const int nu = hole_units(b, nbreak, units);
+    if (n_units_out) *n_units_out = nu;
+    int (*ulist)[NUM_PIECES] = xmalloc((size_t)(nu > 0 ? nu : 1) * sizeof *ulist);
+    int ulen[NUM_PIECES];
+    for (int u = 0; u < nu; u++) ulen[u] = cs_list(&units[u], ulist[u]);
+
+    CellSet keep;                       /* --clue_*: the clues stay */
+    memset(&keep, 0, sizeof(keep));
+    for (int i = 0; i < NUM_PIECES; i++)
+        if (cell_holds_home_clue(b, i / PUZZLE_SIDE, i % PUZZLE_SIDE)) cs_add(&keep, i);
+
+    int n = 0;
+    for (int u = 0; u < nu && n < max_plan; u++) {
+        bool in[NUM_PIECES] = { false };
+        in[u] = true;
+        CellSet core = units[u];
+        int clist[NUM_PIECES], nclist = ulen[u];
+        memcpy(clist, ulist[u], (size_t)ulen[u] * sizeof(int));
+        for (int nun = 1; ; nun++) {
+            for (int ring = 0; n < max_plan; ring++) {
+                CellSet h;
+                memset(&h, 0, sizeof(h));
+                for (int k = 0; k < nclist; k++) {
+                    const int r0 = clist[k] / PUZZLE_SIDE, c0 = clist[k] % PUZZLE_SIDE;
+                    for (int r = r0 - ring; r <= r0 + ring; r++)
+                        for (int c = c0 - ring; c <= c0 + ring; c++)
+                            if (r >= 0 && r < PUZZLE_SIDE && c >= 0 && c < PUZZLE_SIDE &&
+                                !cs_has(&keep, r * PUZZLE_SIDE + c))
+                                cs_add(&h, r * PUZZLE_SIDE + c);
+                }
+                const int nc = cs_count(&h);
+                if (nc > g_hole_cells) break;
+                HoleSpec *hs = &plan[n];
+                hs->n_donors = hole_add_donors(b, &h, HOLE_DONORS < g_hole_cells - nc
+                                                      ? HOLE_DONORS : g_hole_cells - nc,
+                                               nbreak, &keep);
+                hs->cells   = h;
+                hs->n_cells = cs_count(&h);
+                hs->ring    = ring;
+                hs->n_units = nun;
+                hs->breaks  = hole_breaks_touched(b, &h);
+                hs->first   = 0;
+                while (hs->first < NUM_PIECES && !cs_has(&h, hs->first)) hs->first++;
+                hs->seq     = n;
+                bool dup = hs->breaks == 0;
+                for (int k = 0; k < n && !dup; k++)
+                    dup = memcmp(&plan[k].cells, &h, sizeof(CellSet)) == 0;
+                if (!dup) n++;
+                if (nc == NUM_PIECES) break;
+            }
+            if (nun >= HOLE_UNITS || cs_count(&core) > g_hole_cells) break;
+            int v = -1, vd = INT_MAX;           /* the nearest unit not yet in */
+            for (int w = 0; w < nu; w++) {
+                if (in[w]) continue;
+                int d = cell_list_distance(clist, nclist, ulist[w], ulen[w]);
+                if (d < vd) { vd = d; v = w; }
+            }
+            if (v < 0) break;
+            in[v] = true;
+            for (int k = 0; k < ulen[v]; k++) { cs_add(&core, ulist[v][k]); clist[nclist++] = ulist[v][k]; }
+        }
+    }
+    free(ulist);
+    qsort(plan, (size_t)n, sizeof(HoleSpec), hole_spec_cmp);
+    return n;
+}
+
+/* The cache key: the hole's cells and the cells bordering it, each with its
+ * piece and spin -- everything a hole search depends on. */
+static uint64_t hole_key(const Board *b, const CellSet *h) {
+    uint64_t k = 0x9E3779B97F4A7C15ULL;
+    for (int i = 0; i < NUM_PIECES; i++) {
+        const int r = i / PUZZLE_SIDE, c = i % PUZZLE_SIDE;
+        const bool in = cs_has(h, i);
+        if (!in && !((r + 1 < PUZZLE_SIDE && cs_has(h, i + PUZZLE_SIDE)) ||
+                     (r > 0 && cs_has(h, i - PUZZLE_SIDE)) ||
+                     (c + 1 < PUZZLE_SIDE && cs_has(h, i + 1)) ||
+                     (c > 0 && cs_has(h, i - 1))))
+            continue;
+        const Oriented *o = &b->cell[r][c];
+        uint64_t v = ((uint64_t)i << 32) | ((uint64_t)(uint16_t)o->piece_id << 8) |
+                     (uint64_t)o->rotation | (in ? (1ULL << 40) : 0);
+        k = splitmix64(k ^ v);
+    }
+    return k;
+}
+
+/* A private running best for one search, seeded with its start board; the
+ * record checkpoints, not each search (ratchet_search() does the same). */
+static void hole_rstat_init(RecStat *rs, Board *best, const Board *start) {
+    int conn = 0, brk = 0, bp = 0;
+    board_edge_counts(start, &conn, &brk);
+    if (brk > 0) board_break_stats(start, NULL, &bp);
+    *best = *start;
+    atomic_init(&rs->best_total, board_count_placed(start));
+    rs->best_connected    = conn;
+    rs->best_broken       = brk;
+    rs->best_break_pieces = bp;
+    rs->deepest_row = rs->deepest_col = -1;
+    rs->best_board  = best;
+    rs->ckpt_next   = HUGE_VAL;
+    rs->ckpt_dirty  = false;
+}
+
+/* Lift hole hs from the incumbent (B breaks) and refill it under the ceiling
+ * B-1.  proto carries the record's settings and rec_live/rec_rstat. */
+static void hole_search(const Board *inc, int B, const HoleSpec *hs, int idx,
+                        const SearchCtx *proto, HoleResult *out) {
+    out->outcome = HOLE_UNFINISHED;
+    out->proved  = false;
+    out->ratchet = hole_uses_ratchet(hs->breaks);
+    out->cached  = false;
+    out->breaks  = -1;
+
+    Board b = *inc;
+    for (int i = 0; i < NUM_PIECES; i++)
+        if (cs_has(&hs->cells, i)) board_unplace(&b, i / PUZZLE_SIDE, i % PUZZLE_SIDE);
+    int conn = 0, brk = 0;
+    board_edge_counts(&b, &conn, &brk);
+    const int ceiling = B - 1;
+    const int allow   = ceiling - brk;            /* breaks the fill may take */
+    if (allow < 0) { out->outcome = HOLE_PROVED; out->proved = true; return; }
+
+    /* The record root's cuts on the lifted board: one past the ceiling proves
+     * the hole without a search. */
+    FcState fc;
+    fc_init(&fc, &b);
+    Cell seq[MAX_SEQ_LEN]; int n_seq = 0;
+    build_search_sequence_ordered(&b, seq, &n_seq, proto->mode);
+    int lb = 0;
+    bool dead = fc.zero_domains > allow;
+    if (!dead && g_colour_count) {
+        FeasIssue issue;
+        dead = !remaining_feasibility_ex(&b, &fc, &issue, allow);
+    }
+    if (!dead && g_edge_supply) {
+        int d = edge_supply_deficit(&b);
+        if (d > lb) lb = d;
+        dead = d > allow;
+    }
+    if (!dead && g_hall_mode != HALL_OFF) {
+        int def = 0;
+        hall_prune(&fc, seq, n_seq, INT_MAX, &def);
+        if (def > lb) lb = def;
+        dead = def > allow;
+    }
+    if (dead) { out->outcome = HOLE_PROVED; out->proved = true; return; }
+
+    int8_t layer[PUZZLE_SIDE][PUZZLE_SIDE];
+    if (proto->mode == ORD_FRONTIER) frontier_layers(&b, layer);
+    SearchCtx cx = *proto;
+    cx.initial_board     = &b;
+    cx.initial_n_placed  = board_count_placed(&b);
+    cx.initial_connected = conn;
+    cx.input_breaks      = brk;
+    cx.collect           = true;
+    cx.release           = 0;
+    cx.resume            = NULL;
+    cx.hole              = idx + 1;
+    cx.layer             = (const int8_t (*)[PUZZLE_SIDE])layer;
+    cx.lds_D             = 0;
+
+    RecStat prs;
+    Board pbest;
+    SearchLive plive;
+    DfsStats *st = xmalloc(sizeof(DfsStats));
+    stats_init(st);
+    uint64_t sols = 0;
+
+    if (out->ratchet) {
+        cx.k_budget = ceiling;
+        hole_rstat_init(&prs, &pbest, &b);
+        search_live_init(&plive);
+        MismatchResult m = {0};
+        mres_init(&m);
+        RatchetReport rr;
+        memset(&rr, 0, sizeof(rr));
+        run_ratchet(&b, &cx, &prs, &plive, &sols, st, &m, &rr, 1);
+        if (m.found && m.items[0].breaks <= ceiling) {
+            out->outcome = HOLE_GAIN;
+            out->board   = m.items[0].board;
+            out->breaks  = m.items[0].breaks;
+        } else {
+            out->outcome = (search_stop_reason(&plive) & STOP_TIMEOUT) ? HOLE_UNFINISHED
+                                                                         : HOLE_NOGAIN;
+        }
+        mres_free(&m);
+        free(st);
+        return;
+    }
+
+    /* Exhaustive: from the ceiling down, each completion lowering it. */
+    unsigned long long nodes = 0;
+    const int lowest = brk + lb;
+    bool stopped = false, capped = false;
+    int k = ceiling;
+    while (k >= lowest && !stopped) {
+        const int full_d = g_break_mode == BREAK_ANY ? 0 : k - brk;
+        int d_hi = full_d;
+        if (g_break_mode != BREAK_ANY && g_lds_max >= 0 && g_lds_max < d_hi) d_hi = g_lds_max;
+        bool found = false;
+        for (int D = 0; D <= d_hi && !found && !stopped; D++) {
+            hole_rstat_init(&prs, &pbest, &b);
+            search_live_init(&plive);
+            MismatchResult m = {0};
+            mres_init(&m);
+            cx.k_budget   = k;
+            cx.lds_D      = D;
+            cx.rstat      = &prs;
+            cx.live       = &plive;
+            cx.node_count = &nodes;
+            cx.node_cap   = HOLE_NODES;
+            Board w = b;
+            FcState wf = fc;
+            Cell rem[MAX_SEQ_LEN];
+            memcpy(rem, seq, (size_t)n_seq * sizeof(Cell));
+            tail_dfs(&w, &wf, rem, n_seq, 0, 0, brk, conn, 0, 0, &cx, &sols, st, &m);
+            if (m.found) {
+                found = true;
+                out->outcome = HOLE_GAIN;
+                out->board   = m.items[0].board;
+                out->breaks  = m.items[0].breaks;
+            } else if (search_stop_requested(&plive)) {
+                stopped = true;
+                capped  = nodes > HOLE_NODES;
+            }
+            mres_free(&m);
+        }
+        if (found) { k = out->breaks - 1; continue; }
+        if (!stopped) {
+            if (d_hi == full_d) out->proved = true;   /* the level is exhausted */
+            else capped = true;                        /* --lds_max: not a proof */
+        }
+        break;
+    }
+    if (k < lowest) out->proved = true;
+    if (out->outcome != HOLE_GAIN)
+        out->outcome = out->proved ? HOLE_PROVED : capped ? HOLE_NOGAIN : HOLE_UNFINISHED;
+    free(st);
+}
+
+/* The incumbent with hole cells taken from `from` (a cached gain). */
+static void hole_apply(Board *dst, const Board *from, const CellSet *h) {
+    for (int i = 0; i < NUM_PIECES; i++)
+        if (cs_has(h, i)) board_unplace(dst, i / PUZZLE_SIDE, i % PUZZLE_SIDE);
+    for (int i = 0; i < NUM_PIECES; i++) {
+        if (!cs_has(h, i)) continue;
+        const Oriented *o = &from->cell[i / PUZZLE_SIDE][i % PUZZLE_SIDE];
+        board_place(dst, i / PUZZLE_SIDE, i % PUZZLE_SIDE, o->piece_id, o->rotation);
+    }
+}
+
+/* --verbose: a hole on the board, search frame: '#' kept, 'x' a lifted break
+ * cell, 'o' another lifted cell, 'd' a donor (lifted, apart from the ring). */
+static void draw_hole_map(const char *tag, const Board *b, const HoleSpec *hs) {
+    int nbreak[NUM_PIECES];
+    CellSet units[NUM_PIECES];
+    hole_units(b, nbreak, units);
+    char buf[2048]; size_t off = 0;
+    appendf(buf, sizeof(buf), &off, "[%s] hole map (top row first; '#' kept, 'x' break "
+            "cell, 'o' ring, 'd' donor):\n", tag);
+    for (int r = PUZZLE_SIDE - 1; r >= 0; r--) {
+        appendf(buf, sizeof(buf), &off, "  %2d ", r);
+        for (int c = 0; c < PUZZLE_SIDE; c++) {
+            const int i = r * PUZZLE_SIDE + c;
+            char ch = '#';
+            if (cs_has(&hs->cells, i)) {
+                bool ring = false;
+                for (int rr = r - hs->ring; rr <= r + hs->ring && !ring; rr++)
+                    for (int cc = c - hs->ring; cc <= c + hs->ring && !ring; cc++)
+                        ring = rr >= 0 && rr < PUZZLE_SIDE && cc >= 0 && cc < PUZZLE_SIDE &&
+                               nbreak[rr * PUZZLE_SIDE + cc] > 0;
+                ch = nbreak[i] > 0 ? 'x' : ring ? 'o' : 'd';
+            }
+            appendf(buf, sizeof(buf), &off, "%c", ch);
+        }
+        appendf(buf, sizeof(buf), &off, "\n");
+    }
+    #pragma omp critical(stdout_print)
+    { fputs(buf, stdout); fflush(stdout); }
+}
+
+/* Repair the record's complete board `inc` in place (see the section comment).
+ * proto carries the record's settings; rstat is seeded with inc and follows
+ * each commit, for the heartbeat; `draw` draws each committed hole. */
+static void run_holes_auto(Board *inc, const SearchCtx *proto, RecStat *rstat,
+                           SearchLive *live, bool draw, HoleReport *rep) {
+    memset(rep, 0, sizeof(*rep));
+    rep->ended = "no hole improves";
+    const int nt = g_search_parallel
+                 ? (g_nthreads > 0 ? g_nthreads : omp_get_max_threads()) : 1;
+    HoleSpec *plan = xmalloc((size_t)MAX_HOLES * sizeof(HoleSpec));
+    HoleResult *res = xmalloc((size_t)MAX_HOLES * sizeof(HoleResult));
+    int *bidx = xmalloc((size_t)MAX_HOLES * sizeof(int));
+    int *hits = xmalloc((size_t)MAX_HOLES * sizeof(int));
+    uint64_t *keys = xmalloc((size_t)MAX_HOLES * sizeof(uint64_t));
+    HoleCacheEntry *cache = NULL;
+    int n_cache = 0, cap_cache = 0;
+
+    SearchCtx base_cx = *proto;
+    base_cx.rec_live  = live;
+    base_cx.rec_rstat = rstat;
+
+    int conn = 0, B = 0;
+    board_edge_counts(inc, &conn, &B);
+    const int B0 = B;
+    const double t0 = proto->record_start;
+
+    while (B > 0) {
+        int n_units = 0;
+        const int n = hole_plan(inc, plan, MAX_HOLES, &n_units);
+        rep->planned = n;
+        if (draw && g_verbose) {
+            #pragma omp critical(stdout_print)
+            { printf("[%s] hole plan: %d broken, %d unit(s), %d hole(s) of %d-%d cells\n",
+                     proto->tag, B, n_units, n, n > 0 ? plan[0].n_cells : 0,
+                     n > 0 ? plan[n - 1].n_cells : 0);
+              fflush(stdout); }
+        }
+        bool committed = false;
+        int at = 0;
+        while (at < n && !committed) {
+            if (ratchet_out_of_time(proto->deadline)) break;
+            /* The batch: the next HOLE_BATCH holes not in the cache, and the
+             * cached gains met on the way. */
+            int nb = 0, n_search = 0, from = at;
+            while (at < n && n_search < HOLE_BATCH) {
+                uint64_t key = hole_key(inc, &plan[at].cells);
+                int hit = -1;
+                for (int e = 0; e < n_cache && hit < 0; e++)
+                    if (cache[e].key == key) hit = e;
+                if (hit < 0 || cache[hit].outcome == HOLE_GAIN) {
+                    keys[nb] = key;
+                    hits[nb] = hit;
+                    bidx[nb++] = at;
+                    if (hit < 0) n_search++;
+                } else {
+                    rep->cached++;
+                }
+                at++;
+            }
+            if (nb == 0) continue;
+            HoleResult *r = res;
+            #pragma omp parallel for num_threads(nt) if (nt > 1) schedule(dynamic,1)
+            for (int j = 0; j < nb; j++) {
+                if (hits[j] >= 0) {                 /* a cached gain: re-apply it */
+                    r[j].board = *inc;
+                    hole_apply(&r[j].board, cache[hits[j]].gain, &plan[bidx[j]].cells);
+                    int cc = 0, bb = 0;
+                    board_edge_counts(&r[j].board, &cc, &bb);
+                    r[j].outcome = bb < B ? HOLE_GAIN : HOLE_NOGAIN;
+                    r[j].breaks  = bb;
+                    r[j].cached  = true;
+                    r[j].proved  = false;
+                    r[j].ratchet = false;
+                    continue;
+                }
+                if (ratchet_out_of_time(proto->deadline)) {
+                    r[j].outcome = HOLE_UNFINISHED; r[j].cached = false;
+                    r[j].ratchet = false; r[j].proved = false;
+                    continue;
+                }
+                hole_search(inc, B, &plan[bidx[j]], bidx[j], &base_cx, &r[j]);
+            }
+            /* In plan order whatever the threads did. */
+            int win = -1;
+            for (int j = 0; j < nb; j++) {
+                if (r[j].cached) {
+                    rep->cached++;
+                } else {
+                    if (r[j].outcome != HOLE_UNFINISHED) rep->searched++;
+                    if (r[j].outcome == HOLE_UNFINISHED) rep->unfinished++;
+                    else if (r[j].outcome == HOLE_PROVED) rep->proved++;
+                    else if (r[j].outcome == HOLE_NOGAIN) rep->nogain++;
+                    else rep->better++;
+                    if (r[j].outcome != HOLE_UNFINISHED) {
+                        if (n_cache == cap_cache) {
+                            cap_cache = cap_cache ? 2 * cap_cache : 64;
+                            cache = xrealloc(cache, (size_t)cap_cache * sizeof(HoleCacheEntry));
+                        }
+                        cache[n_cache].key = keys[j];
+                        cache[n_cache].outcome = r[j].outcome;
+                        cache[n_cache].gain = NULL;
+                        if (r[j].outcome == HOLE_GAIN) {
+                            cache[n_cache].gain = xmalloc(sizeof(Board));
+                            *cache[n_cache].gain = r[j].board;
+                        }
+                        n_cache++;
+                    }
+                }
+                if (r[j].outcome == HOLE_GAIN && (win < 0 || r[j].breaks < r[win].breaks))
+                    win = j;
+            }
+            if (g_verbose && draw) {
+                #pragma omp critical(stdout_print)
+                { printf("[%s] holes %d-%d of %d: %d searched or re-applied; t=%.1fs\n",
+                         proto->tag, from + 1, at, n, nb, omp_get_wtime() - t0);
+                  fflush(stdout); }
+            }
+            if (win < 0) continue;
+
+            const HoleSpec *hs = &plan[bidx[win]];
+            const int before = B;
+            Board prev = *inc;
+            *inc = r[win].board;
+            board_edge_counts(inc, &conn, &B);
+            if (B != r[win].breaks)
+                fatal("internal error: a committed hole has %d breaks, expected %d",
+                      B, r[win].breaks);
+            rep->gains++;
+            committed = true;
+            int bp = 0;
+            if (B > 0) board_break_stats(inc, NULL, &bp);
+            omp_set_lock(&g_best_lock);
+            rstat->best_connected    = conn;
+            rstat->best_broken       = B;
+            rstat->best_break_pieces = bp;
+            if (rstat->best_board) *rstat->best_board = *inc;
+            omp_unset_lock(&g_best_lock);
+            write_checkpoint_line(inc, proto->config_id);
+            #pragma omp critical(stdout_print)
+            { printf("[%s] hole gain: broken %d -> %d (hole %d/%d: %d cells, %d donor(s), "
+                     "ring %d, %d unit(s), %s)  t=%.1fs\n",
+                     proto->tag, before, B, bidx[win] + 1, n, hs->n_cells, hs->n_donors,
+                     hs->ring, hs->n_units,
+                     r[win].cached ? "cached" : r[win].ratchet ? "ratchet" : "exhaustive",
+                     omp_get_wtime() - t0);
+              fflush(stdout); }
+            if (draw && g_verbose) draw_hole_map(proto->tag, &prev, hs);
+        }
+        if (!committed) {
+            if (ratchet_out_of_time(proto->deadline)) {
+                rep->ended = g_stop ? "stopped" : "time limit";
+                search_request_stop(live, STOP_TIMEOUT);
+            }
+            break;
+        }
+    }
+    if (B == 0) rep->ended = "no broken edge left";
+    rep->removed = B0 - B;
+    for (int e = 0; e < n_cache; e++) free(cache[e].gain);
+    free(cache);
+    free(keys);
+    free(hits);
+    free(bidx);
+    free(res);
+    free(plan);
 }
 
 /* -- Per-record processing ---------------------------------------------------- */
@@ -6149,6 +6872,96 @@ static void resume_copy_row(const char *config_id_str, long long sol_id,
     FeasIssue fi0; memset(&fi0, 0, sizeof(fi0)); fi0.code = FEAS_OK;
     write_status_csv(config_id_str, sol_id, true, status, 0, 0, 0, 0.0, 0,
                      &fi0, &st0, NULL, 0, 0, 0, 0, -1, -1, 0);
+}
+
+/* --holes auto: one validated row.  A complete board with breaks goes through
+ * run_holes_auto(); anything else is written as read.  The row written is the
+ * best complete board, never worse than the one read. */
+static void process_auto(const char *config_id_str, long long field2, long long row,
+                         const char *tag, const Board *base, int n_placed,
+                         int input_connected, int input_breaks, double t0) {
+    DfsStats *st0 = xmalloc(sizeof(DfsStats));
+    stats_init(st0);
+    FeasIssue fi0; memset(&fi0, 0, sizeof(fi0)); fi0.code = FEAS_OK;
+    if (n_placed < NUM_PIECES || input_breaks == 0) {
+        const bool partial = n_placed < NUM_PIECES;
+        if (partial) {
+            #pragma omp atomic
+            g_cnt_auto_partial++;
+        } else {
+            #pragma omp atomic
+            g_cnt_auto_perfect++;
+        }
+        #pragma omp critical(stdout_print)
+        {
+            if (partial)
+                printf("[%s] not a complete board (%d empty cells): --holes auto repairs "
+                       "complete boards; written unchanged.\n", tag, NUM_PIECES - n_placed);
+            else
+                printf("[%s] no broken edge; written unchanged.\n", tag);
+            fflush(stdout);
+        }
+        write_stream_best(base, config_id_str);
+        write_status_csv(config_id_str, field2, true, partial ? "not_complete" : "perfect",
+                         n_placed, NUM_PIECES - n_placed, 0, omp_get_wtime() - t0, 0,
+                         &fi0, st0, NULL, 0, n_placed, input_connected, input_breaks,
+                         -1, -1, 0);
+        free(st0);
+        return;
+    }
+
+    const double eff = g_time_limit_sec < 0.0 ? TIME_LIMIT_DEFAULT : g_time_limit_sec;
+    Board inc = *base, rbest;
+    RecStat rstat;
+    hole_rstat_init(&rstat, &rbest, &inc);
+    SearchLive live;
+    search_live_init(&live);
+    SearchCtx cx;
+    memset(&cx, 0, sizeof(cx));
+    cx.config_id    = config_id_str;
+    cx.row          = row;
+    cx.tag          = tag;
+    cx.mode         = g_order_mode;
+    cx.record_start = t0;
+    cx.deadline     = eff > 0.0 ? t0 + eff : 0.0;
+    cx.collect      = true;
+    const bool example = g_verbose && !atomic_exchange(&g_example_claimed, 1);
+
+    HoleReport rep;
+    run_holes_auto(&inc, &cx, &rstat, &live, example, &rep);
+    write_stream_best(&inc, config_id_str);
+
+    int conn = 0, brk = 0;
+    board_edge_counts(&inc, &conn, &brk);
+    const bool timed = strcmp(rep.ended, "time limit") == 0 || strcmp(rep.ended, "stopped") == 0;
+    const char *outcome = rep.gains > 0 ? "improved" : !timed ? "unchanged"
+                        : g_stop ? "stopped" : "time_limit";
+    if (rep.gains > 0) {
+        #pragma omp atomic
+        g_cnt_auto_improved++;
+        #pragma omp atomic
+        g_auto_removed += (uint64_t)rep.removed;
+    } else {
+        #pragma omp atomic
+        g_cnt_auto_unchanged++;
+    }
+    char cached[48] = "";
+    if (rep.cached > 0) snprintf(cached, sizeof(cached), ", %d skipped (unchanged)", rep.cached);
+    const double elapsed = omp_get_wtime() - t0;
+    #pragma omp critical(stdout_print)
+    {
+        printf("[%s] %s%s  t=%.3fs  score %d -> %d  broken %d -> %d  holes: %d searched "
+               "(%d better, %d proved, %d no gain)%s, %d committed; ended: %s\n",
+               tag, outcome, rep.gains > 0 && timed ? " (time limit)" : "", elapsed,
+               input_connected, conn, input_breaks, brk, rep.searched, rep.better,
+               rep.proved, rep.nogain, cached, rep.gains, rep.ended);
+        fflush(stdout);
+    }
+    write_status_csv(config_id_str, field2, true,
+                     rep.gains > 0 ? "improved" : timed ? "cutoff" : "unchanged",
+                     n_placed, 0, 0, elapsed, (uint64_t)rep.gains, &fi0, st0, NULL, 0,
+                     NUM_PIECES, conn, brk, -1, -1, 0);
+    free(st0);
 }
 
 /* `resume_id` is the row's resume identifier under --resume, else NULL. */
@@ -6299,6 +7112,13 @@ static void process_line(const char *config_id_str, long long field2, long long 
                                 n_placed, 0, holes_applied, omp_get_wtime()-t0, 0,
                                 &fi0, &st0, NULL, 0, n_placed, input_connected, input_breaks,
                                 -1, -1, 0);
+        return;
+    }
+
+    /* --holes auto: the board is repaired hole by hole; the ceiling is its own. */
+    if (g_holes_auto) {
+        process_auto(config_id_str, field2, row, tag, &base, n_placed,
+                     input_connected, input_breaks, t0);
         return;
     }
 
@@ -6623,7 +7443,8 @@ static void process_line(const char *config_id_str, long long field2, long long 
         cx.deadline         = record_deadline;
         cx.collect          = collect;
         cx.layer            = (const int8_t (*)[PUZZLE_SIDE])layer;
-        run_ratchet(&base, &cx, &rstat, &live, &local_solutions, &total_stats, &mres, &rrep);
+        run_ratchet(&base, &cx, &rstat, &live, &local_solutions, &total_stats, &mres, &rrep,
+                    g_search_parallel ? (g_nthreads > 0 ? g_nthreads : omp_get_max_threads()) : 1);
 
         appendf(rec_buf, sizeof(rec_buf), &rec_off,
                 "[%s] ratchet: %d step(s), %lld exact search(es), %lld rollout dive(s), "
@@ -7066,6 +7887,14 @@ static void usage(const char *prog) {
         "  --num_rows N           Number of records to process (default 0 = every\n"
         "                         remaining record from --start_row).\n"
         "  --holes PATH           256 position-indexed 0/1 entries; matrix CSV accepted.\n"
+        "  --holes auto           Repair complete boards: open holes around their breaks\n"
+        "                         (plus donor pieces that fit them) and refill each under\n"
+        "                         the board's breaks minus one; better boards are kept,\n"
+        "                         the row is never written worse.  Holes touching <= 3\n"
+        "                         breaks get the exhaustive search (a proof when nothing\n"
+        "                         gains), larger ones the ratchet; --break_mode forces\n"
+        "                         one.  No --breaks; --time_limit is the row's budget.\n"
+        "  --hole_cells N         Largest auto hole, donors included (default 40).\n"
         "  --rotate K             Rotate K quarter turns CCW before search (0..3).\n"
         "  --verbose              Detailed statistics per row; draws one example row's\n"
         "                         board before and after its search.\n"
@@ -7378,6 +8207,14 @@ int main(int argc, char **argv) {
             g_count = v;
         } else if (strcmp(argv[i], "--holes") == 0 && i+1 < argc) {
             holes_path = argv[++i];
+            g_holes_auto = strcmp(holes_path, "auto") == 0;
+        } else if (strcmp(argv[i], "--hole_cells") == 0 && i+1 < argc) {
+            char *end = NULL; errno = 0;
+            long v = strtol(argv[++i], &end, 10);
+            if (errno || end == argv[i] || *end || v < 2 || v > NUM_PIECES)
+                fatal("--hole_cells expects a cell count in [2,%d], got '%s'",
+                      NUM_PIECES, argv[i]);
+            g_hole_cells = (int)v;
         } else if (strcmp(argv[i], "--best_n") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             long v = strtol(argv[++i], &end, 10);
@@ -7435,6 +8272,7 @@ int main(int argc, char **argv) {
             if (errno || end == argv[i] || *end || v < 0 || v > 480)
                 fatal("--breaks expects an integer in [0,480], got '%s'", argv[i]);
             g_max_mismatch = (int)v;
+            g_breaks_given = true;
         } else if (strcmp(argv[i], "--time_limit") == 0 && i+1 < argc) {
             char *end = NULL; errno = 0;
             double v = strtod(argv[++i], &end);
@@ -7540,6 +8378,42 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Unknown option: %s\n\n", argv[i]);
             usage(argv[0]); return EXIT_FAILURE;
         }
+    }
+
+    /* --holes auto repairs complete boards and writes one board per row; each
+     * board's ceiling is its own break count minus one.  Everything that would
+     * set another ceiling, write other boards or search elsewhere is refused. */
+    if (g_holes_auto) {
+        if (g_breaks_given)
+            fatal("--holes auto sets each board's ceiling to its own breaks minus one: "
+                  "drop --breaks");
+        if (g_break_mode_given && g_break_mode == BREAK_STUCK)
+            fatal("--holes auto refills each hole by an exact search or the ratchet: "
+                  "--break_mode stuck does not apply (lds, any or ratchet do)");
+        if (order_is_side_growth(g_order_mode))
+            fatal("--holes auto does not apply to --order %s: side growth sweeps from the "
+                  "sides, not around a hole", order_name(g_order_mode));
+        if (g_jump)
+            fatal("--holes auto needs --jump off: every hole is refilled completely");
+        if (g_stop_active)
+            fatal("--holes auto cannot be combined with --stop_%s: it writes whole boards",
+                  g_stop_isrow ? "row" : "column");
+        if (release_on())
+            fatal("--holes auto cannot be combined with --early_release: every hole is "
+                  "refilled completely");
+        if (g_resume)
+            fatal("--holes auto cannot be combined with --resume: a row is many searches");
+        if (g_best_output > 0)
+            fatal("--holes auto writes the best complete board of each row: --best_n "
+                  "does not apply");
+        if (g_solution_limit != 1)
+            fatal("--holes auto stops each search at its first better board: --max_emitted "
+                  "must be 1, got %" PRIu64, g_solution_limit);
+        /* Not given: the exhaustive search for small holes, the ratchet for the
+         * others (hole_uses_ratchet()). */
+        if (!g_break_mode_given) g_break_mode = BREAK_LDS;
+    } else if (g_hole_cells != HOLE_CELLS_DEFAULT) {
+        fprintf(stderr, "[warn] --hole_cells has no effect without --holes auto.\n");
     }
 
     /* A stop band exists to feed the finalizer, which structurally validates
@@ -7673,10 +8547,13 @@ int main(int argc, char **argv) {
     }
     if (g_lds_max >= 0 && g_break_mode != BREAK_LDS)
         fprintf(stderr, "[warn] --lds_max has no effect unless --break_mode lds is selected.\n");
-    if (g_ratchet_nodes != RATCHET_NODES_DEFAULT && g_break_mode != BREAK_RATCHET)
+    /* --holes auto without --break_mode runs the ratchet on the larger holes. */
+    const bool ratchet_runs = g_break_mode == BREAK_RATCHET ||
+                              (g_holes_auto && !g_break_mode_given);
+    if (g_ratchet_nodes != RATCHET_NODES_DEFAULT && !ratchet_runs)
         fprintf(stderr, "[warn] --ratchet_nodes has no effect unless --break_mode ratchet "
                         "is selected.\n");
-    if (g_ratchet_rollouts != RATCHET_ROLLOUTS_DEFAULT && g_break_mode != BREAK_RATCHET)
+    if (g_ratchet_rollouts != RATCHET_ROLLOUTS_DEFAULT && !ratchet_runs)
         fprintf(stderr, "[warn] --ratchet_rollouts has no effect unless --break_mode ratchet "
                         "is selected.\n");
     if (g_break_mode == BREAK_RATCHET && g_max_mismatch > 0 && g_jump)
@@ -7732,7 +8609,12 @@ int main(int argc, char **argv) {
            g_rotation * 90, g_rotation > 0 ? "original" : "unchanged");
     printf("  start_row=%lld num_rows=%lld%s\n", g_row_start, g_count,
            g_count == 0 ? " (0 = all remaining)" : "");
-    if (holes_path)
+    if (g_holes_auto)
+        printf("  holes=auto  hole_cells=%d  (built from each board, rotated frame; donors "
+               "<= %d, units <= %d, exhaustive search for holes touching <= %d breaks: "
+               "%llu nodes each)\n", g_hole_cells, HOLE_DONORS, HOLE_UNITS, HOLE_EXACT_BREAKS,
+               (unsigned long long)HOLE_NODES);
+    else if (holes_path)
         printf("  holes=%s (interpreted in rotated frame)\n", holes_path);
     if (g_best_output > 0) printf("  best_n=%d\n", g_best_output);
     else                   printf("  best_n=off\n");
@@ -7765,14 +8647,21 @@ int main(int argc, char **argv) {
     if (!order_uses_soft_completion(g_order_mode) && g_hall_mode == HALL_ADAPTIVE)
         printf("  stride=%d  small=%d", g_hall_stride, g_hall_small);
     printf("\n");
-    printf("  breaks=%d (total break ceiling)", g_max_mismatch);
-    if (g_max_mismatch > 0) {
-        printf("  break_mode=%s", break_mode_name(g_break_mode));
+    if (g_holes_auto)
+        printf("  breaks=each board's own minus one (--holes auto)");
+    else
+        printf("  breaks=%d (total break ceiling)", g_max_mismatch);
+    if (g_max_mismatch > 0 || g_holes_auto) {
+        if (g_holes_auto && !g_break_mode_given)
+            printf("  break_mode=lds for holes touching <= %d breaks, else ratchet",
+                   HOLE_EXACT_BREAKS);
+        else
+            printf("  break_mode=%s", break_mode_name(g_break_mode));
         if (g_break_mode == BREAK_LDS) {
             if (g_lds_max >= 0) printf("  lds_max=%d", g_lds_max);
             else                printf("  lds_max=auto(up to break budget)");
         }
-        if (g_break_mode == BREAK_RATCHET) {
+        if (ratchet_runs) {
             if (g_ratchet_nodes > 0) printf("  ratchet_nodes=%llu", g_ratchet_nodes);
             else                     printf("  ratchet_nodes=0 (each search until exhausted)");
             if (g_ratchet_rollouts > 0) printf("  ratchet_rollouts=%d", g_ratchet_rollouts);
@@ -7780,7 +8669,11 @@ int main(int argc, char **argv) {
         }
     }
     printf("\n");
-    if (greedy_run)
+    if (g_holes_auto)
+        printf("  engine=AUTO HOLES (each hole lifted and refilled under the board's breaks "
+               "minus one; the exhaustive search proves a hole it cannot improve, the "
+               "ratchet proves nothing)\n");
+    else if (greedy_run)
         printf("  engine=GREEDY DIVES (no backtracking, always completes)"
                "  restarts=%lld  lcv=%s  -- fast triage, proves nothing\n",
                g_stuck_restarts, g_lcv ? "on" : "off");
@@ -7792,7 +8685,7 @@ int main(int argc, char **argv) {
                "proof that no completion exists at that break count\n");
     {
         double el = g_time_limit_sec;
-        if (el < 0.0) el = (g_max_mismatch > 0) ? TIME_LIMIT_DEFAULT : 0.0;
+        if (el < 0.0) el = (g_max_mismatch > 0 || g_holes_auto) ? TIME_LIMIT_DEFAULT : 0.0;
         printf("  time_limit=");
         if (el > 0.0) printf("%gs/record", el); else printf("unlimited");
     }
@@ -7830,7 +8723,9 @@ int main(int argc, char **argv) {
     build_fit_index();
 
     /* [2/5] Load holes */
-    if (holes_path) {
+    if (g_holes_auto) {
+        printf("[2/5] Holes: built from each board (--holes auto).\n"); fflush(stdout);
+    } else if (holes_path) {
         printf("[2/5] Loading holes file...\n"); fflush(stdout);
         char why[256];
         memset(g_holes, 0, sizeof(g_holes));
@@ -8152,6 +9047,13 @@ int main(int argc, char **argv) {
     printf("    solution_cutoff      = %" PRIu64 "\n", g_cnt_solution_cutoff);
     printf("    no_solution          = %" PRIu64 "\n", g_cnt_no_solution);
     printf("    cutoff               = %" PRIu64 "\n", g_cnt_cutoff);
+    if (g_holes_auto) {
+        printf("    holes_auto_improved  = %" PRIu64 "  (%" PRIu64 " break(s) removed)\n",
+               g_cnt_auto_improved, g_auto_removed);
+        printf("    holes_auto_unchanged = %" PRIu64 "\n", g_cnt_auto_unchanged);
+        printf("    not_complete         = %" PRIu64 "  (written unchanged)\n", g_cnt_auto_partial);
+        printf("    no_break             = %" PRIu64 "  (written unchanged)\n", g_cnt_auto_perfect);
+    }
     if (g_release_row >= 0)
         printf("    release_cell_closed  = %" PRIu64 "  (not searched, not written)\n",
                g_cnt_release_closed);
