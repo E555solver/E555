@@ -473,7 +473,7 @@ static int       g_lds_max    = -1;   /* -1 = no cap beyond the break budget */
  * board is committed does not depend on the thread count or the load.
  * Measured on eight open interiors (192 cells, rowmajor): mean breaks to
  * complete 51 at 1M nodes, 45 at 10M (~5.5 s a board on one thread), 44.6 at
- * 30M, 45 at 100M.  On jewel tails of 62 and 114 cells no search reached 1M. */
+ * 30M, 45 at 100M.  On four 114-cell tails 100k and 1M gave the same boards. */
 #define RATCHET_NODES_DEFAULT 10000000ULL
 static unsigned long long g_ratchet_nodes = RATCHET_NODES_DEFAULT;
 
@@ -5879,9 +5879,10 @@ static void run_search_at_k(Board *base, const SearchCtx *cx,
  *      complete, the budget is spent, no candidate passes, or --time_limit.
  *
  * Every search is serial and stops at a node count, not a time, and the commit
- * prefers the earlier candidate, so --threads 1 and 20 commit the same boards;
- * when the record has the machine to itself (g_search_parallel) the threads
- * share out a step's candidates.  --time_limit only ends the run.
+ * prefers the earlier candidate, so --threads 1 and 20 commit the same boards
+ * unless --time_limit ends the run, which is all it does here; when the record
+ * has the machine to itself (g_search_parallel) the threads share out a step's
+ * candidates.
  *
  * Breaks are counted in edges: one forced piece may break two or more, and a
  * candidate that would pass --breaks is not tried.  The searches keep the full
@@ -7291,7 +7292,8 @@ static void usage(const char *prog) {
         RATCHET_NODES_DEFAULT);
     fputs(
         "                         0 = each until exhausted).  A node count, not a time,\n"
-        "                         so the committed boards do not depend on --threads.\n"
+        "                         so the committed boards do not depend on --threads\n"
+        "                         (unless --time_limit ends the run).\n"
         "  --restarts N           Independent randomized dives per record (default 50000,\n"
         "                         roughly 5-10 s on four cores).\n"
         "                         Dives are sub-millisecond; N in the millions is fine.\n"

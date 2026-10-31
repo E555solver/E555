@@ -2007,14 +2007,22 @@ counters rather than a scan.
   exact fit first, under 2sides/4sides the first such cell of the outermost
   open layer. Breaks count in edges, and the cuts keep the whole remaining
   budget. It proves nothing. A node cap rather than a time limit makes the
-  output the same at any thread count; the threads share out a step's
-  candidates when one record has the machine. Measured completions (breaks):
-  - Four 114-cell jewel tails (rows 6..14 open), 0.01-0.5 s per board:
-    `rowmajor` 42-47, `spiral` 53-59, `mrv` 61-79, 2sides/4sides 76-100.
-    50,000 dives (~3 s) gave a best of 34-43, a median of 48-56.
+  output the same at any thread count, unless `--time_limit` ends the run; the
+  threads share out a step's candidates when one record has the machine.
+  Measured completions (breaks):
+  - Eight 62-cell jewel tails (rows 10..14 open), `--breaks 60`, under 0.1 s
+    each: `rowmajor` completed all 8 with 42-47, `spiral` all with 42-54, `mrv`
+    7 with 50-60, 4sides 6 with 54-60, 2sides 4 with 48-54. 50,000 dives
+    completed all with 32-35.
+  - Four 114-cell tails (rows 6..14 open), 0.01-0.5 s: `rowmajor` 42-47,
+    `spiral` 53-59, `mrv` 61-79, 2sides/4sides 76-100. 50,000 dives (~3 s)
+    gave a best of 34-43 and a median of 48-56.
   - Eight open interiors (192 cells), one thread per board: `rowmajor` 38-57
     (mean 45) in ~5.5 s. 50,000 dives (~23 s) gave a mean best of 42. The mean
     was 51 at 1M nodes and no better than 45 at 30M or 100M.
+  - The four synthetic swapped boards of the breakcount check, `mrv --breaks
+    12`: it solved 2 with 12 and 8 breaks, where lds finds the minimum (6, 8, 8,
+    8) on all four.
 
 `--order` (default `mrv`, the most constrained cell) also offers `rowmajor`,
 `colmajor`, `snake`, `spiral`, `centerout`, `spiralout`, and the side modes
