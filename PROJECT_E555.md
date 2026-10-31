@@ -1653,9 +1653,8 @@ Four laps are one full turn. At `T = 11` a lap keeps 72 cells in place (rows
   nothing for the beam.
 - Clues: the finalizer needs the clue flags on every lap. The runner does not
   pass them to the cut, so a band cut below row 7 carries no clue, and the
-  finalizer then searches each orientation its lock allows (measured: a
-  rows-0..5 band grown to row 8 gave 33,536 boards over three of the four
-  orientations; grown to row 10, only one survived). Given the clue flags, the
+  finalizer then searches each orientation its lock allows (a band grown a few
+  rows can still hold boards in several orientations). Given the clue flags, the
   cut keeps every clue on its own cell (9.5) and the finalizer reads the
   orientation instead. The closing dive's `--holes` mask must keep the centre
   cell shut (`data/holes_open_border_TR.csv` does).
@@ -1667,8 +1666,8 @@ one fixed frame. A **jewel** is a beamer board s1 and three clockwise laps
 s2..s4, each re-grown to row 10, all holding the same complete 60-cell frame.
 Each lap keeps only rows 1..BR x columns 1..KC of the turned board (cut 3:4 on
 lap 1; 4:3, then 3:4 on laps 2-3), cuts rows 0..BR with `--with_frame`, and
-re-grows with `--keep_ring --no_fanout_sort`; depth-first, one board per frame.
-Measured: 87 jewels per hour on 4 cores (pipeline/README.md), unclued.
+re-grows with `--keep_ring --no_fanout_sort`; depth-first, one board per frame
+(rates and the reasons for these choices: pipeline/README.md).
 `CLUES` (default `center`; `all`, `none`) passes the clue flags to all three
 tools. `FREEZE` (on with `CLUES=all`) cuts with `--with_clue_regions` and
 re-grows with `--freeze_clues`, exhaustively from the lock, so a jewel also
@@ -1985,61 +1984,36 @@ counters rather than a scan.
   Each dive takes an exact fit where one exists and a minimal break where none
   does, never backtracks and always completes; `--restarts N` (default 50000)
   dives, best kept. Value ordering (off with `--no_lcv`) plays each candidate and
-  prefers the one stranding fewest cells (~2.1x the cost per dive, 1-2 more
-  matched edges per board at equal time). Best-of-N improves only
-  logarithmically (26 -> 22 breaks from 2k to 2M dives on one board). It proves
-  nothing.
+  prefers the one stranding fewest cells: about twice the cost per dive, and
+  still better at equal time. Best-of-N improves only logarithmically, so more
+  restarts buy little. It proves nothing.
 - **`any` / `lds`**: exhaustive, iterative deepening over
   `k = input breaks .. --breaks`. An exhausted level proves no completion with
   at most k breaks exists. `--lds_max` caps voluntary mismatches per path.
   While breaks are left, lds under `mrv` and `frontier` takes a cell with no
   exact fit first (frontier: from any layer), so the forced break goes where the
-  search is stuck; otherwise such a cell waited behind every cell with fewer
-  candidates, and the time limit usually came first.
-- **`ratchet`**: exact search between breaks, each break committed and never
-  revisited. The exact search of `--order` runs from the board, on one thread,
-  until exhausted, or for at most `--ratchet_nodes N` nodes (default 0: no cap).
-  Its deepest board is kept. Every candidate at the cell where it is stuck,
-  cheapest break first, gets its own exact search. `--ratchet_rollouts R`
-  greedy dives (default 30) from each search's board then score the candidate:
-  the one whose dives complete with the fewest breaks is the next board (ties:
-  the deeper, then the earlier; R = 0 keeps the deepest). A dive completion
-  within `--breaks` is a finished board. It stops when the board is complete,
-  the breaks are spent, or no candidate passes the cuts.
-  - **Stuck cell.** The one `--order` fills next: under `mrv` and `frontier` a
-    cell with no exact fit first, under 2sides/4sides the first such cell of the
-    outermost open layer.
-  - **Breaks** count in edges, and the cuts keep the whole remaining budget. It
-    proves nothing.
-  - **Repeatability.** Node caps and dives seeded from the board make the output
-    the same at any thread count and on every run, unless `--time_limit` ends
-    it. The threads share out a step's candidates when one record has the
-    machine.
-  - **When to cap.** Uncapped, the first exact search does not finish within
-    `--time_limit` for 2sides/4sides even on a 62-cell tail, nor for any order
-    on a wide open region. The run then ends with no break placed. Cap those
-    runs: `--ratchet_nodes 1000000` for the side sweeps, 10000000 for open
-    regions. `rowmajor`, `mrv`, `frontier` and `spiral` wrote the same boards
-    uncapped as at 1M on the 62- and 114-cell tails, in under 0.1 s a board.
-
-  Measured mean breaks to complete, and time per board:
-
-  | boards | ratchet `rowmajor`, R=0 | R=30 | R=100 | dives |
-  |---|---|---|---|---|
-  | 8 jewel tails, 62 cells open (rows 10..14), one thread | 44.8 (<0.1 s) | 34.4 (~5 s) | 33.1 (~17 s) | 50,000: 33.5 (~5.6 s); 150,000: 33.1 (~19 s) |
-  | 4 tails, 114 cells open (rows 6..14), 4 threads | 44.0 (0.01 s) | 34.5 (~1.2 s) | 34.0 (~3.7 s) | 50,000: 38.5 (~3.2 s); 200,000: 37.8 (~12 s) |
-  | 8 open interiors, 192 cells, one thread, 10M nodes | 45.1 (~5.5 s) | 36.0 (9-39 s) | -- | 50,000: 41.9 (~23 s) |
-
-  Two of the open interiors took 29 and 39 s at R=30 on one thread. Under the
-  default 30 s `--time_limit` they end early, with output that depends on
-  timing: give such boards more time, or more threads with one record each.
-
-  - **Other orders on the 62-cell tails, R=30.** `mrv` averaged 34.6 (~9 s).
-    At 1M nodes, 2sides completed 8 of 8 tails with 47-58 breaks and 4sides
-    7 of 8 with 49-58; at R=0 they completed 4 and 6.
-  - **The four synthetic swapped boards** (`mrv --breaks 12`). R=30 solved 3,
-    with 10, 8 and 8 breaks, against 2 at R=0; lds finds the minimum (6, 8, 8,
-    8) on all four.
+  search is stuck.
+- **`ratchet`**: exact search between breaks, each break kept for good. The
+  exact search of `--order` runs on one thread until exhausted (or
+  `--ratchet_nodes N`; default 0, no cap). At the cell where it is stuck, every
+  candidate, cheapest break first, gets its own exact search, scored by
+  `--ratchet_rollouts R` greedy dives (default 30). The fewest breaks to
+  complete wins, then the deeper board (R = 0: the deepest). A dive completion
+  within `--breaks` counts as a finished board. It proves nothing, and its
+  output does not depend on the thread count unless `--time_limit` ends the
+  run. The stuck cell is the one `--order` fills next: under `mrv`/`frontier`
+  a cell with no exact fit first, under 2sides/4sides the first such cell of
+  the outermost open layer.
+  - **Order.** Use `rowmajor`. On 62-cell jewel tails it matched dives at
+    equal time; on regions of 114-192 open cells it needed 4-6 fewer breaks.
+    `mrv` was close; 2sides/4sides needed about 15 more.
+  - **Rollouts.** They save about 10 breaks over the depth-only rule. R=100
+    gained about one more break, for three times the time.
+  - **Node cap.** Cap the side sweeps (`--ratchet_nodes 1000000`) and wide
+    open regions (10000000). Uncapped, their first exact search does not
+    finish, and the run ends without placing a break. On tails, the other
+    orders exhaust in a moment.
+  - **Time.** Large regions can need more than the default 30 s `--time_limit`.
 
 `--order` (default `mrv`, the most constrained cell) also offers `rowmajor`,
 `colmajor`, `snake`, `spiral`, `centerout`, `spiralout`, and the side modes
@@ -2053,8 +2027,8 @@ dead cell to build a large break-free partial.
 `0..N`, clearing the rest (their pieces return to the pool), and write every
 filling of the band to `<out>.stop_row<N>.csv` as a finalizer input
 (`--finalize_from N`). `--reverse` anchors the band at the far side.
-`--max_emitted` defaults to 1 here (0 = all; rows 0..3 alone gave 7.6 M bands and
-11 GB in five minutes). `--with_frame` adds the 60 frame cells to the band:
+`--max_emitted` defaults to 1 here (0 = all, which can mean millions of bands
+and gigabytes within minutes). `--with_frame` adds the 60 frame cells to the band:
 frame cells the input holds are kept, missing ones are searched, and a band only
 counts once its frame closes. Requires `--breaks 0` and no `--jump`.
 `--with_clue_regions` adds the five 2x2 clue regions the same way (rows 7-8 x
@@ -2097,19 +2071,19 @@ release cell) with the cells per layer.
 is chosen while an inner cell is open, in any order but the greedy dives (static
 orders sort the frame after the inner cells, frontier puts it in layers after the
 last inner one, mrv skips it, 2sides/4sides sweep their inner layers and then the
-frame cells in sweep order). The frame cells stay in every prune. With N the open frame cells, `--early_release N` stops at the first
-board that places every inner cell, leaving the edges to place last.
+frame cells in sweep order). The frame cells stay in every prune. With N the
+open frame cells, `--early_release N` stops at the first board that places
+every inner cell, leaving the edges to place last.
 `--no_colour_count` (like `--no_hall`) drops a start-of-record check that sees
 the cells to be released too; neither is recorded by `--resume`.
 `--edge_supply` cuts a path once the open frame cells facing placed pieces need
 more breaks than are left: per colour, more of them demand it than unused edge
 pieces carry it on their inner face. It is Hall's bound on those cells alone,
 cheap enough for every placement near the frame; at the record root it also
-lifts the first break level, like Hall's root deficiency. On 400 halo boards
-(0.5 s each) without it, 374 of the 400 deepest prefixes already forced frame
-breaks (4.1 per board on average); with it none did, at 152 inner cells
-placed instead of 156. Not recorded by `--resume`; refused with `--jump`,
-2sides/4sides and the greedy dives.
+lifts the first break level, like Hall's root deficiency. Without it, short
+searches on halo boards mostly ended on prefixes that already forced frame
+breaks; with it they stop a few cells earlier with none. Not recorded by
+`--resume`; refused with `--jump`, 2sides/4sides and the greedy dives.
 
 **Resume.** `--resume` splits one exact search over many short runs. Every
 output row carries a resume identifier as field 3 (515 fields): where the
@@ -2146,10 +2120,8 @@ E555_backtracker seed elite.csv done.csv --breaks 0          # no --resume: all 
 
 **Parallelism.** One record per thread, or all threads on one record when there
 are no more records than threads (`--all_for_one` forces it). The search is
-memory-bandwidth bound (four independent single-thread runs reach 2.44x
-aggregate on 4 cores). It uses `popcount` heavily: build with a non-generic
-`ARCH` for real runs (`generic` costs ~12% of dive throughput and ~39% of DFS
-node rate).
+bound by memory bandwidth more than by cores. It uses `popcount` heavily:
+build with a native `ARCH` for real runs (`generic` is markedly slower).
 
 | option | default | meaning |
 |---|---|---|
@@ -2162,8 +2134,8 @@ node rate).
 | `--edge_supply` | off | cut on the frame's inward edges: per colour, demand above the unused edge pieces' supply |
 | `--hall MODE`, `--hall_stride N`, `--hall_min N` | root, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
-| `--ratchet_nodes N` | 0 | node cap per exact search of the ratchet; 0 = until exhausted (1000000 for 2sides/4sides, 10000000 for wide open regions) |
-| `--ratchet_rollouts R` | 30 | ratchet: greedy dives scoring each candidate (fewest breaks to complete wins); 0 = the deepest |
+| `--ratchet_nodes N` | 0 | ratchet: node cap per exact search (0 = none; 1000000 for 2sides/4sides, 10000000 for open regions) |
+| `--ratchet_rollouts R` | 30 | ratchet: dives scoring each candidate; 0 = keep the deepest |
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record; SIGINT/SIGTERM stop every running record the same way (rows not started: copied under `--resume`, else not written), a second signal kills |
 | `--max_emitted N` | 1 | completions per record (0 = all) |
 | `--stop_row N`, `--stop_column N`, `--with_frame`, `--with_clue_regions` | -- | band enumeration; widen the band by the frame, by the five 2x2 clue regions |

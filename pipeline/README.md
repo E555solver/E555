@@ -367,44 +367,35 @@ its own database cache (`E555.db.center`, `E555.db.all`).
 only). The cut also fills the five 2x2 clue blocks and every lap holds them, so
 a jewel's boards share the frame, the 20 block pieces and all five clues.
 Frozen laps reach row 9 but not row 10, so the `auto` settings switch to cuts
-2:4 then 2:3, re-grown to row 9 with 8 bands a lap. Measured: 15 jewels from 60
-`CLUES=all` boards in 33 minutes on 4 cores.
+2:4 then 2:3, re-grown to row 9 with 8 bands a lap.
 
 `BEAM_STOP_ROW`/`FIN_STOP_ROW` set how far s1 and s2..s4 grow; `BEAM_MIN_COL=4`
 keeps beamer boards whose left columns grow whole to row 14 (those whose
 top-left corner then cannot close are dropped); `BEAM_COLUMNS` left columns
 per bottom are picked with a little randomness (`BEAM_TAU`). On a big machine,
 run several copies, each with its own `RUN_DIR`; every run draws its own seed.
+On 4 vCPUs one copy made about 90 jewels an hour unclued, and 15-30 with
+`CLUES=all` and frozen blocks.
 
-What the unfrozen runner measured (whirlpool campaign 20261028-0249, 4 vCPUs,
-an hour per run; the campaign README on the `agent_runs` branch has the
-details). These runs were unclued, without `BEAM_MIN_COL` and `BEAM_TAU`:
+Why the runner works this way (measured unclued):
 
-* **87 jewels per hour** over five hours (78 to 96 per run). The population
-  runner above found none: its frame never survived a second lap.
-* **The rate depends on the beamer batch.** An hour is spent on one produce
-  call's boards, and how many of them survive lap 1 varies: this script made
-  60 per hour on one batch (31% through lap 1), and on another 36 jewels in
-  20 minutes where the campaign's runner made 29 on the same batch (a tie
-  within counting noise).
 * **Keep a small block, not the slab.** Keeping the parent's whole six-row slab
-  leaves the cut a 4-wide wedge against the fixed frame, and 0 of 16 such bands
-  re-grew. Cut 3:4 (rows 0..3, 4 columns kept) re-grew 10 of 10.
+  leaves the cut a 4-wide wedge against the fixed frame, and those bands never
+  re-grew; cut 3:4 (rows 0..3, 4 columns kept) re-grew nearly all.
 * **Cut 4:3 first on laps 2 and 3**, then 3:4: 4:3 rebuilds a smaller database
-  (7.8 s against 13.2 s) and re-grows 7 of 10. On lap 1 it re-grew only 8 of 16
-  against 14 of 16, so lap 1 keeps 3:4. Cut 5:2 is cheap but re-grew too few.
-* **One board per frame.** Consecutive beamer boards share their ring, and in
-  one hour 11 of 37 chains repeated a frame; produce now keeps one board per
-  frame and shuffles them.
-* **`--no_fanout_sort`** took a finalizer call from 35.6 s to 11.3 s with 13 of
-  16 boards re-grown against 14; it costs the run's reproducibility.
-* **One ring per board.** Trying the other rings of a board's lap-1 bands
-  after a jewel cost ~100 s each; a fresh board is cheaper.
+  and re-grows most bands. On lap 1 it re-grew too few, so lap 1 keeps 3:4.
+* **One board per frame, one ring per board.** Consecutive beamer boards share
+  their ring, so produce keeps one board per frame; after a jewel, a fresh board
+  is cheaper than trying the board's other rings.
+* **`--no_fanout_sort`** makes each finalizer call about three times faster for
+  nearly the same yield; it costs the run's reproducibility.
+* **The yield depends on the beamer batch**: how many of a produce call's boards
+  survive lap 1 varies. The population runner above found no jewels at all,
+  because its frame never survived a second lap.
 
-Before the first produce the script reads `DB_FILE` once (1.5 to 8 min,
-depending on the disk; it counts against `WALL`): from a
-cold disk, the beamer's memory-mapped reads kept one produce call busy for 10
-minutes without a board.
+Before the first produce the script reads `DB_FILE` once into the page cache
+(minutes on a slow disk, counted against `WALL`); from a cold disk the beamer's
+memory-mapped reads can stall a produce call for many minutes.
 
 ## The halo: `run_halo.sh`
 

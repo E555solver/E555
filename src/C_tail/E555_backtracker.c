@@ -1,132 +1,70 @@
 /*
  * E555_backtracker.c -- Stage C exact / bounded-mismatch DFS tail solver.
  *
- * Parallel backtracking tail solver for Eternity II partial boards.  It reads a
- * CSV of partial 16x16 boards (Stage-B beam output, or this program's own
- * output) and fills the remaining empty cells of each by a constrained DFS,
- * writing the best board found for every processed record back out as a
- * re-feedable CSV line.
+ * Reads a CSV of partial 16x16 boards (Stage B output, or its own output), fills
+ * the empty cells of each by a constrained DFS, and writes the best board of
+ * every record as a re-feedable CSV line.
  *
  * ALGORITHM
- *   - DFS fills one cell at a time.  Cell order is selectable (--order); the
- *     default mrv chooses the most-constrained cell for fail-first search.  The
- *     static orders (rowmajor/spiral/spiralout/...) remain selectable, and
- *     --reverse flips any of them; spiralout places the top-left corner last.
- *     A piece fits a cell when its oriented edges match
- *     the already-placed neighbours and the gray-0 frame rule (color 0 only on
- *     the outer border, facing out) holds.
- *   - Forward-checking engine: a static (side,color) orientation-bitset
- *     index plus per-cell exact-fit domains (FcState) make MRV counts and
- *     candidate enumeration a few word ops per cell instead of a 256x4 rescan,
- *     and give an immediate cutoff when a neighbour's domain empties.
- *   - Break placements are counted by the same bitsets rather than tested one
- *     at a time: a candidate breaks one edge per placed neighbour it fails to
- *     match, so a bit-sliced sum over at most four fit masks classifies all
- *     1024 orientations at once (break_class_masks).  Where the budget reaches
- *     the neighbour count -- always, for a greedy dive -- the count MRV needs
- *     is just the frame-legal unused total minus the exact fits, two counters
- *     FcState already keeps, and no scan runs at all.  Enumerating by ascending
- *     break class also lands candidates in (breaks, pid, spin) order, so no
- *     sort is needed.  This is where the mismatch engines spend their speed:
- *     the scan it replaced was 79% of all instructions in the exhaustive engine
- *     and about 35% in the dive engine.
- *   - FcState carries the empty cells as a list, so the per-place domain update
- *     touches only those rather than sweeping all 256 and skipping the filled
- *     ones.  That sweep was a further 28% of the dive engine, and worse the
- *     deeper a DFS went.  Together the two are 3.3x-3.7x on dives and 4.1x-6.8x
- *     on single-threaded exhaustive search, at identical output.
- *   - Classic mode (--jump off, except 2sides/4sides) applies three sound
- *     completion prunes: a global empty-domain lower bound, incremental
- *     color/type accounting, and a Hall/deficiency bipartite-matching bound.
- *     Hall is checked at the root by default (--hall adaptive or always adds
- *     checks below it).  --hall controls the policy.  With --jump on, or with an exact side-growth
- *     order, an impossible cell is deferred so independent gaps can keep
- *     growing and completion-only prunes are disabled.
- *   - --clue_center / --clue_corners force the published Eternity II hint
- *     pieces onto their cells before the DFS starts, so they constrain the
- *     search rather than being something it must rediscover, and the emitted
- *     board carries them.  They go on after --rotate, --holes and the duplicate
- *     pass: a holes mask that frees a clue's cell or its stranded piece is what
- *     makes the clue placeable, and any break the clues create counts as an
- *     input break, so --breaks governs it unchanged.  Orientation is read off
- *     the board (this tool fills empty cells, it cannot move placed ones, so a
- *     board carrying a clue has already committed); --clue_orient 0..3 is
- *     consulted only for a board carrying none, and names the CSV frame.  A
- *     board whose clue cell is taken, or whose clue piece sits elsewhere, is
- *     dropped with a message and is NOT written to the output.
- *   - --breaks K allows up to K broken internal edges in the finished
- *     board (default 0 = exact).  K is an ABSOLUTE ceiling: breaks already in
- *     the input count against it, and an input that already exceeds K is
- *     dropped.  Iterative deepening over the budget finds the fewest breaks
- *     when each level is exhaustive (break_mode any, or uncapped lds); stuck
- *     is a faster heuristic.  With --max_emitted 0, retained ties prefer fewer
- *     distinct pieces touched.  --break_mode selects where breaks may be
- *     spent: stuck (dead-end cells only), any (everywhere; complete but
- *     exponential), lds (discrepancy-limited widening from stuck toward
- *     any, --lds_max caps the allowance), or ratchet (exact search between
- *     breaks, each break committed where that search got stuck; see
+ *   - The DFS fills one cell at a time in --order: mrv (default, the most
+ *     constrained cell), frontier, the static orders (rowmajor, spiral,
+ *     spiralout, ...; --reverse flips them) or the side sweeps 2sides/4sides.
+ *     A piece fits when its edges match the placed neighbours and grey (0)
+ *     faces only the outside.
+ *   - Forward checking (FcState): a (side, colour) orientation-bitset index
+ *     keeps every empty cell's exact-fit domain, so MRV counts, candidate lists
+ *     and the empty-domain cutoff are a few word operations.  Break candidates
+ *     are classified by the same bitsets (break_class_masks), all orientations
+ *     at once and already in (breaks, pid, spin) order.
+ *   - Completion cuts (classic mode): an empty-domain bound, colour/type
+ *     accounting and a Hall/deficiency matching bound (--hall; at the root by
+ *     default).  --jump and the side sweeps defer a dead cell instead and run
+ *     no completion cuts.
+ *   - --breaks K: at most K broken internal edges in the finished board, input
+ *     breaks included.  --break_mode chooses how they are spent: stuck (greedy
+ *     dives, the default), any and lds (exhaustive iterative deepening: an
+ *     exhausted level is a proof), ratchet (exact search between breaks; see
  *     run_ratchet()).
- *   - --early_release N moves the DFS leaf N cells before the end of the
- *     search sequence: the exact search stops at the first break-free board
- *     with only N searched cells still empty and reports it as the record's
- *     solution.  Above that gate the search is unchanged -- the released cells
- *     still count in every completion prune -- so a released board is a state
- *     the full search passes through.  Where the gate falls follows --order and
- *     --reverse (rowmajor N=16: the top row; spiralout N=60: the border ring).
- *   - --resume makes the exact search resumable: every output row carries an
- *     identifier of where that record's search stopped (the pieces placed
- *     along the current DFS path), and a later run given the file with
- *     --resume re-places that path and carries on, so a search split into many
- *     short runs visits exactly the tree of one long run.  One thread per
- *     record.  --resume_score S keeps only the rows scoring S or more.  The
- *     identifier format is documented at "Resume identifier" below.
+ *   - --clue_center/--clue_corners put the published hint pieces on their
+ *     cells before the search (after --rotate, --holes and dedup), so they
+ *     constrain it; a clue break counts as an input break.  The orientation is
+ *     read off the board, else --clue_orient.  A board whose clue cell is taken,
+ *     or whose clue piece sits elsewhere, is dropped and not written.
+ *   - --early_release N stops the exact search at the first break-free board
+ *     with only the last N cells of --order open; the search above is unchanged.
+ *   - --resume splits one exact search over many runs: each output row carries
+ *     where its search stopped, and the next run goes on from there (format at
+ *     "Resume identifier" below).
  *
  * OUTPUT
- *   - The mandatory output.csv gets ONE line per processed record: the best
- *     board reached for that record (a completion when found, else the deepest
- *     partial), streamed at end-of-record, thread-safe.  Layout is the
- *     canonical E555 board row config_id,score,pos[256],rot[256] (514 fields;
- *     config_id as read, score = matched internal edges) so the file can be fed straight back in
- *     as input for an improvement loop.  Under --resume the row has 515 fields,
- *     the resume identifier third; the run ends with the min/max/mean/std/
- *     median of the scores written either way.
- *   - <output>.checkpoint.csv: append-only crash-recovery file in the same
- *     re-feedable layout; a record's best board is appended when it improves
- *     (>=10 s throttle per record).  Removed on clean completion.
- *   - stdout names each row "row N/T id" (N counts the input's data rows) and
- *     ends it with one line: the outcome, the score read -> written, the depth.
- *     --verbose adds statistics and draws one example row, before and after.
- *   - SIGINT/SIGTERM stop the running searches as their time limit would; see
- *     handle_stop().
- *   - ~30 s heartbeat progress lines per in-flight record (k, D, nodes, best).
- *   - --status optionally writes <output>.status.csv with one diagnostic row
- *     per parsed input record.  --best_n N additionally writes global
- *     top-N pure and mismatch partial-board CSVs.
+ *   - output.csv: one row per record, its best board (a completion when found,
+ *     else the deepest partial), canonical config_id,score,pos[256],rot[256];
+ *     with --resume the identifier is a third field.  The run ends with the
+ *     score summary.
+ *   - <output>.checkpoint.csv: crash recovery, a record's best board appended as
+ *     it improves (at most every 10 s); removed on a clean finish.
+ *   - stdout: one closing line per row ("row N/T id": outcome, score read ->
+ *     written, depth), a progress line every ~30 s per running record;
+ *     --verbose adds statistics and draws one example row.
+ *   - --status, --best_n and the stop-band files are optional side outputs.
+ *   - SIGINT/SIGTERM stop the searches as their time limit would (handle_stop).
  *
  * PARALLELISM (OpenMP)
- *   - Automatic, resolved once the input window is known: with no more records
- *     than threads, every worker attacks one record's search together; otherwise
- *     each worker takes its own record.  --all_for_one forces the former.
- *   - stuck mode ignores all of that: --restarts dives share nothing, so
- *     they are simply split across threads.
- *   - There is no knob for the frontier split.  It was measured and it does not
- *     matter: see the note on SPLIT_TASKS_PER_THREAD, where an independent-process
- *     control shows this search is limited by the memory system rather than by
- *     scheduling.
+ *   - With no more records than threads, all threads work on one record
+ *     (search-parallel; --all_for_one forces it); otherwise one record per
+ *     thread.  A record with all the threads shares out its dives, or the
+ *     ratchet's candidates, among them.
+ *   - The exact engines write the same output at any thread count.
  *
- * COMPILE
- *   gcc -Wall -Wextra -O3 -march=native -fopenmp \
- *       E555_backtracker.c -o E555_backtracker -lm
- *   (debug self-checks: -DVERIFY_AVAIL for the availability counters,
- *    -DVERIFY_INDEX for the bitset-index candidate enumeration,
- *    -DVERIFY_BREAKCOUNT to recompute every break count and every emitted
- *    candidate list with the per-candidate scan the bit arithmetic replaced,
- *    and abort on any disagreement.  Each costs roughly an order of magnitude.)
- *   -march matters here: the break classification is popcount-heavy, and a
- *   `generic` build calls libgcc for it -- about a quarter of the profile.
+ * BUILD
+ *   gcc -Wall -Wextra -O3 -march=native -fopenmp E555_backtracker.c -o E555_backtracker -lm
+ *   -march matters: the break classification is popcount-heavy.  Self-checks,
+ *   each about 10x slower: -DVERIFY_AVAIL (availability counters),
+ *   -DVERIFY_INDEX (candidate enumeration), -DVERIFY_BREAKCOUNT (break counts
+ *   against a per-candidate scan).
  *
  * RUN
- *   ./E555_backtracker seed.txt completions.csv output.csv [options]
+ *   ./E555_backtracker seed.txt boards.csv output.csv [options]
  */
 
 #define _GNU_SOURCE
@@ -167,42 +105,14 @@
 #define CSV_BUF_BYTES 32768
 #define REC_BUF_BYTES 262144   /* verbose boards + top-N at end */
 #define SPLIT_DEPTH 4           /* max prefix decisions before search-parallel workers start */
-/*
- * Frontier tasks per worker.  Sized automatically from the thread count; there is
- * deliberately no CLI knob for it, because it was measured and it does not matter.
- *
- * MEASUREMENT (2026-07-21, 4 physical / 8 logical cores, 48-cell tail,
- * --break_mode lds --lds_max 0 --breaks 12, 3 reps):
- *   tasks/thread    16      64     128     512    2048
- *   wall @4 thr   5.88s   5.78s  5.76s   5.96s  11.19s
- *   wall @8 thr   4.92s   5.05s  4.99s   5.57s  23.95s
- * Overdecomposition buys nothing here, and large values are actively harmful
- * (the serial frontier build grows).  The reason is that load imbalance is not
- * the bottleneck: four INDEPENDENT single-threaded processes on this machine take
- * 23.7s each versus 14.4s for one alone, i.e. the hardware itself yields only
- * 2.44x aggregate throughput on 4 cores.  The threaded search already achieves
- * 2.37x, so essentially all available parallelism is being extracted and the
- * remaining gap is memory system contention, not scheduling.
- *
- * Do not "optimize" this without re-running that independent-process control:
- * on a machine with more memory bandwidth per core the picture may differ, but
- * on a laptop the scheduler is not what is limiting you.
- */
+/* Frontier tasks per worker in search-parallel mode.  No CLI knob: on a 4-core
+ * machine 16..512 ran alike (the search is bound by memory bandwidth, not by
+ * scheduling) and far larger values slowed the serial frontier build.
+ * Re-measure against independent single-thread processes before changing it. */
 #define SPLIT_TASKS_PER_THREAD 16
-/*
- * Max length of a config-id string, the read side included: parse_csv_line()
- * rejects a row whose id is this long or longer.
- *
- * It has to leave room for CHAINING, because every board this tool writes is
- * named "<input id>_<sol_id>" and the toolkit's whole CSV contract is that any
- * tool's output feeds any tool's input, its own included.  Each pass therefore
- * grows the id by about five characters, and at 64 a real Stage-B id of 47 --
- * RUN_2026-06-19_lowB_Mahalanobis3_r9c436_104_457, from data/board_example_462.csv
- * -- survived five passes of examples/09_backtracker_all_sides.sh and became
- * unreadable on the sixth, losing the board mid-chain.  256 leaves room for a
- * long id and forty passes.  The cost is one CsvRecord field, so it is linear in
- * the input row count and nothing else.
- */
+/* Max length of a config id, read side included.  Every written board is named
+ * "<input id>_<sol_id>", so ids grow by a few characters per pass when output is
+ * fed back in; 256 leaves room for a long id and dozens of passes. */
 #define CONFIG_ID_LEN 256
 
 /* -- Inline RNG (xoroshiro128++ + splitmix64) ---------------------------------- *
@@ -426,78 +336,45 @@ static int      g_max_mismatch     = 0;
 static double   g_time_limit_sec   = -1.0;
 #define TIME_LIMIT_DEFAULT 30.0
 
-/* Break placement policy.  The three modes answer different questions, and the
- * split between them is the whole design: one is a triage filter, two are
- * proof engines.
+/* Break placement policy: two heuristics and two proof engines.
  *
- *   stuck (default): GREEDY DESCENT, no backtracking - see greedy_dive().
- *     Takes an exact fit where one exists, spends a minimal break where none
- *     does, never reconsiders, and therefore always reaches 256 pieces in one
- *     pass over the empty cells.  Cost is O(cells) per dive, so --restarts
- *     runs many randomized dives and keeps the best.  This is a fast filter for
- *     ranking candidate partials, NOT a proof: it never establishes that a
- *     board cannot be completed with fewer breaks.
+ *   stuck (default): greedy dives, no backtracking (greedy_dive()).  An exact
+ *     fit where one exists, else a minimal break; every dive completes, and
+ *     --restarts keeps the best of many.  Fast triage; proves nothing.
+ *   ratchet: exact search between breaks, each break committed where that
+ *     search got stuck and never revisited (run_ratchet()).  Proves nothing.
+ *     The default, and only, break mode of 2sides/4sides.
+ *   any: breaks tried at every cell besides the exact fits; complete within
+ *     the budget but exponentially wide, so pair it with --time_limit.
+ *   lds: a cell with no exact fit tries every break class; a break where an
+ *     exact fit exists costs one discrepancy, at most D per path, with D
+ *     widening 0,1,2,... inside each level (capped by --lds_max).
  *
- *   any: breaks are tried at every cell (in addition to exact fits) - complete
- *     within the budget but exponentially wide, so it must be paired with
- *     --time_limit.
- *
- *   lds (E555): limited discrepancy on VOLUNTARY breaks.  At a cell with no
- *     exact fit, all break classes within the budget are tried.  Taking a break
- *     candidate where an exact fit also exists costs one discrepancy; a search
- *     pass with allowance D permits at most D such choices per path.  D iterates
- *     0,1,2,... inside each budget level's time window (capped by --lds_max),
- *     and each D+1 widens toward any-mode completeness.
- *
- *   ratchet: exact search between breaks, breaks never revisited - see
- *     run_ratchet().  The exact search runs from the board until it is
- *     exhausted or --ratchet_nodes is spent; its deepest board is committed,
- *     every candidate at the cell where it is stuck gets its own exact search,
- *     and the one whose --ratchet_rollouts dives complete with the fewest
- *     breaks is committed next, until the budget is spent.
- *     A heuristic like stuck, but it backtracks between breaks.  The default
- *     for 2sides/4sides with --breaks > 0, the only mode they accept there.
- *
- * any and lds keep the iterative-deepening ladder (k = input_breaks .. budget),
- * so an exhausted level is a theorem: no completion exists with <= k broken
- * edges.  Use them for overnight runs.  stuck and ratchet never enter that loop.
- *
- * Exact search (--breaks 0) is independent of all four: with a zero
- * budget collect_candidates() never gathers break placements, so the mode
- * cannot influence it. */
+ * any and lds deepen k = input_breaks .. budget, so an exhausted level proves
+ * that no completion has <= k broken edges.  With --breaks 0 the mode does not
+ * matter: collect_candidates() gathers no break placements. */
 typedef enum { BREAK_STUCK = 0, BREAK_ANY, BREAK_LDS, BREAK_RATCHET } BreakMode;
 static BreakMode g_break_mode = BREAK_STUCK;
 static bool      g_break_mode_given = false;  /* 2sides/4sides default to ratchet */
 static int       g_lds_max    = -1;   /* -1 = no cap beyond the break budget */
-/* ratchet: nodes per exact search between breaks (0 = until exhausted, the
- * default).  Each search runs on one thread and stops at exactly this many
- * nodes, so which board is committed does not depend on the thread count or
- * the load.  Uncapped, the first search does not end before --time_limit for
- * 2sides/4sides even on a 62-cell tail (side growth runs no cuts: 1.6 G nodes
- * in 9 min), nor on a wide open region in any order.  rowmajor, mrv, frontier
- * and spiral wrote the same boards uncapped as at 1M on the 62- and 114-cell
- * tails, in under 0.1 s a board.  Measured on eight open interiors (192 cells,
- * rowmajor, depth commit), the mean breaks to complete were 51 at 1M nodes, 45
- * at 10M (~5.5 s a board on one thread), 44.6 at 30M, 45 at 100M. */
+/* ratchet: node cap per exact search between breaks (0 = until exhausted).  A
+ * node count, not a time, so the committed boards do not depend on the thread
+ * count or the load.  The side sweeps run no cuts, so their first search
+ * rarely exhausts, even on a tail: cap them (1M).  On wide open regions any
+ * order needs a cap (10M did best on open interiors); on tails the other
+ * orders exhaust quickly. */
 #define RATCHET_NODES_DEFAULT 0ULL
 static unsigned long long g_ratchet_nodes = RATCHET_NODES_DEFAULT;
-/* ratchet: greedy dives from each candidate's continuation; the commit goes to
- * the candidate whose dives complete with the fewest breaks (0 = the deepest
- * continuation, the original rule).  See ratchet_rollout().  Mean breaks to
- * complete, rowmajor: 62-cell tails 44.8 / 34.4 / 33.1 at R = 0 / 30 / 100
- * (50,000 dives 33.5 in the time of R=30), 114-cell tails 44.0 / 34.5 / 34.0
- * (dives 38.5 in the time of R=100), 192-cell open interiors 45.1 / 36.0 at
- * R = 0 / 30 (dives 41.9 in more time).  30: R=100 gains about one break for
- * three times the time, and overruns the default --time_limit on open boards. */
+/* ratchet: greedy dives scoring each candidate's continuation; the fewest
+ * breaks to complete wins (ratchet_rollout(); 0 = the deepest continuation).
+ * Rollouts cut about ten breaks off the depth rule; 100 gained about one more
+ * than 30 for three times the time. */
 #define RATCHET_ROLLOUTS_DEFAULT 30
 static int g_ratchet_rollouts = RATCHET_ROLLOUTS_DEFAULT;
 
-/* Greedy-dive controls (stuck mode only). */
-/* Value ordering costs about 2.1x per dive, so the default restart count is
- * half what it was before --lcv existed: dives run at roughly 4k-9k/s on four
- * cores depending on region size, which is still about 5-10 s of work per
- * record.  Raise it freely; the cost is linear and the boards keep coming out
- * distinct. */
+/* Greedy-dive controls (stuck mode; lcv also in the ratchet's rollouts).  A few
+ * thousand dives a second per core; raise --restarts freely, the cost is
+ * linear and the boards keep coming out distinct. */
 static long long g_stuck_restarts = 50000;  /* independent randomized dives per record */
 static bool      g_lcv            = true;   /* value ordering in the dive; --no_lcv */
 static uint64_t  g_rng_master     = 0;      /* seeded from the clock + pid in main() */
@@ -512,14 +389,11 @@ static const char *break_mode_name(BreakMode m) {
     }
 }
 
-/* Hall is exact but relatively expensive.  The default runs it once, at the
- * record root, where it can prove a whole record infeasible or raise the first
- * budget level.  Below the root it is opt-in (adaptive: periodically and near the
- * leaves).  Measured on exact spiral tails of real boards, Hall below the root
- * rejected 0.03-0.1% of placements yet cost about a quarter of the run time, and
- * every node it cuts is one whose open cells cannot close with zero breaks --
- * which rules out partials that a later, break-tolerant stage could still turn
- * into a high-scoring board. */
+/* Hall is exact but costly.  The default runs it once, at the record root,
+ * where it can prove a record infeasible or raise the first budget level.
+ * Below the root it is opt-in (adaptive: periodically and near the leaves): on
+ * real tails it cut almost nothing there for a large share of the time, and
+ * what it cuts are partials a later break-tolerant stage could still use. */
 typedef enum { HALL_OFF = 0, HALL_ROOT, HALL_ADAPTIVE, HALL_ALWAYS } HallMode;
 static HallMode g_hall_mode = HALL_ROOT;
 static int      g_hall_stride = 8;       /* adaptive: every N placed tail cells */
@@ -537,9 +411,9 @@ static const char *hall_mode_name(HallMode m) {
     }
 }
 
-/* -- v6: traversal order ------------------------------------------------------ */
+/* -- Traversal order --------------------------------------------------------- */
 typedef enum {
-    ORD_ROWMAJOR = 0,  /* (r asc, c asc) - identical to v5 default */
+    ORD_ROWMAJOR = 0,  /* (r asc, c asc) */
     ORD_COLMAJOR,      /* (c asc, r asc) */
     ORD_SNAKE,         /* boustrophedon by row */
     ORD_SPIRAL,        /* outside-in (border rings first) */
@@ -567,46 +441,31 @@ static inline bool is_frame_cell(int r, int c) {
 }
 
 /* -- Stop band (--stop_row / --stop_column) ----------------------------------- *
- * The beamer stops at --stop_row R and emits every board that fills rows 0..R,
- * which the finalizer then resumes from with --finalize_from R.  These options
- * give the backtracker the same shape: restrict the search to a band of rows or
- * columns and emit every distinct way to fill it.
- *
- * The band is the CLOSED range 0..g_stop_n, matching the beamer (--stop_row 12
- * there means rows 0..12, thirteen rows).  --reverse anchors it at the far side
- * instead -- rows 15-N..15, columns 15-N..15 -- so with a stop option on,
- * --reverse both flips static traversal (its older meaning) and picks the side.
- *
- * Membership is decided in the ORIGINAL frame, the one the CSV is written in,
- * so "row 12" means row 12 as the user reads it.  Under --rotate the DFS works
- * in a rotated frame, so callers there must map back first (rotated_to_orig). */
+ * Search only rows (columns) 0..N and emit every distinct filling: the shape the
+ * finalizer resumes from with --finalize_from N (N counts as in the beamer).
+ * --reverse anchors the band at the far side (15-N..15) and also flips the
+ * static traversal.  Membership is decided in the CSV frame, so under --rotate
+ * a search-frame cell is mapped back first (cell_in_band_search). */
 static int  g_stop_n      = -1;      /* band size - 1; -1 = no stop option */
 static bool g_stop_isrow  = true;    /* true: --stop_row, false: --stop_column */
 static bool g_stop_active = false;
 static bool g_with_frame  = false;   /* --with_frame: the 60 frame cells join the band */
 static bool g_with_clue_regions = false;   /* --with_clue_regions: the five 2x2 clue blocks join it */
 
-/* --with_clue_regions widens the band by the five 2x2 clue blocks: the
- * centre (rows 7-8 x cols 7-8, the four cells the centre clue takes) and the
- * inner corners (rows 1-2 / 13-14 x cols 1-2 / 13-14, each holding its corner
- * clue cell on the inner diagonal).  Held block cells survive the cut, missing
- * ones are searched, and the band counts once they close -- so the blocks reach
- * E555_finalizer --freeze_clues.  The set maps onto itself under a quarter turn. */
+/* --with_clue_regions adds the five 2x2 clue blocks to the band: the centre
+ * (rows 7-8 x cols 7-8) and the inner corners (rows 1-2 / 13-14 x cols 1-2 /
+ * 13-14).  Held block cells survive the cut, missing ones are searched, and the
+ * band counts once they close, ready for E555_finalizer --freeze_clues.  The
+ * set maps onto itself under a quarter turn. */
 static inline bool cell_in_clue_region(int r, int c) {
     const bool rr = (r >= 1 && r <= 2) || (r >= 13 && r <= 14);
     const bool cc = (c >= 1 && c <= 2) || (c >= 13 && c <= 14);
     return (rr && cc) || ((r == 7 || r == 8) && (c == 7 || c == 8));
 }
 
-/* --with_frame widens the band to rows 0..N PLUS the whole outer frame, which is
- * what lets a fixed border survive a whirlpool lap.  Everything the band means
- * is expressed through this one predicate, so widening it here does three jobs
- * at once: cells outside the band are cleared, so the frame is no longer wiped;
- * empty cells inside it are searched, so the frame is COMPLETED rather than
- * merely retained; and band completeness now demands all 60 frame cells, so a
- * board only counts when its frame closes.  The frame pieces stay out of the
- * pool, which is right -- they are committed, and the band has that many fewer
- * pieces to place. */
+/* The band predicate.  --with_frame adds the 60 frame cells, which keeps a
+ * fixed border through a whirlpool lap: held frame cells survive the cut,
+ * missing ones are searched, and a band counts only once its frame closes. */
 static inline bool cell_in_band(int r, int c) {
     if (!g_stop_active) return true;
     if (g_with_frame && (r == 0 || r == PUZZLE_SIDE - 1 ||
@@ -616,11 +475,9 @@ static inline bool cell_in_band(int r, int c) {
     return g_reverse ? (v >= PUZZLE_SIDE - 1 - g_stop_n) : (v <= g_stop_n);
 }
 
-/* Band membership for a cell of the SEARCH board, which under --rotate K sits
- * in the rotated frame.  apply_rotation_k turns (r,c) into (c, SIDE-1-r) once
- * per quarter turn, so undoing K turns means applying that same step (4-K)&3
- * times -- the coordinate half of inverse_rotation_k, which cannot be reused
- * here because it moves whole boards, not single cells. */
+/* Band membership for a cell of the search board (rotated frame under
+ * --rotate K): apply apply_rotation_k's per-turn step (4-K)&3 times to get back
+ * to the CSV frame. */
 static inline bool cell_in_band_search(int r, int c) {
     if (!g_stop_active) return true;
     if (g_rotation > 0) {
@@ -816,7 +673,7 @@ typedef struct {
 
 static FILE *g_stream_csv = NULL;   /* mandatory output.csv: best line per record */
 static FILE *g_status_csv = NULL;   /* optional --status per-record diagnostics */
-static FILE *g_ckpt_csv   = NULL;   /* E555: append-only crash-recovery checkpoint;
+static FILE *g_ckpt_csv   = NULL;   /* append-only crash-recovery checkpoint;
                                      * last line per record = its best so far.
                                      * Removed on clean completion. */
 static FILE *g_band_csv   = NULL;   /* --stop_row/--stop_column: one line per band
@@ -894,8 +751,7 @@ typedef struct {
     uint8_t top, right, bottom, left;
 } Oriented;
 
-/* Immutable orientation cache.  v9 reconstructed these six bytes in every
- * break-candidate scan and placement; E555 builds the 1024 entries once. */
+/* Every piece in every orientation, built once (1024 entries). */
 static Oriented g_oriented[NUM_PIECES][4];
 /* Colours on any side of each piece: a frontier cell (FcState) whose placed neighbours
  * demand a colour the piece lacks cannot hold it in any orientation. */
@@ -996,11 +852,10 @@ typedef struct ResumeCursor {
     bool     out_after;
 } ResumeCursor;
 
-/* E555: read-only per-search context.  Bundles the invariants that v8 threaded
- * through tail_dfs()'s parameter list, one instance per (record, budget level,
- * lds allowance).  rstat and live point at shared per-record state (lock- and
- * atomic-protected respectively); everything else is immutable during the
- * search, so the struct is safe to share across search-parallel workers. */
+/* Read-only per-search context, one per (record, budget level, lds allowance,
+ * or ratchet search).  rstat and live point at shared per-record state (lock-
+ * and atomic-protected); the rest is immutable during the search, so workers
+ * share it. */
 typedef struct {
     const char  *config_id;
     long long    row;            /* 1-based input data row */
@@ -1195,26 +1050,15 @@ static void inverse_rotation_k(Board *dst, const Board *src, int k) {
 /* -- Seed loading ------------------------------------------------------------- */
 
 /* -- Eternity II clue pieces -------------------------------------------------- *
- * The five published hint pieces, copied verbatim from g_clue[4][CLUE_N] in
- * src/B_beam/E555_database.c, which is the single source of truth.  This tool is
- * standalone and does not link that translation unit, so the table is repeated
- * here the way the RNG primitives above are; rows are bottom-up and spins are
- * counter-clockwise, which is already this file's convention, so nothing is
- * converted.
+ * The five published hint pieces, a verbatim copy of g_clue[4][CLUE_N] in
+ * src/B_beam/E555_database.c (the source of truth; this tool links nothing).
+ * Rows bottom-up, spins counter-clockwise, as in this file.  Entry 0 is the
+ * centre clue, 1..4 the corner clues; --clue_corners means all four here, as in
+ * the CP-SAT tools (the beamer can only hold the two it reaches).
  *
- * Entry 0 is the centre clue, 1..4 the corner clues.  A bottom-up beam can only
- * ever reach entries 1..2, so the beamer's --clue_corners means those two and
- * merely reserves the pair on row 13.  This tool sees the whole board, so
- * --clue_corners here means all four -- the same choice E555_topper.py and
- * E555_ender.py make, and the reason Stage C is where those two are first
- * enforced rather than held.
- *
- * Orientation o is the hypothesis that our row 0 is the puzzle side reached by
- * rotating the published board o quarter-turns clockwise.  Our border is chosen
- * by our own search, so which physical side is "the bottom" is free: a solution
- * turned 90 degrees still satisfies every edge rule but moves the clues, so all
- * four orientations are legitimate and a board commits to one the moment it
- * carries a single clue.
+ * Orientation o: our row 0 is the puzzle side reached by turning the published
+ * board o quarter-turns clockwise.  All four are legitimate, since a turned
+ * solution still matches; a board commits to one once it carries a clue.
  */
 #define CLUE_N        5
 #define CLUE_ORIENTS  4
@@ -1478,9 +1322,8 @@ static bool parse_board_fields(char *const fields[], int n_fields, int first_pos
  *                         (515 fields; field 3 begins "bt", see "Resume
  *                          identifier"; *resume_out gets a copy of it)
  *
- * v9 guessed the layout from a single field-count special case and then allowed
- * arbitrary trailing fields.  A one-column shift silently corrupts every piece
- * position, so E555 accepts only these unambiguous schemas.
+ * Only these layouts are accepted: a one-column shift would silently corrupt
+ * every piece position.
  */
 static bool parse_csv_line(const char *line,
                            char config_id_out[CONFIG_ID_LEN], long long *sol_id,
@@ -1595,7 +1438,7 @@ static bool board_from_csv(Board *b,
 }
 
 /*
- * E555: reconstruct the SEARCH-INITIAL board of a record: CSV pos/rot, then
+ * reconstruct the SEARCH-INITIAL board of a record: CSV pos/rot, then
  * rotation (inside board_from_csv), then holes (in the rotated frame).  Used
  * by process_line and by the duplicate-detection pass in main, so the state
  * that is hashed for deduplication is exactly the state that gets searched.
@@ -2134,7 +1977,7 @@ static int piece_break_count(const Board *b, int row, int col, const Oriented *o
 }
 #endif  /* VERIFY_INDEX || VERIFY_BREAKCOUNT */
 
-/* -- E555: bitset forward-checking engine ---------------------------------------- */
+/* -- bitset forward-checking engine ---------------------------------------- */
 /*
  * Orientation bitsets: bit index = pid*4 + spin over all 1024 (piece,rotation)
  * placements.  Two static tables are built once after the seed loads:
@@ -2147,9 +1990,9 @@ static int piece_break_count(const Board *b, int row, int col, const Oriented *o
  * mask with the fit masks demanded by its already-placed neighbours (nbmask),
  * plus a mask of the orientations of still-unused pieces (unused4).  The exact-
  * fit domain of a cell is nbmask & unused4: candidate enumeration, MRV counts,
- * and empty-domain cutoffs all become a few dozen word operations instead of a
- * 256-piece x 4-spin rescan.  Break (mismatch) placements are NOT in the index;
- * they are enumerated by the classic scan only when a mode actually wants them.
+ * and empty-domain cutoffs all become a few dozen word operations.  Break
+ * placements are classified from the same masks (break_class_masks) only when
+ * a mode wants them.
  */
 
 #define OMASK_WORDS ((NUM_PIECES * 4 + 63) / 64)
@@ -2229,49 +2072,30 @@ static void build_fit_index(void) {
 
 }
 
-/* Per-search forward-checking state.  In addition to exact-fit masks, E555
- * maintains the remaining colour demand incrementally.  v9 recomputed that
- * demand by scanning all 256 cells after almost every accepted placement; on
- * the supplied run that happened roughly one billion times per hard record. */
+/* Per-search forward-checking state: the exact-fit masks of the empty cells,
+ * plus the remaining colour and type demand, all kept incrementally. */
 typedef struct {
     OMask nbmask[PUZZLE_SIDE][PUZZLE_SIDE];
     OMask unused4;
     uint16_t dom_count[PUZZLE_SIDE][PUZZLE_SIDE];
-    /*
-     * How many frame-legal orientations of still-unused pieces exist in each
-     * cell class, i.e. popcount(g_cellbase_cls[k] & unused4).  It depends on the
-     * pool alone, never on a neighbour, so nine counters cover all 256 cells and
-     * they move only where unused4 moves.  With it, "how many placements here
-     * break at least one edge" is base_avail[class] - dom_count[r][c], which is
-     * what makes the MRV break count O(1) instead of a full candidate scan.
-     */
+    /* Frame-legal orientations of unused pieces per cell class,
+     * popcount(g_cellbase_cls[k] & unused4): nine counters that move only with
+     * the pool.  "Placements here breaking at least one edge" is then
+     * base_avail[class] - dom_count[r][c], an O(1) MRV break count. */
     int32_t base_avail[CELL_CLASSES];
-    /*
-     * The still-empty cells as row*16+col, with each cell's index into that list
-     * so a removal is a swap with the last entry.  fc_adjust_piece_support() runs
-     * over it on every place and unplace; sweeping all 256 cells and skipping the
-     * filled ones instead cost 28% of the dive engine's instructions on a 67-cell
-     * region, and more as a DFS goes deeper and the region shrinks.  The order is
-     * not meaningful -- every reader only accumulates over the list -- which is
-     * what makes the swap legal.
-     */
+    /* The empty cells as row*16+col, with each cell's index into the list, so
+     * a removal is a swap with the last entry (readers only accumulate over it,
+     * so the order does not matter).  Place and unplace touch only these. */
     uint8_t empty_list[NUM_PIECES];
     uint8_t empty_pos[NUM_PIECES];
     int16_t n_empty;
-    /*
-     * The frontier: empty cells with at least one placed neighbour, kept the
-     * same way.  An empty cell with none has the domain "every unused piece of
-     * its type", whose size is base_avail[class] and is never zero (type counts
-     * balance), so only frontier cells need dom_count moved on every place and
-     * unplace; fc_exact_count() answers for the rest.  On a spiral tail half the
-     * empty cells or more are off the frontier, and that loop was two thirds of
-     * the exact search's instructions.  need_cols[cell] is the set of colours the
-     * placed neighbours demand, and col_bits[x] the frontier cells demanding x:
-     * a piece can only sit in a cell that demands one of its own (at most four)
-     * colours, so fc_adjust_piece_support() walks the union of four sets rather
-     * than the frontier, then drops cells demanding a colour the piece lacks.
-     * fc_compute_cell() keeps all of it current.
-     */
+    /* The frontier: empty cells with a placed neighbour.  Any other empty cell
+     * can take every unused piece of its type (base_avail, never zero), so only
+     * frontier domains move on place/unplace; fc_exact_count() answers for the
+     * rest.  need_cols[cell] is the colours its placed neighbours demand and
+     * col_bits[x] the frontier cells demanding x, so fc_adjust_piece_support()
+     * walks only the cells demanding one of the piece's four colours.
+     * fc_compute_cell() keeps it all current. */
     uint64_t fr_bits[CELL_WORDS];                 /* the frontier, one bit per cell */
     uint64_t col_bits[NUM_COLORS][CELL_WORDS];    /* frontier cells demanding colour x */
     uint32_t need_cols[NUM_PIECES];
@@ -2672,7 +2496,7 @@ static inline bool fc_dom_nonzero(const FcState *fc, int r, int c) {
 }
 
 
-/* -- E555: Hall / deficiency prune ----------------------------------------------- */
+/* -- Hall / deficiency prune ----------------------------------------------- */
 /*
  * Bipartite lower bound on the broken edges any completion must still add.
  *
@@ -2917,7 +2741,7 @@ static void board_border_counts(const Board *b,
  * Validate a partial board.  `max_breaks` internal adjacency mismatches are
  * tolerated (for mismatch mode and for re-reading this program's own break-
  * carrying best-partial output); the gray-0 frame rule and the placed-count are
- * always strict.  When max_breaks==0 this is exactly the v5 check.
+ * always strict.
  */
 static bool validate_partial_board_ex(const Board *b, int n_placed, int max_breaks,
                                       char *why, size_t why_sz) {
@@ -2958,7 +2782,7 @@ static bool validate_partial_board_ex(const Board *b, int n_placed, int max_brea
 }
 
 /*
- * v6 lenient full-board check for mismatch mode: every cell must be filled and
+ * Lenient full-board check for mismatch mode: every cell must be filled and
  * obey the gray-0 frame rule, but up to `max_breaks` broken internal edges are
  * tolerated.  The actual broken-edge count is returned via *out_breaks.  Fails
  * only on a structural defect (empty cell, frame violation) or if breaks exceed
@@ -2997,7 +2821,7 @@ static bool validate_complete_board_lenient(const Board *b, int max_breaks,
 /* -- Search sequence ---------------------------------------------------------- */
 
 /*
- * E555: spiralout -- inside-out rectilinear ring path.  Unlike centerout (sorted
+ * spiralout -- inside-out rectilinear ring path.  Unlike centerout (sorted
  * by distance, ragged frontier) this walks contiguous rings with fixed
  * chirality, so every new cell touches the previous ring and the previous cell
  * (typically 2 fixed sides).  Ring k (k=7 innermost 2x2 .. 0 border) is walked
@@ -3035,8 +2859,7 @@ static void build_spiralout_table(void) {
  * For ORD_MRV the static key is irrelevant (cells are chosen dynamically); we
  * fall back to row-major so the initial array is deterministic.
  *
- * Note rows are indexed with r=0 at the bottom; "rowmajor" therefore fills
- * bottom-to-top, matching v5.
+ * Rows are indexed with r=0 at the bottom, so "rowmajor" fills bottom-to-top.
  */
 static long order_key(OrderMode m, int r, int c) {
     const int S = PUZZLE_SIDE, N = PUZZLE_SIDE - 1;
@@ -3305,11 +3128,11 @@ static int edge_supply_deficit(const Board *b) {
 }
 
 /*
- * v6: `budget` is the number of broken internal edges still allowed in the
+ * `budget` is the number of broken internal edges still allowed in the
  * remaining subproblem.  The colour accounting adapts to it soundly:
  *
  *   budget == 0  -> every remaining edge must match exactly: a colour needs a
- *                  non-negative, EVEN surplus (the classic v5 prune).
+ *                  non-negative, EVEN surplus.
  *   budget  > 0  -> up to `budget` edges may break.  Breaking one edge frees
  *                  exactly one unmet colour demand, so completing the board
  *                  requires AT LEAST (sum of positive colour deficits) broken
@@ -3726,7 +3549,7 @@ static void resume_emit(const char *config_id_str, bool keep_id,
 }
 
 /*
- * E555: write one completed stop band.
+ * write one completed stop band.
  *
  * Same canonical 514-field layout as output.csv, so the finalizer and every
  * other reader take it unchanged; pieces outside the band are simply unplaced,
@@ -3734,14 +3557,10 @@ static void resume_emit(const char *config_id_str, bool keep_id,
  * matched-edge count of the band alone -- board_edge_counts skips empty cells,
  * so adjacencies leaving the band are not counted either way.
  *
- * Two failure modes, treated differently on purpose.  A structural defect (an
- * unfilled band cell, a frame-zero violation) is an internal error and aborts,
- * exactly as write_solution does for a full board.  A BROKEN EDGE only drops
- * the board: --break_mode stuck takes a minimal break wherever no exact fit
- * exists, so it produces such bands legitimately, and they are useless
- * downstream because the finalizer validates every color match inside its
- * locked region.  Rejections are counted so a run that emits nothing is
- * diagnosable from the summary rather than mysterious.
+ * A structural defect (an unfilled band cell, a frame-zero violation) is an
+ * internal error and aborts, as in write_solution.  A broken edge only drops
+ * the band, counted for the summary: the finalizer would reject it (bands
+ * require --breaks 0, so this is a guard).
  */
 static void write_band_partial(const Board *b,
                                const char *config_id_str, long long row) {
@@ -3786,7 +3605,7 @@ static void write_band_partial(const Board *b,
       g_band_emitted++; }
 }
 
-/* -- E555: crash-recovery checkpoint + progress heartbeat ------------------------ */
+/* -- crash-recovery checkpoint + progress heartbeat ------------------------ */
 
 /*
  * Append one re-feedable line (same canonical 514-field layout as output.csv)
@@ -4015,9 +3834,7 @@ static void try_update_best(const Board *cur_board,
     bool track_cand = (g_best_output > 0 && track && n_total >= floor_snapshot);
     if (!rstat_cand && !track_cand) return;
 
-    /* Exact search now reaches this function with all metrics already known in
-     * O(1).  v9 rescanned all 256 cells whenever a dead child tied the current
-     * depth; that was billions of full-board scans in the supplied run. */
+    /* The callers pass every metric; only the break-touched pieces need a scan. */
     int break_pieces = 0;
     if (breaks > 0) board_break_stats(cur_board, NULL, &break_pieces);
 
@@ -4089,7 +3906,7 @@ static void try_update_best(const Board *cur_board,
     if (do_ckpt) write_checkpoint_line(&ckpt_copy, config_id_str);
 }
 
-/* -- v8: mismatch-solution collector ------------------------------------------ */
+/* -- Mismatch-solution collector --------------------------------------------- */
 
 typedef struct {
     Board board;     /* rotated frame */
@@ -4180,16 +3997,9 @@ static void mres_merge(MismatchResult *dst, const MismatchResult *src) {
                              src->items[i].breaks, src->items[i].pieces);
 }
 
-/*
- * Candidate-aware MRV support.
- *
- * v6's MRV used only a cheap proxy: number of already-fixed sides.  That was
- * better than row-major, but it still selected cells with hundreds of legal
- * rotations in mismatch-any mode.  v8 keeps v7 candidate-aware MRV: it counts the actual candidate placements
- * that fit the current board and remaining break budget, then chooses the cell
- * with the fewest viable continuations.  This is the main reason --break_mode
- * any becomes usable for small mismatch budgets.
- */
+/* Candidate-aware MRV: count the placements that fit the board and the break
+ * budget left, and choose the cell with the fewest.  This is what makes
+ * --break_mode any usable for small budgets. */
 #define MAX_CANDIDATES (NUM_PIECES * 4)
 
 static int fixed_side_score(const Board *b, int r, int c) {
@@ -4305,13 +4115,10 @@ static inline void break_class_masks(const OMask *base, const OMask *const fit[4
  *
  * A candidate can break at most one edge per placed neighbour, so when the
  * budget reaches that many, "breaks between 1 and budget" is simply every
- * frame-legal unused orientation that is not an exact fit -- two counters the
- * forward-checking state already maintains, and no scan at all.  That is the
- * common case: greedy dives always qualify (DIVE_BREAK_CAP is 4, and a cell has
- * at most four neighbours), and so does any DFS node with four of its budget
- * left.  It matters because pick_next_cell() calls this for EVERY remaining cell
- * at EVERY node: at 79% of all instructions, the scan it replaces was the single
- * largest cost in the exhaustive engine.
+ * frame-legal unused orientation that is not an exact fit: two counters the
+ * forward-checking state keeps, no scan.  Greedy dives always qualify, and so
+ * does any DFS node with four breaks left.  This matters because
+ * pick_next_cell() calls it for every remaining cell at every node.
  *
  * A tighter budget still has to distinguish the break classes, and does it with
  * break_class_masks() rather than per-candidate tests.
@@ -4351,9 +4158,8 @@ static int count_break_candidates_scan(const Board *b, const FcState *fc,
 }
 
 /* Exact MRV in strict mode.  In BREAK_ANY mode the break candidates are part
- * of the branching factor and must be counted too; v9 ignored them whenever
- * one exact fit existed, which could select a nominally 1-way cell having
- * hundreds of actual children.  In BREAK_LDS mode a cell with no exact fit
+ * of the branching factor and are counted too, or a cell with one exact fit
+ * and hundreds of break children would look 1-way.  In BREAK_LDS mode a cell with no exact fit
  * counts 0 while breaks are left: its forced break is placed at once, where it
  * is stuck, rather than after every cell with fewer break candidates (often
  * never, the search ending first; a dead cell never regains a fit).  So in
@@ -4370,7 +4176,7 @@ static int mrv_cell_count(const Board *b, const FcState *fc, int r, int c, int b
 
 /*
  * Enumerate candidate placements at (row,col), best-first: exact fits from the
- * FC index (breaks==0, ascending pid/spin - identical to v8's sorted order),
+ * FC index (breaks==0, ascending pid/spin),
  * then, when a mode wants them, break placements from the classic scan sorted
  * by (breaks,pid,spin).  Break candidates are gathered when the budget allows
  * AND (the cell has no exact fit, or want_breaks_if_exact - i.e. any-mode, or
@@ -4709,80 +4515,43 @@ static inline bool hall_should_run(const FcState *fc, const Cell *cells,
     }
 }
 
-/* -- Greedy dive (stuck mode) -------------------------------------------------- *
+/* -- Greedy dive (stuck mode, and the ratchet's rollouts) ---------------------- *
  *
- * One descent, no backtracking, no recursion: pick a cell, place a piece, never
- * reconsider.  It is deliberately kept out of tail_dfs() - it shares no control
- * flow with the exhaustive search, and keeping the two apart means a change here
- * can never perturb the proof engines.
+ * One descent, no backtracking: pick a cell, place a piece, never reconsider.
+ * Kept apart from tail_dfs() so a change here cannot perturb the proof engines.
  *
- * WHY IT ALWAYS COMPLETES.  cellbase(r,c) restricts a cell to pieces of its
- * required frame type, and the type counts are exactly balanced (4 corners, 56
- * edges, 196 inner).  Every placement consumes one piece of the cell's own type,
- * so the number of unused pieces of type T always equals the number of unfilled
- * cells needing T.  The candidate set at the chosen cell is therefore never
- * empty - at worst every option breaks edges.  A dive is O(cells) and cannot
- * fail, which is what makes restarts affordable in bulk.
+ * It always completes: each cell takes pieces of its own frame type, and the
+ * type counts balance (4 corners, 56 edges, 196 inner), so the chosen cell
+ * always has a candidate -- at worst one that breaks edges.  No completion cut
+ * runs: every branch completes by construction.
  *
- * NONE of the completion prunes (zero-domain bound, colour/parity accounting,
- * Hall deficiency) are called.  They exist to prove a branch cannot complete,
- * and here every branch completes by construction; running them would be pure
- * overhead and could only reject a board we intend to keep.
- *
- * Cell choice defers breaking as long as possible: prefer cells that still have
- * an exact fit, most-constrained first.  Only when EVERY remaining cell is stuck
- * do we break, at the cell with the fewest break candidates - the narrowest
- * commitment available.  This ordering matters more than anything else here; a
- * static order lands on stuck cells roughly three times as often.
- *
- * Divergence between dives comes entirely from random tie-breaking - in the cell
- * choice, and in the piece choice among whatever lcv_pick() below ranks equal.
- * That is measurably enough on its own: a 200,000-dive batch produced 200,000
- * distinct boards, and 2,000,000 produced 2,000,000.  An earlier version also injected voluntary breaks at cells that
- * had an exact fit, on the theory that ties alone might be too rare;
- * measurement showed diversity was already total and the extra breaks only made
- * the boards worse, so it was removed.
- *
- * Diversity being total is also why MORE dives buy so little: the batch is
- * sampling the left tail of a fixed distribution, and best-of-N over a fixed
- * distribution is logarithmic.  Measured on one tail, best breaks went 26 -> 24
- * -> 23 -> 22 for 2k -> 20k -> 200k -> 2M dives while the MEDIAN sat at 35
- * throughout.  Moving the median needs a better policy, not more samples, which
- * is what lcv_pick() below is for.
+ * Cell choice defers breaking: the most constrained cell that still has an
+ * exact fit; only when every cell is stuck, the stuck cell with the fewest
+ * break candidates.  Dives differ only by random tie-breaking, which is enough:
+ * practically every dive gives a distinct board.  More dives therefore sample
+ * the tail of one distribution, and best-of-N improves only logarithmically;
+ * moving the median takes a better policy (lcv_pick()), not more samples.
  */
 #define DIVE_BREAK_CAP 4   /* a cell has at most 4 neighbours, so no placement can
                             * break more than 4 edges: this is "unlimited" here */
 
-/* Candidates scored at one cell.  4, 8 and 16 measured identical on the boards
- * tested, so this is set at the cheap end of the plateau. */
+/* Candidates scored at one cell (4, 8 and 16 did the same; the cheap end). */
 #define LCV_CAP 8
 
 /*
  * Least-constraining-value ordering: which piece, once the cell is chosen.
- *
- * Without it the dive picks uniformly inside the best class, so two placements
- * that both fit right now are interchangeable even when one strands a neighbour
- * and the other does not.  Cell choice has MRV; value choice had nothing.
- *
- * The score is not estimated.  dfs_place()/dfs_unplace() are the same cheap
- * primitives the DFS uses (fc_verify_state compiles out, fc_refresh_neighbors
- * touches four cells), so each candidate is played, the forward-checking state
- * is read back, and the move is undone.  Ranking is lexicographic, which keeps
- * it free of weights to tune:
+ * Each candidate (up to LCV_CAP, sampled when more) is played with
+ * dfs_place(), the forward-checking state read back, and the move undone.
+ * Ranking is lexicographic, with no weights to tune:
  *
  *   1. fewest broken edges          - constant inside a class, first for safety
  *   2. fewest zero-domain cells     - did this move strand a cell
  *   3. largest neighbour domain sum - how much room did it leave
  *
- * Ties break uniformly, by the same reservoir as the cell choice, so diversity
- * across restarts survives.  Measured: about 2.1x the cost per dive, and it
- * wins anyway on half the samples -- on seven clue-bearing row-11 beam boards
- * (three independent beam roots) it gained 1-2 connected edges per board at
- * equal wall time, never losing a board, and moved a batch median from 45 to 40.
- *
- * Two variants measured WORSE and are deliberately absent: sampling the rank
- * with a Boltzmann temperature instead of taking the best (never beat T=0), and
- * widening the accepted break class to min+1 (loses to plain dives outright).
+ * Ties break uniformly, so dives stay diverse.  It costs about twice a plain
+ * dive and still wins at equal time (1-2 matched edges per board).  Two
+ * variants did worse and are absent: a Boltzmann draw over the rank, and
+ * accepting the next break class too.
  */
 static int lcv_pick(Board *b, FcState *fc, int row, int col,
                     const Candidate *cand, int lo, int hi, RNG *rng) {
@@ -4952,11 +4721,8 @@ static void run_greedy_restarts(const Board *base, const Cell *seq, int n_seq,
     int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
     if ((long long)nt > n_want) nt = (int)n_want;
 
-    /* Every restart starts from the same board, so its forward-checking state is
-     * the same too.  Build it once and copy: fc_init() clears ~35 kB and then
-     * recomputes a domain mask per empty cell, which was about 3.7% of the dive
-     * engine spent rediscovering a constant.  FcState holds no pointers into the
-     * board, so the copy is exact. */
+    /* Every restart starts from the same board, so build the forward-checking
+     * state once and copy it (FcState holds no pointers into the board). */
     FcState fc_proto;
     fc_init(&fc_proto, base);
 
@@ -5289,8 +5055,7 @@ static void tail_dfs(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
         bool viable = true;
 
         /* In classic mode a saved partial must itself survive every sound
-         * completion prune.  v9 saved the child before these tests, so the
-         * output could contain a placement already proved impossible. */
+         * completion prune, so no written board is one already proved dead. */
         if (!soft_completion) {
             if (fc->zero_domains > cx->k_budget - new_breaks) {
                 st->fc_rejects[depth]++;
@@ -5360,7 +5125,7 @@ typedef struct {
     int   breaks;
     int   connected;
     int   added;
-    int   disc;    /* E555: lds discrepancies spent along the prefix */
+    int   disc;    /* lds discrepancies spent along the prefix */
 } AfoWorkItem;
 
 typedef struct {
@@ -5512,9 +5277,8 @@ static void side_build_frontier(Board *b, FcState *fc, Cell *seq, int n_seq,
  * for MRV selection, mismatch policy, feasibility accounting, and skip-on-zero-
  * candidate behavior.  A frontier item stores rem[] and pos so workers resume
  * exactly the same subtree; skipped cells are not reconstructed from the Board.
- * emit_pos is the depth at which subtrees are handed to the frontier (E555: a
- * parameter instead of the fixed SPLIT_DEPTH, so the adaptive refinement
- * loop can expand an existing item exactly one more level).
+ * emit_pos is the depth at which subtrees are handed to the frontier, so the
+ * adaptive refinement loop can expand an existing item exactly one more level.
  */
 static void afo_build_frontier(Board *b, FcState *fc, Cell *rem, int n_rem, int pos,
                                int base_depth, int breaks_so_far, int connected_so_far,
@@ -5720,7 +5484,7 @@ static void run_search_at_k_search_parallel(Board *base, const SearchCtx *cx,
     AfoFrontier fr;
     afo_frontier_init(&fr, (int)target_ll);
 
-    /* Initial expansion to SPLIT_DEPTH (the v8 behaviour). */
+    /* Initial expansion to SPLIT_DEPTH. */
     uint64_t prefix_solutions = 0;
     {
         Board prefix = *base;
@@ -5739,7 +5503,7 @@ static void run_search_at_k_search_parallel(Board *base, const SearchCtx *cx,
         }
     }
 
-    /* v9 adaptive refinement: with low branching near the root a fixed split
+    /* Adaptive refinement: with low branching near the root a fixed split
      * depth yields far fewer tasks than threads and starves large machines.
      * While below the task target, consume the SHALLOWEST frontier item and
      * expand it exactly one more level.  Each subtree is expanded at most once
@@ -5893,39 +5657,23 @@ static void run_search_at_k(Board *base, const SearchCtx *cx,
 
 /* -- Ratchet (--break_mode ratchet) ------------------------------------------- *
  *
- * Exact search between breaks, each break committed where the exact search got
- * stuck and never revisited:
- *
- *   1. From the base board, the exact search of --order, on one thread, until
- *      it is exhausted or --ratchet_nodes nodes are spent.  Its deepest board
- *      (pieces, then connected edges, as the record's running best) is the
- *      new base.
- *   2. The base's stuck cell: the cell --order fills next.  mrv and frontier
- *      take a cell with no exact fit first (pick_next_cell), a static order
- *      its next cell, 2sides/4sides the first cell with no exact fit in the
- *      outermost layer still open (else that layer's first open cell; under
- *      --frame_last the frame's layers wait for every inner cell).
- *   3. Every candidate at that cell -- exact fits, then one broken edge, two,
- *      ... up to the budget left -- that passes tail_dfs's completion cuts gets
- *      its own exact search as in 1.
- *   4. The deepest of those boards is the next base (ties: the earlier
- *      candidate, so the cheaper break).  With --ratchet_rollouts R, greedy
- *      dives from each first score it, and the fewest breaks to complete wins,
- *      then the deepest (ratchet_rollout()).  Repeat from 2 until the board is
- *      complete, the budget is spent, no candidate passes, or --time_limit.
- *
- * Every search is serial and stops at a node count, not a time, and the commit
- * prefers the earlier candidate, so --threads 1 and 20 commit the same boards
- * unless --time_limit ends the run, which is all it does here; when the record
- * has the machine to itself (g_search_parallel) the threads share out a step's
- * candidates.
- *
- * Breaks are counted in edges: one forced piece may break two or more, and a
- * candidate that would pass --breaks is not tried.  The searches keep the full
- * remaining budget in their cuts (empty domains, colour count, Hall,
- * --edge_supply) and place exact fits only, so no committed base is one that
- * provably cannot be completed within --breaks.  It proves nothing: a
- * committed break is never reconsidered.
+ * Exact search between breaks, each break committed where it got stuck:
+ *   1. The exact search of --order from the base, on one thread, until
+ *      exhausted or --ratchet_nodes; its deepest board is the new base.
+ *   2. The stuck cell: the cell --order fills next (mrv/frontier: a cell with
+ *      no exact fit first; 2sides/4sides: the first dead cell of the outermost
+ *      open layer, the frame last under --frame_last).
+ *   3. Every candidate there, cheapest break first, that passes tail_dfs's
+ *      completion cuts gets its own exact search as in 1.
+ *   4. The winner is the next base: with --ratchet_rollouts, the fewest breaks
+ *      its dives completed with, then the deepest; else the deepest.  Ties go
+ *      to the earlier (cheaper) candidate.  Repeat until complete, out of
+ *      breaks, no candidate passes, or --time_limit.
+ * Breaks count in edges.  The searches place exact fits only but cut with the
+ * whole remaining budget, so no committed base is provably beyond --breaks.
+ * Node caps, board-seeded dives and the candidate-order commit make the output
+ * independent of the thread count; --time_limit only ends the run.  A record
+ * with the machine to itself shares a step's candidates out among the threads.
  */
 
 typedef struct {
@@ -6748,7 +6496,7 @@ static void process_line(const char *config_id_str, long long field2, long long 
     rstat.ckpt_next  = omp_get_wtime() + CKPT_MIN_INTERVAL_SEC;
     rstat.ckpt_dirty = false;
 
-    /* E555: Hall/deficiency lower bound at the record root.  root_deficiency
+    /* Hall/deficiency lower bound at the record root.  root_deficiency
      * additional broken edges are provably forced (see hall_prune), so budget
      * levels below input_breaks + root_deficiency cannot complete: start the
      * iterative deepening there instead of proving each hopeless level empty.
@@ -6780,9 +6528,8 @@ static void process_line(const char *config_id_str, long long field2, long long 
         { fputs(rec_buf, stdout); fflush(stdout); rec_off = 0; rec_buf[0] = '\0'; }
     }
 
-    /* In classic mode these are proofs about every completion.  Do not spend a
-     * DFS level manufacturing a dead "best partial" as v9 did; stream the input
-     * board unchanged and report the proof. */
+    /* In classic mode these are proofs about every completion: no DFS, the
+     * input board is written unchanged with the proof. */
     if (!soft_completion && (!initial_feasible || hall_impossible)) {
         if (hall_impossible) {
             #pragma omp atomic
@@ -7160,7 +6907,7 @@ typedef struct {
     char     *resume_id;     /* --resume: the row's identifier, else NULL */
 } CsvRecord;
 
-/* -- E555: post-holes duplicate detection ---------------------------------------- */
+/* -- post-holes duplicate detection ---------------------------------------- */
 /*
  * Many Stage-B partials share a common base and differ only in cells that an
  * aggressive --holes file removes; after the holes they are the SAME initial
@@ -7403,8 +7150,9 @@ static void usage(const char *prog) {
         "                           level proves no completion exists at that break count.\n"
         "                         ratchet: the exact search until stuck, then every\n"
         "                           candidate at the stuck cell (cheapest break first)\n"
-        "                           gets its own exact search; the deepest is kept and\n"
-        "                           the next break goes where it is stuck.  Breaks are\n"
+        "                           gets its own exact search, scored by dives (see\n"
+        "                           --ratchet_rollouts); the best is kept and the next\n"
+        "                           break goes where it is stuck.  Breaks are\n"
         "                           never revisited; proves nothing.  The default (and\n"
         "                           only mode) for 2sides/4sides with --breaks > 0.\n"
         "  --ratchet_nodes N      Cap each exact search of the ratchet at N nodes\n"
@@ -7420,14 +7168,11 @@ static void usage(const char *prog) {
         "                         the deepest).  A dive completion within --breaks is\n"
         "                         a finished board.  Seeded from the board: every run\n"
         "                         commits the same.\n"
-        "  --restarts N           Independent randomized dives per record (default 50000,\n"
-        "                         roughly 5-10 s on four cores).\n"
-        "                         Dives are sub-millisecond; N in the millions is fine.\n"
-        "  --no_lcv               Turn off value ordering in the dives.  On by default:\n"
-        "                         it costs about 2.1x per dive and still wins on half\n"
-        "                         the samples (1-2 connected edges per board, measured).\n"
-        "                         More restarts cannot substitute -- they only extend the\n"
-        "                         tail of a fixed distribution, they do not move it.\n"
+        "  --restarts N           Independent randomized dives per record (default\n"
+        "                         50000).  Dives are sub-millisecond; millions are fine.\n"
+        "  --no_lcv               Turn off value ordering in the dives (also the ratchet's\n"
+        "                         rollouts).  On by default: about twice the cost per\n"
+        "                         dive, and still better at equal time.\n"
         "  --lds_max N            With --break_mode lds, cap voluntary mismatch\n"
         "                         placements per root-to-leaf path.  Forced repairs\n"
         "                         at cells with no exact fit do not consume this count.\n"
@@ -7938,12 +7683,10 @@ int main(int argc, char **argv) {
         fatal("--break_mode ratchet breaks where the exact search is stuck; --jump would "
               "skip that cell instead");
 
-    /* mrv is the default order (see g_order_mode).  It is the right default
-     * across the board: once breaks are allowed a static order lands on cells
-     * with no exact fit ~3x as often as MRV, each costing a full unused-pool
-     * scan (measured on a 48-cell tail: 232 M piece tests under spiralout vs
-     * 1.6 M under mrv, for a worse board).  A user-supplied --order is used
-     * as given. */
+    /* mrv is the default order: in the breaking DFS engines a static order
+     * lands on cells with no exact fit far more often, each a full candidate
+     * scan.  (The ratchet does best with rowmajor; a given --order is used as
+     * given.) */
 
     const bool greedy_run = (g_break_mode == BREAK_STUCK && g_max_mismatch > 0);
     if (greedy_run) {
@@ -8298,10 +8041,9 @@ int main(int argc, char **argv) {
     int proc_count = (want < avail) ? (int)want : avail;
     int proc_end = proc_start + proc_count;        /* exclusive */
 
-    /* Resolve automatic parallelism only after the selected input window is
-     * known.  For a small batch, parallelizing one DFS avoids the v9 failure
-     * mode where early-dead records release workers while the remaining hard
-     * records continue serially. */
+    /* Resolve automatic parallelism once the input window is known: a small
+     * batch searches each record with every thread, so a few hard records do
+     * not run on one thread each while the others idle. */
     ParallelMode requested_parallel = g_parallel_mode;
     if (g_resume)                       /* one cursor follows one serial DFS */
         g_parallel_mode = PAR_RECORDS;
@@ -8332,7 +8074,7 @@ int main(int argc, char **argv) {
                g_resume_score, n_skip, proc_count);
     }
 
-    /* -- E555: mark records whose post-holes initial board repeats an earlier
+    /* -- mark records whose post-holes initial board repeats an earlier
      *    row (processed here or skipped below --start_row); they would exactly
      *    repeat that row's search.  Under --resume only the fresh rows take
      *    part: a row with an identifier is its own search state. -- */
