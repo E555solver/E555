@@ -468,13 +468,15 @@ typedef enum { BREAK_STUCK = 0, BREAK_ANY, BREAK_LDS, BREAK_RATCHET } BreakMode;
 static BreakMode g_break_mode = BREAK_STUCK;
 static bool      g_break_mode_given = false;  /* 2sides/4sides default to ratchet */
 static int       g_lds_max    = -1;   /* -1 = no cap beyond the break budget */
-/* ratchet: nodes per exact search between breaks (0 = until exhausted).  Each
- * search runs on one thread and stops at exactly this many nodes, so which
- * board is committed does not depend on the thread count or the load.
- * Measured on eight open interiors (192 cells, rowmajor): mean breaks to
- * complete 51 at 1M nodes, 45 at 10M (~5.5 s a board on one thread), 44.6 at
- * 30M, 45 at 100M.  On four 114-cell tails 100k and 1M gave the same boards. */
-#define RATCHET_NODES_DEFAULT 10000000ULL
+/* ratchet: nodes per exact search between breaks (0 = until exhausted, the
+ * default).  Each search runs on one thread and stops at exactly this many
+ * nodes, so which board is committed does not depend on the thread count or
+ * the load.  Uncapped, the first search on a wide open region may not end
+ * before --time_limit; measured on eight open interiors (192 cells, rowmajor),
+ * the mean breaks to complete were 51 at 1M nodes, 45 at 10M (~5.5 s a board on
+ * one thread), 44.6 at 30M, 45 at 100M.  On four 114-cell tails 100k and 1M
+ * gave the same boards. */
+#define RATCHET_NODES_DEFAULT 0ULL
 static unsigned long long g_ratchet_nodes = RATCHET_NODES_DEFAULT;
 
 /* Greedy-dive controls (stuck mode only). */
@@ -7309,15 +7311,13 @@ static void usage(const char *prog) {
         "                           gets its own exact search; the deepest is kept and\n"
         "                           the next break goes where it is stuck.  Breaks are\n"
         "                           never revisited; proves nothing.  The default (and\n"
-        "                           only mode) for 2sides/4sides with --breaks > 0.\n",
-        stderr);
-    fprintf(stderr,
-        "  --ratchet_nodes N      Nodes per exact search of the ratchet (default %llu;\n",
-        RATCHET_NODES_DEFAULT);
-    fputs(
-        "                         0 = each until exhausted).  A node count, not a time,\n"
-        "                         so the committed boards do not depend on --threads\n"
-        "                         (unless --time_limit ends the run).\n"
+        "                           only mode) for 2sides/4sides with --breaks > 0.\n"
+        "  --ratchet_nodes N      Cap each exact search of the ratchet at N nodes\n"
+        "                         (default 0: each runs until exhausted).  On a wide\n"
+        "                         open region the first may not finish within\n"
+        "                         --time_limit; 10000000 suits those.  A node count, not\n"
+        "                         a time, so the committed boards do not depend on\n"
+        "                         --threads (unless --time_limit ends the run).\n"
         "  --restarts N           Independent randomized dives per record (default 50000,\n"
         "                         roughly 5-10 s on four cores).\n"
         "                         Dives are sub-millisecond; N in the millions is fine.\n"

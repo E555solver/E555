@@ -1998,7 +1998,7 @@ counters rather than a scan.
   candidates, and the time limit usually came first.
 - **`ratchet`**: exact search between breaks, each break committed and never
   revisited. The exact search of `--order` runs from the board, on one thread,
-  until exhausted or `--ratchet_nodes N` nodes (default 10,000,000; 0 = no cap),
+  until exhausted, or for at most `--ratchet_nodes N` nodes (default 0: no cap),
   and its deepest board is kept. Every candidate at the cell where it is stuck,
   cheapest break first, gets its own exact search, and the deepest result (ties:
   the earlier candidate) is the next board. It stops when the board is
@@ -2018,8 +2018,10 @@ counters rather than a scan.
     `spiral` 53-59, `mrv` 61-79, 2sides/4sides 76-100. 50,000 dives (~3 s)
     gave a best of 34-43 and a median of 48-56.
   - Eight open interiors (192 cells), one thread per board: `rowmajor` 38-57
-    (mean 45) in ~5.5 s. 50,000 dives (~23 s) gave a mean best of 42. The mean
-    was 51 at 1M nodes and no better than 45 at 30M or 100M.
+    (mean 45) in ~5.5 s at `--ratchet_nodes 10000000`. 50,000 dives (~23 s) gave
+    a mean best of 42. The mean was 51 at 1M nodes and no better than 45 at 30M
+    or 100M. Uncapped, the first search on such a region may not finish within
+    `--time_limit`: the run then ends there, with output that depends on timing.
   - The four synthetic swapped boards of the breakcount check, `mrv --breaks
     12`: it solved 2 with 12 and 8 breaks, where lds finds the minimum (6, 8, 8,
     8) on all four.
@@ -2145,7 +2147,7 @@ node rate).
 | `--edge_supply` | off | cut on the frame's inward edges: per colour, demand above the unused edge pieces' supply |
 | `--hall MODE`, `--hall_stride N`, `--hall_min N` | root, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
-| `--ratchet_nodes N` | 10000000 | nodes per exact search of the ratchet; 0 = until exhausted |
+| `--ratchet_nodes N` | 0 | node cap per exact search of the ratchet; 0 = until exhausted (10000000 for wide open regions) |
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record; SIGINT/SIGTERM stop every running record the same way (rows not started: copied under `--resume`, else not written), a second signal kills |
 | `--max_emitted N` | 1 | completions per record (0 = all) |
 | `--stop_row N`, `--stop_column N`, `--with_frame`, `--with_clue_regions` | -- | band enumeration; widen the band by the frame, by the five 2x2 clue regions |
