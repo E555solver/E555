@@ -368,8 +368,8 @@ static unsigned long long g_ratchet_nodes = RATCHET_NODES_DEFAULT;
 /* ratchet: greedy dives scoring each candidate's continuation; the fewest
  * breaks to complete wins (ratchet_rollout(); 0 = the deepest continuation).
  * Rollouts cut about ten breaks off the depth rule; 100 gained about one more
- * than 30 for three times the time. */
-#define RATCHET_ROLLOUTS_DEFAULT 30
+ * than 30 for three times the time; the default is 32. */
+#define RATCHET_ROLLOUTS_DEFAULT 32
 static int g_ratchet_rollouts = RATCHET_ROLLOUTS_DEFAULT;
 
 /* Greedy-dive controls (stuck mode; lcv also in the ratchet's rollouts).  A few
@@ -7164,7 +7164,7 @@ static void usage(const char *prog) {
         "                         depend on --threads (unless --time_limit ends it).\n"
         "  --ratchet_rollouts R   Greedy dives from each candidate's continuation; the\n"
         "                         ratchet keeps the one whose dives complete with the\n"
-        "                         fewest breaks, then the deepest (default 30; 0 =\n"
+        "                         fewest breaks, then the deepest (default 32; 0 =\n"
         "                         the deepest).  A dive completion within --breaks is\n"
         "                         a finished board.  Seeded from the board: every run\n"
         "                         commits the same.\n"

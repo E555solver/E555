@@ -1997,7 +1997,7 @@ counters rather than a scan.
   exact search of `--order` runs on one thread until exhausted (or
   `--ratchet_nodes N`; default 0, no cap). At the cell where it is stuck, every
   candidate, cheapest break first, gets its own exact search, scored by
-  `--ratchet_rollouts R` greedy dives (default 30). The fewest breaks to
+  `--ratchet_rollouts R` greedy dives (default 32). The fewest breaks to
   complete wins, then the deeper board (R = 0: the deepest). A dive completion
   within `--breaks` counts as a finished board. It proves nothing, and its
   output does not depend on the thread count unless `--time_limit` ends the
@@ -2135,7 +2135,7 @@ build with a native `ARCH` for real runs (`generic` is markedly slower).
 | `--hall MODE`, `--hall_stride N`, `--hall_min N` | root, 8, 32 | Hall bound: `off`, `root`, `adaptive`, `always` (`--no_hall` = off) |
 | `--lds_max N` | -- | voluntary mismatches per path (lds) |
 | `--ratchet_nodes N` | 0 | ratchet: node cap per exact search (0 = none; 1000000 for 2sides/4sides, 10000000 for open regions) |
-| `--ratchet_rollouts R` | 30 | ratchet: dives scoring each candidate; 0 = keep the deepest |
+| `--ratchet_rollouts R` | 32 | ratchet: dives scoring each candidate; 0 = keep the deepest |
 | `--time_limit S` | unlimited exact, 30 s mismatch | per record; SIGINT/SIGTERM stop every running record the same way (rows not started: copied under `--resume`, else not written), a second signal kills |
 | `--max_emitted N` | 1 | completions per record (0 = all) |
 | `--stop_row N`, `--stop_column N`, `--with_frame`, `--with_clue_regions` | -- | band enumeration; widen the band by the frame, by the five 2x2 clue regions |
