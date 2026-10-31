@@ -60,7 +60,8 @@ Stage B  src/B_beam/E555_beamer.c             5-5-5 chain DB + wide beam + colou
                                                locks clean top rows (--keep_ring: the ring); --backtrack_row, --end_dive
          src/B_beam/E555_roundhouse.c         rotate 90 deg, grow a W-wide strip; exhaustive, DP oracle
 Stage C  src/C_tail/E555_topper.py            CP-SAT break minimizer over bands / --holes masks
-         src/C_tail/E555_backtracker.c        greedy dives + exhaustive DFS + ratchet; --stop_row/--stop_column bands
+         src/C_tail/E555_backtracker.c        greedy dives + exhaustive DFS + ratchet; --holes auto repair;
+                                               --stop_row/--stop_column bands
          src/C_tail/E555_diver.c              the beamer's --end_dive/--end_polish on any board file; no DB;
                                                --holes/--pin_clue/--stop_row rebuild the top like the beamer first
          src/C_tail/E555_ender.py             CP-SAT closer, never returns a worse board
