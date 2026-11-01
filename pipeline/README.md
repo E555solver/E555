@@ -30,6 +30,7 @@ bash pipeline/run_board_farm.sh MAX_HOURS=48        # the farm, two days
 python3 pipeline/run_farm.py DB=/tmp/E555.db THREADS=10   # the graduating farm
 bash pipeline/run_halo.sh TOTAL_TIME=4h             # the halo loop, four hours
 bash pipeline/run_cycles.sh TOTAL_TIME=1d DB_FILE=/data/E555.db   # cycles on every core, a day
+bash pipeline/run_cycles.sh INPUT=partials.csv.gz RUN_DIR=elite_out THREADS=$(nproc)   # distil one big file of partials
 ```
 
 ## How every runner works

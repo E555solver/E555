@@ -116,7 +116,11 @@ does better at equal compute. Without the dives a beam covers ~15 border
 configurations in 300 s instead of one, and the distiller spends its dives on
 the best partials: 40 such cycles gave 464 four times and 463 26 times, against
 461-463 from beams that dive every board. `pipeline/run_cycles.sh` runs these
-cycles in parallel; its settings block holds every option above.
+cycles in parallel; its settings block holds every option above. With
+`INPUT=FILE` it distils one big file of partials instead, cut once into chunks
+of `CHUNK_ROWS` consecutive rows, each one distiller call on one thread
+(`--top 50 --probe_per_top 1`, about 51 min a 1000-row chunk), and ranks every
+chunk's elites in `elites.csv`.
 
 **Which partials to distil** (`STOP_ROW` x `MIN_COL` of `run_cycles.sh`,
 measured 2026-10-31 on 4 threads). Each arm ran whole cycles: a 300 s beam
