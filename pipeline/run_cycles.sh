@@ -48,20 +48,22 @@
 #   - FILE is cut once into consecutive chunks of CHUNK_ROWS board rows,
 #     comments dropped: RUN_DIR/chunks/k_00000.csv, k_00001.csv, ... FILE itself
 #     is only read. Chunk k_N becomes cycle c_N, a cycle whose beam is done.
-#   - A cycle is one distiller call on one thread. Unless you set them, INPUT
-#     changes four defaults: THREADS_PER_SLOT=1 (so SLOTS=0 gives one slot per
-#     thread), TOP=50, PROBE_PER_TOP=1 and TOTAL_TIME=0 (no deadline). The
-#     distiller screens the chunk, finishes the best FINISH_KEEP of it, and
-#     probes the best TOP finished boards, which (SELECT_AGREE=1) are the TOP it
-#     keeps: the chunk's elites, with ids k<N>_<id in FILE>.
+#   - A cycle is one distiller call on one thread. The settings left empty take
+#     INPUT mode's defaults: THREADS_PER_SLOT=1 (so SLOTS=0 gives one slot per
+#     thread), TOP=50, PROBE_PER_TOP=1, TOTAL_TIME=0 (no deadline) and
+#     RANK_EVERY=20. The distiller screens the chunk, finishes the best
+#     FINISH_KEEP of it, and probes the best TOP finished boards, which
+#     (SELECT_AGREE=1) are the TOP it keeps: the chunk's elites, with ids
+#     k<N>_<id in FILE>.
 #   - Every elite is kept. best.csv is rebuilt every RANK_EVERY chunks and at
 #     the end, when RUN_DIR/elites.csv ranks all of them.
 # Cost of a 1000-row chunk on one thread at these defaults (the distiller's
 # COST table): screen 1000 x 0.15 s = 150 s, finish 500 x 3 s = 1500 s, probe
 # 50 x 28 s = 1400 s; about 51 min. 500 chunks (500k rows) on 32 threads take
 # 13-14 h. A smaller FINISH_KEEP or FINISH_DIVES shortens the finish, and
-# PROBE_PER_TOP=0 drops the probe. The start line estimates the run from the
-# settings given. RUN_DIR then holds:
+# PROBE_PER_TOP=0 drops the probe. Before the first chunk, a dry run of the
+# distiller on one chunk checks the distil settings and prints its estimate for
+# a chunk and for the run. RUN_DIR then holds:
 #   elites.csv    every elite of every chunk, rescored, best first
 #   best.csv      the BEST_KEEP best distinct elites, best first
 #   cycles.log    one line per finished chunk: chunk, rows, best, minutes
@@ -83,12 +85,14 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)  # E555 checkout. Set this if you copied
 SEED=data/seed_Edge5.txt                # relative to REPO
 RUN_DIR=cycles_out                      # relative to where you START it
 THREADS=$(nproc)
-THREADS_PER_SLOT=4      # threads of one cycle. 4 is the measured setting; more
-                        # threads give a beam more boards in BEAM_WALL. INPUT mode: 1
+# A setting left empty takes its mode's default, the normal one or INPUT mode's.
+THREADS_PER_SLOT=       # threads of one cycle; empty = 4, the measured setting
+                        # (more give a beam more boards in BEAM_WALL), or 1 in
+                        # INPUT mode
 SLOTS=0                 # cycles at once; 0 = THREADS / THREADS_PER_SLOT
-TOTAL_TIME=24h          # seconds, or 90m, 4h, 2d; 0 = no deadline (INPUT mode's
-                        # default). Cycles still running at the end are stopped
-                        # and resume on a rerun.
+TOTAL_TIME=             # seconds, or 90m, 4h, 2d; 0 = no deadline; empty = 24h,
+                        # or 0 in INPUT mode. Cycles still running at the end
+                        # are stopped and resume on a rerun.
 MAX_CYCLES=0            # new cycles this run at most; 0 = until TOTAL_TIME. With
                         # 1, a run is one cycle: handy for sweeping settings
 DB_FILE=chain.db        # the chain database cache, ~6.5 GB, shared by every
@@ -127,12 +131,12 @@ BEAM_EXTRA=             # more beamer flags, e.g. BEAM_EXTRA="--clue_center"
                         # (a clue flag needs its own DB_FILE)
 
 # 2. distil (tools/E555_distiller.py)
-TOP=10                  # --top: boards kept per cycle. INPUT mode: 50
+TOP=                    # --top: boards kept per cycle; empty = 10, or 50 in INPUT mode
 SCREEN_DIVES=300        # --screen_dives: dives per partial in the screen
 FINISH_DIVES=20000      # --finish_dives  } the finish of the best partials
 FINISH_POLISH=5000      # --finish_polish }
-PROBE_PER_TOP=4         # --probe_per_top: finished boards probed per kept board;
-                        # 0 = no probe. INPUT mode: 1.
+PROBE_PER_TOP=          # --probe_per_top: finished boards probed per kept board,
+                        # 0 = none; empty = 4, or 1 in INPUT mode.
                         # The campaign's later cycles used FINISH_DIVES=5000
                         # FINISH_POLISH=2000 PROBE_PER_TOP=12: shorter cycles
                         # (24 instead of ~35 min), the same best.
@@ -144,6 +148,8 @@ MAX_AGREE=0.95          # best.csv drops a board agreeing with a better one on
                         # more than this share of its cells
 RANK_POOL=2000          # best.csv: --max_agree runs on the best RANK_POOL boards
                         # of all cycles (it compares each with every one kept)
+RANK_EVERY=             # rebuild best.csv every N cycles, and at the end;
+                        # empty = 1, or 20 in INPUT mode
 KEEP_CORPUS=0           # 1 = keep every cycle's partials (~100 MB a cycle); in
                         # INPUT mode, the chunks and each distiller's work
 KEEP_LOGS=1             # 1 = keep each cycle's logs, gzipped
@@ -155,7 +161,6 @@ INPUT=                  # one big board CSV (.csv or .csv.gz); set = distil-only
 CHUNK_ROWS=1000         # consecutive board rows per chunk (one distiller call each)
 FINISH_KEEP=0.5         # --finish_keep: share of a chunk's partials finished
 SELECT_AGREE=1.0        # --max_agree inside a chunk (1.0 = keep every elite)
-RANK_EVERY=20           # rebuild best.csv every N chunks (and at the end)
 # -----------------------------------------------------------------------------
 CLI=" "                 # the names given on the command line
 for arg in "$@"; do
@@ -164,13 +169,10 @@ for arg in "$@"; do
         *) echo "expected NAME=value, got: $arg" >&2; exit 1 ;;
     esac
 done
-# INPUT mode's own defaults: each applies to a setting that still holds the
-# value shipped above (keep these in step) and was not given on the command line.
 if [ -n "$INPUT" ]; then
-    for d in THREADS_PER_SLOT:4:1 TOP:10:50 PROBE_PER_TOP:4:1 TOTAL_TIME:24h:0; do
-        IFS=: read -r name shipped own <<< "$d"
-        [[ $CLI == *" $name "* ]] || [ "${!name}" != "$shipped" ] || printf -v "$name" %s "$own"
-    done
+    : "${THREADS_PER_SLOT:=1}" "${TOP:=50}" "${PROBE_PER_TOP:=1}" "${TOTAL_TIME:=0}" "${RANK_EVERY:=20}"
+else
+    : "${THREADS_PER_SLOT:=4}" "${TOP:=10}" "${PROBE_PER_TOP:=4}" "${TOTAL_TIME:=24h}" "${RANK_EVERY:=1}"
 fi
 
 die() { echo "$*" >&2; exit 1; }
@@ -184,12 +186,13 @@ case "${BASH_REMATCH[2]}" in
     m) TOTAL_S=$(( BASH_REMATCH[1] * 60 )) ;;
     *) TOTAL_S=${BASH_REMATCH[1]} ;;
 esac
+# FINISH_KEEP, SELECT_AGREE and DISTIL_EXTRA are the distiller's to check: in
+# INPUT mode its dry run does, before the first chunk.
 WHOLE=(THREADS THREADS_PER_SLOT SLOTS MAX_CYCLES TOP SCREEN_DIVES FINISH_DIVES FINISH_POLISH
-       PROBE_PER_TOP BEST_KEEP RANK_POOL KEEP_CORPUS KEEP_LOGS)
+       PROBE_PER_TOP BEST_KEEP RANK_POOL RANK_EVERY KEEP_CORPUS KEEP_LOGS)
 NUMBER=(MAX_AGREE)
 if [ -n "$INPUT" ]; then
-    WHOLE+=(CHUNK_ROWS RANK_EVERY)
-    NUMBER+=(FINISH_KEEP SELECT_AGREE)
+    WHOLE+=(CHUNK_ROWS)
 else
     WHOLE+=(RNG_SEED SAMPLES COLUMNS BEAM_WIDTH BACKTRACK_ROW STOP_ROW MIN_COL EXTEND_NODES
             BEAM_WALL MAX_EMITTED WARM_DB)
@@ -201,21 +204,17 @@ done
 for v in "${NUMBER[@]}"; do
     [[ ${!v} =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$v must be a number of 0 or more (got: ${!v})"
 done
-# at_most_one X... -- true when every X is a number of at most 1
-at_most_one() { awk 'BEGIN { for (i = 1; i < ARGC; i++) if (ARGV[i] + 0 > 1) exit 1 }' "$@"; }
-at_most_one "$MAX_AGREE" || die "MAX_AGREE must be at most 1 (got: $MAX_AGREE)"
+awk -v a="$MAX_AGREE" 'BEGIN { exit !(a <= 1) }' || die "MAX_AGREE must be at most 1 (got: $MAX_AGREE)"
 [ "$THREADS_PER_SLOT" -ge 1 ] || die "THREADS_PER_SLOT must be at least 1"
 [ "$SLOTS" -gt 0 ] || SLOTS=$(( THREADS / THREADS_PER_SLOT ))
 [ "$SLOTS" -ge 1 ] || die "THREADS=$THREADS is fewer than THREADS_PER_SLOT=$THREADS_PER_SLOT"
 [ $(( SLOTS * THREADS_PER_SLOT )) -le "$THREADS" ] ||
     die "SLOTS x THREADS_PER_SLOT = $(( SLOTS * THREADS_PER_SLOT )) is more than THREADS=$THREADS"
-[ "$TOP" -ge 1 ] && [ "$BEST_KEEP" -ge 1 ] || die "TOP and BEST_KEEP must be at least 1"
+[ "$TOP" -ge 1 ] && [ "$BEST_KEEP" -ge 1 ] && [ "$RANK_EVERY" -ge 1 ] ||
+    die "TOP, BEST_KEEP and RANK_EVERY must be at least 1"
 [ "$RANK_POOL" -ge "$BEST_KEEP" ] || die "RANK_POOL must be at least BEST_KEEP=$BEST_KEEP"
 if [ -n "$INPUT" ]; then
-    [ "$CHUNK_ROWS" -ge 1 ] && [ "$RANK_EVERY" -ge 1 ] || die "CHUNK_ROWS and RANK_EVERY must be at least 1"
-    [[ $FINISH_KEEP =~ [1-9] ]] && at_most_one "$FINISH_KEEP" ||
-        die "FINISH_KEEP must be above 0 and at most 1 (got: $FINISH_KEEP)"
-    at_most_one "$SELECT_AGREE" || die "SELECT_AGREE must be at most 1 (got: $SELECT_AGREE)"
+    [ "$CHUNK_ROWS" -ge 1 ] || die "CHUNK_ROWS must be at least 1"
 else
     [ "$SAMPLES" -ge 1 ] && [ "$COLUMNS" -ge 1 ] || die "SAMPLES and COLUMNS must be at least 1"
     [ "$BACKTRACK_ROW" -ge 1 ] && [ "$BACKTRACK_ROW" -lt "$STOP_ROW" ] ||
@@ -350,7 +349,7 @@ cycle() {
         echo "$(( SECONDS - t0 ))" > "$dir/beam.seconds"
         touch "$dir/beam.done"
     fi
-    local corpus=()
+    local corpus=() prefix=()
     while read -r f; do
         case "$f" in *.csv) [ -s "$f" ] && corpus+=("$f") ;; esac
     done < "$dir/beam/outputs.txt"
@@ -358,8 +357,11 @@ cycle() {
         echo "no boards to distil: none of the files in beam/outputs.txt is left" > "$dir/failed"
         return 0
     fi
+    # INPUT mode: an elite's id names its chunk, k<N>_<id in INPUT>, as a beam's
+    # boards are named after their cycle.
+    [ -z "$INPUT" ] || prefix=(--prefix "k${name#c_}")
     t0=$SECONDS
-    run_tool 0 python3 tools/E555_distiller.py "${corpus[@]}" "${DISTIL[@]}" \
+    run_tool 0 python3 tools/E555_distiller.py "${corpus[@]}" "${DISTIL[@]}" "${prefix[@]}" \
         --threads "$th" --seed_file "$SEED" --out "$dir/distilled.csv" >> "$dir/distil.log" 2>&1
     rc=$?
     # Stopped (130, 143, or a stop asked for): the distil resumes on a rerun.
@@ -367,12 +369,6 @@ cycle() {
     if [ "$rc" -ne 0 ] || [ ! -s "$dir/distilled.csv" ]; then
         echo "distiller exit $rc: $(tail -1 "$dir/distil.log")" > "$dir/failed"
         return 0
-    fi
-    # INPUT mode: an elite's id names its chunk, k<N>_<id in INPUT>, as a beam's
-    # board names its cycle.
-    if [ -n "$INPUT" ]; then
-        sed "s/^/k${name#c_}_/" "$dir/distilled.csv" > "$dir/distilled.tmp" &&
-            mv "$dir/distilled.tmp" "$dir/distilled.csv" || { echo "cannot rename the elites" > "$dir/failed"; return 0; }
     fi
     echo "$(( SECONDS - t0 + $(cat "$dir/distil.seconds" 2>/dev/null || echo 0) ))" > "$dir/distil.seconds"
     # The marker first: a crash in the cleanup below then costs disk, not the cycle.
@@ -390,42 +386,39 @@ cycle() {
     fi
 }
 
-# gather FILE -- every finished cycle's distilled boards in one file, cycle by
-# cycle (a big run has too many to name on one command line); fails when no
-# cycle has finished.
-gather() {
-    local d
+# rank_cycles OUT ARGS... -- E555_rank.py ARGS --rescore over the boards of every
+# finished cycle, written to OUT. The boards are first gathered into one file: a
+# big run has too many cycles to name on a command line. Fails when no cycle
+# has finished or the rank fails.
+rank_cycles() {
+    local out=$1 d rc=1; shift
     for d in "$RUN_DIR"/cycles/c_*; do
         [ -e "$d/distilled.done" ] && printf '%s\0' "$d/distilled.csv"
-    done | xargs -0 -r cat -- > "$1"
-    [ -s "$1" ]
+    done | xargs -0 -r cat -- > "$RUN_DIR/gathered.tmp"
+    if [ -s "$RUN_DIR/gathered.tmp" ]; then
+        python3 tools/E555_rank.py "$RUN_DIR/gathered.tmp" --seed_file "$SEED" "$@" --rescore \
+            --quiet --out "$out" > /dev/null 2> "$RUN_DIR/rank.log" && rc=0 ||
+            echo "[warn] $(basename "$out" .tmp) not rebuilt: $(tail -1 "$RUN_DIR/rank.log")"
+    fi
+    rm -f "$RUN_DIR/gathered.tmp"
+    return "$rc"
 }
 
-# rebuild_best -- best.csv afresh from every finished cycle: the best RANK_POOL
-# boards (a bounded, streaming --top), then the near-duplicate filter over that
-# pool, then the first BEST_KEEP survivors. E555_rank.py applies its --top
-# before --max_agree, hence the two calls; only the second rescores, since each
-# --rescore appends the score to a board's id.
-UNRANKED=0              # INPUT mode: chunks harvested since the last rebuild
+# rebuild_best -- best.csv afresh: E555_rank.py takes the best RANK_POOL boards
+# of all cycles (--top streams them) and drops their near-duplicates (it runs
+# --max_agree after --top); the first BEST_KEEP that remain are best.csv.
+UNRANKED=0              # cycles harvested since the last rebuild
 rebuild_best() {
     UNRANKED=0
-    gather "$RUN_DIR/pool.in" || { rm -f "$RUN_DIR/pool.in"; return 0; }
-    python3 tools/E555_rank.py "$RUN_DIR/pool.in" --seed_file "$SEED" --top "$RANK_POOL" \
-        --quiet --out "$RUN_DIR/pool.tmp" > /dev/null 2> "$RUN_DIR/rank.log" &&
-    python3 tools/E555_rank.py "$RUN_DIR/pool.tmp" --seed_file "$SEED" --max_agree "$MAX_AGREE" \
-        --rescore --quiet --out "$RUN_DIR/agree.tmp" > /dev/null 2>> "$RUN_DIR/rank.log" &&
-    head -n "$BEST_KEEP" "$RUN_DIR/agree.tmp" > "$BEST.tmp" && mv "$BEST.tmp" "$BEST" ||
-        echo "[warn] best.csv not rebuilt: $(tail -1 "$RUN_DIR/rank.log")"
-    rm -f "$RUN_DIR/pool.in" "$RUN_DIR/pool.tmp" "$RUN_DIR/agree.tmp" "$BEST.tmp"
+    rank_cycles "$BEST.tmp" --top "$RANK_POOL" --max_agree "$MAX_AGREE" &&
+        head -n "$BEST_KEEP" "$BEST.tmp" > "$BEST.new" && mv "$BEST.new" "$BEST"
+    rm -f "$BEST.tmp" "$BEST.new"
 }
 
-# harvest DIR -- the parent's bookkeeping for a finished cycle: one line in
-# cycles.log, best.csv rebuilt from every distillate (so a crash between the two
-# loses nothing), the harvested marker. In INPUT mode best.csv waits for
-# RANK_EVERY chunks, and every distillate is on disk meanwhile.
+# harvest DIR -- the parent's bookkeeping for a finished cycle: best.csv rebuilt
+# from every distillate every RANK_EVERY cycles, one line in cycles.log, the
+# harvested marker. A crash in between loses nothing: the distillates stay.
 DONE=0                  # INPUT mode: chunks harvested, in all
-BEST_SO_FAR=$(awk '/^c_/ { for (i = 2; i <= NF; i++) if ($i ~ /^best=[0-9]+$/) {
-                  s = substr($i, 6) + 0; if (s > m) m = s } } END { print m + 0 }' "$LOG")
 harvest() {
     local dir=$1 name cfg parts b mins note=
     name=$(basename "$dir")
@@ -433,22 +426,19 @@ harvest() {
     b=$(best_of "$dir/distilled.csv")
     mins=$(( ( $(cat "$dir/beam.seconds" 2>/dev/null || echo 0) +
                $(cat "$dir/distil.seconds" 2>/dev/null || echo 0) ) / 60 ))
+    UNRANKED=$(( UNRANKED + 1 ))
+    if [ "$UNRANKED" -ge "$RANK_EVERY" ]; then rebuild_best; note=", best.csv $(best_of "$BEST")"; fi
     if [ -n "$INPUT" ]; then
+        DONE=$(( DONE + 1 ))
         echo "$name chunk=k_${name#c_} rows=$parts best=$b minutes=$mins $(date '+%F %T')" >> "$LOG"
-        touch "$dir/harvested"
-        DONE=$(( DONE + 1 )) UNRANKED=$(( UNRANKED + 1 ))
-        [ "$b" -le "$BEST_SO_FAR" ] || BEST_SO_FAR=$b
-        if [ "$UNRANKED" -ge "$RANK_EVERY" ]; then rebuild_best; note=", best.csv rebuilt"; fi
-        echo "[cycles] $name: best $b ($mins min); $DONE of $N_CHUNKS chunks done," \
-             "best so far $BEST_SO_FAR$note"
-        return 0
+        echo "[cycles] $name: best $b ($mins min); $DONE of $N_CHUNKS chunks done$note"
+    else
+        cfg=$( { zcat "$dir/beam.log.gz" 2>/dev/null || cat "$dir/beam.log" 2>/dev/null; } |
+               sed -n 's/^\[sum\] configs: \([0-9]*\),.*/\1/p' | tail -1)
+        echo "$name seed=$(cat "$dir/seed") configs=${cfg:-?} partials=$parts best=$b" \
+             "minutes=$mins run_best=$(best_of "$BEST") $(date '+%F %T')" >> "$LOG"
+        echo "[cycles] $name: best $b ($mins min)$note"
     fi
-    cfg=$( { zcat "$dir/beam.log.gz" 2>/dev/null || cat "$dir/beam.log" 2>/dev/null; } |
-           sed -n 's/^\[sum\] configs: \([0-9]*\),.*/\1/p' | tail -1)
-    rebuild_best
-    echo "$name seed=$(cat "$dir/seed") configs=${cfg:-?} partials=$parts best=$b" \
-         "minutes=$mins run_best=$(best_of "$BEST") $(date '+%F %T')" >> "$LOG"
-    echo "[cycles] $name: best $b ($mins min), best.csv $(best_of "$BEST")"
     touch "$dir/harvested"
 }
 # tag DIR -- what names a cycle in cycles.log besides its directory
@@ -492,7 +482,7 @@ To distil this INPUT, use a new RUN_DIR; to carry on, give the same INPUT and CH
             echo "[warn] $FREE_MB MB free in $CHUNKS: the chunks of INPUT take about $NEED_MB MB"
         echo "[cycles] cutting $INPUT into chunks of $CHUNK_ROWS board rows"
         T0=$SECONDS
-        rm -f "$CHUNKS"/k_*.csv
+        find "$CHUNKS" -name 'k_*.csv' -delete
         zcat -f -- "$INPUT" | awk '!/^[ \t\r]*([#%]|$)/' |
             split -l "$CHUNK_ROWS" -d -a 5 --additional-suffix=.csv - "$CHUNKS/k_"
         ST=("${PIPESTATUS[@]}")
@@ -548,19 +538,22 @@ done
 [ "${#PENDING[@]}" -eq 0 ] || echo "[cycles] resuming ${#PENDING[@]} cycle(s) stopped in their distil"
 if [ -n "$INPUT" ]; then
     NEXT=0              # new_chunk takes the first chunk without a cycle from here
-    # A chunk's distil in seconds, from the distiller's COST table (seconds a
-    # board on one thread: screen 0.15 at 300 dives, finish 3 at 20000 + 5000,
-    # probe 28) and its K = min(ceil(F P), 400 N); P taken as CHUNK_ROWS.
-    EST=$(awk -v r="$CHUNK_ROWS" -v sd="$SCREEN_DIVES" -v fd="$FINISH_DIVES" -v fp="$FINISH_POLISH" \
-              -v fk="$FINISH_KEEP" -v top="$TOP" -v m="$PROBE_PER_TOP" -v th="$THREADS_PER_SLOT" 'BEGIN {
-          k = r * fk; if (k > int(k)) k = int(k) + 1; if (k > 400 * top) k = 400 * top
-          p = m * top; if (p > k) p = k
-          printf "%d", (r * 0.15 * sd / 300 + k * 3 * (fd + fp) / 25000 + p * 28) / th }')
     TO_GO=$(( N_CHUNKS - DONE ))
     echo "[cycles] $(date '+%F %T') start: INPUT mode, $SLOTS slot(s) x $THREADS_PER_SLOT thread(s)," \
          "$DEADLINE_TXT, results in $RUN_DIR"
-    echo "[cycles] $INPUT: $N_ROWS board rows in $N_CHUNKS chunk(s) of $CHUNK_ROWS, $TO_GO to go;" \
-         "about $(hms "$EST") a chunk, $(hms $(( (TO_GO + SLOTS - 1) / SLOTS * EST ))) in all"
+    echo "[cycles] $INPUT: $N_ROWS board rows in $N_CHUNKS chunk(s) of $CHUNK_ROWS, $TO_GO to go"
+    # A dry run of the distiller on a chunk still to do checks the distil
+    # settings, and its [plan] line gives the stages and minutes of a chunk.
+    K=("$CHUNKS"/k_*.csv)
+    if [ "$TO_GO" -gt 0 ] && [ -e "${K[0]}" ]; then
+        PLAN=$(python3 tools/E555_distiller.py "${K[0]}" "${DISTIL[@]}" --threads "$THREADS_PER_SLOT" \
+                   --seed_file "$SEED" --dry_run 2>&1) || die "the distil settings fail: $(tail -1 <<< "$PLAN")"
+        PLAN=$(sed -n 's/^\[plan\] //p' <<< "$PLAN")
+        MIN=$(sed -n 's/.*about \([0-9]*\) min.*/\1/p' <<< "$PLAN")
+        echo "[cycles] a chunk: $PLAN; all $TO_GO on $SLOTS slot(s):" \
+             "about $(hms $(( (TO_GO + SLOTS - 1) / SLOTS * ${MIN:-0} * 60 )))"
+    fi
+    unset K
     IGNORED=
     for v in SAMPLES COLUMNS BEAM_WIDTH BACKTRACK_ROW STOP_ROW MIN_COL EXTEND_NODES LAMBDA_MAHA \
              LAMBDA_J FRAC_RAND TAU BEAM_WALL MAX_EMITTED BEAM_EXTRA DB_FILE WARM_DB RNG_SEED; do
@@ -670,16 +663,11 @@ rm -f "$STOPFILE"
 
 echo
 [ "$STOP" = 1 ] && echo "[cycles] stopped; run the same command again to carry on."
+rebuild_best
 if [ -n "$INPUT" ]; then
-    # Every elite, best first, and best.csv from all of them.
-    rebuild_best
-    if gather "$RUN_DIR/elites.in"; then
-        python3 tools/E555_rank.py "$RUN_DIR/elites.in" --seed_file "$SEED" --rescore --quiet \
-            --out "$RUN_DIR/elites.tmp" > /dev/null 2> "$RUN_DIR/rank.log" &&
-            mv "$RUN_DIR/elites.tmp" "$RUN_DIR/elites.csv" ||
-            echo "[warn] elites.csv not rebuilt: $(tail -1 "$RUN_DIR/rank.log")"
-    fi
-    rm -f "$RUN_DIR/elites.in" "$RUN_DIR/elites.tmp"
+    # elites.csv: every elite of every chunk, best first
+    rank_cycles "$RUN_DIR/elites.csv.tmp" && mv "$RUN_DIR/elites.csv.tmp" "$RUN_DIR/elites.csv"
+    rm -f "$RUN_DIR/elites.csv.tmp"
     [ "$STOP" = 1 ] || [ "$DONE" -ge "$N_CHUNKS" ] ||
         echo "[cycles] $(( N_CHUNKS - DONE )) chunk(s) to go: run the same command again to carry on."
     if [ -s "$RUN_DIR/elites.csv" ]; then
