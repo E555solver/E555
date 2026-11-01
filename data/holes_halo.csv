@@ -1,23 +1,24 @@
-# The halo: lift rows 0-2 and columns 0, 1, 14, 15 (100 cells), keep the core rows 3+ x cols 2-13.
+# The halo: rows 0-2 and 13-15, and columns 0-2 and 13-15 of rows 3-12 (156 cells), around the kept
+# 10 x 10 core rows 3-12 x cols 3-12.
 # Row convention: first data line below = row 0 (BOTTOM), last = row 15 (TOP).
-# Made for pipeline/run_halo.sh. On a beamer stop-row-10 board it lifts 80 pieces (the frame and
-# the ring inside it, up to row 10) and keeps the 8 x 12 core rows 3-10 x cols 2-13, so all 60
-# frame cells are open: with --frame_last, --early_release 60 releases the first board that
-# places every inner cell.
-# bin/E555_backtracker data/seed_Edge5.txt boards.csv halo.csv --holes data/holes_halo.csv --clue_center --breaks 0 --order spiralout --frame_last --edge_supply --early_release 60 --no_colour_count --no_hall --time_limit 1
+# Made for pipeline/run_halo.sh. Its beam writes L-band boards (--backtrack_unlock_right 3
+# --stop_row 11): rows 0-11 x cols 0-12 placed, break-free. On those the mask lifts 66 placed cells
+# (the frame the beam wrote and the two rings inside it) and keeps 90 (rows 3-11 x cols 3-12), so
+# the 166 open cells around the core, the whole frame among them, are searched again:
+# bin/E555_backtracker data/seed_Edge5.txt boards.csv halo.csv --holes data/holes_halo.csv --clue_center --break_mode ratchet --breaks 20 --order frontier --edge_supply --ratchet_nodes 1000000
 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
 1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
-1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,1,0, 0,0,0,0, 0,0,0,0, 0,1,1,1
+1,1,1,0, 0,0,0,0, 0,0,0,0, 0,1,1,1
+1,1,1,0, 0,0,0,0, 0,0,0,0, 0,1,1,1
+1,1,1,0, 0,0,0,0, 0,0,0,0, 0,1,1,1
+1,1,1,0, 0,0,0,0, 0,0,0,0, 0,1,1,1
+1,1,1,0, 0,0,0,0, 0,0,0,0, 0,1,1,1
+1,1,1,0, 0,0,0,0, 0,0,0,0, 0,1,1,1
+1,1,1,0, 0,0,0,0, 0,0,0,0, 0,1,1,1
+1,1,1,0, 0,0,0,0, 0,0,0,0, 0,1,1,1
+1,1,1,0, 0,0,0,0, 0,0,0,0, 0,1,1,1
+1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
+1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
+1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
