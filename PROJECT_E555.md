@@ -1747,8 +1747,10 @@ With P unique partials, and the options' defaults:
 | `--out FILE` | `distilled.csv` | output; `FILE.plan.sh` and `FILE_work/` go next to it |
 | `--seed_file F` | `data/seed_Edge5.txt` | piece seed |
 | `--screen_dives D` | 300 | screen: dives per partial |
+| `--finish_keep F` | 0.5 | screen: K = min(ceil(F P), 400 N) partials kept for the finish, 0 < F <= 1 |
 | `--finish_dives D`, `--finish_polish R` | 20000, 5000 | finish: dives and kick-and-polish rounds per kept board (R = 0: none) |
-| `--probe_per_top M` | 4 | probe: M N boards |
+| `--probe_per_top M` | 4 | probe: M N boards; 0 = no probe, the best N finished boards go to the select as they are |
+| `--max_agree A` | 0.8 | select: skip a board sharing more than this share of its cells with a better one; 1 skips none |
 | `--threads T` | 0 (all) | threads of every diver call |
 
 Writes `FILE` (canonical rows, best first), `FILE.plan.sh` (the

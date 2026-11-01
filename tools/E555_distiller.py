@@ -3,8 +3,8 @@
 E555_distiller.py -- distil a corpus of boards to the few worth the CP-SAT tail.
 
     python3 tools/E555_distiller.py BOARDS.csv[.gz] ... [--top N] [--out FILE]
-        [--screen_dives D] [--finish_dives D] [--finish_polish R]
-        [--probe_per_top M] [--threads T]
+        [--screen_dives D] [--finish_keep F] [--finish_dives D]
+        [--finish_polish R] [--probe_per_top M] [--max_agree A] [--threads T]
 
 Reads board CSVs (plain or gzip; partial or complete; any stop rows) and writes
 
@@ -19,18 +19,20 @@ brackets):
     0 read     parse every row; drop exact repeats; group partials by the
                number of placed cells
     1 screen   every unique partial: the best of --screen_dives [300] seeded
-               dives (E555_diver --end_dive); keep K = min(ceil(P/2), 400 N),
-               split over the groups in proportion to their size, closure
-               breaking ties
+               dives (E555_diver --end_dive); keep K = min(ceil(F P), 400 N)
+               with F = --finish_keep [0.5], split over the groups in
+               proportion to their size, closure breaking ties
     2 finish   the K kept: E555_diver --end_dive --finish_dives [20000]
                --end_polish --finish_polish [5000]
     3 probe    the best --probe_per_top [4] x N complete boards: the ender's
                redive at fixed work, E555_diver --reopen auto --rounds 8
                --copies 8 --end_dive 3000 --end_polish 1000 --prior 1 --nogo 1
-               (never a worse board; boards carrying clue pieces skip it)
+               (never a worse board; boards carrying clue pieces skip it).
+               With --probe_per_top 0 nothing is probed: the best N finished
+               boards go on with their finished scores
     4 select   best first by probed score, probe gain, finished score, screen
-               score, closure; skip a board sharing more than 80% of its
-               cells with a better one; keep N
+               score, closure; skip a board sharing more than --max_agree
+               [0.8] of its cells with a better one (1 skips none); keep N
 
 Every diver call is seeded and keys each board's random streams on the board
 itself, so the output depends on neither the thread count (--threads, default
@@ -74,14 +76,16 @@ FINISH_POLISH = 5000
 PROBE_PER_TOP = 4
 PROBE = ["--reopen", "auto", "--rounds", "8", "--copies", "8", "--end_dive", "3000",
          "--end_polish", "1000", "--prior", "1", "--nogo", "1"]
-KEEP_FRACTION = 0.5         # screen: keep this share of the unique partials,
+KEEP_FRACTION = 0.5         # screen: keep this share of the unique partials
+                            # (the default of --finish_keep),
 KEEP_PER_TOP = 400          # but at most this many per board asked for
-MAX_AGREE = 0.8             # select: max shared-cell fraction with a better board
+MAX_AGREE = 0.8             # select: max shared-cell fraction with a better
+                            # board (the default of --max_agree)
 CHUNK = {"screen": 5000, "finish": 500, "probe": 50}   # boards per diver call
 # Seconds per board on one thread (measured on 4 threads, times 4) at the
 # default settings: the report's time estimates, scaled with the dives asked for.
 COST = {"screen": 0.15, "finish": 3.0, "probe": 28.0}
-VERSION = 3
+VERSION = 4
 
 # Set by SIGINT/SIGTERM (see on_signal): the diver call in flight is stopped and
 # its chunk is not written, so the stage files only ever hold whole results.
@@ -338,23 +342,35 @@ def main():
     ap.add_argument("--seed_file", help="piece seed file (default data/seed_Edge5.txt)")
     ap.add_argument("--screen_dives", type=int, default=SCREEN_DIVES,
                     help=f"screen: dives per partial (default {SCREEN_DIVES})")
+    ap.add_argument("--finish_keep", type=float, default=KEEP_FRACTION,
+                    help=f"screen: share of the unique partials kept for the finish, "
+                         f"above 0 and at most 1, capped at {KEEP_PER_TOP} per board "
+                         f"kept (default {KEEP_FRACTION})")
     ap.add_argument("--finish_dives", type=int, default=FINISH_DIVES,
                     help=f"finish: dives per kept board (default {FINISH_DIVES})")
     ap.add_argument("--finish_polish", type=int, default=FINISH_POLISH,
                     help=f"finish: kick-and-polish rounds, 0 = none (default {FINISH_POLISH})")
     ap.add_argument("--probe_per_top", type=int, default=PROBE_PER_TOP,
-                    help=f"probe: boards probed per board kept (default {PROBE_PER_TOP})")
+                    help=f"probe: boards probed per board kept, 0 = no probe: the best "
+                         f"finished boards are selected as they are (default {PROBE_PER_TOP})")
+    ap.add_argument("--max_agree", type=float, default=MAX_AGREE,
+                    help=f"select: skip a board sharing more than this share of its cells "
+                         f"with a better one, 0..1; 1 skips none (default {MAX_AGREE})")
     ap.add_argument("--threads", type=int, default=0,
                     help="threads of every diver call (default 0 = all); the output "
                          "does not depend on it")
     args = ap.parse_args()
     if args.top < 1:
         raise SystemExit("--top must be at least 1")
-    for name in ("screen_dives", "finish_dives", "probe_per_top"):
+    for name in ("screen_dives", "finish_dives"):
         if getattr(args, name) < 1:
             raise SystemExit(f"--{name} must be at least 1")
-    if args.finish_polish < 0 or args.threads < 0:
-        raise SystemExit("--finish_polish and --threads must be 0 or more")
+    if args.finish_polish < 0 or args.probe_per_top < 0 or args.threads < 0:
+        raise SystemExit("--finish_polish, --probe_per_top and --threads must be 0 or more")
+    if not 0 < args.finish_keep <= 1:
+        raise SystemExit("--finish_keep must be above 0 and at most 1")
+    if not 0 <= args.max_agree <= 1:
+        raise SystemExit("--max_agree must be in 0..1")
     screen_flags = ["--end_dive", str(args.screen_dives)]
     finish_flags = ["--end_dive", str(args.finish_dives)]
     if args.finish_polish:
@@ -372,8 +388,8 @@ def main():
     work = out.with_name(out.stem + "_work")
     resumed = prepare_work(work, manifest_of(
         args.inputs, seed_path, args.top,
-        {"screen": screen_flags, "finish": finish_flags, "probe": PROBE,
-         "probe_per_top": args.probe_per_top}))
+        {"screen": screen_flags, "finish_keep": args.finish_keep, "finish": finish_flags,
+         "probe": PROBE, "probe_per_top": args.probe_per_top, "max_agree": args.max_agree}))
     diver = Diver(exe, seed_path, work, args.threads)
     threads = args.threads or os.cpu_count() or 1
     t_start = time.time()
@@ -411,7 +427,7 @@ def main():
           f"{unique} unique -- " + ", ".join(
               f"{v} with {g} placed" if g < N_PIECES else f"{v} complete"
               for g, v in sorted(groups.items())), flush=True)
-    keep = min(math.ceil(n_part * KEEP_FRACTION), KEEP_PER_TOP * args.top)
+    keep = min(math.ceil(n_part * args.finish_keep), KEEP_PER_TOP * args.top)
     n_probe = args.probe_per_top * args.top
     cost_screen = COST["screen"] * args.screen_dives / SCREEN_DIVES
     cost_finish = (COST["finish"] * (args.finish_dives + args.finish_polish)
@@ -467,7 +483,9 @@ def main():
     # -- 3 probe -------------------------------------------------------------------
     def rank_key(k):
         return (-finished[k][0], -screen.get(k, 0), -meta[k][4], k)
-    cands = sorted(finished, key=rank_key)[:n_probe]
+    # With --probe_per_top 0 the candidates are the best N finished boards, and
+    # every one keeps its finished score, as a clued board does.
+    cands = sorted(finished, key=rank_key)[:max(args.probe_per_top, 1) * args.top]
     if not cands:
         raise SystemExit("[select] no board could be finished: nothing to write")
     parsed = {}
@@ -475,20 +493,25 @@ def main():
         _, _, pos, rot = V.parse_row(next(csv.reader([finished[k][1]])))
         parsed[k] = (pos, rot)
     clued = {k for k in cands if V.clue_orient(*parsed[k])[1] > 0}
-    probed = dict((k, finished[k]) for k in clued)
-    probed.update(diver.run("probe", [(k, *parsed[k]) for k in cands if k not in clued],
-                            PROBE, len(cands) - len(clued)))
-    gained = sum(probed[k][0] > finished[k][0] for k in cands if k in probed)
-    print(f"[probe] {len(cands)} board(s), {gained} improved"
-          + (f", {len(clued)} carrying clue pieces left as they were" if clued else ""),
-          flush=True)
+    as_is = clued if args.probe_per_top else set(cands)
+    probed = dict((k, finished[k]) for k in as_is)
+    probed.update(diver.run("probe", [(k, *parsed[k]) for k in cands if k not in as_is],
+                            PROBE, len(cands) - len(as_is)))
+    if args.probe_per_top:
+        gained = sum(probed[k][0] > finished[k][0] for k in cands if k in probed)
+        print(f"[probe] {len(cands)} board(s), {gained} improved"
+              + (f", {len(clued)} carrying clue pieces left as they were" if clued else ""),
+              flush=True)
+    else:
+        print(f"[probe] none (--probe_per_top 0): the best {len(cands)} finished "
+              f"board(s) go to the select as they are", flush=True)
 
     # -- 4 select -------------------------------------------------------------------
     order = sorted((k for k in cands if k in probed),
                    key=lambda k: (-probed[k][0], -(probed[k][0] - finished[k][0]),
                                   -finished[k][0], -screen.get(k, 0), -meta[k][4], k))
     recs = [dict(k=k, line=probed[k][1]) for k in order]
-    kept = R.filter_max_agree(recs, MAX_AGREE)[:args.top]
+    kept = R.filter_max_agree(recs, args.max_agree)[:args.top]
 
     # -- outputs ---------------------------------------------------------------------
     with open(out, "w", newline="") as fh, open(work / "summary.csv", "w", newline="") as sm:
