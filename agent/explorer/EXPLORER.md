@@ -353,8 +353,10 @@ than what exists.
   456: exact 0, score 456.
 - Beams of this kind make thousands of 450s quickly and have never passed 465.
 
-*Halo.* `run_halo.sh` with its defaults (`CLUES=center`) ran 6 minutes and
-scored 949 exact partials, the best exact 321 (174 placed), with no jackpot.
+*Halo.* The exact-search `run_halo.sh` (before 2026-11-01) with its defaults
+(`CLUES=center`) ran 6 minutes and scored 949 exact partials, the best exact
+321 (174 placed); none placed every inner piece. Its successor ratchets the
+halo with 20 breaks; `pipeline/README.md` has its measurements.
 
 *Whirlpool* (`ref/`, campaign 20261028-0249).
 - Its v08 runner makes 87 jewels per hour: boards whose fixed 60-cell frame

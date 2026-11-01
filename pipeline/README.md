@@ -16,7 +16,7 @@ settings here will make far more sense afterwards.
 | `run_board_farm.sh` | runs a pipeline pass in a loop forever, keeps only the best boards, and periodically re-attacks them | days |
 | `run_farm.py` | the same idea with a different chain, and boards that graduate: built, endered once, then deeply endered into `elite.csv` and never searched again | days |
 | `run_cycles.sh` | fresh boards in parallel cycles: a beam that only grows row-11 partials over many border configurations (no end dives), then the distiller on them; every cycle's best boards collect in `best.csv`. The route that made the 464s of `data/best_464.csv` (rows 4-8) | 25 min a cycle on 4 threads, as many slots as the cores allow |
-| `run_halo.sh` | beam to row 10, lift the halo (rows 0-2, columns 0, 1, 14, 15) and search for a board with every inner piece placed, the frame last; the best boards climb a ladder of longer resumed searches | hours |
+| `run_halo.sh` | L-band boards to row 11 (`--backtrack_unlock_right 3`), the halo around their 10 x 10 core (rows 0-2 and 13-15, columns 0-2 and 13-15) lifted and refilled by a frontier ratchet allowed 20 breaks; every complete board polished at length | hours |
 | `topper_sweep.sh` | one plan of topper passes over a slice of a board file | minutes |
 | `slurm_wrapper.sh` | runs any of the above as a batch job | -- |
 
@@ -402,46 +402,72 @@ memory-mapped reads can stall a produce call for many minutes.
 
 ## The halo: `run_halo.sh`
 
-A loop until `TOTAL_TIME` is spent, looking for a board whose 196 inner pieces
-are all placed break-free, the frame left for last:
+A loop until `TOTAL_TIME` is spent, looking for complete boards with at most
+`BREAKS` (20) broken edges:
 
 | step | tool | what it does |
 |---|---|---|
-| A | `E555_beamer --random_edges` | `SAMPLES` bottoms x `COLUMNS` left columns, a beam `BEAM_WIDTH` wide, exhaustive from `BACKTRACK_ROW` to `STOP_ROW`, no extension |
-| B | `E555_backtracker` | up to `MAX_BOARDS` distinct boards: `data/holes_halo.csv` lifts rows 0-2 and columns 0, 1, 14, 15, and an exact search (`--breaks 0 --frame_last --edge_supply --resume`) fills the inner cells, `BT_TIME` seconds a board |
-| C | `E555_rank.py --split` | the boards scoring N or more go to `elite.csv` and onto the ladder; the rest are deleted with the beam's boards |
-| D | `E555_backtracker --resume` | the ladder: each rung continues its boards' searches, `LADDER_TIME` seconds a board doubled per rung, and the better `RUNG_KEEP`% move up |
+| A | `E555_beamer --random_edges --backtrack_unlock_right 3` | `SAMPLES` bottoms x `COLUMNS` left columns, a beam `BEAM_WIDTH` wide to `BACKTRACK_ROW` (10), exhaustive to row 11 over columns 0-12: break-free blocks with the right band open, no extension |
+| B | `E555_backtracker --break_mode ratchet --order frontier` | `RATCHET_BOARDS` of them, spread evenly over the beam's file: `data/holes_halo.csv` lifts rows 0-2 and 13-15 and columns 0-2 and 13-15, and the ratchet refills the 166 open cells outward from the 10 x 10 core within `BREAKS` breaks |
+| C | `E555_diver --reopen auto`, `E555_rank.py` | each complete board polished for `POLISH_TIME` seconds (50000 dives and 50000 polish rounds per copy, 8 copies a round) into `complete.csv`; `best.csv` keeps the best boards of every ratchet, complete or not |
 
 ```bash
 bash pipeline/run_halo.sh                                     # four hours, every core
-bash pipeline/run_halo.sh TOTAL_TIME=30m SAMPLES=4            # a short look
+bash pipeline/run_halo.sh TOTAL_TIME=30m SAMPLES=2            # a short look
 bash pipeline/run_halo.sh TOTAL_TIME=2d DB_FILE=/tmp/E555.db  # a shared database cache
 ```
 
-The idea: the rows the beam laid first, and the side columns, may hold the
-pieces the top needs. Lifting them gives those pieces back to an exact search
-that fails early on most boards; the ladder keeps a lucky one going.
+The idea: the beam fills its first rows and the side columns long before the
+pieces run short. Lifting them gives those pieces back, so one search can
+rebuild the frame, the band and the top together around a core the beam built
+well.
 
-- **Jackpots.** With the 60 frame cells searched last, `--early_release 60`
-  releases the first board that places every inner cell; it goes to
-  `jackpots.csv`, and its search goes on to the next one. `--edge_supply`
-  keeps the edge pieces left able to meet every inner edge facing the frame,
-  so a jackpot's frame can still close on its inward edges without a break.
-- **Threshold.** N is the score at the best `ELITE_PCT`% (default 5) of every
-  board scored so far (`scores.txt`); `ELITE_SCORE=N` fixes it.
-- **Ladder.** Boards compete only with boards that have had the same search
-  time; a finished search leaves the ladder. The top rung keeps its best
-  `TOP_RUNG_CAP` and searches them on every round. `top.csv` holds the deepest
-  boards seen.
-- **Clues.** `CLUES=center` by default: the corner clues kill most beams on
-  row 2 and most halo searches at once.
-- **Rounds.** B, D and the beam stop cleanly before `TOTAL_TIME` ends; Ctrl-C
-  does the same. A rerun with the same `RUN_DIR` goes on with its rounds,
-  histogram and ladder. Rows of B and D carry a resume identifier (515 fields).
-- **Beamer settings.** `BACKTRACK_ROW=6` writes millions of boards a round;
-  `BEAM_MAX` caps them. `EXHAUST_INNER=1` leaves A almost empty at stop row 10.
-  `--lambda_corners` is refused with `--random_edges`; it applies with
-  `ROTATIONS=file` (one border row a round).
+- **The ratchet.** An exact search outward from the core breaks where it is
+  stuck, each break kept for good. It goes on until the board is complete,
+  `BREAKS` breaks are spent, or its cuts prove the rest cannot be finished
+  within them. It ends on its own, so no time ladder is needed. Under its node
+  cap (`RATCHET_NODES`) a board's result is the same at any thread count.
+- **The sample.** Every `STEP`-th board of the beam's file, so it spans the
+  round's configurations and roots. The backtracker skips repeats after the
+  lift.
+- **The polish.** One diver call per complete board, so each board gets its
+  own clock. It never returns a worse board. It is off under `CLUES=all`,
+  because an auto band can lift a corner clue.
+- **Rounds.** The beam and the ratchet stop cleanly before `TOTAL_TIME` ends,
+  and Ctrl-C does the same. A rerun with the same `RUN_DIR` goes on with its
+  round count, `complete.csv` and `best.csv`.
+- **The database.** Each round reads `DB_FILE` before its beam: ~1 s when it
+  is in the page cache, ~20 s when it is not. Out of the cache, the beamer's
+  memory-mapped lookups wait on the disk, and one configuration took 6 minutes
+  instead of 8 s.
+
+**Measured** (4 threads, `CLUES=center`). The beam, per configuration:
+
+| width, backtrack row | boards |
+|---|---|
+| 10000, 10 | ~1000 from 150-250 emitting roots, 8 s |
+| 10000, 9 | 36k-91k |
+| 2000 or 10000, 8 | over 200k on 110-180 roots: one configuration fills the cap |
+
+The frontier ratchet on 34 halo boards (166 open cells):
+
+| ceiling, nodes | result | s a board, one thread |
+|---|---|---|
+| `--breaks 20`, 1e6 | every board stops at "no candidate passes the cuts", 172-203 of 256 placed (mean 183) | 4.3 |
+| `--breaks 20`, 1e5 | the same, 168-201 placed (mean 179) | 4.7 |
+| `--breaks 64`, 1e6 | complete, 435-442 (mean 437.8) | 6.1 |
+| `--breaks 64`, 1e5 | complete, 431-441 (mean 436.4) | 6.7 |
+| `--breaks 64`, 1e5, no lift (the 100 open band cells only) | complete, 439-446 (mean 442.5) | 7.0 |
+
+- **The lift costs edges.** With diver dives and polish instead (`--end_dive
+  10000 --end_polish 5000`, 8 boards): 442.4 lifted, 451.9 without.
+- **No screen.** Dive scores do not rank these boards. Two runs of one screen
+  (backtracker stuck dives or diver dives, 300-1000 a board) agree at Spearman
+  +0.02 to +0.12. The median of a board's stuck dives repeats (+0.57 to +0.72)
+  but does not predict the ratchet (+0.14, +0.05).
+- The ratchet writes byte-identical boards at 1 and 4 threads.
+- A round at the defaults on 4 threads: the beam 2-3.5 min (14-16
+  configurations, 16k-21k boards), the ratchet ~7 min (400 boards).
 
 ## The topper sweep
 

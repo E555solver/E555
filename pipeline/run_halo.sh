@@ -1,114 +1,131 @@
 #!/bin/bash
-# run_halo.sh -- grow partial boards, lift the halo around their core, and search
-# the halo with the empty top for a board whose every inner piece is placed. The
-# best few percent climb a ladder of ever longer searches. Repeat.
+# run_halo.sh -- grow L-band boards to row 11, lift the halo around their core,
+# and search the halo again with a frontier ratchet allowed BREAKS broken edges,
+# looking for complete boards that could beat the 465 record. Every complete
+# board is polished at length. Repeat.
 #
 #   bash pipeline/run_halo.sh
-#   bash pipeline/run_halo.sh TOTAL_TIME=8h THREADS=16 DB_FILE=/tmp/E555.db
-#   bash pipeline/run_halo.sh RUN_DIR=halo2 MAX_BOARDS=20000 LADDER_TIME=1
+#   bash pipeline/run_halo.sh TOTAL_TIME=2d THREADS=32 DB_FILE=/data/E555.db
+#   bash pipeline/run_halo.sh RUN_DIR=halo2 BREAKS=24 RATCHET_BOARDS=2000
 #
 # One round:
 #   A  E555_beamer --random_edges: SAMPLES bottoms x COLUMNS left columns, a beam
-#      BEAM_WIDTH wide, exhaustive from BACKTRACK_ROW to STOP_ROW, no extension.
-#   B  E555_backtracker on up to MAX_BOARDS distinct boards: HOLES lifts rows
-#      0-2 and columns 0, 1, 14, 15 (the frame and the ring inside it), and an
-#      exact search (--breaks 0 --frame_last) fills the inner cells first and the
-#      frame last, BT_TIME seconds a board. A board whose 196 inner cells are all
-#      placed is released at once (the frame left open) and kept in jackpots.csv;
-#      --edge_supply has kept the edge pieces left able to meet every inner edge
-#      facing the frame.
-#   C  The boards scoring at least the best ELITE_PCT% of every board scored so
-#      far go to elite.csv and to the first rung of the ladder; the rest are
-#      deleted with the beam's boards.
-#   D  The ladder: every rung continues its boards' own searches (--resume) for
-#      LADDER_TIME seconds, doubled on each rung up, and the better RUNG_KEEP%
-#      move up; the top rung keeps its best TOP_RUNG_CAP and goes on searching
-#      them round after round. A finished search leaves the ladder.
+#      BEAM_WIDTH wide to BACKTRACK_ROW, then an exhaustive search to STOP_ROW
+#      over columns 0..15-UNLOCK_RIGHT (--backtrack_unlock_right, no extension):
+#      break-free blocks, rows 0-11 x columns 0-12, the right band left open.
+#   B  RATCHET_BOARDS of them, spread evenly over the beam's file: HOLES lifts
+#      the halo (rows 0-2 and 13-15, columns 0-2 and 13-15: 66 cells of a block,
+#      the frame the beam wrote among them) and keeps the 10 x 10 core, and
+#      E555_backtracker --break_mode ratchet --order frontier refills the 166
+#      open cells outward from the core: an exact search, a break where it is
+#      stuck, until the board is complete, BREAKS breaks are spent, or its cuts
+#      prove the rest cannot be finished within them.
+#   C  Each complete board (at most BREAKS breaks, so 480-BREAKS or more) gets a
+#      long E555_diver --reopen auto polish of POLISH_TIME seconds and goes to
+#      complete.csv; best.csv keeps the BEST_KEEP best boards of every ratchet.
 # Then back to A while TOTAL_TIME lasts.
 #
-# Why: the rows the beam laid first, and the side columns, may hold the pieces
-# the top needs. Lifting them gives those pieces back to an exact search, which
-# fails early on most boards and keeps a lucky one going.
+# Why: the beam fills its first rows and the side columns long before the
+# pieces run short. Lifting them gives those pieces back, and the search rebuilds
+# the frame, the band and the top together around a core the beam built well.
+#
+# Measured on 4 threads, 34 halo boards from this beam (pipeline/README.md):
+#   - Under BREAKS=20 the ratchet stopped on every board with "no candidate
+#     passes the cuts", at 172-203 of 256 cells placed, about 4.3 s a board on
+#     one thread: its cuts prove the rest cannot finish within 20 breaks. Under
+#     a loose ceiling (--breaks 64) it completed them with 38-45 breaks (435-442).
+#     A complete board within BREAKS is a rare find; best.csv shows how close a
+#     run gets.
+#   - Lifting the halo costs edges: finished on their open band alone, the same
+#     boards reach 442.5 with the ratchet (436.4 lifted; 1e5 nodes, loose
+#     ceiling) and 451.9 with diver dives and polish (442.4 lifted; 8 boards).
+#   - Dive scores do not rank these boards: two runs of one dive screen agree at
+#     Spearman +0.02 to +0.12. So the sample is spread evenly, not screened.
 #
 # What RUN_DIR holds afterwards:
-#   jackpots.csv  boards with every inner cell placed, break-free, frame open
-#   top.csv       the TOP_KEEP deepest boards seen, best first
-#   elite.csv     every board that entered the ladder, as first searched
-#   ladder/       rung_K.csv, the boards on each rung, resumable
-#   halo.log      one line per round; scores.txt the threshold's histogram
+#   complete.csv  every complete board found, polished, best first
+#   best.csv      the BEST_KEEP best boards of every ratchet, complete or not
+#   halo.log      one line per round
 #   logs/         each round's logs, gzipped (KEEP_LOGS=1)
-# A rerun with the same RUN_DIR carries on: rounds, histogram, ladder. Ctrl-C is
-# safe: the running tool stops cleanly, its rows are kept, and the run ends.
-# Rows from B and D carry a resume identifier as field 3 (515 fields); every
-# reader takes the last 512 fields. NEEDS ~8 GB RAM for the beamer.
+# A rerun with the same RUN_DIR carries on: the round count, complete.csv and
+# best.csv. Ctrl-C is safe: the running tool stops cleanly, what it finished is
+# kept (a board whose polish was stopped is kept as the ratchet wrote it), and
+# the run ends.
+# NEEDS ~8 GB RAM for the beamer, ~7 GB of disk for DB_FILE, bash 4.4+, GNU sed.
 set -uo pipefail        # not -e: a round that fails must not kill the run
 
 # ---- settings: edit here, or pass NAME=value on the command line ------------
 REPO=$(cd "$(dirname "$0")/.." && pwd)  # E555 checkout. Set this if you copied
                                         # this script somewhere else.
-SEED=data/seed_Edge5.txt                # SEED, HOLES, ROTATIONS: relative to REPO
+SEED=data/seed_Edge5.txt                # SEED and HOLES: relative to REPO
 RUN_DIR=halo_out                        # relative to where you START it
 THREADS=$(nproc)
 TOTAL_TIME=4h           # the whole loop: seconds, or 90m, 4h, 2d. A step still
                         # running at the end is stopped and harvested.
-DB_FILE=chain.db        # the chain database cache, ~6 GB. A bare name lands in
+DB_FILE=chain.db        # the chain database cache, ~6.5 GB. A bare name lands in
                         # RUN_DIR; give an absolute path to share it between runs.
                         # The clue setting is appended (chain.db.center): a clued
                         # database leaves the clue pieces out. Empty = rebuild
                         # it in memory every round (~2 minutes each).
 CLUES=center            # center | all | none -- held by the beam and put back by
-                        # the backtracker. The corner clues kill most beams on
-                        # row 2 and most halo searches at once.
+                        # the ratchet
+RNG_SEED=0              # 0 = a fresh seed every round; S = S, S+1, ... per round.
+                        # The seed names the round's boards (h<seed>_...).
 
-# A. beamer
-ROTATIONS=              # empty = --random_edges. A Stage A rotations file
-                        # instead: one border row per round, in turn, with
-                        # SAMPLES bottoms each and LAMBDA_CORNERS
-SAMPLES=10              # random bottoms per round (--samples; --top_bottoms
-                        # with ROTATIONS)
-COLUMNS=5               # left columns per bottom (--top_columns)
+# A. beam (E555_beamer): break-free blocks, rows 0..STOP_ROW x columns 0..15-UNLOCK_RIGHT
+SAMPLES=4               # --samples: random bottom rows per round
+COLUMNS=4               # --top_columns: left columns per bottom
 BEAM_WIDTH=10000
-STOP_ROW=10
-BACKTRACK_ROW=7         # --backtrack_row: exhaustive rows BACKTRACK_ROW+1..STOP_ROW;
-                        # 0 = the beam alone. Row 6 writes millions of boards a round
+BACKTRACK_ROW=10        # --backtrack_row: rows BACKTRACK_ROW+1..STOP_ROW exhaustive.
+                        # Measured per configuration: 10 writes ~1000 boards
+                        # from ~200 roots, 9 writes 36k-91k, 8 hundreds of
+                        # thousands that pile up on a few roots
+STOP_ROW=11
+UNLOCK_RIGHT=3          # --backtrack_unlock_right: the right columns left open
 BC_WINDOW=7,7
 POOL=64                 # --pool_factor
 TAU=0.1                 # --tau_bottoms and --tau_columns
-EXHAUST_INNER=0         # --exhaust_inner_color N; 1 leaves A almost empty at row 10
-LAMBDA_CORNERS=0.5      # --lambda_corners, with ROTATIONS only: the beamer
-                        # refuses it with --random_edges. 0 = off
-RNG_SEED=0              # 0 = a fresh seed every round; S = S, S+1, ... per round.
-                        # The seed names the round's boards (h<seed>_rndb...).
+EXHAUST_INNER=0         # --exhaust_inner_color N
 BEAM_WALL=1800          # cap on one beamer call, seconds
-BEAM_MAX=300000         # --max_emitted: stop the beam after this many boards
-                        # (about 2 KB each on disk); 0 = no cap
-MAX_BOARDS=10000        # distinct boards searched per round, the same share from
-                        # every configuration; 0 = all of them
+BEAM_MAX=200000         # --max_emitted: a disk guard (~2 KB a board)
+BEAM_EXTRA=             # more beamer flags
 
-# B. backtracker
-HOLES=data/holes_halo.csv   # must lift the whole frame up to STOP_ROW
-BT_ORDER=spiralout      # --order, with --frame_last; ahead of frontier and mrv with --edge_supply
-BT_TIME=0.1             # seconds per board, the first look
-BT_EXTRA=               # more backtracker flags, e.g. BT_EXTRA="--reverse"
+# B. ratchet (E555_backtracker --break_mode ratchet)
+HOLES=data/holes_halo.csv   # the halo lifted from every board
+RATCHET_BOARDS=         # boards ratcheted a round, spread evenly over the beam's;
+                        # empty = 100 per thread
+BREAKS=20               # --breaks: a complete board has at most this many broken
+                        # edges, so it scores 480 - BREAKS or more
+RATCHET_ORDER=frontier  # --order: outward from the core, fewest fits first
+RATCHET_NODES=1000000   # --ratchet_nodes: node cap of each exact search
+ROLLOUTS=32             # --ratchet_rollouts: dives scoring each candidate break
+RATCHET_TIME=120        # --time_limit per board, seconds: a guard only
+RATCHET_EXTRA=          # more backtracker flags
 
-# C, D. elite and ladder
-ELITE_PCT=5             # the best ELITE_PCT% of every board scored so far
-ELITE_SCORE=0           # > 0: a fixed threshold instead of ELITE_PCT
-RUNGS=6                 # rungs of the ladder; 0 = no ladder
-LADDER_TIME=0.5         # seconds per board on the first rung, doubled per rung
-RUNG_KEEP=50            # % of a rung's boards that move up each round
-TOP_RUNG_CAP=64         # boards the top rung keeps searching
-TOP_KEEP=100            # boards in top.csv
+# C. results
+POLISH_TIME=1800        # seconds of E555_diver --reopen auto per complete board,
+                        # on all threads; 0 = none. Complete boards are rare.
+POLISH_DIVES=50000      # --end_dive    } per copy; 8 copies a round, rounds until
+POLISH_STEPS=50000      # --end_polish  } POLISH_TIME (the 465's own re-dive)
+POLISH_EXTRA=           # more diver flags, e.g. POLISH_EXTRA="--plateau"
+RECORD=465              # a complete board above this is announced
+BEST_KEEP=100           # boards in best.csv
 KEEP_LOGS=1             # 1 = keep each round's logs, gzipped, in RUN_DIR/logs
 # -----------------------------------------------------------------------------
 for arg in "$@"; do
     case "$arg" in
-        [A-Za-z_]*=*) declare "$arg" ;;
+        [A-Za-z_]*=*) [[ -v ${arg%%=*} ]] ||
+                          { echo "unknown setting ${arg%%=*}: the settings are at the top of $0" >&2; exit 1; }
+                      declare "$arg" ;;
         *) echo "expected NAME=value, got: $arg" >&2; exit 1 ;;
     esac
 done
 
 die() { echo "$*" >&2; exit 1; }
+[ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 4 ]; } ||
+    die "bash 4.4 or newer is needed (empty arrays under set -u)"
+[[ $THREADS =~ ^[0-9]+$ ]] && [ "$THREADS" -ge 1 ] || die "THREADS must be a whole number, at least 1 (got: $THREADS)"
+: "${RATCHET_BOARDS:=$(( 100 * THREADS ))}"
 [[ $TOTAL_TIME =~ ^([0-9]+)([smhd]?)$ ]] ||
     die "TOTAL_TIME must be seconds, or a whole number with s, m, h or d: $TOTAL_TIME"
 case "${BASH_REMATCH[2]}" in
@@ -118,47 +135,33 @@ case "${BASH_REMATCH[2]}" in
     *) TOTAL_S=${BASH_REMATCH[1]} ;;
 esac
 case "$CLUES" in
-    all|1)   CLUES=all;    CLUE_ARG=(--clue_center --clue_corners) ;;
-    center)  CLUE_ARG=(--clue_center) ;;
-    none|0)  CLUES=none;   CLUE_ARG=() ;;
+    all)    CLUE_ARG=(--clue_center --clue_corners) ;;
+    center) CLUE_ARG=(--clue_center) ;;
+    none)   CLUE_ARG=() ;;
     *) die "CLUES must be center, all or none (got: $CLUES)" ;;
 esac
-for v in SAMPLES COLUMNS BEAM_WIDTH STOP_ROW BACKTRACK_ROW POOL EXHAUST_INNER BEAM_WALL \
-         BEAM_MAX MAX_BOARDS ELITE_SCORE RUNGS RUNG_KEEP TOP_RUNG_CAP TOP_KEEP KEEP_LOGS RNG_SEED; do
+for v in SAMPLES COLUMNS BEAM_WIDTH BACKTRACK_ROW STOP_ROW UNLOCK_RIGHT POOL EXHAUST_INNER BEAM_WALL \
+         BEAM_MAX RATCHET_BOARDS BREAKS RATCHET_NODES ROLLOUTS RATCHET_TIME POLISH_TIME POLISH_DIVES \
+         POLISH_STEPS RECORD BEST_KEEP KEEP_LOGS RNG_SEED; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
 done
-for v in ELITE_PCT BT_TIME LADDER_TIME; do
-    [[ ${!v} =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v p="${!v}" 'BEGIN { exit !(p > 0) }' ||
-        die "$v must be a number above 0 (got: ${!v})"
+[[ $TAU =~ ^[0-9]+([.][0-9]+)?$ ]] || die "TAU must be a number, 0 or more (got: $TAU)"
+for v in SAMPLES COLUMNS BEAM_MAX RATCHET_BOARDS BREAKS RATCHET_TIME POLISH_DIVES BEST_KEEP; do
+    [ "${!v}" -ge 1 ] || die "$v must be at least 1"
 done
-awk -v p="$ELITE_PCT" 'BEGIN { exit !(p <= 100) }' || die "ELITE_PCT is a percentage, at most 100"
-[ "$RUNG_KEEP" -ge 1 ] && [ "$RUNG_KEEP" -le 100 ] || die "RUNG_KEEP is a percentage, 1 to 100"
-[ "$SAMPLES" -ge 1 ] || die "SAMPLES must be at least 1: --samples 0 never ends"
-[ "$BACKTRACK_ROW" -lt "$STOP_ROW" ] || die "BACKTRACK_ROW must be below STOP_ROW, or 0"
+[ "$BACKTRACK_ROW" -ge 1 ] && [ "$BACKTRACK_ROW" -lt "$STOP_ROW" ] ||
+    die "BACKTRACK_ROW must be at least 1 and below STOP_ROW=$STOP_ROW"
+[ "$KEEP_LOGS" -le 1 ] || die "KEEP_LOGS must be 0 or 1"
 
 case "$RUN_DIR" in /*) ;; *) RUN_DIR="$PWD/$RUN_DIR" ;; esac
 cd "$REPO" || die "REPO=$REPO does not exist"
 [ -d bin ] && [ -d tools ] || die "REPO=$REPO is not an E555 checkout -- set REPO at the top"
-[ -x bin/E555_beamer ] && [ -x bin/E555_backtracker ] || make ||
-    die "the build failed; try make ARCH=generic"
+make -s beamer backtracker diver > /dev/null || die "the build failed: run make in $REPO (make ARCH=generic in a container)"
 [ -f "$SEED" ]  || die "seed file not found: $SEED"
 [ -f "$HOLES" ] || die "holes mask not found: $HOLES"
-SEED=$PWD/$SEED; HOLES=$PWD/$HOLES
-# The jackpot release counts the 60 frame cells as the last ones open, so the
-# mask must open the whole frame the beam fills (rows 0..STOP_ROW).
-awk -v stop="$STOP_ROW" '!/^[ \t]*([#%]|$)/ { gsub(/[ \t\r]/, ""); n = split($0, f, ",")
-        if (r <= stop) for (c = 1; c <= n; c++)
-            if ((r == 0 || c == 1 || c == 16) && f[c] != 1) bad = 1
-        r++ } END { exit bad }' "$HOLES" || die "HOLES must lift the whole frame up to row $STOP_ROW"
-NROT=0
-if [ -n "$ROTATIONS" ]; then
-    [ -s "$ROTATIONS" ] || die "rotations file not found: $ROTATIONS"
-    ROTATIONS=$PWD/$ROTATIONS
-    NROT=$(awk '!/^[ \t]*([#%]|$)/' "$ROTATIONS" | grep -c .)
-    [ "$NROT" -ge 1 ] || die "no border rows in $ROTATIONS"
-fi
-
-mkdir -p "$RUN_DIR/logs" "$RUN_DIR/ladder" || die "cannot create RUN_DIR=$RUN_DIR"
+SEED=$(readlink -f -- "$SEED"); HOLES=$(readlink -f -- "$HOLES")
+mkdir -p "$RUN_DIR/logs" || die "cannot create RUN_DIR=$RUN_DIR"
+DB_ARG=()
 if [ -n "$DB_FILE" ]; then
     case "$DB_FILE" in /*) ;; *) DB_FILE="$RUN_DIR/$DB_FILE" ;; esac
     [ "$CLUES" = none ] || DB_FILE="$DB_FILE.$CLUES"
@@ -169,97 +172,33 @@ if [ -n "$DB_FILE" ]; then
             echo "[warn] only ${FREE_GB}G free for $DB_FILE; the chain database needs about 6.5G"
     fi
     DB_ARG=(--db_file "$DB_FILE")
-else
-    DB_ARG=()
 fi
 
-ELITE=$RUN_DIR/elite.csv
-JACK=$RUN_DIR/jackpots.csv
-TOP=$RUN_DIR/top.csv
+COMPLETE=$RUN_DIR/complete.csv
+BEST=$RUN_DIR/best.csv
 LOG=$RUN_DIR/halo.log
-SCORES=$RUN_DIR/scores.txt
-LADDER=$RUN_DIR/ladder
-touch "$ELITE" "$JACK" "$TOP" "$SCORES"
-
+touch "$COMPLETE" "$BEST" "$LOG"
 # The round count goes on from the last run in this RUN_DIR.
-ROUND=0
-[ -s "$LOG" ] && ROUND=$(awk '$1 == "round" { n = $2 } END { print n + 0 }' "$LOG")
+ROUND=$(sed -n 's/^round \([0-9][0-9]*\) .*/\1/p' "$LOG" | tail -1)
+ROUND=${ROUND:-0}
 rm -rf "$RUN_DIR"/round_*       # a round a previous run was killed in
 
-hms()  { local s=$1; if [ "$s" -ge 3600 ]; then printf '%dh%02dm' $((s/3600)) $((s%3600/60))
-         elif [ "$s" -ge 60 ]; then printf '%dm%02ds' $((s/60)) $((s%60)); else printf '%ds' "$s"; fi; }
-rows() { awk '!/^[ \t]*([#%]|$)/' "$@" 2>/dev/null | grep -c . ; }
-
-# distinct FILE... -- the boards, one per distinct board after the HOLES lift,
-# each renamed <config id>_<beam index>. The beam writes many boards that differ
-# only in the lifted cells, and those are one search.
-distinct() {
-    awk -F, -v OFS=, -v mask="$HOLES" '
-        BEGIN { r = 0
-                while ((getline line < mask) > 0) {
-                    if (line ~ /^[ \t]*[#%]/ || line !~ /[01]/) continue
-                    gsub(/[ \t\r]/, "", line)
-                    n = split(line, f, ",")
-                    for (c = 1; c <= n; c++) lift[r * 16 + c - 1] = (f[c] == 1)
-                    r++ } }
-        /^[ \t]*[#%]/ || NF < 514 { next }
-        { k = ""
-          for (p = 0; p < 256; p++) {
-              cell = $(NF - 511 + p) + 0
-              if (cell != 999 && !lift[cell]) k = k p ":" cell ":" ($(NF - 255 + p) + 0) " " }
-          if (k in seen) next
-          seen[k] = 1
-          id = $1; gsub(/[ \t]/, "", id); $1 = id "_" ($2 + 0)
-          print }' "$@"
-}
-# thin FILE MAX -- at most about MAX of FILE's boards, the same share from every
-# configuration (the id before its _<index>), evenly spread within each.
-thin() {
-    awk -F, -v max="$2" '
-        FNR == NR { id = $1; sub(/_[0-9]+$/, "", id); if (!(id in n)) nc++; n[id]++; next }
-        { id = $1; sub(/_[0-9]+$/, "", id); k = ++i[id]; q = max / nc
-          if (q >= n[id] || int(k * q / n[id]) != int((k - 1) * q / n[id])) print }' "$1" "$1"
-}
-# searched FILE -- the rows a --resume run wrote with an identifier (a row it
-# never started comes back as it went in, without one).
-searched() { awk -F, '$3 ~ /^bt1;/' "$1" 2>/dev/null; }
-# inner_awk: n = the board's placed inner cells (rows and columns 1..14), 0..196.
-INNER='n = 0; for (i = NF - 511; i <= NF - 256; i++) { c = $i + 0
-       if (c != 999) { r = int(c / 16); k = c % 16; if (r >= 1 && r <= 14 && k >= 1 && k <= 14) n++ } }'
-# jackpots FILE -- copy the boards with every inner cell placed to jackpots.csv,
-# once each (a released board's search goes on to the next release).
-jackpots() {
-    awk -F, "{ $INNER; if (n == 196) print }" "$1" 2>/dev/null >> "$JACK"
-    awk -F, '{ k = $0; for (i = 1; i <= NF - 512; i++) sub(/^[^,]*,/, "", k)
-               if (!(k in seen)) { seen[k] = 1; print } }' "$JACK" > "$JACK.tmp" && mv "$JACK.tmp" "$JACK"
-}
-best_inner() { cat "$@" 2>/dev/null | awk -F, "NF >= 514 { $INNER; if (n > m) m = n } END { print m + 0 }"; }
-
-# add_scores FILE -- fold the scores (field 2) of FILE's boards into scores.txt,
-# kept as "score count", best first.
-add_scores() {
-    { cat "$SCORES"
-      awk -F, '!/^[ \t]*[#%]/ && NF >= 514 { print $2 + 0, 1 }' "$1"
-    } | awk '{ n[$1] += $2 } END { for (s in n) print s, n[s] }' |
-        sort -k1,1nr > "$SCORES.tmp" && mv "$SCORES.tmp" "$SCORES"
-}
-# threshold -- the score of the board at the best ELITE_PCT% of scores.txt, so a
-# round only adds the boards that rank in the top ELITE_PCT% of the whole run.
-threshold() {
-    [ "$ELITE_SCORE" -gt 0 ] && { echo "$ELITE_SCORE"; return; }
-    awk -v pct="$ELITE_PCT" '{ s[NR] = $1; c[NR] = $2; tot += $2 }
-        END { k = tot * pct / 100; if (k < 1) k = 1
-              for (i = 1; i <= NR; i++) { acc += c[i]; if (acc >= k) { print s[i]; exit } }
-              print 0 }' "$SCORES"
-}
-# best_first -- rows on stdin, best score first
-best_first() { awk -F, '{ print ($2 + 0) "\t" $0 }' | sort -t "$(printf '\t')" -k1,1nr -s | cut -f2-; }
-# keep_top FILE... -- merge into top.csv: the TOP_KEEP best distinct boards
-keep_top() {
-    cat "$TOP" "$@" 2>/dev/null | awk -F, 'NF >= 514' | best_first |
-        awk -F, -v keep="$TOP_KEEP" '{ k = $0; for (i = 1; i <= NF - 512; i++) sub(/^[^,]*,/, "", k)
-                   if (!(k in seen) && kept < keep) { seen[k] = 1; kept++; print } }' > "$TOP.tmp" &&
-        mv "$TOP.tmp" "$TOP"
+hms()   { local s=$1; if [ "$s" -ge 3600 ]; then printf '%dh%02dm' $((s/3600)) $((s%3600/60))
+          elif [ "$s" -ge 60 ]; then printf '%dm%02ds' $((s/60)) $((s%60)); else printf '%ds' "$s"; fi; }
+count() { if [ -s "$1" ]; then python3 tools/E555_rank.py "$1" --count; else echo 0; fi; }
+# best FILE MEASURE -- MEASURE (score, placed) of the best board by it; - for none
+best()  { local v=; [ "$(count "$1")" -eq 0 ] ||
+              v=$(python3 tools/E555_rank.py "$1" --seed_file "$SEED" --sort "$2" --field "$2"); echo "${v:--}"; }
+# merge OUT ARGS... FILE... -- rebuild OUT from itself and the FILEs that hold boards,
+# best first, one row per distinct board
+merge() {
+    local out=$1 f in=() args=(); shift
+    while [ "$#" -gt 0 ] && [ "${1#--}" != "$1" ]; do args+=("$1" "$2"); shift 2; done
+    for f in "$out" "$@"; do [ "$(count "$f")" -eq 0 ] || in+=("$f"); done
+    [ "${#in[@]}" -gt 0 ] || return 0
+    python3 tools/E555_rank.py "${in[@]}" --seed_file "$SEED" --sort score --unique "${args[@]}" \
+        --quiet --out "$out.tmp" > /dev/null 2> "$RUN_DIR/rank.log" && mv "$out.tmp" "$out" ||
+        echo "[warn] $(basename "$out") not rebuilt: $(tail -1 "$RUN_DIR/rank.log")"
 }
 
 STOP=0
@@ -290,76 +229,46 @@ run_tool() {
     return "$rc"
 }
 
-BEAM=(--stop_row "$STOP_ROW" --beam_width "$BEAM_WIDTH" --bc_window "$BC_WINDOW"
-      --pool_factor "$POOL" --top_columns "$COLUMNS" --tau_bottoms "$TAU"
+read -r -a BEAM_MORE <<< "$BEAM_EXTRA"
+read -r -a RATCHET_MORE <<< "$RATCHET_EXTRA"
+read -r -a POLISH_MORE <<< "$POLISH_EXTRA"
+BEAM=(--random_edges --samples "$SAMPLES" --top_columns "$COLUMNS" --beam_width "$BEAM_WIDTH"
+      --backtrack_row "$BACKTRACK_ROW" --stop_row "$STOP_ROW" --backtrack_unlock_right "$UNLOCK_RIGHT"
+      --extend_nodes 0 --bc_window "$BC_WINDOW" --pool_factor "$POOL" --tau_bottoms "$TAU"
       --tau_columns "$TAU" --exhaust_inner_color "$EXHAUST_INNER" --max_emitted "$BEAM_MAX"
-      "${CLUE_ARG[@]}" "${DB_ARG[@]}" --threads "$THREADS" --print_cmd)
-[ "$BACKTRACK_ROW" -eq 0 ] || BEAM+=(--backtrack_row "$BACKTRACK_ROW" --extend_nodes 0)
-read -r -a BT_MORE <<< "$BT_EXTRA"
-# The 60 frame cells are the last open ones, so --early_release 60 releases the
-# first board with every inner cell placed. --edge_supply cuts a path once the
-# inner cells ask the frame for more of a colour than the unused edge pieces
-# carry inward. The colour count and Hall would also ask the rest of the frame
-# to close; that is left for later.
-BT=(--holes "$HOLES" "${CLUE_ARG[@]}" --breaks 0 --order "$BT_ORDER" --frame_last
-    --edge_supply --early_release 60 --no_colour_count --no_hall --resume
-    --threads "$THREADS" --print_cmd "${BT_MORE[@]}")
+      "${CLUE_ARG[@]}" "${DB_ARG[@]}" --threads "$THREADS" --print_cmd "${BEAM_MORE[@]}")
+RATCHET=(--holes "$HOLES" "${CLUE_ARG[@]}" --break_mode ratchet --breaks "$BREAKS"
+         --order "$RATCHET_ORDER" --edge_supply --ratchet_nodes "$RATCHET_NODES"
+         --ratchet_rollouts "$ROLLOUTS" --time_limit "$RATCHET_TIME" --threads "$THREADS"
+         --print_cmd "${RATCHET_MORE[@]}")
+POLISH=(--reopen auto --copies 8 --end_dive "$POLISH_DIVES" --end_polish "$POLISH_STEPS"
+        --rounds 1000000 --emit_score 0 --threads "$THREADS" --print_cmd "${POLISH_MORE[@]}")
+# An auto band is at most 5 deep: it never reaches the centre clue (7,7), but it
+# can lift a corner clue, and the polish does not put clues back.
+POLISHING=1
+[ "$POLISH_TIME" -gt 0 ] && [ "$CLUES" != all ] || POLISHING=0
 
 echo "[halo] $RUN_DIR: $THREADS threads, $(hms "$TOTAL_S"), clues $CLUES, db ${DB_FILE:-<in memory>}"
-if [ -n "$ROTATIONS" ]; then
-    echo "[halo] A: $ROTATIONS, one of its $NROT border rows a round, $SAMPLES bottoms x $COLUMNS columns"
+echo "[halo] A: random borders, $SAMPLES bottoms x $COLUMNS columns, width $BEAM_WIDTH, exhaustive" \
+     "from row $BACKTRACK_ROW to $STOP_ROW, the right $UNLOCK_RIGHT columns left open"
+echo "[halo] B: $RATCHET_BOARDS boards a round, $(basename "$HOLES") lifted: ratchet --breaks $BREAKS" \
+     "--order $RATCHET_ORDER, $RATCHET_NODES nodes a search, $ROLLOUTS rollouts${RATCHET_EXTRA:+, $RATCHET_EXTRA}"
+if [ "$POLISHING" = 1 ]; then
+    echo "[halo] C: every complete board polished $(hms "$POLISH_TIME"): E555_diver --reopen auto," \
+         "$POLISH_DIVES dives + $POLISH_STEPS polish rounds x 8 copies a round${POLISH_EXTRA:+, $POLISH_EXTRA}"
+elif [ "$CLUES" = all ]; then
+    echo "[halo] C: no polish under CLUES=all (an auto band can lift a corner clue)"
 else
-    echo "[halo] A: random borders, $SAMPLES bottoms x $COLUMNS columns"
-    [ "$LAMBDA_CORNERS" = 0 ] ||
-        echo "[halo]    (--lambda_corners left out: the beamer refuses it with --random_edges)"
+    echo "[halo] C: no polish (POLISH_TIME=0)"
 fi
-echo "[halo]    width $BEAM_WIDTH to row $STOP_ROW, backtrack row $BACKTRACK_ROW, bc_window $BC_WINDOW, pool $POOL, tau $TAU, exhaust_inner $EXHAUST_INNER"
-echo "[halo] B: up to $MAX_BOARDS boards a round, $(basename "$HOLES") lifted, --order $BT_ORDER --frame_last --edge_supply, ${BT_TIME}s a board${BT_EXTRA:+, $BT_EXTRA}"
-if [ "$ELITE_SCORE" -gt 0 ]; then echo "[halo] C: boards scoring $ELITE_SCORE or more climb the ladder"
-else echo "[halo] C: the best $ELITE_PCT% of every board scored climb the ladder"; fi
-[ "$RUNGS" -eq 0 ] || echo "[halo] D: $RUNGS rungs from ${LADDER_TIME}s a board, doubling, $RUNG_KEEP% move up; top rung keeps $TOP_RUNG_CAP"
 [ -z "$DB_FILE" ] || [ -s "$DB_FILE" ] ||
     echo "[halo] the first round builds the chain database ($DB_FILE), about 2 minutes on 4 threads"
-[ "$ROUND" -eq 0 ] || echo "[halo] going on from round $ROUND: $(rows "$LADDER"/rung_*.csv) boards on the ladder, $(rows "$JACK") jackpots"
+[ "$ROUND" -eq 0 ] || echo "[halo] going on from round $ROUND: $(count "$COMPLETE") complete board(s)," \
+                           "best.csv best $(best "$BEST" score)"
 echo "[halo] $(date '+%F %T') start, $(hms "$TOTAL_S")" >> "$LOG"
 
-# ladder RD -- one pass over the rungs, top first, so a board moves up one rung a
-# round at most. Sets LAD to a summary of the rung sizes.
-ladder() {
-    local rd=$1 k t n out keep
-    LAD=
-    for (( k = RUNGS - 1; k >= 0; k-- )); do
-        [ -s "$LADDER/rung_$k.csv" ] || continue
-        if [ "$STOP" = 1 ] || [ "$(left)" -le 30 ]; then LAD="$LAD r$k:$(rows "$LADDER/rung_$k.csv")"; continue; fi
-        t=$(awk -v a="$LADDER_TIME" -v k="$k" 'BEGIN { print a * 2 ^ k }')
-        out=$rd/rung_$k.out.csv
-        run_tool $(( $(left) - 20 )) bin/E555_backtracker "$SEED" "$LADDER/rung_$k.csv" \
-            "$out" "${BT[@]}" --time_limit "$t" >> "$rd/ladder.log" 2>&1
-        jackpots "$out"
-        keep_top "$out"
-        if [ "$STOP" = 1 ] || [ "$(left)" -le 20 ]; then
-            # Stopped part way: the rows not reached come back unchanged, so the
-            # rung keeps every board for the next run and nothing moves up.
-            searched "$out" > "$LADDER/rung_$k.csv"
-            LAD="$LAD r$k:$(rows "$LADDER/rung_$k.csv")"
-            continue
-        fi
-        # A finished search is written once, as done; it leaves the ladder.
-        searched "$out" | grep -v ';done' | best_first > "$rd/rung_$k.live"
-        n=$(rows "$rd/rung_$k.live")
-        if [ "$k" -eq $(( RUNGS - 1 )) ]; then
-            head -n "$TOP_RUNG_CAP" "$rd/rung_$k.live" > "$LADDER/rung_$k.csv"
-        else
-            keep=$(( (n * RUNG_KEEP + 99) / 100 ))
-            head -n "$keep" "$rd/rung_$k.live" >> "$LADDER/rung_$(( k + 1 )).csv"
-            : > "$LADDER/rung_$k.csv"
-        fi
-        LAD="$LAD r$k:$n"
-    done
-}
-
-SEARCHED=0; KEPT=0; DONE_ROUNDS=0; FAILS=0
-while [ "$STOP" = 0 ] && [ "$(left)" -ge 60 ]; do
+DONE_ROUNDS=0; FAILS=0
+while [ "$STOP" = 0 ] && [ "$(left)" -ge 120 ]; do
     ROUND=$(( ROUND + 1 ))
     RD=$RUN_DIR/round_$ROUND
     rm -rf "$RD"; mkdir -p "$RD"
@@ -367,28 +276,32 @@ while [ "$STOP" = 0 ] && [ "$(left)" -ge 60 ]; do
     else RS=$(( RNG_SEED + ROUND - 1 )); fi
     TAG="round $ROUND seed $RS"
 
-    # -- A: the beam. It gets at most a third of what is left; the backtracking
-    #    of the configuration in hand can run past --wall_time, hence the guard.
-    BW=$(( $(left) / 3 )); [ "$BW" -le "$BEAM_WALL" ] || BW=$BEAM_WALL
-    if [ -n "$ROTATIONS" ]; then
-        BORDER=("$ROTATIONS" --start_row $(( (ROUND - 1) % NROT )) --num_rows 1
-                --top_bottoms "$SAMPLES")
-        [ "$LAMBDA_CORNERS" = 0 ] || BORDER+=(--lambda_corners "$LAMBDA_CORNERS")
-    else
-        BORDER=(--random_edges --samples "$SAMPLES")
-    fi
+    # -- A: the beam. It gets at most a quarter of what is left; the exhaustive
+    #    search of the configuration in hand can run past --wall_time, hence the guard.
+    BW=$(( $(left) / 4 )); [ "$BW" -le "$BEAM_WALL" ] || BW=$BEAM_WALL
     T0=$SECONDS
-    run_tool $(( BW + 120 )) bin/E555_beamer "$SEED" "${BORDER[@]}" "${BEAM[@]}" --rng_seed "$RS" \
-        --prefix "h$RS" --wall_time "$BW" --out_dir "$RD/beam" > "$RD/beam.log" 2>&1
+    # The beamer memory-maps the chain database. Out of the page cache, its
+    # lookups wait on the disk: one configuration took 6 minutes instead of 8 s.
+    # Reading the file first takes ~20 s cold and ~1 s cached.
+    [ -z "$DB_FILE" ] || [ ! -s "$DB_FILE" ] || cat "$DB_FILE" > /dev/null
+    run_tool $(( BW + 120 )) bin/E555_beamer "$SEED" "${BEAM[@]}" --rng_seed "$RS" --prefix "h$RS" \
+        --wall_time "$BW" --out_dir "$RD/beam" > "$RD/beam.log" 2>&1
     RC=$?
-    TA=$(( SECONDS - T0 ))
-    BOARDS=()
-    while read -r f; do
-        case "$f" in *.csv) [ -s "$f" ] && BOARDS+=("$f") ;; esac
-    done < "$RD/beam/outputs.txt" 2>/dev/null
-    NB=0; [ "${#BOARDS[@]}" -eq 0 ] || NB=$(rows "${BOARDS[@]}")
-    CFG=$(sed -n 's/^\[sum\] configs: \([0-9]*\),.*; \([0-9]*\) reached .*/\1 configs, \2 reached the stop row/p' "$RD/beam.log" | tail -1)
-    A="A $(hms $TA): ${CFG:-? configs}, $NB boards"
+    # boards.csv: the beam's boards, comments dropped, each named <config id>_<beam
+    # index> (every board of a configuration shares the config id).
+    : > "$RD/boards.csv"
+    if [ -s "$RD/beam/outputs.txt" ]; then
+        while read -r f; do
+            case "$f" in *.csv) [ -s "$f" ] && sed -E '/^[[:space:]]*([#%]|$)/d
+                s/^[[:space:]]*([^,[:space:]]+)[[:space:]]*,[[:space:]]*([0-9]+)[[:space:]]*,/\1_\2,\2,/' \
+                "$f" >> "$RD/boards.csv" ;; esac
+        done < "$RD/beam/outputs.txt"
+    fi
+    rm -rf "$RD/beam"
+    NB=$(count "$RD/boards.csv")
+    CFG=$(sed -n 's/^\[sum\] configs: \([0-9]*\),.*; \([0-9]*\) reached .*/\1 configs, \2 reached the stop row/p' \
+          "$RD/beam.log" | tail -1)
+    A="A $(hms $(( SECONDS - T0 ))): ${CFG:-? configs}, $NB boards"
     if [ "$RC" != 0 ] && [ "$STOP" = 0 ] && [ "$NB" -eq 0 ]; then
         FAILS=$(( FAILS + 1 ))
         cp "$RD/beam.log" "$RUN_DIR/logs/round_${ROUND}_beam_FAILED.log"
@@ -400,76 +313,82 @@ while [ "$STOP" = 0 ] && [ "$(left)" -ge 60 ]; do
     fi
     FAILS=0
 
-    # -- B: the first look, cut short (cleanly, by SIGTERM) at the deadline
-    B="B skipped"; NS=0
-    if [ "$NB" -gt 0 ] && [ "$STOP" = 0 ] && [ "$(left)" -gt 30 ]; then
-        distinct "${BOARDS[@]}" > "$RD/distinct.csv"
-        rm -rf "$RD/beam"/*.csv
-        ND=$(rows "$RD/distinct.csv")
-        if [ "$MAX_BOARDS" -gt 0 ] && [ "$ND" -gt "$MAX_BOARDS" ]; then
-            thin "$RD/distinct.csv" "$MAX_BOARDS" > "$RD/boards.csv"
-        else
-            mv "$RD/distinct.csv" "$RD/boards.csv"
-        fi
-        rm -f "$RD/distinct.csv"
-        NT=$(rows "$RD/boards.csv")
+    # -- B: the ratchet on RATCHET_BOARDS boards, every STEP-th of the beam's, so
+    #    the sample spans its configurations and roots; stopped by SIGTERM at the
+    #    deadline, when the boards in hand write their best so far.
+    B="B skipped"; NP=0; NR=0; NC=0; DEEP=-; ENDED=
+    if [ "$NB" -gt 0 ] && [ "$STOP" = 0 ] && [ "$(left)" -gt 90 ]; then
+        STEP=$(( (NB + RATCHET_BOARDS - 1) / RATCHET_BOARDS ))
+        sed -n "1~${STEP}p" "$RD/boards.csv" > "$RD/picked.csv"
+        NP=$(count "$RD/picked.csv")
         T0=$SECONDS
-        run_tool $(( $(left) - 20 )) bin/E555_backtracker "$SEED" "$RD/boards.csv" \
-            "$RD/halo.raw.csv" "${BT[@]}" --time_limit "$BT_TIME" > "$RD/bt.log" 2>&1
+        run_tool $(( $(left) - 60 )) bin/E555_backtracker "$SEED" "$RD/picked.csv" "$RD/ratchet.csv" \
+            "${RATCHET[@]}" > "$RD/ratchet.log" 2>&1
         RC=$?
-        TB=$(( SECONDS - T0 ))
-        rm -f "$RD/boards.csv"
-        searched "$RD/halo.raw.csv" > "$RD/halo.csv"
-        rm -f "$RD/halo.raw.csv"
-        NS=$(rows "$RD/halo.csv")
-        jackpots "$RD/halo.csv"
-        STAT=$(awk -F, "{ $INNER; s += n; if (n > m) m = n; rows++ }
-                        END { if (rows) printf \"interior mean %.1f best %d\", s / rows, m }" "$RD/halo.csv")
-        B="B $(hms $TB): $NS of $NT boards ($ND distinct)${STAT:+, $STAT}"
+        NR=$(count "$RD/ratchet.csv")
+        if [ "$NR" -gt 0 ]; then
+            python3 tools/E555_rank.py "$RD/ratchet.csv" --seed_file "$SEED" --quiet \
+                --split placed 256 "$RD/new_complete.csv" "$RD/partial.csv" > /dev/null
+            NC=$(count "$RD/new_complete.csv")
+            DEEP=$(best "$RD/ratchet.csv" placed)
+        fi
+        # how each board's ratchet ended, e.g. "ended_budget_spent=12 ended_complete=1"
+        ENDED=$(grep -o 'ended: [a-z ]*[a-z]' "$RD/ratchet.log" | sed 's/^ended: //; s/ /_/g' | sort | uniq -c |
+                sed -E 's/^ *([0-9]+) (.*)/ended_\2=\1/' | tr '\n' ' ')
+        B="B $(hms $(( SECONDS - T0 ))): $NR of $NP boards, deepest $DEEP placed, $NC complete"
         [ "$RC" = 0 ] || [ "$STOP" = 1 ] || B="$B, backtracker exit $RC"
-        [ "$(left)" -gt 20 ] || B="$B, cut at the deadline"
     fi
+    rm -f "$RD/boards.csv"
 
-    # -- C: onto the ladder
-    C="C: nothing to split"
-    if [ "$NS" -gt 0 ]; then
-        add_scores "$RD/halo.csv"
-        N=$(threshold)
-        python3 tools/E555_rank.py "$RD/halo.csv" --seed_file "$SEED" --quiet \
-            --split score "$N" "$RD/elite_new.csv" "$RD/below.csv"
-        NE=$(rows "$RD/elite_new.csv")
-        cat "$RD/elite_new.csv" >> "$ELITE" 2>/dev/null
-        [ "$RUNGS" -eq 0 ] || grep -v ';done' "$RD/elite_new.csv" >> "$LADDER/rung_0.csv"
-        keep_top "$RD/elite_new.csv"
-        SEARCHED=$(( SEARCHED + NS )); KEPT=$(( KEPT + NE ))
-        C="C: N=$N -> +$NE"
+    # -- C: every complete board polished on its own clock (one diver call each,
+    #    as --wall_time covers a whole call), then complete.csv and best.csv
+    C=
+    if [ "$NC" -gt 0 ]; then
+        : > "$RD/polished.csv"
+        for (( i = 0; i < NC; i++ )); do
+            t=$(( $(left) - 60 )); [ "$t" -le "$POLISH_TIME" ] || t=$POLISH_TIME
+            rm -f "$RD/one.csv"
+            if [ "$POLISHING" = 1 ] && [ "$STOP" = 0 ] && [ "$t" -ge 10 ]; then
+                run_tool $(( t + 120 )) bin/E555_diver "$SEED" "$RD/new_complete.csv" "$RD/one.csv" \
+                    --start_row "$i" --num_rows 1 "${POLISH[@]}" --wall_time "$t" --rng_seed "$RS" \
+                    >> "$RD/polish.log" 2>&1
+            fi
+            # never worse than the ratchet's board; a stopped polish keeps that board
+            if [ "$(count "$RD/one.csv")" -gt 0 ]; then cat "$RD/one.csv" >> "$RD/polished.csv"
+            else sed -n "$(( i + 1 ))p" "$RD/new_complete.csv" >> "$RD/polished.csv"; fi
+        done
+        merge "$COMPLETE" "$RD/polished.csv"
+        BC=$(best "$RD/polished.csv" score)
+        C=" | C: $NC complete, best $BC"
+        [ "$BC" -le "$RECORD" ] ||
+            echo "[halo] *** $TAG: a complete board scores $BC, above RECORD=$RECORD ($COMPLETE) ***"
     fi
+    merge "$BEST" --top "$BEST_KEEP" "$RD/partial.csv" "$RD/polished.csv"
 
-    # -- D: the ladder
-    D="D: no ladder"
-    if [ "$RUNGS" -gt 0 ] && [ "$STOP" = 0 ]; then
-        T0=$SECONDS
-        ladder "$RD"
-        D="D $(hms $(( SECONDS - T0 ))):${LAD:- empty}"
-    fi
     DONE_ROUNDS=$(( DONE_ROUNDS + 1 ))
-    BI=$(best_inner "$TOP")
-    echo "[halo] $TAG | $A | $B | $C | $D | best interior $BI/196, jackpots $(rows "$JACK") | $(hms $(( $(left) > 0 ? $(left) : 0 ))) left"
-    echo "round $ROUND seed $RS boards=$NB searched=$NS ${C#C: } ladder=${LAD:-} best_interior=$BI jackpots=$(rows "$JACK") $(date '+%F %T')" >> "$LOG"
+    NCT=$(count "$COMPLETE"); BCT=$(best "$COMPLETE" score)
+    echo "[halo] $TAG | $A | $B$C | complete.csv $NCT (best $BCT), best.csv best $(best "$BEST" score)" \
+         "| $(hms $(( $(left) > 0 ? $(left) : 0 ))) left"
+    echo "round $ROUND seed $RS boards=$NB ratcheted=$NR deepest=$DEEP complete=$NC ${ENDED}complete_total=$NCT" \
+         "best_complete=$BCT $(date '+%F %T')" >> "$LOG"
 
     if [ "$KEEP_LOGS" = 1 ]; then
-        for l in beam bt ladder; do
+        for l in beam ratchet polish; do
             [ -s "$RD/$l.log" ] && gzip -c "$RD/$l.log" > "$RUN_DIR/logs/round_${ROUND}_$l.log.gz"
         done
     fi
-    rm -rf "$RD"            # the beam's boards and those below N: deleted for good
+    rm -rf "$RD"            # the beam's boards and the round's work: deleted for good
 done
 
 echo
 [ "$STOP" = 1 ] && echo "[halo] interrupted."
-echo "[halo] $DONE_ROUNDS round(s), $SEARCHED boards searched, $KEPT onto the ladder;" \
-     "ladder $(rows "$LADDER"/rung_*.csv) boards, jackpots $(rows "$JACK") in $JACK"
-echo "[halo] $(date '+%F %T') end, $DONE_ROUNDS rounds, jackpots $(rows "$JACK")" >> "$LOG"
-[ "$(rows "$TOP")" -gt 0 ] || exit 0
-echo "[halo] the deepest boards ($TOP), best interior $(best_inner "$TOP")/196:"
-python3 tools/E555_rank.py "$TOP" --seed_file "$SEED" --top 5
+echo "[halo] $DONE_ROUNDS round(s); $(count "$COMPLETE") complete board(s) in $COMPLETE," \
+     "best.csv best $(best "$BEST" score)"
+echo "[halo] $(date '+%F %T') end, $DONE_ROUNDS rounds, complete $(count "$COMPLETE")" >> "$LOG"
+if [ "$(count "$COMPLETE")" -gt 0 ]; then
+    echo "[halo] the best complete boards ($COMPLETE):"
+    python3 tools/E555_rank.py "$COMPLETE" --seed_file "$SEED" --sort score --top 5
+elif [ "$(count "$BEST")" -gt 0 ]; then
+    echo "[halo] no complete board yet; the best boards ($BEST):"
+    python3 tools/E555_rank.py "$BEST" --seed_file "$SEED" --sort score --top 5
+fi
