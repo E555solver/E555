@@ -1756,6 +1756,8 @@ With P unique partials, and the options' defaults:
 | `--probe_per_top M` | 4 | probe: M N boards; 0 = no probe, the best N finished boards go to the select as they are |
 | `--max_agree A` | 0.8 | select: skip a board sharing more than this share of its cells with a better one; 1 skips none |
 | `--threads T` | 0 (all) | threads of every diver call |
+| `--prefix NAME` | -- | write the boards as `NAME_<input id>`, as the beamer's `--prefix` does |
+| `--dry_run` | off | read the inputs, print the `[plan]` line (stage sizes, minutes) and stop; nothing is dived or written |
 
 Writes `FILE` (canonical rows, best first), `FILE.plan.sh` (the
 `E555_ender.py --profile deep` command for them) and `FILE_work/` (every stage's

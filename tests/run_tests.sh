@@ -305,7 +305,8 @@ step_rank() {
 # bytes from a fresh run on gzip input and from a resumed run (which spells out
 # the default stage options and --threads 1: neither may force a fresh start);
 # complete input boards must never come back worse; the plan must run the
-# ender, without --holes.
+# ender, without --holes. --prefix must name the boards, and --dry_run must
+# stop at its [plan] line with nothing written (run_cycles.sh relies on both).
 step_distiller() {
     head -12 data/E565_lowB_baseline.csv > "$OUT/dst_slice.csv"
     ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" dst_slice.csv --top 2 \
@@ -347,13 +348,19 @@ EOF
     # The first seven rows of best_463.csv: the original 463s, enough and fast.
     head -n 7 data/best_463.csv > "$OUT/dst_463.csv"
     ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" dst_463.csv \
-        --top 1 --out dst_c.csv > dst_c.log 2>&1 ) || fail "the distiller failed on complete boards"
+        --top 1 --prefix gate --out dst_c.csv > dst_c.log 2>&1 ) || fail "the distiller failed on complete boards"
     python3 tools/E555_rank.py "$OUT/dst_c.csv" --seed_file data/seed_Edge5.txt --csv \
         > "$OUT/dst_c_rank.csv"
     worse=$(awk -F, 'NR>1 && $4<463' "$OUT/dst_c_rank.csv" | head -1)
     [ -z "$worse" ] || fail "a complete 463 came back worse: $worse"
+    grep -q '^gate_' "$OUT/dst_c.csv" || fail "--prefix gate did not name the boards gate_<id>"
+    ( cd "$OUT" && python3 "$REPO/tools/E555_distiller.py" dst_slice.csv --top 2 \
+        --out dst_d.csv --dry_run > dst_d.log 2>&1 ) || fail "--dry_run exited nonzero"
+    grep -q '^\[plan\] screen' "$OUT/dst_d.log" && [ ! -e "$OUT/dst_d.csv" ] && [ ! -e "$OUT/dst_d_work" ] \
+        || fail "--dry_run did not stop at its plan with nothing written"
     echo "ok: complete boards that recount; identical on gzip input and on resume;" \
-         "no 463 made worse; the plan runs the ender without --holes"
+         "no 463 made worse; the plan runs the ender without --holes;" \
+         "--prefix names the boards; --dry_run stops at its plan"
 }
 
 step_rotate() {

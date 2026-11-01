@@ -5,6 +5,7 @@ E555_distiller.py -- distil a corpus of boards to the few worth the CP-SAT tail.
     python3 tools/E555_distiller.py BOARDS.csv[.gz] ... [--top N] [--out FILE]
         [--screen_dives D] [--finish_keep F] [--finish_dives D]
         [--finish_polish R] [--probe_per_top M] [--max_agree A] [--threads T]
+        [--prefix NAME] [--dry_run]
 
 Reads board CSVs (plain or gzip; partial or complete; any stop rows) and writes
 
@@ -38,8 +39,10 @@ Every diver call is seeded and keys each board's random streams on the board
 itself, so the output depends on neither the thread count (--threads, default
 all) nor where a run was interrupted: on SIGINT or SIGTERM the diver call in
 flight is stopped and its chunk thrown away, so a rerun redoes it. A rerun with
-other stage settings starts its work directory afresh. Calibration of the
-screen: PROJECT_E555.md, E555_distiller.py.
+other stage settings starts its work directory afresh. --prefix NAME writes the
+boards as NAME_<input id>; --dry_run reads the inputs, prints the stage plan
+and its time estimate, and stops, writing nothing. Calibration of the screen:
+PROJECT_E555.md, E555_distiller.py.
 """
 from __future__ import annotations
 
@@ -359,6 +362,12 @@ def main():
     ap.add_argument("--threads", type=int, default=0,
                     help="threads of every diver call (default 0 = all); the output "
                          "does not depend on it")
+    ap.add_argument("--prefix", default="", metavar="NAME",
+                    help="write every board as NAME_<input id>, as the beamer's "
+                         "--prefix does (default: the input ids)")
+    ap.add_argument("--dry_run", action="store_true",
+                    help="read the inputs, print the stage plan and its time "
+                         "estimate, and stop: nothing is dived or written")
     args = ap.parse_args()
     if args.top < 1:
         raise SystemExit("--top must be at least 1")
@@ -371,6 +380,8 @@ def main():
         raise SystemExit("--finish_keep must be above 0 and at most 1")
     if not 0 <= args.max_agree <= 1:
         raise SystemExit("--max_agree must be in 0..1")
+    if args.prefix and not all(c.isalnum() or c in "_.-" for c in args.prefix):
+        raise SystemExit("--prefix may hold only letters, digits, '_', '.' and '-'")
     screen_flags = ["--end_dive", str(args.screen_dives)]
     finish_flags = ["--end_dive", str(args.finish_dives)]
     if args.finish_polish:
@@ -386,7 +397,8 @@ def main():
         raise SystemExit(f"{exe} not found: build it with `make diver` in {root}")
     out = Path(args.out)
     work = out.with_name(out.stem + "_work")
-    resumed = prepare_work(work, manifest_of(
+    # The ids name the output only, so --prefix is not in the manifest.
+    resumed = not args.dry_run and prepare_work(work, manifest_of(
         args.inputs, seed_path, args.top,
         {"screen": screen_flags, "finish_keep": args.finish_keep, "finish": finish_flags,
          "probe": PROBE, "probe_per_top": args.probe_per_top, "max_agree": args.max_agree}))
@@ -437,6 +449,8 @@ def main():
     print(f"[plan] screen {n_part}, finish {keep}, probe {n_probe}, keep {args.top}: "
           f"about {est:.0f} min on {threads} thread(s)"
           + ("  (resuming)" if resumed else ""), flush=True)
+    if args.dry_run:
+        return 0
 
     def boards_where(pick):
         """(k, pos, rot) of the unique boards `pick(k)` selects, in input order."""
@@ -523,6 +537,8 @@ def main():
         for rank, rec in enumerate(kept, 1):
             k = rec["k"]
             fi, line_no, cid, placed, clo = meta[k]
+            if args.prefix:
+                cid = f"{args.prefix}_{cid}"
             _, _, pos, rot = V.parse_row(next(csv.reader([probed[k][1]])))
             w.writerow([cid, probed[k][0]] + pos + rot)
             src = f"{names[fi]}:{line_no}"
