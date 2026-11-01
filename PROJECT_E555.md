@@ -1939,7 +1939,7 @@ instead of +0.50: 9 boards better, none worse. Every gain there came from the
 redive (none from 566 CP-SAT calls), and a re-dived band keeps gaining with
 time (9.2, `--reopen`), so the redive calls get long walls.
 `E555_backtracker --holes auto` (9.5) repairs boards hole by hole without
-CP-SAT. It is cheaper than this tool and weaker than its redive.
+CP-SAT; it gains less than the redive, and more slowly.
 
 **Output.** First the files, the number of boards, the threads, each plan step
 with its real cap at this budget, and the latest finishing time; then per board
@@ -2144,53 +2144,33 @@ searches on halo boards mostly ended on prefixes that already forced frame
 breaks; with it they stop a few cells earlier with none. Not recorded by
 `--resume`; refused with `--jump`, 2sides/4sides and the greedy dives.
 
-**Auto holes.** `--holes auto` repairs complete boards without CP-SAT. For a
-board with B breaks:
-- **Units.** The broken junctions that share a cell form one unit.
-- **Holes.** Each unit, alone and merged with its nearest units (up to three),
-  is opened with a ring of 0, 1, 2, ... cells around it, while the hole fits
-  `--hole_cells`. Up to 8 **donors** are added: cells elsewhere whose piece fits
-  a hole cell on all its locked sides (at least two). The smallest holes go
-  first.
-- **Search.** Each hole is refilled under the ceiling B-1, starting at that
-  ceiling. A hole touching at most 3 breaks gets the exhaustive search: each
-  better board lowers the ceiling, and an exhausted level proves that the hole
-  cannot improve. Larger holes go to the ratchet, which proves nothing.
-  `--break_mode lds|any|ratchet` forces one engine.
-- **Commit.** After each batch of 16 holes, the best gain is kept and the holes
-  are rebuilt from the new board. A hole is not searched again until it or its
-  border changes.
+**Auto holes.** `--holes auto` repairs complete boards hole by hole, without
+CP-SAT. For a board with B breaks:
+- **Holes.** Broken junctions that share a cell form a unit. Each unit, alone
+  or merged with its nearest units (up to three), is opened with a growing ring
+  around it while the hole fits `--hole_cells`, plus up to 8 **donors**: cells
+  elsewhere whose piece fits a hole cell on all its locked sides (at least
+  two). Small holes go first.
+- **Search.** Each hole is refilled under the ceiling B-1. A hole touching at
+  most 3 breaks gets the exhaustive search, which finds a better board or
+  proves the hole cannot improve; larger holes go to the ratchet, which proves
+  nothing. `--break_mode lds|any|ratchet` forces one engine.
+- **Commit.** After each batch of 16 holes the best gain is kept and the holes
+  are rebuilt. A hole is searched again only once it or its border changes.
 
-The run ends when no hole gains or at `--time_limit` (30 s per row). The row
-written is never worse than the one read; when nothing gains it is the same
-board, written as a canonical row. Incomplete boards are written the same
-way. The output does not depend on
-the thread count, unless `--time_limit` ends the run. A row with the machine to
-itself searches its holes in parallel.
+The run ends when no hole gains, or at `--time_limit` (30 s per row). The row
+written is never worse than the input; unchanged and incomplete boards come
+back as canonical rows. The output does not depend on the thread count unless
+`--time_limit` ends the run. Refused with `--breaks`, `--break_mode stuck`,
+2sides/4sides, `--jump`, a stop band, `--early_release`, `--resume`,
+`--best_n` and `--max_emitted` other than 1.
 
-Refused with:
-- `--breaks`;
-- `--break_mode stuck`;
-- 2sides/4sides;
-- `--jump`;
-- a stop band;
-- `--early_release`;
-- `--resume`;
-- `--best_n`;
-- `--max_emitted` other than 1.
-
-Measured:
-- **Dived boards** (452-454, all from one partial): every board gained, a few
-  edges each, more with a larger `--hole_cells`. Donors helped there; they are
-  not yet measured more broadly. The ender's redive (9.3) gained about twice as
-  much, at several times the cost.
-- **Polished boards** (462-465): nothing at `--hole_cells` 40 or 64. At 96, one
-  board of nine gained +1. Such a row outlasts the default `--time_limit`, so
-  raise it.
-- **The ender's output:** nothing.
-
-Use it as a cheap first pass, or with a large `--hole_cells` and
-`--time_limit` on boards the ender has not touched.
+**When to use it.** `E555_diver --reopen auto` (9.2) is faster and gains more,
+on dived and on polished boards, so run it (or the ender) first. Auto holes
+gets slower with `--hole_cells`, roughly threefold from 40 to 64 and again to
+96, so raise `--time_limit` with it. On polished boards it gained only at 96,
+and rarely; on the ender's output, never. Its use is a CPU-only pass that also
+proves small holes optimal.
 
 **Resume.** `--resume` splits one exact search over many short runs. Every
 output row carries a resume identifier as field 3 (515 fields): where the
