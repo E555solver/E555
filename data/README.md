@@ -24,7 +24,8 @@ CSVs), **borders** (Stage A output), and **holes** (movable-cell masks).
 | `holes_open_border_TRL.csv` | Opens the Top, Right and Left borders plus adjacent corners. |
 | `holes_open_border_TR.csv` | Opens the Top and Right borders plus adjacent corners. |
 | `holes_open_TR3_frontier.csv` | Opens the top 3 rows, the right 3 columns and the box rows 10-15 x cols 8-15, for `E555_backtracker --order frontier`; the header gives the layers and the commands. |
-| `holes_halo.csv` | Opens rows 0-2 and 13-15 and columns 0-2 and 13-15: a ring three cells wide around the 10 x 10 core rows 3-12 x cols 3-12. The halo that `pipeline/run_halo.sh` lifts from its row-11 L-band boards (66 placed cells lifted, 90 kept) before its 16-break ratchet (`E555_backtracker --break_mode ratchet --order frontier`). |
+| `holes_halo3.csv` | Opens rows 0-2 and 13-15 and columns 0-2 and 13-15: a ring three cells wide around the 10 x 10 core rows 3-12 x cols 3-12. `pipeline/run_halo.sh HALO=3` lifts it from its row-12 L-band boards (69 placed cells lifted, 100 kept, 156 searched) before its 20-break ratchet (`E555_backtracker --break_mode ratchet --order frontier`). |
+| `holes_halo2.csv` | Opens rows 0-1 and 14-15 and columns 0-1 and 14-15: a ring two cells wide around the 12 x 12 core rows 2-13 x cols 2-13. `pipeline/run_halo.sh HALO=2` lifts it from its row-12 L-band boards (50 placed cells lifted, 132 kept, 124 searched). |
 
 ## Board CSV convention (used across the whole toolkit)
 

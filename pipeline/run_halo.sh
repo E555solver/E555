@@ -1,25 +1,26 @@
 #!/bin/bash
-# run_halo.sh -- grow L-band boards to row 11, lift the halo around their core,
+# run_halo.sh -- grow L-band boards to row 12, lift the halo around their core,
 # and search the halo again with a frontier ratchet allowed BREAKS broken edges,
 # looking for complete boards that could beat the 465 record. Every complete
 # board is polished at length. Repeat.
 #
 #   bash pipeline/run_halo.sh
 #   bash pipeline/run_halo.sh TOTAL_TIME=2d THREADS=32 DB_FILE=/data/E555.db
-#   bash pipeline/run_halo.sh RUN_DIR=halo2 BREAKS=24 RATCHET_BOARDS=2000
+#   bash pipeline/run_halo.sh HALO=3 RUN_DIR=halo3 BREAKS=24
 #
-# One round:
-#   A  E555_beamer --random_edges: SAMPLES bottoms x COLUMNS left columns, a beam
-#      BEAM_WIDTH wide to BACKTRACK_ROW, then an exhaustive search to STOP_ROW
-#      over columns 0..15-UNLOCK_RIGHT (--backtrack_unlock_right, no extension):
-#      break-free blocks, rows 0-11 x columns 0-12, the right band left open.
-#   B  RATCHET_BOARDS of them, spread evenly over the beam's file: HOLES lifts
-#      the halo (rows 0-2 and 13-15, columns 0-2 and 13-15: 66 cells of a block,
-#      the frame the beam wrote among them) and keeps the 10 x 10 core, and
-#      E555_backtracker --break_mode ratchet --order frontier refills the 166
-#      open cells outward from the core: an exact search, a break where it is
-#      stuck, until the board is complete, BREAKS breaks are spent, or its cuts
-#      prove the rest cannot be finished within them.
+# HALO (2 or 3) is the halo's width: the beam leaves the right HALO columns
+# open, and the ratchet lifts data/holes_halo<HALO>.csv. One round:
+#   A  E555_beamer --random_edges: up to SAMPLES bottoms x COLUMNS left columns,
+#      a beam BEAM_WIDTH wide to BACKTRACK_ROW, then an exhaustive search to
+#      STOP_ROW over columns 0..15-HALO (--backtrack_unlock_right HALO, no
+#      extension): break-free blocks, rows 0-12. The beam stops once it has
+#      written RATCHET_BOARDS boards.
+#   B  The ratchet on every one: the mask lifts the halo (HALO=2: rows 0-1 and
+#      14-15, columns 0-1 and 14-15, 50 cells of a block; HALO=3: three wide,
+#      69 cells) and keeps the core, and E555_backtracker --break_mode ratchet
+#      --order frontier refills the open cells (124 or 156) outward from it: an
+#      exact search, a break where it is stuck, until the board is complete,
+#      BREAKS breaks are spent, or its cuts prove the rest cannot be finished.
 #   C  Each complete board (at most BREAKS breaks, so 480-BREAKS or more) gets a
 #      long E555_diver --reopen auto polish of POLISH_TIME seconds and goes to
 #      complete.csv; best.csv keeps the BEST_KEEP best boards of every ratchet.
@@ -29,18 +30,18 @@
 # pieces run short. Lifting them gives those pieces back, and the search rebuilds
 # the frame, the band and the top together around a core the beam built well.
 #
-# Measured on 4 threads, 34 halo boards from this beam (pipeline/README.md):
+# Measured on 4 threads, ~34 boards a setting (pipeline/README.md):
 #   - Under BREAKS=20 the ratchet stopped on every board with "no candidate
-#     passes the cuts", at 172-203 of 256 cells placed, about 4.3 s a board on
-#     one thread: its cuts prove the rest cannot finish within 20 breaks. Under
-#     a loose ceiling (--breaks 64) it completed them with 38-45 breaks (435-442).
-#     A complete board within BREAKS is a rare find; best.csv shows how close a
-#     run gets.
-#   - Lifting the halo costs edges: finished on their open band alone, the same
-#     boards reach 442.5 with the ratchet (436.4 lifted; 1e5 nodes, loose
-#     ceiling) and 451.9 with diver dives and polish (442.4 lifted; 8 boards).
-#   - Dive scores do not rank these boards: two runs of one dive screen agree at
-#     Spearman +0.02 to +0.12. So the sample is spread evenly, not screened.
+#     passes the cuts", at 167-225 of 256 cells placed, 5.5-7 s a board on one
+#     thread: its cuts prove the rest cannot finish within 20 breaks. Under a
+#     loose ceiling (--breaks 64) it completed them at 435-444 with HALO=2
+#     (mean 439.3) and 431-442 with HALO=3 (mean 436.7). A complete board
+#     within BREAKS is a rare find; best.csv shows how close a run gets.
+#   - The lift costs edges: at stop row 11, HALO=3 boards finished on their
+#     open band alone reached 442.5 with the ratchet (436.4 lifted) and 451.9
+#     with diver dives and polish (442.4 lifted).
+#   - Dive scores do not rank these boards (two runs of one dive screen agree
+#     at Spearman +0.02 to +0.12), so the beam's boards are not screened.
 #
 # What RUN_DIR holds afterwards:
 #   complete.csv  every complete board found, polished, best first
@@ -57,7 +58,7 @@ set -uo pipefail        # not -e: a round that fails must not kill the run
 # ---- settings: edit here, or pass NAME=value on the command line ------------
 REPO=$(cd "$(dirname "$0")/.." && pwd)  # E555 checkout. Set this if you copied
                                         # this script somewhere else.
-SEED=data/seed_Edge5.txt                # SEED and HOLES: relative to REPO
+SEED=data/seed_Edge5.txt                # relative to REPO
 RUN_DIR=halo_out                        # relative to where you START it
 THREADS=$(nproc)
 TOTAL_TIME=4h           # the whole loop: seconds, or 90m, 4h, 2d. A step still
@@ -71,29 +72,33 @@ CLUES=center            # center | all | none -- held by the beam and put back b
                         # the ratchet
 RNG_SEED=0              # 0 = a fresh seed every round; S = S, S+1, ... per round.
                         # The seed names the round's boards (h<seed>_...).
+HALO=2                  # 2 | 3: the halo's width. The beam leaves that many right
+                        # columns open (--backtrack_unlock_right HALO), and the
+                        # ratchet lifts data/holes_halo<HALO>.csv: HALO=3 keeps a
+                        # 10 x 10 core and searches 156 cells, HALO=2 keeps 12 x 12
+                        # (one row of it the ratchet's) and searches 124
 
-# A. beam (E555_beamer): break-free blocks, rows 0..STOP_ROW x columns 0..15-UNLOCK_RIGHT
-SAMPLES=4               # --samples: random bottom rows per round
-COLUMNS=4               # --top_columns: left columns per bottom
+# A. beam (E555_beamer): break-free blocks, rows 0..STOP_ROW x columns 0..15-HALO
+SAMPLES=16              # --samples: random bottom rows per round, at most: the beam
+COLUMNS=4               # --top_columns: left columns per bottom } stops as soon as
+                        # it has written RATCHET_BOARDS boards
 BEAM_WIDTH=10000
-BACKTRACK_ROW=10        # --backtrack_row: rows BACKTRACK_ROW+1..STOP_ROW exhaustive.
-                        # Measured per configuration: 10 writes ~1000 boards
-                        # from ~200 roots, 9 writes 36k-91k, 8 hundreds of
-                        # thousands that pile up on a few roots
-STOP_ROW=11
-UNLOCK_RIGHT=3          # --backtrack_unlock_right: the right columns left open
+BACKTRACK_ROW=          # --backtrack_row: rows BACKTRACK_ROW+1..STOP_ROW exhaustive;
+                        # empty = 10 for HALO=3, 8 for HALO=2. Measured boards per
+                        # configuration at STOP_ROW=12: HALO=3 from row 10 ~80, from
+                        # row 9 ~7000; HALO=2 from row 8 ~320, from 9 ~20, from 10 ~0
+STOP_ROW=12
 BC_WINDOW=7,7
 POOL=64                 # --pool_factor
 TAU=0.1                 # --tau_bottoms and --tau_columns
 EXHAUST_INNER=0         # --exhaust_inner_color N
 BEAM_WALL=1800          # cap on one beamer call, seconds
-BEAM_MAX=200000         # --max_emitted: a disk guard (~2 KB a board)
 BEAM_EXTRA=             # more beamer flags
 
 # B. ratchet (E555_backtracker --break_mode ratchet)
-HOLES=data/holes_halo.csv   # the halo lifted from every board
-RATCHET_BOARDS=         # boards ratcheted a round, spread evenly over the beam's;
-                        # empty = 100 per thread
+RATCHET_BOARDS=         # boards a round: the beam stops once it has written them
+                        # (--max_emitted) and the ratchet takes them all; empty =
+                        # 100 per thread
 BREAKS=20               # --breaks: a complete board has at most this many broken
                         # edges, so it scores 480 - BREAKS or more
 RATCHET_ORDER=frontier  # --order: outward from the core, fewest fits first
@@ -140,13 +145,17 @@ case "$CLUES" in
     none)   CLUE_ARG=() ;;
     *) die "CLUES must be center, all or none (got: $CLUES)" ;;
 esac
-for v in SAMPLES COLUMNS BEAM_WIDTH BACKTRACK_ROW STOP_ROW UNLOCK_RIGHT POOL EXHAUST_INNER BEAM_WALL \
-         BEAM_MAX RATCHET_BOARDS BREAKS RATCHET_NODES ROLLOUTS RATCHET_TIME POLISH_TIME POLISH_DIVES \
-         POLISH_STEPS RECORD BEST_KEEP KEEP_LOGS RNG_SEED; do
+case "$HALO" in
+    2|3) HOLES=data/holes_halo$HALO.csv; : "${BACKTRACK_ROW:=$(( HALO == 3 ? 10 : 8 ))}" ;;
+    *) die "HALO must be 2 or 3 (got: $HALO)" ;;
+esac
+for v in SAMPLES COLUMNS BEAM_WIDTH BACKTRACK_ROW STOP_ROW POOL EXHAUST_INNER BEAM_WALL RATCHET_BOARDS \
+         BREAKS RATCHET_NODES ROLLOUTS RATCHET_TIME POLISH_TIME POLISH_DIVES POLISH_STEPS RECORD \
+         BEST_KEEP KEEP_LOGS RNG_SEED; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
 done
 [[ $TAU =~ ^[0-9]+([.][0-9]+)?$ ]] || die "TAU must be a number, 0 or more (got: $TAU)"
-for v in SAMPLES COLUMNS BEAM_MAX RATCHET_BOARDS BREAKS RATCHET_TIME POLISH_DIVES BEST_KEEP; do
+for v in SAMPLES COLUMNS RATCHET_BOARDS BREAKS RATCHET_TIME POLISH_DIVES BEST_KEEP; do
     [ "${!v}" -ge 1 ] || die "$v must be at least 1"
 done
 [ "$BACKTRACK_ROW" -ge 1 ] && [ "$BACKTRACK_ROW" -lt "$STOP_ROW" ] ||
@@ -233,9 +242,9 @@ read -r -a BEAM_MORE <<< "$BEAM_EXTRA"
 read -r -a RATCHET_MORE <<< "$RATCHET_EXTRA"
 read -r -a POLISH_MORE <<< "$POLISH_EXTRA"
 BEAM=(--random_edges --samples "$SAMPLES" --top_columns "$COLUMNS" --beam_width "$BEAM_WIDTH"
-      --backtrack_row "$BACKTRACK_ROW" --stop_row "$STOP_ROW" --backtrack_unlock_right "$UNLOCK_RIGHT"
+      --backtrack_row "$BACKTRACK_ROW" --stop_row "$STOP_ROW" --backtrack_unlock_right "$HALO"
       --extend_nodes 0 --bc_window "$BC_WINDOW" --pool_factor "$POOL" --tau_bottoms "$TAU"
-      --tau_columns "$TAU" --exhaust_inner_color "$EXHAUST_INNER" --max_emitted "$BEAM_MAX"
+      --tau_columns "$TAU" --exhaust_inner_color "$EXHAUST_INNER" --max_emitted "$RATCHET_BOARDS"
       "${CLUE_ARG[@]}" "${DB_ARG[@]}" --threads "$THREADS" --print_cmd "${BEAM_MORE[@]}")
 RATCHET=(--holes "$HOLES" "${CLUE_ARG[@]}" --break_mode ratchet --breaks "$BREAKS"
          --order "$RATCHET_ORDER" --edge_supply --ratchet_nodes "$RATCHET_NODES"
@@ -249,9 +258,10 @@ POLISHING=1
 [ "$POLISH_TIME" -gt 0 ] && [ "$CLUES" != all ] || POLISHING=0
 
 echo "[halo] $RUN_DIR: $THREADS threads, $(hms "$TOTAL_S"), clues $CLUES, db ${DB_FILE:-<in memory>}"
-echo "[halo] A: random borders, $SAMPLES bottoms x $COLUMNS columns, width $BEAM_WIDTH, exhaustive" \
-     "from row $BACKTRACK_ROW to $STOP_ROW, the right $UNLOCK_RIGHT columns left open"
-echo "[halo] B: $RATCHET_BOARDS boards a round, $(basename "$HOLES") lifted: ratchet --breaks $BREAKS" \
+echo "[halo] A: HALO=$HALO, random borders, up to $SAMPLES bottoms x $COLUMNS columns, width $BEAM_WIDTH," \
+     "exhaustive from row $BACKTRACK_ROW to $STOP_ROW, the right $HALO columns left open;" \
+     "the beam stops at $RATCHET_BOARDS boards"
+echo "[halo] B: every board the beam writes, $(basename "$HOLES") lifted: ratchet --breaks $BREAKS" \
      "--order $RATCHET_ORDER, $RATCHET_NODES nodes a search, $ROLLOUTS rollouts${RATCHET_EXTRA:+, $RATCHET_EXTRA}"
 if [ "$POLISHING" = 1 ]; then
     echo "[halo] C: every complete board polished $(hms "$POLISH_TIME"): E555_diver --reopen auto," \
@@ -313,16 +323,12 @@ while [ "$STOP" = 0 ] && [ "$(left)" -ge 120 ]; do
     fi
     FAILS=0
 
-    # -- B: the ratchet on RATCHET_BOARDS boards, every STEP-th of the beam's, so
-    #    the sample spans its configurations and roots; stopped by SIGTERM at the
+    # -- B: the ratchet on every board the beam wrote; stopped by SIGTERM at the
     #    deadline, when the boards in hand write their best so far.
-    B="B skipped"; NP=0; NR=0; NC=0; DEEP=-; ENDED=
+    B="B skipped"; NR=0; NC=0; DEEP=-; ENDED=
     if [ "$NB" -gt 0 ] && [ "$STOP" = 0 ] && [ "$(left)" -gt 90 ]; then
-        STEP=$(( (NB + RATCHET_BOARDS - 1) / RATCHET_BOARDS ))
-        sed -n "1~${STEP}p" "$RD/boards.csv" > "$RD/picked.csv"
-        NP=$(count "$RD/picked.csv")
         T0=$SECONDS
-        run_tool $(( $(left) - 60 )) bin/E555_backtracker "$SEED" "$RD/picked.csv" "$RD/ratchet.csv" \
+        run_tool $(( $(left) - 60 )) bin/E555_backtracker "$SEED" "$RD/boards.csv" "$RD/ratchet.csv" \
             "${RATCHET[@]}" > "$RD/ratchet.log" 2>&1
         RC=$?
         NR=$(count "$RD/ratchet.csv")
@@ -335,7 +341,7 @@ while [ "$STOP" = 0 ] && [ "$(left)" -ge 120 ]; do
         # how each board's ratchet ended, e.g. "ended_budget_spent=12 ended_complete=1"
         ENDED=$(grep -o 'ended: [a-z ]*[a-z]' "$RD/ratchet.log" | sed 's/^ended: //; s/ /_/g' | sort | uniq -c |
                 sed -E 's/^ *([0-9]+) (.*)/ended_\2=\1/' | tr '\n' ' ')
-        B="B $(hms $(( SECONDS - T0 ))): $NR of $NP boards, deepest $DEEP placed, $NC complete"
+        B="B $(hms $(( SECONDS - T0 ))): $NR of $NB boards, deepest $DEEP placed, $NC complete"
         [ "$RC" = 0 ] || [ "$STOP" = 1 ] || B="$B, backtracker exit $RC"
     fi
     rm -f "$RD/boards.csv"

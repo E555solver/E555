@@ -1,0 +1,24 @@
+# The halo, two cells wide: rows 0-1 and 14-15, and columns 0-1 and 14-15 of rows 2-13 (112 cells),
+# around the kept 12 x 12 core rows 2-13 x cols 2-13.
+# Row convention: first data line below = row 0 (BOTTOM), last = row 15 (TOP).
+# Made for pipeline/run_halo.sh HALO=2. Its beam writes L-band boards (--backtrack_unlock_right 2
+# --stop_row 12): rows 0-12 x cols 0-13 placed, break-free. On those the mask lifts 50 placed cells
+# (the frame the beam wrote and the ring inside it) and keeps 132 (rows 2-12 x cols 2-13), so the
+# 124 open cells, the whole frame among them, are searched again:
+# bin/E555_backtracker data/seed_Edge5.txt boards.csv halo.csv --holes data/holes_halo2.csv --clue_center --break_mode ratchet --breaks 20 --order frontier --edge_supply --ratchet_nodes 1000000
+1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
+1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,0,0, 0,0,0,0, 0,0,0,0, 0,0,1,1
+1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1
+1,1,1,1, 1,1,1,1, 1,1,1,1, 1,1,1,1

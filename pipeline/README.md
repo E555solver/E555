@@ -16,7 +16,7 @@ settings here will make far more sense afterwards.
 | `run_board_farm.sh` | runs a pipeline pass in a loop forever, keeps only the best boards, and periodically re-attacks them | days |
 | `run_farm.py` | the same idea with a different chain, and boards that graduate: built, endered once, then deeply endered into `elite.csv` and never searched again | days |
 | `run_cycles.sh` | fresh boards in parallel cycles: a beam that only grows row-11 partials over many border configurations (no end dives), then the distiller on them; every cycle's best boards collect in `best.csv`. The route that made the 464s of `data/best_464.csv` (rows 4-8) | 25 min a cycle on 4 threads, as many slots as the cores allow |
-| `run_halo.sh` | L-band boards to row 11 (`--backtrack_unlock_right 3`), the halo around their 10 x 10 core (rows 0-2 and 13-15, columns 0-2 and 13-15) lifted and refilled by a frontier ratchet allowed 20 breaks; every complete board polished at length | hours |
+| `run_halo.sh` | L-band boards to row 12 (`--backtrack_unlock_right HALO`), the halo around their core lifted (`HALO=2`: two cells wide around 12 x 12; `HALO=3`: three wide around 10 x 10) and refilled by a frontier ratchet allowed 20 breaks; every complete board polished at length | hours |
 | `topper_sweep.sh` | one plan of topper passes over a slice of a board file | minutes |
 | `slurm_wrapper.sh` | runs any of the above as a batch job | -- |
 
@@ -403,17 +403,19 @@ memory-mapped reads can stall a produce call for many minutes.
 ## The halo: `run_halo.sh`
 
 A loop until `TOTAL_TIME` is spent, looking for complete boards with at most
-`BREAKS` (20) broken edges:
+`BREAKS` (20) broken edges. `HALO` (2, the default, or 3) is the halo's width:
+the beam leaves the right `HALO` columns open, and the ratchet lifts
+`data/holes_halo<HALO>.csv`.
 
 | step | tool | what it does |
 |---|---|---|
-| A | `E555_beamer --random_edges --backtrack_unlock_right 3` | `SAMPLES` bottoms x `COLUMNS` left columns, a beam `BEAM_WIDTH` wide to `BACKTRACK_ROW` (10), exhaustive to row 11 over columns 0-12: break-free blocks with the right band open, no extension |
-| B | `E555_backtracker --break_mode ratchet --order frontier` | `RATCHET_BOARDS` of them, spread evenly over the beam's file: `data/holes_halo.csv` lifts rows 0-2 and 13-15 and columns 0-2 and 13-15, and the ratchet refills the 166 open cells outward from the 10 x 10 core within `BREAKS` breaks |
+| A | `E555_beamer --random_edges --backtrack_unlock_right HALO` | up to `SAMPLES` bottoms x `COLUMNS` left columns, a beam `BEAM_WIDTH` wide to `BACKTRACK_ROW` (8 for `HALO=2`, 10 for `HALO=3`), exhaustive to row 12: break-free blocks with the right band open, no extension. It stops once it has written `RATCHET_BOARDS` boards |
+| B | `E555_backtracker --break_mode ratchet --order frontier` | every one of them: the mask lifts the halo (`HALO=2`: rows 0-1 and 14-15, columns 0-1 and 14-15, 50 cells of a block, 124 searched around a 12 x 12 core; `HALO=3`: three wide, 69 lifted, 156 searched around 10 x 10), and the ratchet refills it outward from the core within `BREAKS` breaks |
 | C | `E555_diver --reopen auto`, `E555_rank.py` | each complete board polished for `POLISH_TIME` seconds (50000 dives and 50000 polish rounds per copy, 8 copies a round) into `complete.csv`; `best.csv` keeps the best boards of every ratchet, complete or not |
 
 ```bash
-bash pipeline/run_halo.sh                                     # four hours, every core
-bash pipeline/run_halo.sh TOTAL_TIME=30m SAMPLES=2            # a short look
+bash pipeline/run_halo.sh                                     # four hours, every core, HALO=2
+bash pipeline/run_halo.sh HALO=3 RUN_DIR=halo3                # the three-wide halo
 bash pipeline/run_halo.sh TOTAL_TIME=2d DB_FILE=/tmp/E555.db  # a shared database cache
 ```
 
@@ -427,9 +429,11 @@ well.
   `BREAKS` breaks are spent, or its cuts prove the rest cannot be finished
   within them. It ends on its own, so no time ladder is needed. Under its node
   cap (`RATCHET_NODES`) a board's result is the same at any thread count.
-- **The sample.** Every `STEP`-th board of the beam's file, so it spans the
-  round's configurations and roots. The backtracker skips repeats after the
-  lift.
+- **The beam writes what the ratchet takes.** Its `--max_emitted` is
+  `RATCHET_BOARDS`, so it stops after the configurations that fill it, and
+  `SAMPLES` x `COLUMNS` is only an upper bound. The boards of a configuration
+  come root by root in the beam's rank order. The backtracker skips repeats
+  after the lift.
 - **The polish.** One diver call per complete board, so each board gets its
   own clock. It never returns a worse board. It is off under `CLUES=all`,
   because an auto band can lift a corner clue.
@@ -441,33 +445,53 @@ well.
   memory-mapped lookups wait on the disk, and one configuration took 6 minutes
   instead of 8 s.
 
-**Measured** (4 threads, `CLUES=center`). The beam, per configuration:
+**Measured** (4 threads, `CLUES=center`, width 10000). Boards the beam writes
+per configuration, at stop row 12 (~8 s a configuration):
 
-| width, backtrack row | boards |
+| `HALO`, backtrack row | boards |
 |---|---|
-| 10000, 10 | ~1000 from 150-250 emitting roots, 8 s |
-| 10000, 9 | 36k-91k |
-| 2000 or 10000, 8 | over 200k on 110-180 roots: one configuration fills the cap |
+| 2, 8 | ~320 (217-419) |
+| 2, 9 | ~20 |
+| 2, 10 or 11 | 0-1 |
+| 3, 9 | ~7000 |
+| 3, 10 | ~80 (20-195) |
+| 3, 11 | 0 |
 
-The frontier ratchet on 34 halo boards (166 open cells):
+At stop row 11 (`HALO=3`), backtrack row 10 wrote ~1000 boards a configuration
+and row 9 36k-91k.
 
-| ceiling, nodes | result | s a board, one thread |
-|---|---|---|
-| `--breaks 20`, 1e6 | every board stops at "no candidate passes the cuts", 172-203 of 256 placed (mean 183) | 4.3 |
-| `--breaks 20`, 1e5 | the same, 168-201 placed (mean 179) | 4.7 |
-| `--breaks 64`, 1e6 | complete, 435-442 (mean 437.8) | 6.1 |
-| `--breaks 64`, 1e5 | complete, 431-441 (mean 436.4) | 6.7 |
-| `--breaks 64`, 1e5, no lift (the 100 open band cells only) | complete, 439-446 (mean 442.5) | 7.0 |
+The frontier ratchet, 1e6 nodes, on ~34 boards spread over each beam's file:
 
-- **The lift costs edges.** With diver dives and polish instead (`--end_dive
-  10000 --end_polish 5000`, 8 boards): 442.4 lifted, 451.9 without.
+| `HALO`, stop row, backtrack row | `--breaks 20`: placed of 256 (mean) | s a board, one thread | `--breaks 64`: complete at (mean) | s a board |
+|---|---|---|---|---|
+| 2, 12, 8 | 167-201 (180) | 6.6 | 435-444 (439.3) | 9.0 |
+| 2, 12, 9 | 170-225 (184) | 6.9 | 434-446 (438.8) | 8.8 |
+| 3, 12, 10 | 169-190 (180) | 6.9 | 431-442 (436.7) | 9.1 |
+| 3, 12, 9 | 174-188 (181) | 5.5 | 432-441 (436.2) | 7.5 |
+| 3, 11, 10 | 172-203 (183) | 4.3 | 435-442 (437.8) | 6.1 |
+
+- **No board completes within 20 breaks.** Every one stops at "no candidate
+  passes the cuts", its cuts having proved that the rest cannot finish within
+  the breaks left. A complete board within `BREAKS` is a rare find; `best.csv`
+  shows how close a run gets.
+- **`HALO=2` is the default.** It completes about 2.6 edges better than
+  `HALO=3`, and its beam fills a round from fewer configurations.
+- **The lift costs edges.** At stop row 11 (`HALO=3`, 1e5 nodes), the same
+  boards finished on their open band alone reached 442.5 with the ratchet
+  against 436.4 lifted, and 451.9 against 442.4 with diver dives and polish
+  (`--end_dive 10000 --end_polish 5000`, 8 boards).
 - **No screen.** Dive scores do not rank these boards. Two runs of one screen
   (backtracker stuck dives or diver dives, 300-1000 a board) agree at Spearman
   +0.02 to +0.12. The median of a board's stuck dives repeats (+0.57 to +0.72)
   but does not predict the ratchet (+0.14, +0.05).
 - The ratchet writes byte-identical boards at 1 and 4 threads.
-- A round at the defaults on 4 threads: the beam 2-3.5 min (14-16
-  configurations, 16k-21k boards), the ratchet ~7 min (400 boards).
+- A round at the defaults on 4 threads:
+  - `HALO=2`: the beam 26-30 s (2 configurations, ~400 boards), the ratchet
+    9.6 min for 402 boards; deepest 229-230 of 256 placed, best score 409.
+  - `HALO=3`: the beam 49-61 s (5-6 configurations), the ratchet 8.1 min for
+    409 boards; deepest 189-192.
+  - Before the beam was sized to the ratchet (stop row 11), it wrote 16k-21k
+    boards a round in 2-3.5 min, of which the ratchet used 400.
 
 ## The topper sweep
 
