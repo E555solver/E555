@@ -66,10 +66,11 @@
  * from it: the band of rows (or columns) holding its damage (auto), a fixed
  * band, or a mask. The lifted board is dived with the complete one as its
  * incumbent, so the board written is the incumbent itself unless a dive beats
- * it -- never worse. --rounds N re-dives each board's best N times, the auto
- * band re-chosen every round (--reopen given n times: round r reopens the
- * (r mod n)-th spec). --copies K dives every board K times on streams
- * of its own and keeps the best copy; --orders gives the copies different
+ * it -- never worse. A clue piece on its clue cell at its clue spin is never
+ * lifted: the band is dived around it. --rounds N re-dives each board's best
+ * N times, the auto band re-chosen every round (--reopen given n times: round
+ * r reopens the (r mod n)-th spec). --copies K dives every board K times on
+ * streams of its own and keeps the best copy; --orders gives the copies different
  * places to start filling from; --prior / --nogo start the dives of a reopened
  * board pulled toward the incumbent's clean placements and away from its
  * broken ones (E555_dive.h, "COPIES, INCUMBENTS, ORDERS"). --holes and --reopen
@@ -303,6 +304,20 @@ static int dr_lift(const uint16_t *pid, const uint8_t *rot, const DrSpec *sp,
     }
     for (int x = 0; x < NUM_PIECES; x++)
         if (dr_dist(x, side) < depth) { lift[x] = true; n++; }
+    return n;
+}
+
+/* --reopen never lifts a clue piece on its clue cell at its clue spin, in any
+   of the four frames (the centre clue's four cells, the corner clues' four):
+   the dives fill the cells around it, and every board written keeps it. Takes
+   and returns the number of lifted cells. */
+static int dr_keep_clues(const uint16_t *pid, const uint8_t *rot, bool lift[NUM_PIECES], int n) {
+    for (int o = 0; o < 4; o++)
+        for (int k = 0; k < CLUE_N; k++) {
+            const ClueCell *cc = &g_clue[o][k];
+            const int x = cc->row * PUZZLE_SIDE + cc->col;
+            if (lift[x] && pid[x] == cc->piece && rot[x] == cc->spin) { lift[x] = false; n--; }
+        }
     return n;
 }
 
@@ -904,7 +919,8 @@ static void dr_run(const size_t *idx, size_t n, bool by_side, bool seed) {
                 for (size_t i = 0; i < live; i++) {
                     DrBoard *b = &g_batch.b[cut[i]];
                     bool lift[NUM_PIECES];
-                    if (!dr_lift(b->inc_pid, b->inc_rot, &g_spec[round % g_nspec], lift)) {
+                    const int nl = dr_lift(b->inc_pid, b->inc_rot, &g_spec[round % g_nspec], lift);
+                    if (!dr_keep_clues(b->inc_pid, b->inc_rot, lift, nl)) {
                         dr_write_complete(g_out, g_batch.id, b->inc_pid, b->inc_rot);
                         g_st.solved++;
                         b->done = true;
@@ -1370,7 +1386,7 @@ int main(int argc, char **argv) {
         if (!open) {
             if (!g_reopen) { g_st.complete++; continue; }
             bool lift[NUM_PIECES], brk[NUM_PIECES];
-            const int nl = dr_lift(b.pid, b.rot, &g_spec[0], lift);
+            const int nl = dr_keep_clues(b.pid, b.rot, lift, dr_lift(b.pid, b.rot, &g_spec[0], lift));
             if (!nl) {                          /* auto, and nothing is broken */
                 if (strcmp(id, g_batch.id) != 0) dr_batch();
                 dr_write_complete(g_out, id, b.pid, b.rot);

@@ -28,7 +28,7 @@ brackets):
     3 probe    the best --probe_per_top [4] x N complete boards: the ender's
                redive at fixed work, E555_diver --reopen auto --rounds 8
                --copies 8 --end_dive 3000 --end_polish 1000 --prior 1 --nogo 1
-               (never a worse board; boards carrying clue pieces skip it).
+               (never a worse board; clue pieces in place stay).
                With --probe_per_top 0 nothing is probed: the best N finished
                boards go on with their finished scores
     4 select   best first by probed score, probe gain, finished score, screen
@@ -498,7 +498,8 @@ def main():
     def rank_key(k):
         return (-finished[k][0], -screen.get(k, 0), -meta[k][4], k)
     # With --probe_per_top 0 the candidates are the best N finished boards, and
-    # every one keeps its finished score, as a clued board does.
+    # every one keeps its finished score. A probe never lifts a clue piece in
+    # place (E555_diver --reopen), so clued boards are probed like any other.
     cands = sorted(finished, key=rank_key)[:max(args.probe_per_top, 1) * args.top]
     if not cands:
         raise SystemExit("[select] no board could be finished: nothing to write")
@@ -506,16 +507,13 @@ def main():
     for k in cands:
         _, _, pos, rot = V.parse_row(next(csv.reader([finished[k][1]])))
         parsed[k] = (pos, rot)
-    clued = {k for k in cands if V.clue_orient(*parsed[k])[1] > 0}
-    as_is = clued if args.probe_per_top else set(cands)
+    as_is = set() if args.probe_per_top else set(cands)
     probed = dict((k, finished[k]) for k in as_is)
     probed.update(diver.run("probe", [(k, *parsed[k]) for k in cands if k not in as_is],
                             PROBE, len(cands) - len(as_is)))
     if args.probe_per_top:
         gained = sum(probed[k][0] > finished[k][0] for k in cands if k in probed)
-        print(f"[probe] {len(cands)} board(s), {gained} improved"
-              + (f", {len(clued)} carrying clue pieces left as they were" if clued else ""),
-              flush=True)
+        print(f"[probe] {len(cands)} board(s), {gained} improved", flush=True)
     else:
         print(f"[probe] none (--probe_per_top 0): the best {len(cands)} finished "
               f"board(s) go to the select as they are", flush=True)

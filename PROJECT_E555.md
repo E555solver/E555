@@ -1742,7 +1742,7 @@ With P unique partials, and the options' defaults:
 | read | drop exact repeats; group partials by placed-cell count | all unique |
 | screen | best of 300 seeded dives per partial (`E555_diver --end_dive 300`), ties by closure | K = min(ceil(P/2), 400 N), split over groups |
 | finish | `E555_diver --end_dive 20000 --end_polish 5000` | K |
-| probe | the ender's redive at fixed work (`--reopen auto --rounds 8 --copies 8 --end_dive 3000 --end_polish 1000 --prior 1 --nogo 1`); complete inputs join here; clued boards skip it | 4 N |
+| probe | the ender's redive at fixed work (`--reopen auto --rounds 8 --copies 8 --end_dive 3000 --end_polish 1000 --prior 1 --nogo 1`); complete inputs join here; clue pieces in place stay | 4 N |
 | select | best by probed score, then probe gain, finished score, screen score, closure; a board sharing > 80% of its cells with a better one is skipped | N |
 
 | option | default | meaning |
@@ -1854,6 +1854,7 @@ bin/E555_diver data/seed_Edge5.txt old_boards.csv redone.csv \
   - a mask file.
 
   Given n times, round r uses the (r mod n)-th spec.
+- A clue piece on its clue cell at its clue spin (the centre clue on any of its four cells, a corner clue on (2,2), (2,13), (13,2) or (13,13)) is never lifted: the band is dived around it, so every board written keeps it.
 - `--reopen` does not combine with `--holes`, which makes every board a partial with no incumbent, nor with `--backtrack`/`--stop_row`.
 - **Measured** on 24 dived-and-polished boards (459-461: `data/E565_lowB_baseline.csv` finished with 3000/10000), with `--reopen auto --copies 8` on 4 threads (`examples/11_diver_reopen.sh` runs the best):
   - 15 s per board: `--end_dive 1000 --end_polish 10000` gained +1.03 edges per board (81% of 72 runs). 500/7000, 4 copies of 2000/20000, `auto` and `auto+1` in turn, `--plateau`, and `--prior 1 --nogo 1` all came within 0.1 of it. 10000/10000 gained +0.88; 3000/1000 with `--prior 1 --nogo 1`, the best setting on the previous engine, +0.58.
