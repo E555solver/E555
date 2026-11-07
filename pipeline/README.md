@@ -388,9 +388,9 @@ s4 ends the board.
 - Lap 2's bands are cut from s1 with a lap-1 band's frame left of column K+1,
   and build the rest of the frame themselves, so a lap-1 band pairs with every
   lap-2 band of its start.
-- Either band may use a piece from s1's middle columns or from the other band.
-  The s1 written to `jewels.csv` leaves such a cell open, so it dives lower
-  than s2..s4.
+- Either band may take a piece that s1 holds in its lower rows, or one the
+  other band uses. A board holds each piece once, so the s1 written to
+  `jewels.csv` leaves such a cell open.
 
 **Borders.** Each produce call starts from a fresh border.
 - `BORDERS=anneal` (the default) runs Stage A with `--double_decker DD_SIDES`
@@ -428,7 +428,9 @@ s4 ends the board.
 **Dives (`DIVE=1`).** `E555_diver` finishes each jewel's four boards as soon as
 the jewel is found:
 - each board gets `DIVE_DIVES` dives and `DIVE_POLISH` polish rounds
-  (`DIVE_COPIES` copies);
+  (`DIVE_COPIES` copies). s1 is dived from the beamer board with the jewel's
+  frame and top corner clues added, not from the s1 of `jewels.csv` with its
+  open cells;
 - then `DIVE_REOPEN` seconds of re-dives of its most damaged band
   (`--reopen auto+2`), which never make it worse;
 - each board's best goes to `dived.csv`, and the 20 best of the run to

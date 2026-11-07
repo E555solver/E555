@@ -64,7 +64,8 @@
 #
 # DIVE=1 finishes each jewel's four boards with E555_diver as soon as it is
 # found: DIVE_DIVES dives and DIVE_POLISH polish rounds (DIVE_COPIES copies),
-# then DIVE_REOPEN seconds of re-dives of each board's most damaged band.
+# then DIVE_REOPEN seconds of re-dives of each board's most damaged band. s1 is
+# dived from the beamer board with the jewel's frame and top corner clues.
 #
 # NEEDS about 8 GB of RAM for the beamer, and DB_FILE: the beamer's 6.4 GB chain
 # database is written there on the first call and loaded in seconds by every
@@ -288,7 +289,7 @@ one_per_frame() {
 # filled cell whose edge does not match a band cell next to it stays empty: a
 # band may refill a cell beside columns it had cleared.
 overlay() {
-    awk -F, -v useseed="${4:+1}" 'BEGIN {OFS = ","}
+    awk -F, -v useseed="${4:+1}" 'BEGIN {OFS = ","; np = 0}
         useseed && FILENAME == ARGV[1] { if (NF) { split($0, e, /[ \t]+/); m = (e[1] == "") ? 1 : 0
             for (d = 0; d < 4; d++) E[np, d] = e[d + 1 + m] + 0; np++ }; next }
         FILENAME == ARGV[1 + useseed] {
@@ -691,11 +692,21 @@ whirl() {
 
 # dive_jewel -- E555_diver on each of the four boards of the jewel just written
 # to jewels.csv; appends them to dived.csv and sets DIVE_NOTE to their scores
-# and the best of the four
+# and the best of the four. s1 is dived from the beamer board with only the
+# jewel's frame and top corner clues added (masks/s1lift.csv lifts the rest):
+# the jewel's own s1 has open cells in its lower rows, whose pieces its bands
+# took for their corners.
 dive_jewel() {
-    local j d=$BOARD_DIR s scores= best=0
+    local j d=$BOARD_DIR s scores= best=0 id
     for j in 1 2 3 4; do
         tail -n 4 jewels.csv | sed -n "${j}p" > "$d/to_dive.csv"
+        if [ "$j" = 1 ]; then
+            id=$(cut -d, -f1 "$d/to_dive.csv")
+            "$BIN/E555_diver" "$SEED" "$d/s1.csv" "$d/s1frame.csv" --holes "$MASKS/s1lift.csv" \
+                --end_dive 0 --emit_score 0 --threads "$THREADS" > "$d/s1frame.log" 2>&1 || : > "$d/s1frame.csv"
+            overlay "$d/s1raw.csv" "$d/s1frame.csv" "$d/s1dive.csv" "$SEED"
+            sed "s/^[^,]*/$id/" "$d/s1dive.csv" > "$d/to_dive.csv"
+        fi
         rm -f "$d/dived.csv"
         "$BIN/E555_diver" "$SEED" "$d/to_dive.csv" "$d/dived.csv" \
             --end_dive "$DIVE_DIVES" --end_polish "$DIVE_POLISH" --copies "$DIVE_COPIES" \
@@ -790,6 +801,7 @@ mask "$MASKS/held.csv"  "$BLOCKS"                                  # the frozen 
 mask "$MASKS/jewel.csv" "$FRAME || $FROZEN && $BLOCKS"             # what a jewel shares
 mask "$MASKS/open.csv"  "r > $BEAM_STOP_ROW && (c >= $C0 && c <= $K || c >= 15 - $K && c <= 14)"
 mask "$MASKS/share.csv" "!($FRAME && c <= $K) && !($FROZEN && $BLOCKS)"   # lifted for lap 2's starts
+mask "$MASKS/s1lift.csv" "!($FRAME || r == 13 && (c == 2 || c == 13))"    # lifted before s1's dive
 # The beamer maps the database file into memory and reads only the pages it
 # touches, in random order, which from a cold disk can stall a produce call for
 # minutes; one sequential read first (it counts against WALL) puts the whole
