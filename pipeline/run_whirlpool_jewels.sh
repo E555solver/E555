@@ -77,16 +77,14 @@
 # A frozen lap stops lower the higher K is (FIN_STOP_ROW=auto: 11-K). Above a
 # lock at row K the rows beside the frozen centre block (rows 7-8) must wrap a
 # fixed 2x2 block between the fixed ring ends, so the higher K, the rarer a
-# lap: lap-1 bands of real boards (CLUES=all, left column kept) reached row 9
-# frozen on 0 of 10 boards at K=4 (no band past row 7) and 0 of 18 at K=3 (10
-# of them past row 8), where K=2 gave 4 jewels from 8 boards. Stopped at
-# 11-K, K=3 made 5 jewels from 20 boards; K=4 passed lap 1 on 4 of 11, and
-# its lap-2 corner (rows 8-14 x columns 1-4) is the wall: the larger K, the
-# larger it. End to end on 4 cores K=3 made 6 jewels in an hour and the
-# defaults (K=4) 1 in 45 minutes. FREEZE=corners holds only the four
-# corner blocks and re-grows the centre one, its clue still on its cell:
-# K=3 then made 13 jewels from 20 boards, K=4 passed lap 1 on 5 of 11 and
-# none lap 2.
+# lap: with the earlier chain of laps, frozen lap-1 bands of real boards
+# (CLUES=all, left column kept) reached row 9 on 0 of 10 boards at K=4 and 0
+# of 18 at K=3, where K=2 gave 4 jewels from 8 boards. End to end on 4 cores
+# (frozen) K=3 made 6 jewels in an hour, every s4 from s3, and the defaults
+# (K=4) none in 45 minutes: lap 2 is the wall there (of 633 boards, 125 had a
+# lap-1 band, 74 of them no lap-2 band, and the 6 past lap 1 grew no s3).
+# FREEZE=corners holds only the four corner blocks and re-grows the centre
+# one, its clue still on its cell.
 #
 # NEEDS about 8 GB of RAM for the beamer, and DB_FILE: the beamer's 6.4 GB chain
 # database is written there on the first call (~2 min) and loaded in seconds by
@@ -196,10 +194,10 @@ case "$FREEZE" in
 esac
 # Checked here, because a bad value would otherwise fail every lap quietly.
 # FIN_STOP_ROW=auto. With all five blocks frozen, a lap re-grows only as far as
-# the rows the frozen centre block leaves it: lap-1 bands of real boards
-# reached row 9 from K=2 (4 jewels from 8 boards) but no row past 7 from K=4
-# and past 8 from K=3; stopped at 11-K they passed lap 1 (K=3: 12 of 20
-# boards, 5 jewels; K=4: 4 of 11, none past lap 2).
+# the rows the frozen centre block leaves it: with the earlier chain of laps,
+# lap-1 bands of real boards reached row 9 from K=2 (4 jewels from 8 boards)
+# but no row past 7 from K=4 and past 8 from K=3; stopped at 11-K they passed
+# lap 1 (K=3: 12 of 20 boards; K=4: 4 of 11).
 if [ "$FIN_STOP_ROW" = auto ]; then
     case "$FREEZE" in
         1) FIN_STOP_ROW=$(( 11 - K < 9 ? 11 - K : 9 )) ;;
