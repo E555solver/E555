@@ -341,7 +341,7 @@ laps under **one fixed frame**, keeps a band of the board through every turn,
 and keeps the chains that make it -- the jewels:
 
 ```
-s1  beamer board: rows 0..10, columns 1..2 whole to row 14  -> close the band, turn counter-clockwise, re-grow -> s2
+s1  beamer board: rows 0..10                                -> close the band, turn counter-clockwise, re-grow -> s2
 s2  rows 0..K = s1's columns 0..K, re-grown to row 9        -> close the band, turn, re-grow -> s3
 s3                                                          -> close the band, turn, re-grow -> s4
 ```
@@ -365,15 +365,16 @@ bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl y
 1. *Close the band.* `E555_backtracker --stop_column K --with_frame` writes
    every exact filling of s_k's columns 0..K plus the frame, up to `BANDS` per
    board. Columns K+1..14 are cleared first, so the band may use their pieces
-   (the finalizer frees them anyway). On lap 1 the beamer's column extension
-   (`--backtrack_min_col BEAM_MIN_COL`, default 2) already holds s1's columns
-   1..BEAM_MIN_COL up to row 14, so the band builds the frame and closes the
-   rest of columns 0..K above row 10. On laps 2-3 it closes s_k's top-left
-   corner block, rows above `FIN_STOP_ROW` x columns 1..K, against the fixed
-   frame. With a rotations border the left column is fixed up to row 14, and
-   `BEAM_MIN_COL=K` wrote no board in the first test (`CLUES=all`), hence the
-   smaller default.
-   It runs on every board the previous lap wrote (`FIN_BOARDS` of them, one
+   (the finalizer frees them anyway). Either way it closes a top-left corner
+   block. On lap 1 that is rows 11..14 x columns 0..K with the frame still
+   open: produce clears whatever the beamer placed there, frame cells included.
+   A rotations border fixes the left column up to row 14, and against it no
+   band closed (0 of 628 beamer boards, `CLUES=all`, K=4); cleared, 44 of the
+   628 got one. On laps 2-3 it is rows above `FIN_STOP_ROW` x columns 1..K,
+   against the fixed frame. The beamer's own column filter
+   (`BEAM_MIN_COL`, `--backtrack_min_col`) is then only a pre-filter, off by
+   default; with a rotations border, 2 columns already wrote no board.
+   The band step runs on every board the batch or the previous lap wrote (`FIN_BOARDS` of them, one
    per thread), and a board whose corner cannot close writes no band: the lap
    selects the boards that can.
 2. *Turn* counter-clockwise (`E555_rotate.py 3`): the band becomes rows 0..K.
@@ -394,8 +395,8 @@ lead back to them, which is how the chain is traced from s4 to s1.
 (`E555_sort_rotations.py --sort score_dd --top 1`). The beamer then sweeps
 its bottoms (`BEAM_BOTTOMS`, 0 = all, sampled with `BEAM_TAU`, until
 `BEAM_TIME` or `BEAM_BOARDS`) x `BEAM_COLUMNS` left columns, and spends the
-TOP reserve last (`--lambda_reserve RESERVE_F`): s1's row 14 under columns
-1..K is part of the band the laps keep. A rotations file instead gives its
+TOP reserve last (`--lambda_reserve RESERVE_F`), so the pieces that fit row 14
+stay free for the lap-1 band, which builds s1's row 14 under columns 1..K. A rotations file instead gives its
 next row to each call, and `random` uses the beamer's `--random_edges`. Every
 border used is appended to `RUN_DIR/borders.csv`, so a later run can reuse
 them (`BORDERS=w1/borders.csv`).

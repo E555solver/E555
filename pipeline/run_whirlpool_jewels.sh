@@ -13,9 +13,8 @@
 # whirlpool turns the board a quarter turn and re-grows it, so a different side
 # becomes the bottom. This runner looks for JEWELS:
 #
-#   s1   a beamer board, rows 0..BEAM_STOP_ROW complete and columns
-#        1..BEAM_MIN_COL grown whole to row 14 (the beamer's column extension,
-#        --backtrack_min_col); lap 1's band closes the rest of columns 0..K
+#   s1   a beamer board, rows 0..BEAM_STOP_ROW complete; whatever it holds
+#        above them in columns 0..K is cleared, and lap 1's band closes it
 #   s2   s1 turned counter-clockwise and re-grown to row FIN_STOP_ROW
 #   s3   s2 turned counter-clockwise and re-grown
 #   s4   s3 turned counter-clockwise and re-grown
@@ -30,12 +29,11 @@
 # One lap (s_k -> s_k+1):
 #
 #   close the band     E555_backtracker --stop_column K --with_frame: every exact
-#                      filling of columns 0..K plus the frame. On lap 1 the
-#                      beamer's extension already holds columns 1..BEAM_MIN_COL
-#                      up to row 14, so the band builds the frame and closes
-#                      columns BEAM_MIN_COL+1..K above the stop row; on laps
-#                      2-3 it closes the top-left corner block (rows above
-#                      FIN_STOP_ROW x columns 1..K) under the fixed frame.
+#                      filling of columns 0..K plus the frame. It closes the
+#                      top-left corner block: on lap 1 rows above
+#                      BEAM_STOP_ROW x columns 0..K with the frame still open,
+#                      on laps 2-3 rows above FIN_STOP_ROW x columns 1..K
+#                      under the fixed frame.
 #                      Columns K+1..14 are cleared first and lend it their
 #                      pieces; the finalizer frees them anyway. It runs on
 #                      every board the batch or the previous lap wrote:
@@ -55,8 +53,9 @@
 # BORDERS: each produce call starts from a fresh border. anneal (the default)
 # runs Stage A with --double_decker DD_SIDES, ANNEAL_RESTARTS restarts in
 # parallel, and keeps the best by Score_dd (tools/E555_sort_rotations.py); the
-# beamer then spends the TOP reserve last (--lambda_reserve RESERVE_F), since
-# s1's row 14 under columns 1..K is part of the band the laps keep. A path
+# beamer then spends the TOP reserve last (--lambda_reserve RESERVE_F), so the
+# pieces that fit row 14 stay free for the lap-1 band, which builds s1's row 14
+# under columns 1..K, and the laps keep it. A path
 # instead takes its next row from that rotations file each call; random uses
 # the beamer's own --random_edges. Every border used is appended to
 # borders.csv, so a later run can take them as a file.
@@ -119,11 +118,11 @@ RESERVE_F=2             # beamer --lambda_reserve: cost of placing a TOP reserve
 BEAM_WIDTH=10000
 BEAM_STOP_ROW=10        # s1 is complete up to this row
 BEAM_BACKTRACK=6        # exhaustive from this row (--backtrack_row)
-BEAM_MIN_COL=2          # the beamer writes boards whose columns 1..N grow whole to
-                        # row 14 (--backtrack_min_col, 0..K; 0 = off); the lap-1
-                        # band closes the rest of columns 0..K. With a rotations
-                        # border the left column is fixed to row 14, so N = K
-                        # writes few boards
+BEAM_MIN_COL=0          # N > 0: the beamer writes only boards whose columns 1..N grow
+                        # whole to row 14 (--backtrack_min_col, 0..K). The lap-1 band
+                        # closes the corner above BEAM_STOP_ROW itself, so it is
+                        # only a pre-filter, for BORDERS=random; a rotations border
+                        # fixes the left column, and N = 2 wrote no board
 BEAM_BOTTOMS=0          # bottom orderings tried per border, sampled with BEAM_TAU;
                         # 0 = all, until BEAM_TIME or BEAM_BOARDS (not with random)
 BEAM_COLUMNS=16         # left columns tried per bottom
@@ -269,17 +268,24 @@ function region_set(line,   x, n, p, c, r, k, s, m) {
 }
 BEGIN { ring_cells() }'
 
-# one_per_frame IN OUT -- keep the first board of each distinct frame, if its
-# top-left corner can close: the column extension lays column 0 up to row 14,
-# and where no unused corner fits on top of it (the extension's top cap
-# stopped at once) no band can ever close the frame there -- 110 of 170 boards
-# in one batch of the earlier runner
+# open_corner IN OUT -- clear the top-left corner the lap-1 band closes: rows
+# above BEAM_STOP_ROW x columns 0..K, the frame cells included. A rotations
+# border fixes the left column up to row 14 and the top-left corner, and no
+# band closed against them (0 of 628 beamer boards, CLUES=all, K=4); cleared,
+# 44 of the 628 got a band. The band puts a cleared clue back on its own cell.
+open_corner() {
+    awk -F, -v s="$BEAM_STOP_ROW" -v kc="$K" 'BEGIN {OFS = ","} !/^[#%]/ && NF {
+        n = NF - 512
+        for (p = 1; p <= 256; p++) {
+            c = $(n + p) + 0; if (c == 999) continue
+            if (int(c / 16) > s && c % 16 <= kc) $(n + p) = 999
+        }
+        print }' "$1" > "$2"
+}
+
+# one_per_frame IN OUT -- keep the first board of each distinct frame
 one_per_frame() {
-    awk "$RING"' !/^[#%]/ && NF {
-        n = split($0, x, ",") - 512; c14 = c15 = 0
-        for (p = 1; p <= 256; p++) { c14 += x[n + p] + 0 == 224; c15 += x[n + p] + 0 == 240 }
-        if (c14 && !c15) next
-        r = ring_of($0); if (!(r in seen)) { seen[r] = 1; print } }' "$1" > "$2"
+    awk "$RING"' !/^[#%]/ && NF { r = ring_of($0); if (!(r in seen)) { seen[r] = 1; print } }' "$1" > "$2"
 }
 
 # jewel_key CHAIN -- the frame key if the four boards in CHAIN (s1..s4) make a
@@ -392,7 +398,8 @@ produce() {    # produce N -> queue.csv
         --threads "$THREADS" --rng_seed "$((RNG_SEED + $1))" --out_dir "$d" --print_cmd \
         > "$d.log" 2>&1 || log "[produce] the beamer exited non-zero (see $d.log)"
     xargs -r cat < "$d/outputs.txt" > "$d/all.csv" 2> /dev/null || : > "$d/all.csv"
-    one_per_frame "$d/all.csv" "$d/one.csv"
+    open_corner "$d/all.csv" "$d/open.csv"
+    one_per_frame "$d/open.csv" "$d/one.csv"
     PRODUCED=$(count_boards "$d/all.csv")
     shuf --random-source=<(yes "$RNG_SEED.$1") "$d/one.csv" > "$d/shuf.csv"
     tag_ids "$d/shuf.csv" queue.csv "q$1_"
@@ -546,7 +553,7 @@ while [ $((SECONDS - T0)) -lt "$WALL" ]; do
         nq=$(count_boards queue.csv)
         [ "$nq" = 0 ] || lap1_bands
         log "[produce $NP] border: $BORDER_NOTE"
-        log "[produce $NP] $nq of the $PRODUCED boards written: one per frame, top-left corner closable; $NBANDED with a lap-1 band ($((SECONDS - T0)) s)"
+        log "[produce $NP] $nq of the $PRODUCED boards written: one per frame; $NBANDED with a lap-1 band ($((SECONDS - T0)) s)"
     fi
     if [ "$nq" = 0 ]; then
         EMPTY=$((EMPTY + 1)); [ "$EMPTY" -lt 2 ] && continue

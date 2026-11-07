@@ -1715,9 +1715,9 @@ same complete 60-cell frame, each board's rows 0..K being its parent's columns
 0..K. A lap closes the band before it turns: `E555_backtracker --stop_column K
 --with_frame` fills s_k's columns 0..K and the frame exactly (columns K+1..14
 cleared, their pieces lent), on every board the previous lap wrote, so it
-selects the boards whose top-left corner block closes; on lap 1 the beamer's
-extension (`--backtrack_min_col BEAM_MIN_COL`, default 2) already built s1's
-columns 1..BEAM_MIN_COL, and the band closes the rest of 0..K. It then
+selects the boards whose top-left corner block closes; on lap 1 it closes s1's
+rows above the stop row in columns 0..K, cleared first, frame cells included
+(an annealed border's left column, fixed to row 14, let no band close). It then
 turns the band counter-clockwise and re-grows it with `--finalize_from K
 --keep_ring --no_fanout_sort`; depth-first, one board per frame, the chain
 traced back through board ids. Each produce call starts from a Stage A border
