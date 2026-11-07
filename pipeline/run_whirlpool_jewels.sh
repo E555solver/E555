@@ -71,10 +71,15 @@
 # centre and the four inner corners, rows/columns 1-2 and 13-14 -- and every
 # lap holds them as it holds the frame (finalizer --freeze_clues). The four
 # boards of such a jewel share 80 pieces: the frame and the 20 block pieces.
-# A frozen lap reaches row 9 rather than 10, hence FIN_STOP_ROW=9. It is the
-# strictest setting: re-growing around the frozen centre block from a lock at
-# row K succeeds less often the higher K is (on 4 cores, no frozen lap re-grew
-# from row 4), so it is meant for long runs on many cores.
+# A frozen lap reaches row 9 rather than 10, hence FIN_STOP_ROW=9. Above a
+# lock at row K the rows beside the frozen centre block (rows 7-8) must wrap a
+# fixed 2x2 block between the fixed ring ends, so the higher K, the rarer a
+# lap: lap-1 bands of real boards (CLUES=all, left column kept) reached row 9
+# frozen on 0 of 10 boards at K=4 (no band past row 7) and 0 of 18 at K=3 (10
+# of them past row 8), where K=2 gave 4 jewels from 8 boards. FREEZE=corners
+# holds only the four corner blocks and re-grows the centre one, its clue
+# still on its cell: lap 1 then passed on 5 of 10 boards at K=4 and 15 of 18
+# at K=3 (unfrozen: 9 of 10, 17 of 18).
 #
 # NEEDS about 8 GB of RAM for the beamer, and DB_FILE: the beamer's 6.4 GB chain
 # database is written there on the first call (~2 min) and loaded in seconds by

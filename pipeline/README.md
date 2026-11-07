@@ -419,7 +419,8 @@ its own database cache (`E555.db.center`, `E555.db.all`). **Frozen blocks**
 (`FREEZE=1`, the default): the band also fills the five 2x2 clue blocks and
 every lap holds them (`--with_clue_regions`, `--freeze_clues`), so a jewel's
 boards share the frame, the 20 block pieces and all five clues. A frozen lap
-reaches row 9 (`FIN_STOP_ROW=9`).
+reaches row 9 (`FIN_STOP_ROW=9`). `FREEZE=corners` holds only the four corner
+blocks and re-grows the centre one every lap, its clue still on its cell.
 
 **Measured** (one annealed border, `CLUES=all`, frozen, 300 s beamer calls on
 4 cores; frames with a lap-1 band, of the frames written):
@@ -436,10 +437,23 @@ Keeping the annealed left column costs most of the yield: with it cleared
 too, 44 of 628 frames got a K=4 band (194 at K=2), but then only 34% of the
 left column's top four edges stayed on their side. The probe matters because
 the annealer does not model the corner clues: on that border only one clue
-orientation had a top-left block at all. A frozen lap from a lock at row 4
-re-grows rarely; on 4 cores none of 28 did (they died at rows 5-6, where the
-same bands re-grew unfrozen), which is why the frozen K=4 default is for long
-runs on many cores.
+orientation had a top-left block at all.
+
+**The frozen centre block and K.** Above a lock at row K, the rows beside the
+frozen centre block (rows 7-8) must wrap a fixed 2x2 block between the fixed
+ring ends, with 6-K free rows below it to adapt. Lap 1, re-grown to row 9 from the
+real boards that had a lap-1 band (8 most different bands each, exhaustive):
+
+| K | boards | all five blocks frozen | corner blocks frozen (`corners`) | unfrozen |
+|---|---|---|---|---|
+| 4 | 10 | 0 pass (no band past row 7) | 5 pass | 9 pass |
+| 3 | 18 | 0 pass (10 past row 8) | 15 pass | 17 pass |
+| 2 | 8 | 6 pass, 4 jewels | | |
+
+So with all five blocks frozen only K=2 made jewels on 4 cores (4 of 8
+boards, each in about 6 minutes, all 60 frame pieces on their annealed
+sides). `FREEZE=1 K=4`, the default, keeps the frozen centre block, the corner
+blocks and a 5-row band, and is meant for long runs on many cores.
 
 `jewels.log` gives each jewel's frame key and `shared=a/b/c`: the interior
 cells each lap kept from its parent, the measure of what a jewel shares.
