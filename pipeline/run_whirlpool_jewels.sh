@@ -64,8 +64,9 @@
 #
 # DIVE=1 finishes each jewel's four boards with E555_diver as soon as it is
 # found: DIVE_DIVES dives and DIVE_POLISH polish rounds (DIVE_COPIES copies),
-# then DIVE_REOPEN seconds of re-dives of each board's most damaged band. s1 is
-# dived from the beamer board with the jewel's frame and top corner clues.
+# then DIVE_REOPEN seconds of re-dives of the rows above the stop rows; the
+# frame and the frozen blocks never move, so a dived board keeps its jewel's.
+# s1 is dived from the beamer board with the jewel's frame and top corner clues.
 #
 # NEEDS about 8 GB of RAM for the beamer, and DB_FILE: the beamer's 6.4 GB chain
 # database is written there on the first call and loaded in seconds by every
@@ -98,8 +99,9 @@ DIVE=0                  # 1 = dive each jewel's four boards as soon as it is fou
 DIVE_DIVES=100000       # E555_diver per board: dives (--end_dive),
 DIVE_POLISH=200000      # polish rounds (--end_polish)
 DIVE_COPIES=1           # and copies of both, the best kept (--copies);
-DIVE_REOPEN=30          # then seconds per board of re-dives of its most damaged band
-                        # (--reopen auto+2, never worse; 0 = none)
+DIVE_REOPEN=30          # then seconds per board of re-dives of the rows above the stop
+                        # rows, the frame and the frozen blocks kept (--reopen,
+                        # never worse; 0 = none)
 CLUES=all               # none | center | all: the Eternity II clues every tool holds
 FREEZE=1                # 1 = the band also fills the five 2x2 clue blocks and every
                         # lap holds them, like the frame; corners = the four corner
@@ -714,12 +716,13 @@ dive_jewel() {
         # a complete board has nothing to dive: it is re-dived as it is
         [ -s "$d/dived.csv" ] && [ "$(count_boards "$d/dived.csv")" -gt 0 ] ||
             cp "$d/to_dive.csv" "$d/dived.csv"
-        # then its most damaged band, two rows deeper than the damage reaches,
-        # dived again and again until DIVE_REOPEN seconds are spent; the board
-        # written is never worse than the one read
+        # then the interior of the rows the dive filled, and two below them
+        # (masks/reopen.csv: never the frame or a frozen block), dived again and
+        # again until DIVE_REOPEN seconds are spent; the board written is never
+        # worse than the one read
         if [ "$DIVE_REOPEN" -gt 0 ]; then
             rm -f "$d/redived.csv"
-            "$BIN/E555_diver" "$SEED" "$d/dived.csv" "$d/redived.csv" --reopen auto+2 \
+            "$BIN/E555_diver" "$SEED" "$d/dived.csv" "$d/redived.csv" --reopen "$MASKS/reopen.csv" \
                 --rounds 1000000 --wall_time "$DIVE_REOPEN" --copies 8 --end_dive 1000 \
                 --end_polish 10000 --emit_score 0 --threads "$THREADS" --print_cmd \
                 > "$d/redive$j.log" 2>&1 || true
@@ -802,6 +805,8 @@ mask "$MASKS/jewel.csv" "$FRAME || $FROZEN && $BLOCKS"             # what a jewe
 mask "$MASKS/open.csv"  "r > $BEAM_STOP_ROW && (c >= $C0 && c <= $K || c >= 15 - $K && c <= 14)"
 mask "$MASKS/share.csv" "!($FRAME && c <= $K) && !($FROZEN && $BLOCKS)"   # lifted for lap 2's starts
 mask "$MASKS/s1lift.csv" "!($FRAME || r == 13 && (c == 2 || c == 13))"    # lifted before s1's dive
+ROW0=$(( (BEAM_STOP_ROW < FIN_STOP_ROW ? BEAM_STOP_ROW : FIN_STOP_ROW) - 1 ))
+mask "$MASKS/reopen.csv" "r >= $ROW0 && r <= 14 && c >= 1 && c <= 14 && !($FROZEN && $BLOCKS)"  # re-dived
 # The beamer maps the database file into memory and reads only the pages it
 # touches, in random order, which from a cold disk can stall a produce call for
 # minutes; one sequential read first (it counts against WALL) puts the whole

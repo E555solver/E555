@@ -431,14 +431,15 @@ the jewel is found:
   (`DIVE_COPIES` copies). s1 is dived from the beamer board with the jewel's
   frame and top corner clues added, not from the s1 of `jewels.csv` with its
   open cells;
-- then `DIVE_REOPEN` seconds of re-dives of its most damaged band
-  (`--reopen auto+2`), which never make it worse;
+- then `DIVE_REOPEN` seconds of re-dives (`--reopen`, never worse) of the
+  rows the dive filled. The frame and the frozen blocks never move, so a
+  dived board still holds its jewel's;
 - each board's best goes to `dived.csv`, and the 20 best of the run to
   `best.csv`;
 - the scores are added to the jewel's line in `jewels.log`.
 
 The defaults are past the point where more work pays. On real K=3 jewels,
-s2..s4 reach about 454, and ten times the fresh dives gains less than one
+the boards reach 453-456, and ten times the fresh dives gains less than one
 edge.
 
 **Output (in `RUN_DIR`):**
