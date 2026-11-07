@@ -133,8 +133,14 @@ BEAM_BOTTOMS=0          # bottom orderings tried per border, sampled with BEAM_T
                         # 0 = all, until BEAM_TIME or BEAM_BOARDS (not with random)
 BEAM_COLUMNS=16         # left columns tried per bottom
 BEAM_TAU=0.1            # randomness in picking bottoms and columns; 0 = the best-ranked
-BEAM_BOARDS=2000        # boards per beamer call
-BEAM_TIME=570           # seconds per beamer call
+BEAM_CORNERS=0.5        # CLUES=all: --lambda_corners; a 1 s probe first reads the
+                        # beamer's exact catalog of clued top-corner blocks per clue
+                        # orientation, and the beam runs only in the orientations
+                        # whose top-left catalog is not empty (--pin_clue), one call
+                        # each; the annealed border used is the best by Score_dd
+                        # that has one. 0 = off: one unpinned call
+BEAM_BOARDS=2000        # boards per produce call, shared by its beamer calls
+BEAM_TIME=570           # seconds per produce call, shared by its beamer calls
 
 # the band: E555_backtracker --stop_column K before each turn
 BANDS=60                # fillings kept per board
@@ -174,7 +180,7 @@ for v in K BOARD_TIME ANNEAL_RESTARTS ANNEAL_STEPS DD_RESERVE BEAM_MIN_COL BEAM_
          LAP_TRIES FIN_STOP_ROW LAP_TIME FIN_BOARDS; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
 done
-for v in BEAM_TAU RESERVE_F; do
+for v in BEAM_TAU RESERVE_F BEAM_CORNERS; do
     [[ ${!v} =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$v must be a number, 0 or more (got: ${!v})"
 done
 [ "$BEAM_BACKTRACK" -lt "$BEAM_STOP_ROW" ] && [ "$BEAM_STOP_ROW" -le 14 ] ||
@@ -365,49 +371,101 @@ cut_bands() {
 # Consecutive beamer boards differ in a few interior cells and share their ring,
 # so lap 1 would find the same frame again; one board per frame avoids that.
 
-# border N DIR -- sets BORDER_ARGS (the beamer's border arguments) and
-# BORDER_NOTE for call N
+# probe_corners FILE ROW DIR -- the beamer's exact catalog of top-left and
+# top-right corner blocks for border ROW of FILE, per clue orientation (the
+# corner clue, its 2x2 block, the edges beside it), from a 1-second
+# --lambda_corners run. Sets PINS, the --pin_clue values of the orientations
+# whose top-left catalog is not empty, and CORNER_NOTE. With the left column
+# kept, a board in another orientation can never close its top-left corner.
+probe_corners() {
+    local file=$1 row=$2 d=$3 db=()
+    [ -z "$DB_FILE" ] || db=(--db_file "$DB_FILE")
+    rm -rf "$d/probe"
+    "$BIN/E555_beamer" "$SEED" "$file" --start_row "$row" --num_rows 1 "${CLUE_ARG[@]}" \
+        --lambda_corners "$BEAM_CORNERS" --top_bottoms 1 --top_columns 1 --beam_width 100 \
+        --stop_row "$BEAM_STOP_ROW" --wall_time 1 --max_emitted 1 "${db[@]}" \
+        --threads "$THREADS" --out_dir "$d/probe" > "$d/probe.log" 2>&1 || :
+    # [corner] border row R, clue orientation O: TL n block(s) on ... | TR m block(s) on ...
+    # --pin_clue N names the quadrant of the centre clue: orientation 0 1 2 3 = N 1 4 3 2
+    PINS=$(awk '/^\[corner\] border row .* clue orientation/ {
+            o = $7 + 0; tl = $9 + 0; if (tl > 0) printf "%s ", substr("1432", o + 1, 1) }' "$d/probe.log")
+    CORNER_NOTE="TL blocks per orientation $(awk '/^\[corner\] border row .* clue orientation/ {
+            printf "%s%s", (n++ ? "/" : ""), $9 + 0 }' "$d/probe.log"), TR $(awk '/^\[corner\] border row .* clue orientation/ {
+            for (i = 1; i <= NF; i++) if ($i == "TR") { printf "%s%s", (n++ ? "/" : ""), $(i + 1) + 0 } }' "$d/probe.log")"
+    rm -rf "$d/probe"
+}
+
+# border N DIR -- sets BORDER_ARGS (the beamer's border arguments), PINS (the
+# clue orientations to beam, empty = all of them, unpinned) and BORDER_NOTE
+# for call N; BORDER_ARGS=() when no border is usable
 border() {
-    local n=$1 d=$2 rows row
+    local n=$1 d=$2 rows row i
+    PINS=; CORNER_NOTE=
+    local probe=0; [ "$CLUES" = all ] && [ "$BEAM_CORNERS" != 0 ] && [ "$BORDERS" != random ] && probe=1
     case "$BORDERS" in
         random)
-            BORDER_ARGS=(--random_edges --samples 0); BORDER_NOTE="random edges" ;;
+            BORDER_ARGS=(--random_edges --samples 0); BORDER_NOTE="random edges"; return ;;
         anneal)
             python3 "$REPO/src/A_border/E555_edge_annealer.py" "$SEED" --out "$d/borders.csv" \
                 --restarts "$ANNEAL_RESTARTS" --steps "$ANNEAL_STEPS" \
                 --double_decker "$DD_SIDES" --decker_reserve "$DD_RESERVE" \
                 --threads "$THREADS" --rng_seed "$((RNG_SEED + n))" > "$d/anneal.log" 2>&1 ||
                 { BORDER_ARGS=(); BORDER_NOTE="the annealer failed (see $d/anneal.log)"; return; }
-            python3 "$TOOLS/E555_sort_rotations.py" "$d/borders.csv" --sort score_dd --top 1 \
-                -o "$d/border.csv" >> "$d/anneal.log" 2>&1 ||
+            python3 "$TOOLS/E555_sort_rotations.py" "$d/borders.csv" --sort score_dd \
+                -o "$d/sorted.csv" >> "$d/anneal.log" 2>&1 ||
                 { BORDER_ARGS=(); BORDER_NOTE="sorting the borders failed (see $d/anneal.log)"; return; }
+            # the best by Score_dd that has a top-left corner block in some orientation
+            rows=$(count_boards "$d/sorted.csv"); row=-1
+            for ((i = 0; i < rows; i++)); do
+                [ "$probe" = 1 ] || { row=$i; break; }
+                probe_corners "$d/sorted.csv" "$i" "$d"
+                [ -z "$PINS" ] || { row=$i; break; }
+            done
+            [ "$row" -ge 0 ] || { BORDER_ARGS=(); BORDER_NOTE="none of the $rows annealed borders has a top-left corner block in any clue orientation"; return; }
+            # the row with its own comment line (Decker=, the reserve marks' context)
+            awk -v r="$row" '/^#/ {c = $0; next} NF { if (k++ == r) { print c; print; exit } }' \
+                "$d/sorted.csv" > "$d/border.csv"
             { echo "# produce $n"; cat "$d/border.csv"; } >> "$RUN_DIR/borders.csv"
             BORDER_ARGS=("$d/border.csv" --start_row 0 --num_rows 1)
-            BORDER_NOTE="annealed, best of $ANNEAL_RESTARTS: $(grep -o -m 1 'Score_dd=[^ ]*' "$d/border.csv" || :) $(grep -o -m 1 'Decker=[^ ]*' "$d/border.csv" || :)" ;;
+            BORDER_NOTE="annealed, rank $((row + 1)) of $rows by Score_dd: $(grep -o -m 1 'Score_dd=[^ ]*' "$d/border.csv" || :) $(grep -o -m 1 'Decker=[^ ]*' "$d/border.csv" || :)" ;;
         *)
             rows=$(count_boards "$BORDERS"); row=$(( (n - 1) % rows ))
             BORDER_ARGS=("$BORDERS" --start_row "$row" --num_rows 1)
-            BORDER_NOTE="$(basename "$BORDERS") row $row" ;;
+            BORDER_NOTE="$(basename "$BORDERS") row $row"
+            if [ "$probe" = 1 ]; then
+                probe_corners "$BORDERS" "$row" "$d"
+                [ -n "$PINS" ] || { BORDER_ARGS=(); BORDER_NOTE="$BORDER_NOTE has no top-left corner block in any clue orientation"; return; }
+            fi ;;
     esac
-    [ "$BORDERS" = random ] || BORDER_ARGS+=(--top_bottoms "$BEAM_BOTTOMS" --tau_bottoms "$BEAM_TAU")
-    [ "$BORDERS" = random ] || [ "$RESERVE_F" = 0 ] || BORDER_ARGS+=(--lambda_reserve "$RESERVE_F")
+    [ -z "$CORNER_NOTE" ] || BORDER_NOTE="$BORDER_NOTE; $CORNER_NOTE; beamed in orientation pins: $PINS"
+    BORDER_ARGS+=(--top_bottoms "$BEAM_BOTTOMS" --tau_bottoms "$BEAM_TAU")
+    [ "$RESERVE_F" = 0 ] || BORDER_ARGS+=(--lambda_reserve "$RESERVE_F")
+    [ "$probe" = 0 ] || BORDER_ARGS+=(--lambda_corners "$BEAM_CORNERS")
 }
 
-produce() {    # produce N -> queue.csv
-    local d=produce$1 db=(); rm -rf "$d"; mkdir "$d"
+produce() {    # produce N -> queue.csv; NOBORDER=1 when no border was usable
+    local d=produce$1 db=() pins pin n t b
+    rm -rf "$d"; mkdir "$d"
     [ -z "$DB_FILE" ] || db=(--db_file "$DB_FILE")
     border "$1" "$d"
-    PRODUCED=0; : > queue.csv
-    [ "${#BORDER_ARGS[@]}" -gt 0 ] || return    # keeps $d/anneal.log
-    timeout -k 10 $((BEAM_TIME + 60)) "$BIN/E555_beamer" "$SEED" "${BORDER_ARGS[@]}" \
-        --top_columns "$BEAM_COLUMNS" --tau_columns "$BEAM_TAU" "${CLUE_ARG[@]}" \
-        --beam_width "$BEAM_WIDTH" --backtrack_row "$BEAM_BACKTRACK" --stop_row "$BEAM_STOP_ROW" \
-        --backtrack_min_col "$BEAM_MIN_COL" \
-        --max_emitted "$BEAM_BOARDS" --wall_time "$BEAM_TIME" "${db[@]}" \
-        --threads "$THREADS" --rng_seed "$((RNG_SEED + $1))" --out_dir "$d" --print_cmd \
-        > "$d.log" 2>&1 || log "[produce] the beamer exited non-zero (see $d.log)"
-    : > "$d/all.csv"                # a killed beamer leaves no outputs.txt
-    [ ! -s "$d/outputs.txt" ] || xargs -r cat < "$d/outputs.txt" > "$d/all.csv" 2> /dev/null || :
+    PRODUCED=0; NOBORDER=0; : > queue.csv; : > "$d/all.csv"
+    [ "${#BORDER_ARGS[@]}" -gt 0 ] || { NOBORDER=1; return; }    # keeps $d/anneal.log
+    # one beamer call per clue orientation to beam, sharing BEAM_TIME and
+    # BEAM_BOARDS; one unpinned call when no orientation was chosen
+    pins=${PINS:-0}; n=$(echo $pins | wc -w)
+    t=$(( BEAM_TIME / n > 30 ? BEAM_TIME / n : 30 )); b=$(( BEAM_BOARDS / n > 1 ? BEAM_BOARDS / n : 1 ))
+    for pin in $pins; do
+        local pin_arg=(); [ "$pin" = 0 ] || pin_arg=(--pin_clue "$pin")
+        timeout -k 10 $((t + 60)) "$BIN/E555_beamer" "$SEED" "${BORDER_ARGS[@]}" "${pin_arg[@]}" \
+            --top_columns "$BEAM_COLUMNS" --tau_columns "$BEAM_TAU" "${CLUE_ARG[@]}" \
+            --beam_width "$BEAM_WIDTH" --backtrack_row "$BEAM_BACKTRACK" --stop_row "$BEAM_STOP_ROW" \
+            --backtrack_min_col "$BEAM_MIN_COL" \
+            --max_emitted "$b" --wall_time "$t" "${db[@]}" \
+            --threads "$THREADS" --rng_seed "$((RNG_SEED + $1))" --out_dir "$d/o$pin" --print_cmd \
+            > "$d.o$pin.log" 2>&1 || log "[produce] the beamer exited non-zero (see $d.o$pin.log)"
+        # a killed beamer leaves no outputs.txt
+        [ ! -s "$d/o$pin/outputs.txt" ] || xargs -r cat < "$d/o$pin/outputs.txt" >> "$d/all.csv" 2> /dev/null || :
+    done
     open_corner "$d/all.csv" "$d/open.csv"
     one_per_frame "$d/open.csv" "$d/one.csv"
     PRODUCED=$(count_boards "$d/all.csv")
@@ -547,7 +605,7 @@ whirl_board() {
 
 # ---- main loop -----------------------------------------------------------------------
 log "[cfg] run_dir=$RUN_DIR threads=$THREADS wall=$WALL board_time=$BOARD_TIME rng_seed=$RNG_SEED db_file=${DB_FILE:-<rebuilt each call>}"
-log "[cfg] clues=$CLUES freeze=$FREEZE K=$K borders=$BORDERS beam: stop_row=$BEAM_STOP_ROW min_col=$BEAM_MIN_COL bottoms=$BEAM_BOTTOMS columns=$BEAM_COLUMNS tau=$BEAM_TAU; bands: $BANDS per board, $BANDS_GROWN x $LAP_TRIES grown; finalizer: stop_row=$FIN_STOP_ROW lap_time=$LAP_TIME pool=$FIN_BOARDS"
+log "[cfg] clues=$CLUES freeze=$FREEZE K=$K borders=$BORDERS beam: stop_row=$BEAM_STOP_ROW min_col=$BEAM_MIN_COL bottoms=$BEAM_BOTTOMS columns=$BEAM_COLUMNS tau=$BEAM_TAU corners=$BEAM_CORNERS; bands: $BANDS per board, $BANDS_GROWN x $LAP_TRIES grown; finalizer: stop_row=$FIN_STOP_ROW lap_time=$LAP_TIME pool=$FIN_BOARDS"
 T0=$SECONDS; NB=0; NJ=0; NP=0; EMPTY=0
 # The beamer maps the database file into memory and reads only the pages it
 # touches, in random order. From a cold disk (after a reboot) that kept one
@@ -571,6 +629,9 @@ while [ $((SECONDS - T0)) -lt "$WALL" ]; do
         nq=$(count_boards queue.csv)
         [ "$nq" = 0 ] || lap1_bands
         log "[produce $NP] border: $BORDER_NOTE"
+        # a round whose annealed borders all lack a usable corner is not a
+        # broken beamer: the next round anneals afresh
+        [ "$NOBORDER" = 0 ] || continue
         log "[produce $NP] $nq of the $PRODUCED boards written: one per frame; $NBANDED with a lap-1 band ($((SECONDS - T0)) s)"
     fi
     if [ "$nq" = 0 ]; then
