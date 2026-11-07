@@ -14,49 +14,48 @@
 # becomes the bottom. This runner looks for JEWELS, four boards around one s1:
 #
 #   s1   a beamer board, rows 0..BEAM_STOP_ROW complete, with the annealed
-#        left column, closed by the bands of laps 1 and 2 (its two top corners)
-#   s2   lap 1: s1 turned counter-clockwise, its left columns 0..K locked as
-#        rows 0..K, re-grown to row FIN_STOP_ROW
-#   s3   lap 2: s1 turned clockwise, its right columns 15-K..15 locked
-#   s4   lap 3: s3 turned clockwise, its right columns locked -- or, when no s4
-#        grows that way, s2 turned counter-clockwise, its left columns locked;
-#        either way s1's top side is s4's bottom
+#        left column
+#   s2   lap 1: s1's left band (columns 0..K, its top-left corner closed),
+#        turned counter-clockwise to rows 0..K, re-grown to row FIN_STOP_ROW
+#   s3   lap 2: s1's right band (columns 15-K..15, its top-right corner
+#        closed), turned clockwise, re-grown
+#   s4   lap 3: s3's right band, turned clockwise -- or, when no s4 grows that
+#        way, s2's left band, turned counter-clockwise; either way s1's top
+#        side is s4's bottom
 #
 # all four holding the SAME complete 60-cell frame (and, FREEZE, the same clue
 # blocks). Each of s1's four sides is the bottom once, and s2 and s3 both lock
-# a band of s1 itself, so a jewel's boards share about 14*K interior cells
-# with s1 or with each other, plus the frame. DIVE=1 dives each jewel's four
-# boards as it is found and reports the best.
+# a band of s1 itself: about 14*K interior cells each. The two side bands are
+# cut separately and share only the frame and the blocks; each may borrow a
+# piece the other uses. DIVE=1 dives each jewel's four boards as it is found
+# and reports the best.
 #
-# One lap (a parent board -> its child):
+# A band:
 #
-#   close the band     E555_backtracker --stop_column K --with_frame (right
-#                      side: --reverse): every exact filling of those columns
-#                      plus the frame. It closes a top corner block: on laps 1
-#                      and 2 rows above BEAM_STOP_ROW x columns 1..K (or
-#                      15-K..14) of s1, lap 1 against the annealed left column,
-#                      building the rest of the frame; on lap 3 rows above
-#                      FIN_STOP_ROW under the fixed frame. The other inner
-#                      columns are cleared first and lend it their pieces; the
-#                      finalizer frees them anyway. A board whose corner
-#                      cannot close writes no band, so the lap selects the
-#                      boards that can. Lap 2 starts from a lap-1 band that
-#                      re-grew, overlaid with s1: the band's frame and blocks,
-#                      s1's own right columns.
+#   close              E555_backtracker --stop_column K --with_frame (the right
+#                      band: --reverse): every exact filling of those columns
+#                      plus the frame. It closes a top corner block: s1's rows
+#                      above BEAM_STOP_ROW (lap 1 against the annealed left
+#                      column, lap 2 under lap 1's frame left of column K+1
+#                      and its blocks, building the rest of the frame), or on
+#                      lap 3 the rows above FIN_STOP_ROW under the fixed
+#                      frame. The other inner columns are cleared first and
+#                      lend it their pieces; the finalizer frees them anyway.
+#                      A board whose corner cannot close writes no band, so
+#                      the lap selects the boards that can.
 #   turn               tools/E555_rotate.py: counter-clockwise for a left
 #                      band, clockwise for a right one; the band becomes rows
 #                      0..K and the frame
 #   re-grow            E555_finalizer --finalize_from K --keep_ring up to row
 #                      FIN_STOP_ROW, exhaustively (--backtrack_row K: a DFS
 #                      from the lock, no beam to cut options): the frame is
-#                      held in place, so every lap keeps the ring lap 1
-#                      completed
+#                      held in place
 #
 # A lap picks BANDS_GROWN x LAP_TRIES of its bands, most different first
 # (tools/E555_rank.py --diverse), and re-grows them BANDS_GROWN at a time. The
 # search is depth-first: the boards a group re-grows feed the next lap, and
-# the first s4 ends that board. Only lap 3 closes a corner above FIN_STOP_ROW;
-# laps 1 and 2 close theirs above BEAM_STOP_ROW, on s1.
+# the first s4 ends that board. Laps 1 and 2 close their corners above
+# BEAM_STOP_ROW, on s1, lap 3 above FIN_STOP_ROW.
 #
 # BORDERS: each produce call starts from a fresh border. anneal (the default)
 # runs Stage A with --double_decker DD_SIDES, ANNEAL_RESTARTS restarts in
@@ -97,7 +96,7 @@
 #
 # WRITES into RUN_DIR:
 #   jewels.csv    the jewels' four boards, ids b<board>_s1 .. b<board>_s4 (s1
-#                 closed: the beamer rows and both top corners)
+#                 with both side bands; a cell both took a piece for is open)
 #   jewels.log    one line per jewel: board, s4's parent (from=s3|s2), frame
 #                 key, the interior cells kept (shared=s1s2/s1s3/<from>s4/s1s4),
 #                 DIVE=1: the four dived scores and their max, time
