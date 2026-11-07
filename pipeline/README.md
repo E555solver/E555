@@ -341,9 +341,9 @@ laps under **one fixed frame**, keeps a band of the board through every turn,
 and keeps the chains that make it -- the jewels:
 
 ```
-s1  beamer board: rows 0..10                                -> close the band, turn counter-clockwise, re-grow -> s2
-s2  rows 0..K = s1's columns 0..K, re-grown to row 10       -> close the band, turn, re-grow -> s3
-s3                                                          -> close the band, turn, re-grow -> s4
+s1  beamer board: rows 0..10, annealed bottom and left column -> close the band, turn counter-clockwise, re-grow -> s2
+s2  rows 0..K = s1's columns 0..K, re-grown to row 9            -> close the band, turn, re-grow -> s3
+s3                                                              -> close the band, turn, re-grow -> s4
 ```
 
 s1..s4 hold the same complete 60-cell frame, and each board's bottom rows
@@ -352,10 +352,10 @@ all four sides under one border, consecutive boards share 14 x K interior
 cells, and none of its sides is a leftover of the beamer's early guesses.
 
 ```bash
-bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour, all five clues, K=4
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour: all five clues, blocks frozen, K=4
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1  # then dive the jewels
-bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=2 FREEZE=1 \
-    FIN_STOP_ROW=9 LAP_TIME=480                                        # the 2x2 clue blocks frozen too
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db FREEZE=0 \
+    FIN_STOP_ROW=10 LAP_TIME=240                                       # the 2x2 clue blocks re-grown each lap
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db BORDERS=random   # the beamer's sampled borders
 bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl your own boards
 ```
@@ -363,31 +363,26 @@ bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl y
 **One lap**, s_k to s_k+1:
 
 1. *Close the band.* `E555_backtracker --stop_column K --with_frame` writes
-   every exact filling of s_k's columns 0..K plus the frame, up to `BANDS` per
-   board. Columns K+1..14 are cleared first, so the band may use their pieces
-   (the finalizer frees them anyway). Either way it closes a top-left corner
-   block. On lap 1 that is rows 11..14 x columns 0..K with the frame still
-   open: produce clears whatever the beamer placed there, frame cells included.
-   A rotations border fixes the left column up to row 14, and against it no
-   band closed (0 of 628 beamer boards, `CLUES=all`, K=4); cleared, 44 of the
-   628 got one. On laps 2-3 it is rows above `FIN_STOP_ROW` x columns 1..K,
-   against the fixed frame. The beamer's own column filter
-   (`BEAM_MIN_COL`, `--backtrack_min_col`) is then only a pre-filter, off by
-   default; with a rotations border, 2 columns already wrote no board.
-   The band step runs on every board the batch or the previous lap wrote (`FIN_BOARDS` of them, one
-   per thread), and a board whose corner cannot close writes no band: the lap
-   selects the boards that can.
+   every exact filling of s_k's columns 0..K plus the frame (and, frozen, the
+   five 2x2 clue blocks), up to `BANDS` per board. Columns K+1..14 are cleared
+   first, so the band may use their pieces (the finalizer frees them anyway).
+   Either way it closes a top-left corner block: on lap 1 rows 11..14 x
+   columns 1..K of s1, which produce clears, against the annealed left
+   column, building the rest of the frame; on laps 2-3 rows above
+   `FIN_STOP_ROW` x columns 1..K, against the fixed frame. It runs on every
+   board the batch or the previous lap wrote (`FIN_BOARDS`, one per thread),
+   and a board whose corner cannot close writes no band: the lap selects the
+   boards that can.
 2. *Turn* counter-clockwise (`E555_rotate.py 3`): the band becomes rows 0..K.
 3. *Re-grow* with `E555_finalizer --finalize_from K --keep_ring
    --no_fanout_sort` up to `FIN_STOP_ROW`, exhaustively (`--backtrack_row K`:
    a DFS from the lock, so no beam cuts an option). `--keep_ring` holds the
    frame in place, so the ring lap 1 completed is the ring every later lap
-   keeps. Measured on 8 real K=4 bands: the exhaustive search found the same
-   20 boards as beams of width 20000 and 200000 (the narrower beam was full
-   on one band), in the same 24 s, nearly all of it the reduced database's
-   rebuild (~3 s a band on 4 cores). The fan-out sort would add 7 s a band,
-   three times the rest, and an exhaustive search finds the same boards
-   without it (`--no_fanout_sort`), only in another order.
+   keeps. On 8 real K=4 bands the exhaustive search found the same 20 boards
+   as beams of width 20000 and 200000 (the narrower one was full on one band)
+   in the same 24 s, nearly all of it the reduced database's rebuild (~3 s a
+   band on 4 cores); the fan-out sort would add 7 s a band and, for an
+   exhaustive search, only reorders the same boards (`--no_fanout_sort`).
 
 A lap picks `BANDS_GROWN x LAP_TRIES` of its bands, most different first
 (`E555_rank.py --diverse`), and grows them `BANDS_GROWN` per finalizer call.
@@ -398,27 +393,53 @@ lead back to them, which is how the chain is traced from s4 to s1.
 
 **Borders.** Each produce call starts from a fresh border. `BORDERS=anneal`
 (default) runs Stage A with `--double_decker DD_SIDES` (`ALL`),
-`ANNEAL_RESTARTS` restarts in parallel, and keeps the best by `Score_dd`
-(`E555_sort_rotations.py --sort score_dd --top 1`). The beamer then sweeps
-its bottoms (`BEAM_BOTTOMS`, 0 = all, sampled with `BEAM_TAU`, until
-`BEAM_TIME` or `BEAM_BOARDS`) x `BEAM_COLUMNS` left columns, and spends the
-TOP reserve last (`--lambda_reserve RESERVE_F`), so the pieces that fit row 14
-stay free for the lap-1 band, which builds s1's row 14 under columns 1..K. A rotations file instead gives its
-next row to each call, and `random` uses the beamer's `--random_edges`. Every
-border used is appended to `RUN_DIR/borders.csv`, so a later run can reuse
-them (`BORDERS=w1/borders.csv`).
+`ANNEAL_RESTARTS` restarts in parallel, sorted by `Score_dd`. With
+`CLUES=all` a 1 s beamer probe (`--lambda_corners`) reads, per clue
+orientation, the exact catalog of top-left and top-right corner blocks the
+border's sides allow around the corner clues; the border used is the best by
+`Score_dd` whose top-left catalog is not empty in some orientation, and the
+beam runs one call per such orientation (`--pin_clue`, with
+`--lambda_corners BEAM_CORNERS`), sharing `BEAM_TIME` and `BEAM_BOARDS`. It
+sweeps all bottoms (`BEAM_BOTTOMS=0`, sampled with `BEAM_TAU`) x
+`BEAM_COLUMNS` left columns, and spends the TOP reserve last
+(`--lambda_reserve RESERVE_F`). A rotations file instead gives its next row
+to each call, and `random` uses the beamer's `--random_edges`. Every border
+used is appended to `RUN_DIR/borders.csv`, so a later run can reuse them
+(`BORDERS=w1/borders.csv`).
 
-**Clues.** Every tool holds all five clues by default (`CLUES=all`; `center`,
-`none`). A clued run keeps its own database cache (`E555.db.center`,
-`E555.db.all`). The clues stay on their own cells through every lap.
-**Frozen blocks** (`FREEZE=1`): the band also fills the five 2x2 clue blocks
-and every lap holds them (`--with_clue_regions`, `--freeze_clues`, searched
-exhaustively from the lock), so a jewel's boards share the frame, the 20 block
-pieces and all five clues. A frozen lap re-grows only from a low lock, so
-`FREEZE=1` needs K <= 2 and the settings of the third example above (row 9,
-longer laps, more bands). From K = 4, none of 28 lap-1 boards re-grew frozen:
-they died at rows 5-6, and the same bands re-grew unfrozen. The earlier runner
-had measured the same: frozen, a lock at row 3 reached no row past 8.
+**The annealed sides.** The bottom row, the whole left column (the top-left
+corner included) and the right column up to row 10 keep the annealed border's
+sides and the beamer's order. The lap-1 band fills the top row and the right
+column above row 10 from the edges left, and may trade pieces between those
+two sides: the backtracker has no option to restrict an edge to its side.
+
+**Clues.** Every tool holds all five clues (`CLUES=all`, the default;
+`center`, `none`), each on its own cell through every lap. A clued run keeps
+its own database cache (`E555.db.center`, `E555.db.all`). **Frozen blocks**
+(`FREEZE=1`, the default): the band also fills the five 2x2 clue blocks and
+every lap holds them (`--with_clue_regions`, `--freeze_clues`), so a jewel's
+boards share the frame, the 20 block pieces and all five clues. A frozen lap
+reaches row 9 (`FIN_STOP_ROW=9`).
+
+**Measured** (one annealed border, `CLUES=all`, frozen, 300 s beamer calls on
+4 cores; frames with a lap-1 band, of the frames written):
+
+| beamer setting | K=4 | K=3 | K=2 |
+|---|---|---|---|
+| 16 columns, all orientations | 1 of 624 | 1 | 3 |
+| 64 columns, tau 0.5 | 3 of 693 | 5 | 7 |
+| 4 columns, tau 1 / `--bail_columns 8` | 0 of 544 / 0 of 599 | 0 / 0 | 1 / 1 |
+| corner probe + pinned orientation, 16 columns | **6 of 879** | **15** | **28** |
+| the same, 64 columns, tau 0.5 | 5 of 834 | 13 | 32 |
+
+Keeping the annealed left column costs most of the yield: with it cleared
+too, 44 of 628 frames got a K=4 band (194 at K=2), but then only 34% of the
+left column's top four edges stayed on their side. The probe matters because
+the annealer does not model the corner clues: on that border only one clue
+orientation had a top-left block at all. A frozen lap from a lock at row 4
+re-grows rarely; on 4 cores none of 28 did (they died at rows 5-6, where the
+same bands re-grew unfrozen), which is why the frozen K=4 default is for long
+runs on many cores.
 
 `jewels.log` gives each jewel's frame key and `shared=a/b/c`: the interior
 cells each lap kept from its parent, the measure of what a jewel shares.
@@ -432,12 +453,9 @@ block per lap: about 90 jewels an hour on 4 vCPUs unclued, 15-30 with
 the best board. It had measured keeping the parent's slab: on lap 1, 6 of 16
 boards re-grew (against 14 of 16 for the small block); on lap 2 a 5-column
 kept block left a wedge against the frame, and 0 of 16 bands re-grew, even
-exhaustively. This runner differs in two ways. It turns counter-clockwise, so
-lap 1's band is the part of s1 the beamer's extension already built. And
+exhaustively. This runner turns counter-clockwise, keeps a K+1-row band, and
 each lap selects, among all the boards the finalizer wrote, the ones whose
-corner closes, instead of repairing the corner of one board. How often such a
-board then re-grows is what a run measures: read `run.log` for how far each
-board got and why it stopped.
+corner closes, instead of repairing the corner of one board.
 
 Before the first produce the script reads `DB_FILE` once into the page cache
 (minutes on a slow disk, counted against `WALL`); from a cold disk the beamer's

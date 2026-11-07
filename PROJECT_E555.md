@@ -1712,25 +1712,29 @@ Four laps are one full turn. At `T = 11` a lap keeps 72 cells in place (rows
 one fixed frame, keeping a band of the board through every turn. A **jewel**
 is a beamer board s1 and three counter-clockwise laps s2..s4, all holding the
 same complete 60-cell frame, each board's rows 0..K being its parent's columns
-0..K. A lap closes the band before it turns: `E555_backtracker --stop_column K
---with_frame` fills s_k's columns 0..K and the frame exactly (columns K+1..14
-cleared, their pieces lent), on every board the previous lap wrote, so it
-selects the boards whose top-left corner block closes; on lap 1 it closes s1's
-rows above the stop row in columns 0..K, cleared first, frame cells included
-(an annealed border's left column, fixed to row 14, let no band close). It then
-turns the band counter-clockwise and re-grows it exhaustively with
-`--finalize_from K --backtrack_row K --keep_ring --no_fanout_sort` (the same
-boards as a beam, in the same time, nearly all of it the rebuild; the sort
-would triple it and only reorders an exhaustive search); depth-first, one board per frame, the chain
-traced back through board ids. Each produce call starts from a Stage A border
-(`--double_decker ALL`, the best of `ANNEAL_RESTARTS` by `Score_dd`, beamer
-`--lambda_reserve`), a rotations file's next row, or `--random_edges`.
-`CLUES` (default `all`; `center`, `none`) passes the clue flags to all three
-tools. `FREEZE=1` cuts with `--with_clue_regions` and re-grows with
-`--freeze_clues`, exhaustively from the lock, so a jewel also holds the five 2x2
-clue blocks; a frozen lap re-grows only from a low lock, so it needs K <= 2
-(K = 4, the default, re-grew none of 28 frozen) and reaches row 9, not 10.
-Settings and the earlier clockwise runner's measurements: pipeline/README.md.
+0..K (K=4 by default). A lap closes the band before it turns: `E555_backtracker
+--stop_column K --with_frame` fills s_k's columns 0..K and the frame exactly
+(columns K+1..14 cleared, their pieces lent), on every board the previous lap
+wrote, so it selects the boards whose top-left corner block closes; on lap 1
+it closes s1's rows above the stop row in columns 1..K against the annealed
+left column, which is kept with the bottom row (the top row and the right
+column above row 10 may trade edges: the backtracker has no side
+restriction). It then turns the band counter-clockwise and re-grows it
+exhaustively with `--finalize_from K --backtrack_row K --keep_ring
+--no_fanout_sort` (the same boards as a beam, in the same time, nearly all of
+it the rebuild; the sort would triple it and only reorders an exhaustive
+search); depth-first, one board per frame, the chain traced back through
+board ids. Each produce call starts from a Stage A border (`--double_decker
+ALL`, beamer `--lambda_reserve`), a rotations file's next row, or
+`--random_edges`. With `CLUES=all` (the default) a 1 s `--lambda_corners`
+probe reads the exact catalog of clued top-corner blocks per clue
+orientation; the annealed border used is the best by `Score_dd` with a
+top-left block in some orientation, and the beam runs pinned (`--pin_clue`)
+in those orientations only (6x the lap-1 bands of an unpinned beam, measured).
+`FREEZE=1` (the default) cuts with `--with_clue_regions` and re-grows with
+`--freeze_clues`, so a jewel also holds the five 2x2 clue blocks; frozen laps
+reach row 9, not 10, and re-grow rarely from a lock at row 4.
+Settings and measurements: pipeline/README.md.
 
 ---
 
