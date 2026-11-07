@@ -1732,8 +1732,11 @@ orientation; the annealed border used is the best by `Score_dd` with a
 top-left block in some orientation, and the beam runs pinned (`--pin_clue`)
 in those orientations only (6x the lap-1 bands of an unpinned beam, measured).
 `FREEZE=1` (the default) cuts with `--with_clue_regions` and re-grows with
-`--freeze_clues`, so a jewel also holds the five 2x2 clue blocks; frozen laps
-reach row 9, not 10, and re-grow rarely from a lock at row 4.
+`--freeze_clues`, so a jewel also holds the five 2x2 clue blocks; a frozen lap
+stops at row 11-K (`FIN_STOP_ROW=auto`), the rows the frozen centre block
+leaves it. `FREEZE=corners` holds the four corner blocks only. Measured on 4
+cores: K=3 made jewels (5 of 20 boards frozen, 13 of 20 with `corners`), K=4
+none (no lap-2 corner closed).
 Settings and measurements: pipeline/README.md.
 
 ---

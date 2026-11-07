@@ -3,9 +3,9 @@
 # keeping a band of it through every turn.
 #
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour: all five clues, blocks frozen, K=4
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3              # the highest K that made frozen jewels on 4 cores
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3 FREEZE=corners  # centre block re-grown: 3x the jewels
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1  # 10 min, then dive
-#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db FREEZE=0 \
-#       FIN_STOP_ROW=10 LAP_TIME=240                                       # the 2x2 clue blocks re-grown each lap
 #   bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv RUN_DIR=w1      # whirl your boards
 #
 # The beamer grows a board upward from row 0, so its bottom rows were chosen
@@ -71,15 +71,18 @@
 # centre and the four inner corners, rows/columns 1-2 and 13-14 -- and every
 # lap holds them as it holds the frame (finalizer --freeze_clues). The four
 # boards of such a jewel share 80 pieces: the frame and the 20 block pieces.
-# A frozen lap reaches row 9 rather than 10, hence FIN_STOP_ROW=9. Above a
+# A frozen lap stops lower the higher K is (FIN_STOP_ROW=auto: 11-K). Above a
 # lock at row K the rows beside the frozen centre block (rows 7-8) must wrap a
 # fixed 2x2 block between the fixed ring ends, so the higher K, the rarer a
 # lap: lap-1 bands of real boards (CLUES=all, left column kept) reached row 9
 # frozen on 0 of 10 boards at K=4 (no band past row 7) and 0 of 18 at K=3 (10
-# of them past row 8), where K=2 gave 4 jewels from 8 boards. FREEZE=corners
-# holds only the four corner blocks and re-grows the centre one, its clue
-# still on its cell: lap 1 then passed on 5 of 10 boards at K=4 and 15 of 18
-# at K=3 (unfrozen: 9 of 10, 17 of 18).
+# of them past row 8), where K=2 gave 4 jewels from 8 boards. Stopped at
+# 11-K, K=3 made 5 jewels from 20 boards; K=4 passed lap 1 on 4 of 11 and
+# then found no lap-2 corner that closes (rows 8-14 x columns 1-4). The
+# higher K, the larger that corner. FREEZE=corners holds only the four
+# corner blocks and re-grows the centre one, its clue still on its cell:
+# K=3 then made 13 jewels from 20 boards, K=4 passed lap 1 on 5 of 11 and
+# none lap 2.
 #
 # NEEDS about 8 GB of RAM for the beamer, and DB_FILE: the beamer's 6.4 GB chain
 # database is written there on the first call (~2 min) and loaded in seconds by
@@ -155,7 +158,8 @@ BAND_TIME=15            # seconds per board
 # the re-grow: E555_finalizer --finalize_from K
 BANDS_GROWN=8           # bands per finalizer call
 LAP_TRIES=3             # finalizer calls a lap may make before it gives up
-FIN_STOP_ROW=9          # s2..s4 are re-grown up to this row (unfrozen: 10)
+FIN_STOP_ROW=auto       # s2..s4 are re-grown up to this row; auto = 11-K with FREEZE=1
+                        # (K=2: 9, K=3: 8, K=4: 7), 9 with FREEZE=corners, 10 unfrozen
 LAP_TIME=480            # seconds per finalizer call, shared by its bands (unfrozen: 240)
 FIN_BOARDS=200          # boards a finalizer call writes: the next lap's pool
 # -----------------------------------------------------------------------------
@@ -183,6 +187,18 @@ case "$FREEZE" in
     *) die "FREEZE must be 0, 1 or corners (got: $FREEZE)" ;;
 esac
 # Checked here, because a bad value would otherwise fail every lap quietly.
+# FIN_STOP_ROW=auto. With all five blocks frozen, a lap re-grows only as far as
+# the rows the frozen centre block leaves it: lap-1 bands of real boards
+# reached row 9 from K=2 (4 jewels from 8 boards) but no row past 7 from K=4
+# and past 8 from K=3; stopped at 11-K they passed lap 1 (K=3: 12 of 20
+# boards, 5 jewels; K=4: 4 of 11, none past lap 2).
+if [ "$FIN_STOP_ROW" = auto ]; then
+    case "$FREEZE" in
+        1) FIN_STOP_ROW=$(( 11 - K < 9 ? 11 - K : 9 )) ;;
+        corners) FIN_STOP_ROW=9 ;;
+        *) FIN_STOP_ROW=10 ;;
+    esac
+fi
 for v in K BOARD_TIME ANNEAL_RESTARTS ANNEAL_STEPS DD_RESERVE BEAM_MIN_COL BEAM_STOP_ROW BEAM_BACKTRACK \
          BEAM_BOTTOMS BEAM_COLUMNS BEAM_BOARDS BEAM_TIME BANDS BAND_TIME BANDS_GROWN \
          LAP_TRIES FIN_STOP_ROW LAP_TIME FIN_BOARDS; do
