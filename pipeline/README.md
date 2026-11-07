@@ -335,10 +335,9 @@ keeps a multi-day run to kilobytes.
 
 ## The jewel whirlpool: `run_whirlpool_jewels.sh`
 
-The runner above carries a population of boards through its laps, and the
-frame changes from lap to lap. This one follows a single beamer board s1
-under **one fixed frame**, re-grows it from each of its other sides, and keeps
-the boards that make it -- the jewels. The laps form a tree around s1:
+This runner follows one beamer board s1 at a time under **one fixed frame**,
+re-grows it from each of its other sides, and keeps the four boards that make
+it, a **jewel**:
 
 ```
 s1  beamer board, rows 0..8, annealed bottom and left column
@@ -348,192 +347,110 @@ s4  lap 3: s3's right band turned clockwise, or else s2's left band turned
            counter-clockwise: s1's top side is s4's bottom either way
 ```
 
-s1..s4 hold the same complete 60-cell frame, and each of s1's four sides is
-the bottom of one of them. So a jewel's interior was grown from all four sides
-under one border, and none of its sides is a leftover of the beamer's early
-guesses. s2 and s3 both lock a band of s1 itself, and s4 locks s3's band (or
-s2's), which holds s1's top-right (top-left) corner. On the real jewels found,
-s1 shared 46-53 interior cells with s2, 54-62 with s3 and 26-31 with s4.
+All four hold the same complete 60-cell frame, and each of s1's sides is the
+bottom of one of them, so no side of a jewel is left over from the beamer's
+early guesses. s2 and s3 both keep a band of s1 itself, and s4 keeps one of
+s1's top corners through its parent.
 
 ```bash
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour: all five clues, blocks frozen, K=4
-bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3              # 6 frozen jewels an hour on 4 cores (K=4: none in 45 min)
-bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1  # 10 min, each jewel dived as it is found
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3              # a narrower band: more jewels
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3 DIVE=1       # each jewel dived as it is found
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3 FREEZE=corners  # centre block re-grown
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db BORDERS=random   # the beamer's sampled borders
 bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl your own boards
 ```
 
-**One band**, from a board to its child:
+**One lap:**
 
-1. *Close.* `E555_backtracker --stop_column K --with_frame` writes every
-   exact filling of the board's columns 0..K plus the frame (and, frozen, the
-   five 2x2 clue blocks), up to `BANDS` per board; with `--reverse` it bands
-   the right columns 15-K..15 instead. The other inner columns are cleared
-   first and lend their pieces (the finalizer frees them anyway). The band
-   closes a top corner block: s1's rows above `BEAM_STOP_ROW` (laps 1 and 2),
-   or the rows above `FIN_STOP_ROW` under the fixed frame (lap 3). A board
-   whose corner cannot close writes no band, so a lap selects the boards that
-   can.
-2. *Turn* (`E555_rotate.py`): counter-clockwise for a left band, clockwise for
-   a right one. The band becomes rows 0..K.
-3. *Re-grow* with `E555_finalizer --finalize_from K --keep_ring
-   --no_fanout_sort` up to `FIN_STOP_ROW`, exhaustively (`--backtrack_row K`:
-   a DFS from the lock, so no beam cuts an option). `--keep_ring` holds the
-   frame in place. On 8 real K=4 bands the exhaustive search found the same
-   20 boards as beams of width 20000 and 200000 (the narrower one was full on
-   one band) in the same 24 s, nearly all of it the reduced database's rebuild
-   (~3 s a band on 4 cores); the fan-out sort would add 7 s a band and, for an
-   exhaustive search, only reorders the same boards (`--no_fanout_sort`).
-   Every band of a call runs in its share of `LAP_TIME`, and each keeps
-   `FIN_BOARDS`/bands of its boards.
+1. *Close the band.* `E555_backtracker --stop_column K --with_frame` writes
+   every exact filling of the band's columns and the frame, up to `BANDS` per
+   board (`--reverse` for a right band). With the blocks frozen, it fills the
+   five 2x2 clue blocks too. Each filling closes a top corner block:
+   - above `BEAM_STOP_ROW` for laps 1 and 2;
+   - above `FIN_STOP_ROW` for lap 3.
 
-**s1's two side bands** are cut separately and share only what a jewel must
-share: the frame and, frozen, the clue blocks. Lap-1 bands are s1's left band
-and the frame, closed against the annealed left column. Lap-2 bands are cut
-from s1 with a lap-1 band's frame left of column K+1 and its blocks, and build
-the frame right of it themselves: under a lap-1 band's whole frame no
-top-right corner closed (0 of 435 real K=4 bands, 0 of 12 synthetic). A
-lap-1 band and a lap-2 band of the same start therefore meet only on the
-frame and the blocks, and inside each may use a piece the other uses (closing
-both corners in one board worked on 0 of 11 real K=4 boards). Lap 1 grows a
-lap-1 band under its lap-2 partner's frame, so that s2 and s3 carry one frame;
-lap 2 grows the lap-2 bands whose partner re-grew; lap 3 cuts s3's right
-band, or, when no s4 grows that way, the left band of the s2s that share a
-start with an s3. The s1 written to `jewels.csv` is the beamer board with both
-bands on it; a cell both bands took a piece for stays open.
+   The other inner columns are cleared and lend their pieces. A board whose
+   corner cannot close writes no band.
+2. *Turn* it with `E555_rotate.py`, so that the band becomes rows 0..K.
+3. *Re-grow* it to `FIN_STOP_ROW` with `E555_finalizer --finalize_from K
+   --backtrack_row K --keep_ring`. This is an exhaustive search from the lock,
+   with the frame held in place.
+   - `--keep_ids` names each board `<its band>.<n>`, and the same naming for
+     bands and paired bands traces a jewel back to s1.
+   - `--max_per_line` gives each band an equal share of `FIN_BOARDS`.
 
-Each lap picks `BANDS_GROWN x LAP_TRIES` of its bands, most different first
-(`E555_rank.py --diverse`), and grows them `BANDS_GROWN` per finalizer call.
-The search is depth-first: a call's boards feed the next lap, and the first
-s4 ends the board. A band's id is the id of the board it was cut from plus
-`.n`, and each lap's `parents.txt` maps a re-grown board to its band; that is
-how the tree is traced from s4 back to s1.
+Each lap tries up to `LAP_TRIES` groups of `BANDS_GROWN` bands, the most
+different first (`E555_rank.py --diverse`). The search is depth-first: the first
+s4 ends the board.
 
-**Borders.** Each produce call starts from a fresh border. `BORDERS=anneal`
-(default) runs Stage A with `--double_decker DD_SIDES` (`ALL`),
-`ANNEAL_RESTARTS` restarts in parallel, sorted by `Score_dd`. With
-`CLUES=all` a 1 s beamer probe (`--lambda_corners`) reads, per clue
-orientation, the exact catalog of top-left and top-right corner blocks the
-border's sides allow around the corner clues; the border used is the best by
-`Score_dd` whose two catalogs are both non-empty in some orientation (laps 1
-and 2 close both corners of s1), and the beam runs one call per such
-orientation (`--pin_clue`, with `--lambda_corners BEAM_CORNERS`), sharing
-`BEAM_TIME` and `BEAM_BOARDS`. It sweeps all bottoms (`BEAM_BOTTOMS=0`,
-sampled with `BEAM_TAU`) x `BEAM_COLUMNS` left columns, and spends the TOP
-reserve last (`--lambda_reserve RESERVE_F`). A rotations file instead gives
-its next row to each call, and `random` uses the beamer's `--random_edges`.
-Every border used is appended to `RUN_DIR/borders.csv`, so a later run can
-reuse them (`BORDERS=w1/borders.csv`).
+**s1's two side bands** share only the frame and the clue blocks.
+- Lap 2's bands are cut from s1 with a lap-1 band's frame left of column K+1,
+  and build the rest of the frame themselves, so a lap-1 band pairs with every
+  lap-2 band of its start.
+- Either band may use a piece from s1's middle columns or from the other band.
+  The s1 written to `jewels.csv` leaves such a cell open, so it dives lower
+  than s2..s4.
 
-**The annealed sides.** The bottom row, the whole left column (the top-left
-corner included) and the right column up to `BEAM_STOP_ROW` keep the
-annealed border's sides and the beamer's order. The side bands fill the top
-row and the right column above the stop row from the edges left, and may
-trade pieces between those two sides: the backtracker has no option to
-restrict an edge to its side.
+**Borders.** Each produce call starts from a fresh border.
+- `BORDERS=anneal` (the default) runs Stage A with `--double_decker DD_SIDES`
+  and sorts the borders by `Score_dd`.
+- With `CLUES=all`, a 1 s beamer probe (`--lambda_corners`) reads, for each clue
+  orientation, the exact catalog of top-left and top-right corner blocks the
+  border allows.
+- The border used is the best whose two catalogs are both non-empty in some
+  orientation. The beam runs pinned (`--pin_clue`) in those orientations only,
+  and spends the TOP reserve last (`--lambda_reserve`).
+- A rotations file gives its next row to each call instead, and `random` uses
+  the beamer's `--random_edges`.
+- Every border used is appended to `RUN_DIR/borders.csv`, so a later run can
+  reuse them (`BORDERS=w1/borders.csv`).
 
-**Clues.** Every tool holds all five clues (`CLUES=all`, the default;
-`center`, `none`), each on its own cell through every lap. A clued run keeps
-its own database cache (`E555.db.center`, `E555.db.all`). **Frozen blocks**
-(`FREEZE=1`, the default): the bands also fill the five 2x2 clue blocks and
-every lap holds them (`--with_clue_regions`, `--freeze_clues`), so a jewel's
-boards share the frame, the 20 block pieces and all five clues. Above a lock
-at row K the rows beside the frozen centre block (rows 7-8) must wrap a fixed
-2x2 block between the fixed ring ends, with 6-K free rows below it to adapt,
-so a frozen lap stops lower the higher K is: `FIN_STOP_ROW=auto` is 11-K with
-`FREEZE=1` (9 with `corners`, 10 unfrozen). With the earlier chain of laps
-(below), frozen lap-1 bands of real boards reached row 9 on 0 of 10 boards at
-K=4 and 0 of 18 at K=3, where K=2 gave 4 jewels from 8 boards.
-`FREEZE=corners` holds only the four corner blocks and re-grows the centre
-one every lap, its clue still on its cell.
+**Clues.** Every tool holds all five clues on their cells through every lap
+(`CLUES=all`, the default; `center`, `none`).
+- **`FREEZE=1`** (the default) also holds the five 2x2 clue blocks
+  (`--with_clue_regions`, `--freeze_clues`). A jewel's boards then share the
+  frame, the 20 block pieces and the clues.
+- **A frozen lap stops at `FIN_STOP_ROW=auto`, 11-K**, the rows the frozen
+  centre block leaves it.
+- **`FREEZE=corners`** holds only the four corner blocks.
+- **Database.** A clued run keeps its own database cache (`E555.db.center`,
+  `E555.db.all`).
 
-**The beamer's settings** (measured with the earlier chain: beamer stop row
-10, the probe asking for a top-left block only; one annealed border,
-`CLUES=all`, frozen, 300 s beamer calls on 4 cores; frames with a lap-1 band,
-of the frames written):
+**Choosing K and the stop row.**
+- **K.** A wider band keeps more of s1, but leaves each lap fewer rows and a
+  bigger corner to close. With the blocks frozen, `K=3` finds jewels steadily,
+  while at `K=4` most boards stop at lap 2.
+- **The stop row.** The side bands close their corners against s1's own rows,
+  so a lower beamer stop row (`BEAM_STOP_ROW=8`) leaves the corners more
+  pieces.
 
-| beamer setting | K=4 | K=3 | K=2 |
-|---|---|---|---|
-| 16 columns, all orientations | 1 of 624 | 1 | 3 |
-| 64 columns, tau 0.5 | 3 of 693 | 5 | 7 |
-| 4 columns, tau 1 / `--bail_columns 8` | 0 of 544 / 0 of 599 | 0 / 0 | 1 / 1 |
-| corner probe + pinned orientation, 16 columns | **6 of 879** | **15** | **28** |
-| the same, 64 columns, tau 0.5 | 5 of 834 | 13 | 32 |
+**Dives (`DIVE=1`).** `E555_diver` finishes each jewel's four boards as soon as
+the jewel is found:
+- each board gets `DIVE_DIVES` dives and `DIVE_POLISH` polish rounds
+  (`DIVE_COPIES` copies);
+- then `DIVE_REOPEN` seconds of re-dives of its most damaged band
+  (`--reopen auto+2`), which never make it worse;
+- each board's best goes to `dived.csv`, and the 20 best of the run to
+  `best.csv`;
+- the scores are added to the jewel's line in `jewels.log`.
 
-Keeping the annealed left column costs most of the yield: with it cleared
-too, 44 of 628 frames got a K=4 band (194 at K=2), but then only 34% of the
-left column's top four edges stayed on their side. The probe matters because
-the annealer does not model the corner clues: on that border only one clue
-orientation had a top-left block at all.
+The defaults are past the point where more work pays. On real K=3 jewels,
+s2..s4 reach about 454, and ten times the fresh dives gains less than one
+edge.
 
-**The beamer's stop row.** s1's two side bands must close their corners
-against s1's own rows, which the beamer filled with the pieces that fit them
-best. Stopping it lower leaves the corners more pieces (real boards,
-`CLUES=all`, frozen, cut back to the stop row; lap-2 bands cut as the runner
-cuts them):
+**Output (in `RUN_DIR`):**
 
-| K | stop row | boards | with a lap-1 band | with a lap-2 band |
-|---|---|---|---|---|
-| 4 | 10 | 11 | 10 | 0 |
-| 4 | 9 | 11 | 9 | 1 (120 bands) |
-| 4 | 8 | 11 | 9 | **4** (277) |
-| 4 | 7 | 11 | 7 | 4 (9180) |
-| 3 | 10 | 20 | 18 | 1 (56) |
-| 3 | 8 | 20 | 17 | **12** (1112) |
-| 4, unfrozen | 10 | 11 | 10 | 1 (60) |
-| 4, unfrozen | 8 | 11 | 9 | 4 (240) |
+| file | what |
+|---|---|
+| `jewels.csv` | each jewel's four boards, ids `b<board>_s1` .. `_s4` |
+| `jewels.log` | per jewel: `from=s3\|s2` (s4's parent) and `shared=a/b/c/d`, the interior cells s1 shares with s2 and with s3, s4 with its parent, and s1 with s4; the dive scores |
+| `run.log` | one line per board; it names the lap that stopped the board, and why |
+| `borders.csv` | every border used |
 
-So `BEAM_STOP_ROW=8`.
-
-**Measured** (`CLUES=all`, frozen, 4 cores; `FIN_STOP_ROW=auto`: 8 at K=3, 7
-at K=4). The first two rows whirl a fixed set of real beamer boards
-(`LAP_TIME=240`, `LAP_TRIES=2`); the last two run end to end from fresh
-annealed borders (the probe, `ANNEAL_RESTARTS=8`, `BEAM_TIME=300`, everything
-else default). The earlier chain (below) ran the same boards and settings
-with s1 to row 10:
-
-| run | boards whirled | past lap 1 | past lap 2 | jewels | earlier chain |
-|---|---|---|---|---|---|
-| K=4, fixed boards | 11 | 1 | 0 | 0 | 11 / 4 / 0 / 0 |
-| K=3, fixed boards | 20 | 5 | 1 | 1 | 20 / 12 / 7 / 5 |
-| `K=3`, 60 min | 258 | 17 | 9 | **6** | 452 / 17 / 9 / 6 |
-| defaults (K=4), 45 min | 633 | 6 | 0 | 0 | 753 / 8 / 3 / 1 |
-
-Every jewel was checked: all placed edges matched, the five clues on their
-cells, the frame and the blocks the same on s1..s4 under their turns. Every
-s4 grew from s3; the s2 fallback never made a jewel. At K=3 the tree makes as
-many jewels as the chain did, and each shares far more with s1: s1 and s4
-share 26-31 interior cells, where the chain's s4 kept nothing of s1 but the
-frame and the blocks. At K=4 lap 2 is the wall: of the 633 boards, 125 had a
-lap-1 band, 74 of them no lap-2 band, and the 6 that passed lap 1 grew no s3.
-Dived as `DIVE=1` dives them (`E555_diver --end_dive 10000 --end_polish
-20000`, under a second a board on 4 cores, well inside `DIVE_TIME`), the six
-K=3 jewels' s1 boards reached 430-439 and their s2..s4 449-454: the best of
-each jewel 451-454.
-
-`jewels.log` gives each jewel's frame key, `from=s3|s2` and
-`shared=a/b/c/d`: the interior cells s1 shares with s2 and with s3, s4 with
-its parent, and s1 with s4. On a big machine, run several copies, each with
-its own `RUN_DIR`; every run draws its own seed. Several copies share one
-`DB_FILE` through the page cache.
-
-**What came before.** This runner's previous version (commit 6116fb9) made a
-chain, s1 -> s2 -> s3 -> s4, each lap turning its parent counter-clockwise and
-locking its left band. Consecutive boards shared 40-50 interior cells, but s3
-kept only s1's K x K top-left corner and s4 nothing of s1 but the frame and
-the blocks, and laps 2 and 3 each closed a corner against the fixed frame.
-Before it, an earlier runner (campaign 20261028-0249 on the `agent_runs`
-branch) turned clockwise and kept only the frame and a 12-cell block per lap:
-about 90 jewels an hour on 4 vCPUs unclued, 15-30 with `CLUES=all` and frozen
-blocks, whose s2..s4 dived to 455-461 without beating the best board. It had
-measured keeping the parent's slab: on lap 1, 6 of 16 boards re-grew (against
-14 of 16 for the small block); on lap 2 a 5-column kept block left a wedge
-against the frame, and 0 of 16 bands re-grew, even exhaustively.
-
-Before the first produce the script reads `DB_FILE` once into the page cache
-(minutes on a slow disk, counted against `WALL`); from a cold disk the beamer's
-memory-mapped reads can stall a produce call for many minutes.
+On a big machine, run several copies, each with its own `RUN_DIR`; every run
+draws its own seed. The copies share one `DB_FILE` through the page cache,
+which the script fills with one sequential read before the first produce.
 
 ## The halo: `run_halo.sh`
 

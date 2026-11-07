@@ -1,20 +1,20 @@
 #!/bin/bash
-# run_whirlpool_jewels.sh -- re-grow a board from all four sides under one
-# border, each time locking a band of it.
+# run_whirlpool_jewels.sh -- re-grow a beamer board from its other three sides
+# under one fixed frame, and keep the boards that make it: the jewels.
 #
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour: all five clues, blocks frozen, K=4
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3              # a narrower band: more jewels
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3 FREEZE=corners  # centre block re-grown
-#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1  # 10 min, each jewel dived
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3 DIVE=1       # each jewel dived as it is found
 #   bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv RUN_DIR=w1      # whirl your boards
 #
 # The beamer grows a board upward from row 0, so its bottom rows were chosen
 # first, by a beam that was still guessing, and are never searched again. The
-# whirlpool turns the board a quarter turn and re-grows it, so a different side
-# becomes the bottom. This runner looks for JEWELS, four boards around one s1:
+# whirlpool turns the board and re-grows it, so another side becomes the
+# bottom. A JEWEL is four boards around one beamer board s1, all holding the
+# same complete 60-cell frame (and, FREEZE, the same clue blocks):
 #
-#   s1   a beamer board, rows 0..BEAM_STOP_ROW complete, with the annealed
-#        left column
+#   s1   a beamer board, rows 0..BEAM_STOP_ROW, with the annealed left column
 #   s2   lap 1: s1's left band (columns 0..K, its top-left corner closed),
 #        turned counter-clockwise to rows 0..K, re-grown to row FIN_STOP_ROW
 #   s3   lap 2: s1's right band (columns 15-K..15, its top-right corner
@@ -23,87 +23,64 @@
 #        way, s2's left band, turned counter-clockwise; either way s1's top
 #        side is s4's bottom
 #
-# all four holding the SAME complete 60-cell frame (and, FREEZE, the same clue
-# blocks). Each of s1's four sides is the bottom once, and s2 and s3 both lock
-# a band of s1 itself: about 14*K interior cells each. The two side bands are
-# cut separately and share only the frame and the blocks; each may borrow a
-# piece the other uses. DIVE=1 dives each jewel's four boards as it is found
-# and reports the best.
+# So each of s1's four sides is a bottom once, and s2 and s3 both lock a band
+# of s1 itself. The two side bands are cut separately and share only the frame
+# and the blocks; each may borrow a piece the other uses, or one from s1's
+# middle columns (the s1 written to jewels.csv leaves such a cell open).
 #
 # A band:
-#
-#   close              E555_backtracker --stop_column K --with_frame (the right
-#                      band: --reverse): every exact filling of those columns
-#                      plus the frame. It closes a top corner block: s1's rows
-#                      above BEAM_STOP_ROW (lap 1 against the annealed left
-#                      column, lap 2 under lap 1's frame left of column K+1
-#                      and its blocks, building the rest of the frame), or on
-#                      lap 3 the rows above FIN_STOP_ROW under the fixed
-#                      frame. The other inner columns are cleared first and
-#                      lend it their pieces; the finalizer frees them anyway.
-#                      A board whose corner cannot close writes no band, so
-#                      the lap selects the boards that can.
-#   turn               tools/E555_rotate.py: counter-clockwise for a left
-#                      band, clockwise for a right one; the band becomes rows
-#                      0..K and the frame
-#   re-grow            E555_finalizer --finalize_from K --keep_ring up to row
-#                      FIN_STOP_ROW, exhaustively (--backtrack_row K: a DFS
-#                      from the lock, no beam to cut options): the frame is
-#                      held in place
+#   close     E555_backtracker --stop_column K --with_frame (the right band:
+#             --reverse): every exact filling of those columns plus the frame,
+#             closing a top corner block above BEAM_STOP_ROW (laps 1 and 2) or
+#             above FIN_STOP_ROW (lap 3). The other inner columns are cleared
+#             and lend their pieces. A board whose corner cannot close writes
+#             no band, so a lap selects the boards that can.
+#   turn      tools/E555_rotate.py: counter-clockwise for a left band,
+#             clockwise for a right one; the band becomes rows 0..K
+#   re-grow   E555_finalizer --finalize_from K --keep_ring up to FIN_STOP_ROW,
+#             exhaustively from the lock (--backtrack_row K), the frame held
 #
 # A lap picks BANDS_GROWN x LAP_TRIES of its bands, most different first
-# (tools/E555_rank.py --diverse), and re-grows them BANDS_GROWN at a time. The
-# search is depth-first: the boards a group re-grows feed the next lap, and
-# the first s4 ends that board. Laps 1 and 2 close their corners above
-# BEAM_STOP_ROW, on s1, lap 3 above FIN_STOP_ROW.
+# (E555_rank.py --diverse), and re-grows them BANDS_GROWN at a time; the search
+# is depth-first, and the first s4 ends the board. A board's id names its
+# parent: a band is <the board it was cut from>.<n>, a re-grown board <its
+# band>.<n> (finalizer --keep_ids), and a lap-1 band paired with a lap-2 band
+# <lap-2 band>_<n>.
 #
 # BORDERS: each produce call starts from a fresh border. anneal (the default)
-# runs Stage A with --double_decker DD_SIDES, ANNEAL_RESTARTS restarts in
-# parallel, and keeps the best by Score_dd (tools/E555_sort_rotations.py); the
-# beamer then spends the TOP reserve last (--lambda_reserve RESERVE_F), so the
-# pieces that fit row 14 stay free for the bands of laps 1 and 2, which build
-# s1's row 14 under columns 1..K and 15-K..14. A path instead takes its next
-# row from that rotations file each call; random uses
-# the beamer's own --random_edges. Every border used is appended to
-# borders.csv, so a later run can take them as a file.
+# runs Stage A with --double_decker DD_SIDES and takes the best by Score_dd
+# whose two top corner blocks exist in some clue orientation (a 1 s beamer
+# probe, CLUES=all); the beamer spends the TOP reserve last (--lambda_reserve).
+# A path takes its next row from that rotations file each call; random uses the
+# beamer's own --random_edges. Every border used is appended to borders.csv.
 #
-# CLUES: every tool holds all five Eternity II clues (CLUES=all, the default),
-# the centre one (center) or none. Clued boards keep each clue on its own cell
-# through every lap; INPUT boards must carry the clues they are run with.
-# FREEZE=1 (the default): the band also fills the five 2x2 clue blocks -- the
-# centre and the four inner corners, rows/columns 1-2 and 13-14 -- and every
-# lap holds them as it holds the frame (finalizer --freeze_clues). The four
-# boards of such a jewel share 80 pieces: the frame and the 20 block pieces.
-# A frozen lap stops lower the higher K is (FIN_STOP_ROW=auto: 11-K). Above a
-# lock at row K the rows beside the frozen centre block (rows 7-8) must wrap a
-# fixed 2x2 block between the fixed ring ends, so the higher K, the rarer a
-# lap: with the earlier chain of laps, frozen lap-1 bands of real boards
-# (CLUES=all, left column kept) reached row 9 on 0 of 10 boards at K=4 and 0
-# of 18 at K=3, where K=2 gave 4 jewels from 8 boards. End to end on 4 cores
-# (frozen) K=3 made 6 jewels in an hour, every s4 from s3, and the defaults
-# (K=4) none in 45 minutes: lap 2 is the wall there (of 633 boards, 125 had a
-# lap-1 band, 74 of them no lap-2 band, and the 6 past lap 1 grew no s3).
-# FREEZE=corners holds only the four corner blocks and re-grows the centre
-# one, its clue still on its cell.
+# CLUES: every tool holds all five clues (CLUES=all, the default), the centre
+# one (center) or none, each on its own cell through every lap; INPUT boards
+# must carry the clues they are run with. FREEZE=1 (the default): the bands
+# also fill the five 2x2 clue blocks -- the centre and the four inner corners
+# -- and every lap holds them like the frame (finalizer --freeze_clues). A
+# frozen lap stops lower the higher K is (FIN_STOP_ROW=auto: 11-K), and K=3
+# finds more jewels than K=4. FREEZE=corners holds only the four corner blocks.
+#
+# DIVE=1 finishes each jewel's four boards with E555_diver as soon as it is
+# found: DIVE_DIVES dives and DIVE_POLISH polish rounds (DIVE_COPIES copies),
+# then DIVE_REOPEN seconds of re-dives of each board's most damaged band.
 #
 # NEEDS about 8 GB of RAM for the beamer, and DB_FILE: the beamer's 6.4 GB chain
-# database is written there on the first call (~2 min) and loaded in seconds by
-# every later one. A clued database leaves the clue pieces out, so the clue
-# setting is appended to the name (E555.db.center, E555.db.all): one file per
-# setting. Built with `make` (the finalizer needs --no_fanout_sort).
+# database is written there on the first call and loaded in seconds by every
+# later one. A clued database leaves the clue pieces out, so the clue setting is
+# appended to the name (E555.db.center, E555.db.all). Built with `make`.
 #
 # WRITES into RUN_DIR:
-#   jewels.csv    the jewels' four boards, ids b<board>_s1 .. b<board>_s4 (s1
-#                 with both side bands; a cell both took a piece for is open)
-#   jewels.log    one line per jewel: board, s4's parent (from=s3|s2), frame
-#                 key, the interior cells kept (shared=s1s2/s1s3/<from>s4/s1s4),
-#                 DIVE=1: the four dived scores and their max, time
-#   frames.txt    the frame key of every jewel found (one frame, one jewel)
+#   jewels.csv    the jewels' four boards, ids b<board>_s1 .. b<board>_s4
+#   jewels.log    one line per jewel: board, s4's parent (from=s3|s2), the
+#                 interior cells shared (shared=s1s2/s1s3/<from>s4/s1s4), the
+#                 dived scores and their max (DIVE=1), time
 #   borders.csv   every border a produce call used (anneal or file mode)
 #   run.log       one line per board; boards/<n>/ holds a board's tool logs
 #                 until the next board starts
-#   dived.csv     DIVE=1: every jewel's four boards dived and polished by
-#   best.csv      E555_diver, and the 20 best of them
+#   dived.csv     DIVE=1: every jewel's four boards dived, and the 20 best of
+#   best.csv      them
 set -euo pipefail
 
 # ---- settings: edit here, or pass NAME=value on the command line ------------
@@ -117,8 +94,11 @@ BOARD_TIME=1800         # seconds at most per board (its three laps)
 RNG_SEED=0              # 0 = random, different for every copy started
 INPUT=                  # whirl these boards instead of producing them
 DIVE=0                  # 1 = dive each jewel's four boards as soon as it is found
-DIVE_TIME=300           # seconds per jewel, a quarter per board (a run may end up to
-                        # this long after WALL)
+DIVE_DIVES=100000       # E555_diver per board: dives (--end_dive),
+DIVE_POLISH=200000      # polish rounds (--end_polish)
+DIVE_COPIES=1           # and copies of both, the best kept (--copies);
+DIVE_REOPEN=30          # then seconds per board of re-dives of its most damaged band
+                        # (--reopen auto+2, never worse; 0 = none)
 CLUES=all               # none | center | all: the Eternity II clues every tool holds
 FREEZE=1                # 1 = the band also fills the five 2x2 clue blocks and every
                         # lap holds them, like the frame; corners = the four corner
@@ -140,10 +120,8 @@ BEAM_WIDTH=10000
 BEAM_STOP_ROW=8         # s1 is complete up to this row
 BEAM_BACKTRACK=6        # exhaustive from this row (--backtrack_row)
 BEAM_MIN_COL=0          # N > 0: the beamer writes only boards whose columns 1..N grow
-                        # whole to row 14 (--backtrack_min_col, 0..K). The lap-1 band
-                        # closes the corner above BEAM_STOP_ROW itself, so it is
-                        # only a pre-filter, for BORDERS=random; a rotations border
-                        # fixes the left column, and N = 2 wrote no board
+                        # whole to row 14 (--backtrack_min_col, 0..K): a pre-filter
+                        # for BORDERS=random (a rotations border fixes the left column)
 BEAM_BOTTOMS=0          # bottom orderings tried per border, sampled with BEAM_TAU;
                         # 0 = all, until BEAM_TIME or BEAM_BOARDS (not with random)
 BEAM_COLUMNS=16         # left columns tried per bottom
@@ -193,11 +171,8 @@ case "$FREEZE" in
     *) die "FREEZE must be 0, 1 or corners (got: $FREEZE)" ;;
 esac
 # Checked here, because a bad value would otherwise fail every lap quietly.
-# FIN_STOP_ROW=auto. With all five blocks frozen, a lap re-grows only as far as
-# the rows the frozen centre block leaves it: with the earlier chain of laps,
-# lap-1 bands of real boards reached row 9 from K=2 (4 jewels from 8 boards)
-# but no row past 7 from K=4 and past 8 from K=3; stopped at 11-K they passed
-# lap 1 (K=3: 12 of 20 boards; K=4: 4 of 11).
+# FIN_STOP_ROW=auto: with all five blocks frozen, a lap re-grows only as far as
+# the rows the frozen centre block leaves it, 11-K.
 if [ "$FIN_STOP_ROW" = auto ]; then
     case "$FREEZE" in
         1) FIN_STOP_ROW=$(( 11 - K < 9 ? 11 - K : 9 )) ;;
@@ -205,7 +180,7 @@ if [ "$FIN_STOP_ROW" = auto ]; then
         *) FIN_STOP_ROW=10 ;;
     esac
 fi
-for v in K BOARD_TIME DIVE_TIME ANNEAL_RESTARTS ANNEAL_STEPS DD_RESERVE BEAM_MIN_COL BEAM_STOP_ROW BEAM_BACKTRACK \
+for v in K BOARD_TIME DIVE_DIVES DIVE_POLISH DIVE_COPIES DIVE_REOPEN ANNEAL_RESTARTS ANNEAL_STEPS DD_RESERVE BEAM_MIN_COL BEAM_STOP_ROW BEAM_BACKTRACK \
          BEAM_BOTTOMS BEAM_COLUMNS BEAM_BOARDS BEAM_TIME BANDS BAND_TIME BANDS_GROWN \
          LAP_TRIES FIN_STOP_ROW LAP_TIME FIN_BOARDS; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
@@ -237,19 +212,18 @@ esac
 [ -z "$DB_FILE" ] || [ "$CLUES" = none ] || DB_FILE=$DB_FILE.$CLUES   # one cache per clue setting
 # bash seeds RANDOM per process, so copies started together still differ
 [ "$RNG_SEED" != 0 ] || RNG_SEED=$(( (RANDOM << 15 | RANDOM) + 1 ))
-for t in beamer backtracker finalizer $([ "$DIVE" = 1 ] && echo diver); do
+for t in beamer backtracker finalizer diver; do
     [ -x "$BIN/E555_$t" ] || { echo "no $BIN/E555_$t: run make in $REPO" >&2; exit 1; }
 done
 mkdir -p "$RUN_DIR"; RUN_DIR=$(cd "$RUN_DIR" && pwd); cd "$RUN_DIR"
-: > jewels.csv; : > jewels.log; : > frames.txt; : > run.log; rm -f dived.csv best.csv
+: > jewels.csv; : > jewels.log; : > run.log; rm -f dived.csv best.csv
 log() { echo "$*" | tee -a run.log; }
 
 # ---- helpers ------------------------------------------------------------------
 # Boards are CSV rows whose last 512 fields are pos[256] (the cell of each piece,
 # 999 = unplaced) and rot[256]; cell = row*16 + col, row 0 at the bottom. Field
-# 1 is the board's id: every board this runner handles gets one of its own, and
-# the backtracker writes it on each band it cuts from that board, which is how
-# a chain is traced back from s4 to s1.
+# 1 is the board's id, which names its parent (see the header): that is how a
+# jewel is traced back from s4 to s1.
 
 # count_boards FILE / nth_board FILE N -- data lines only (# and % are comments)
 count_boards() { awk '!/^[#%]/ && NF {n++} END {print n + 0}' "$1" 2> /dev/null || echo 0; }
@@ -261,73 +235,49 @@ tag_ids() {
     awk -F, -v pre="$3" 'BEGIN {OFS = ","} !/^[#%]/ && NF {$1 = pre (++n); print}' "$1" > "$2"
 }
 
-# The frame as a ring: its 60 cells counter-clockwise from cell 0 (bottom row
-# left to right, right column up, top row right to left, left column down).
-# A counter-clockwise quarter turn moves ring position i to i+15, so one frame
-# turned any way is the same ring shifted by a multiple of 15. RING prints, per
-# board, the piece at each ring position ("-" where empty).
-RING='
-function ring_cells(   i, k) {
-    k = 0
-    for (i = 0;  i <= 15; i++) RC[k++] = i                 # bottom row
-    for (i = 1;  i <= 15; i++) RC[k++] = i * 16 + 15       # right column
-    for (i = 14; i >= 0;  i--) RC[k++] = 15 * 16 + i       # top row
-    for (i = 14; i >= 1;  i--) RC[k++] = i * 16            # left column
+# rank_to IN OUT ARGS... -- E555_rank.py IN ARGS --out OUT, quietly
+rank_to() {
+    local in=$1 out=$2; shift 2
+    python3 "$TOOLS/E555_rank.py" "$in" --seed_file "$SEED" --quiet --out "$out" "$@" 2> /dev/null
 }
-function ring_of(line,   x, n, p, at, i, s) {               # 60 fields, space-separated
-    n = split(line, x, ",") - 512; split("", at)
-    for (p = 0; p < 256; p++) if (x[n + 1 + p] != 999) at[x[n + 1 + p] + 0] = p
-    s = ""
-    for (i = 0; i < 60; i++) s = s (i ? " " : "") ((RC[i] in at) ? at[RC[i]] : "-")
-    return s
+# select_ids IDS FILE -- the data lines of FILE whose id is listed in IDS
+select_ids() { awk -F, 'FILENAME == ARGV[1] { k[$1]; next } !/^[#%]/ && NF && ($1 in k)' "$1" "$2"; }
+# first_child FILE PARENT [paired] -- the id of FILE's first board grown from
+# PARENT: its id less the last .<n> (paired: less a _<n> too)
+first_child() {
+    awk -F, -v p="$2" -v pair="${3:+1}" '!/^[#%]/ && NF { q = $1; sub(/\.[0-9]+$/, "", q)
+        if (pair) sub(/_[0-9]+$/, "", q)
+        if (q == p) { print $1; exit } }' "$1"
 }
-function shift(s, d,   f, i, t) {                          # position i takes i+d
-    split(s, f, " "); t = ""
-    for (i = 0; i < 60; i++) t = t (i ? " " : "") f[(i + d) % 60 + 1]
-    return t
-}
-function key_of(s,   d, t, best) {                         # the same for all 4 turns
-    best = s
-    for (d = 15; d < 60; d += 15) { t = shift(s, d); if (t < best) best = t }
-    gsub(/ /, ".", best); return best
-}
-# The pieces on the five frozen 2x2 clue blocks (rows and columns 1-2 and
-# 13-14, and rows/columns 7-8), in piece order, or "" unless all their cells
-# are placed. A turn moves the blocks onto each other, so a held set reads the
-# same on every board of a chain.
-function region_set(line,   x, n, p, c, r, k, s, m) {
-    n = split(line, x, ",") - 512; s = ""; m = 0
-    for (p = 0; p < 256; p++) {
-        c = x[n + 1 + p]; if (c == 999) continue
-        r = int(c / 16); k = c % 16
-        if (((r == 1 || r == 2 || r == 13 || r == 14) && (k == 1 || k == 2 || k == 13 || k == 14)) ||
-            (centre && (r == 7 || r == 8) && (k == 7 || k == 8))) s = s (m++ ? "." : "") p
-    }
-    return m == (centre ? 20 : 16) ? s : ""
-}
-BEGIN { ring_cells() }'
 
-# open_corner IN OUT -- clear the two top corners the bands of laps 1 and 2
-# close: rows above BEAM_STOP_ROW x columns 1..K and 15-K..14, top row
-# included. A rotations border's left column and top-left corner stay as
-# annealed, so the bottom row and the whole left column keep their sides; the
-# lap-1 band then fills the top row and the right column above the stop row
-# from the edges left, which may trade places between those two sides (the
-# backtracker has no side restriction). That costs yield: on 628 beamer boards
-# (CLUES=all, frozen) 1 got a K=4 band with the left column kept, 44 with it
-# cleared. Under BORDERS=random the column above the stop row is the
-# extension's own choice, so it is cleared too. The band puts a cleared clue
-# back on its own cell.
+# mask FILE EXPR -- a 16x16 0/1 region (the --holes format, first line row 0):
+# 1 where the bash arithmetic EXPR in r (row) and c (column) holds
+mask() {
+    local r c line
+    for ((r = 0; r < 16; r++)); do
+        line=
+        for ((c = 0; c < 16; c++)); do line+="${line:+,}$(( $2 ))"; done
+        echo "$line"
+    done > "$1"
+}
+
+# open_corner IN OUT -- clear the two top corners the side bands close: rows
+# above BEAM_STOP_ROW x columns 1..K and 15-K..14 (masks/open.csv). A rotations
+# border's left column stays as annealed; under BORDERS=random the column
+# above the stop row is the extension's own choice, so it is cleared too. A
+# band puts a cleared clue back on its own cell.
 open_corner() {
-    awk -F, -v s="$BEAM_STOP_ROW" -v kc="$K" -v c0="$([ "$BORDERS" = random ] && echo 0 || echo 1)" '
-        BEGIN {OFS = ","} !/^[#%]/ && NF {
-        n = NF - 512
-        for (p = 1; p <= 256; p++) {
-            c = $(n + p) + 0; if (c == 999) continue
-            k = c % 16
-            if (int(c / 16) > s && ((k >= c0 && k <= kc) || (k >= 15 - kc && k <= 14))) $(n + p) = 999
-        }
-        print }' "$1" > "$2"
+    : > "$2"
+    [ "$(count_boards "$1")" -gt 0 ] || return 0
+    "$BIN/E555_diver" "$SEED" "$1" "$2" --holes "$MASKS/open.csv" --end_dive 0 --emit_score 0 \
+        --threads "$THREADS" > "${2%.csv}.log" 2>&1 || : > "$2"
+}
+
+# one_per_frame IN OUT -- the best board of each distinct frame
+one_per_frame() {
+    : > "$2"
+    [ "$(count_boards "$1")" -gt 0 ] || return 0
+    rank_to "$1" "$2" --group_box "$MASKS/frame.csv" --per_group 1 || [ -f "$2" ] || : > "$2"
 }
 
 # overlay BANDS BOARDS OUT [SEED] -- every line of BANDS, keeping its own
@@ -370,41 +320,45 @@ overlay() {
         function side(c, d) { return E[at[c], (d + sp[c]) % 4] }' ${4:+"$4"} "$2" "$1" > "$3"
 }
 
-# one_per_frame IN OUT -- keep the first board of each distinct frame
-one_per_frame() {
-    awk "$RING"' !/^[#%]/ && NF { r = ring_of($0); if (!(r in seen)) { seen[r] = 1; print } }' "$1" > "$2"
+# is_jewel -- whether BOARD_DIR/s1.csv .. s4.csv make a jewel: turned back to
+# s1's orientation (s2 clockwise, s3 counter-clockwise, s4 twice), all four
+# place every cell of masks/jewel.csv (the frame; FREEZE: and the frozen
+# blocks) with the same pieces. The rest each lap guarantees: every board is
+# exactly matched, and each lap locks its parent's band.
+is_jewel() {
+    local d=$BOARD_DIR j
+    cp "$d/s1.csv" "$d/back.csv"
+    for j in 2 3 4; do
+        python3 "$TOOLS/E555_rotate.py" "$d/s$j.csv" "$(( j == 2 ? 1 : j == 3 ? 3 : 2 ))" \
+            --out "$d/turn.csv" --seed_file "$SEED" > /dev/null || return 1
+        grep -v '^[#%]' "$d/turn.csv" >> "$d/back.csv" || return 1
+    done
+    rank_to "$d/back.csv" "$d/held4.csv" --complete "$MASKS/jewel.csv" || return 1
+    [ "$(count_boards "$d/held4.csv")" = 4 ] || return 1
+    rank_to "$d/back.csv" "$d/frames.csv" --group_box "$MASKS/jewel.csv" --per_group 1 || return 1
+    [ "$(count_boards "$d/frames.csv")" = 1 ]
 }
 
-# jewel_key CHAIN -- the frame key if the four boards in CHAIN (the closed s1,
-# s2, s3, s4) make a jewel, else nothing. Each must hold all 60 frame cells,
-# the same frame turned with the board: s2 is s1 turned counter-clockwise
-# (ring shift 45), s3 s1 turned clockwise (15), s4 s1 turned twice (30),
-# whether it grew from s3 or from s2. Under FREEZE all four must also hold the
-# same frozen clue-block pieces, and the key is the frame's and theirs. Not
-# re-tested here, because each lap guarantees it: every board is exactly
-# matched (no breaks), rows 0..FIN_STOP_ROW are complete, and each lap locks
-# its parent's band.
-jewel_key() {
-    awk -v freeze="$([ "$FREEZE" = 0 ] && echo 0 || echo 1)" -v centre="$FROZEN_CENTRE" "$RING"' !/^[#%]/ && NF { R[++k] = ring_of($0); Q[k] = region_set($0) }
-        END {
-            if (k != 4) exit
-            for (j = 1; j <= 4; j++) if (R[j] ~ /-/) exit           # frame complete
-            if (shift(R[1], 45) != R[2] || shift(R[1], 15) != R[3] || shift(R[1], 30) != R[4]) exit
-            if (!freeze) { print key_of(R[1]); exit }
-            if (Q[1] == "" || Q[2] != Q[1] || Q[3] != Q[1] || Q[4] != Q[1]) exit   # blocks held
-            print key_of(R[1]) "/" Q[1]
-        }' "$1"
+# new_frame S1 -- whether no jewel found before holds S1's frame (FREEZE: and
+# blocks) in any turn; jewels.csv holds every jewel in all four turns
+new_frame() {
+    [ -s jewels.csv ] || return 0
+    cat jewels.csv "$1" > "$BOARD_DIR/seen.csv"
+    rank_to "$BOARD_DIR/seen.csv" "$BOARD_DIR/frames.csv" --group_box "$MASKS/jewel.csv" \
+        --per_group 1 || return 1
+    [ "$(count_boards "$BOARD_DIR/frames.csv")" = "$(count_boards "$BOARD_DIR/seen.csv")" ]
 }
 
-# held_blocks IN OUT -- the boards of IN that hold all the frozen clue blocks
+# held_blocks FILE -- keep the boards of FILE that hold every frozen block cell
 held_blocks() {
-    awk -v centre="$FROZEN_CENTRE" "$RING"' !/^[#%]/ && NF && region_set($0) != ""' "$1" > "$2"
+    rank_to "$1" "$1.held" --complete "$MASKS/held.csv" || :
+    [ -f "$1.held" ] || : > "$1.held"
+    mv "$1.held" "$1"
 }
 
 # free_centre FILE -- FREEZE=corners: clear the centre 2x2 block of the turned
 # bands but for the centre clue, so the finalizer re-grows the block instead of
-# freezing it. At K=4 the frozen centre block let no lap-1 band past row 7 (0
-# of 80 bands, 10 boards); re-grown, 5 of the 10 boards passed lap 1.
+# freezing it, which leaves a high-K lap more room.
 free_centre() {
     awk -F, -v keep="$([ "$CLUES" = none ] && echo -1 || echo 138)" 'BEGIN {OFS = ","}
         !/^[#%]/ && NF {
@@ -420,18 +374,14 @@ free_centre() {
 
 # shared_cells A B TURN -- interior cells where board A, turned TURN times
 # clockwise (3 = counter-clockwise), and board B hold the same piece at the
-# same spin
+# same spin: E555_rank.py's agreement between the two, "?" if unknown
 shared_cells() {
-    python3 "$TOOLS/E555_rotate.py" "$1" "$3" --out "$BOARD_DIR/turn.csv" --seed_file "$SEED" > /dev/null
-    awk -F, '!/^[#%]/ && NF {
-        n = NF - 512
-        for (p = 1; p <= 256; p++) {
-            c = $(n + p) + 0; if (c == 999) continue    # fields may carry a space
-            r = int(c / 16); k = c % 16; if (r < 1 || r > 14 || k < 1 || k > 14) continue
-            key = p "," c "," ($(n + 256 + p) + 0)
-            if (FILENAME == ARGV[1]) A[key] = 1; else if (key in A) s++
-        } }
-        END { print s + 0 }' "$BOARD_DIR/turn.csv" "$2"
+    local d=$BOARD_DIR last=
+    python3 "$TOOLS/E555_rotate.py" "$1" "$3" --out "$d/turn.csv" --seed_file "$SEED" > /dev/null &&
+        cat "$d/turn.csv" "$2" > "$d/pair.csv" &&
+        last=$(python3 "$TOOLS/E555_rank.py" "$d/pair.csv" --seed_file "$SEED" --diverse 2 \
+               --diversity_box 1:14,1:14 --csv 2> /dev/null | tail -n 1) || last=
+    if [ -n "$last" ]; then echo "${last##*,}"; else echo "?"; fi
 }
 
 # ---- the band ---------------------------------------------------------------------
@@ -585,56 +535,40 @@ lap1_bands() {
 }
 
 # ---- one lap ----------------------------------------------------------------------
-# grow LABEL PREFIX BANDS DIR TURN -- turn the bands TURN times clockwise (3 =
+# grow LABEL BANDS DIR TURN -- turn the bands TURN times clockwise (3 =
 # counter-clockwise: the left band goes to the bottom; 1 = clockwise: the right
-# band does) and re-grow them to FIN_STOP_ROW: DIR/next.csv (ids PREFIX<n>)
-# and DIR/parents.txt (each board's id, then the id of the band it grew from).
-# Fails when nothing re-grew, with the reason in WHY.
+# band does) and re-grow them to FIN_STOP_ROW: DIR/next.csv, each board named
+# <its band>.<n>. Fails when nothing re-grew, with the reason in WHY.
 grow() {
-    local label=$1 pre=$2 bands=$3 d=$4 turn=$5 t nb
+    local label=$1 bands=$2 d=$3 turn=$4 t nb
     rm -rf "$d"; mkdir -p "$d"      # the finalizer appends to its output
-    python3 "$TOOLS/E555_rotate.py" "$bands" "$turn" --out "$d/turned.csv" --seed_file "$SEED" > /dev/null
+    python3 "$TOOLS/E555_rotate.py" "$bands" "$turn" --out "$d/turned.csv" --seed_file "$SEED" > /dev/null ||
+        { WHY="$label: the bands did not turn (E555_rotate.py)"; return 1; }
     [ "$FREEZE" != corners ] || free_centre "$d/turned.csv"
     nb=$(count_boards "$d/turned.csv")
+    [ "$nb" -gt 0 ] || { WHY="$label: no band to re-grow"; return 1; }
     t=$(cap "$LAP_TIME"); [ "$t" -gt 5 ] || { WHY="out of time"; return 1; }
     # An exhaustive search from the lock (--backtrack_row = --finalize_from: the
-    # locked band is the single root, no beam row runs), each band with an
-    # equal share of LAP_TIME. Measured on 8 real K=4 bands: the same 20
-    # boards as beams of width 20000 and 200000 (the narrower one was full on
-    # one band), in the same 24 s -- nearly all of it the reduced database's
-    # rebuild, ~3 s a band. The beam width then only sizes an unused
-    # workspace (1000: 0.01 GB instead of 1.4). --no_fanout_sort: the sort
-    # took 7 s a band, three times the rest, and an exhaustive search finds
-    # the same boards without it, only in another order.
+    # locked band is the single root, no beam row runs), each band with an equal
+    # share of LAP_TIME and at most FIN_BOARDS/bands of its boards, so every
+    # band runs. Nearly all of the time is the reduced database's rebuild; the
+    # beam width only sizes an unused workspace. --no_fanout_sort: for an
+    # exhaustive search the sort only reorders the same boards.
     timeout -k 5 "$(left)" "$BIN/E555_finalizer" "$SEED" "$d/turned.csv" --out_dir "$d/fin" \
         --finalize_from "$K" --stop_row "$FIN_STOP_ROW" --keep_ring --no_fanout_sort \
         "${CLUE_ARG[@]}" "${FREEZE_ARG[@]}" \
         --backtrack_row "$K" --time_limit "$(( t / nb > 1 ? t / nb : 1 ))" --beam_width 1000 \
-        --max_emitted 0 --wall_time "$t" --rng_seed "$((RNG_SEED + NB))" \
-        --threads "$THREADS" --print_cmd > "$d/fin.log" 2>&1 || true
-    : > "$d/raw.csv"                # a killed finalizer leaves no outputs.txt
-    [ ! -s "$d/fin/outputs.txt" ] || xargs -r cat < "$d/fin/outputs.txt" > "$d/raw.csv" 2> /dev/null || :
+        --keep_ids --max_per_line "$(( (FIN_BOARDS + nb - 1) / nb ))" --wall_time "$t" \
+        --rng_seed "$((RNG_SEED + NB))" --threads "$THREADS" --print_cmd > "$d/fin.log" 2>&1 || true
+    : > "$d/next.csv"               # a killed finalizer leaves no outputs.txt
+    [ ! -s "$d/fin/outputs.txt" ] ||
+        xargs -r cat < "$d/fin/outputs.txt" 2> /dev/null | grep -v '^[#%]' > "$d/next.csv" || :
     rm -rf "$d/fin"
-    # The finalizer names a board p<line>r<repeat>l<column>, line counted from 0
-    # over the data lines of its input: that line's id is the board's parent.
-    # It runs the bands one after another, each in its share of the time, and
-    # a cap on its output would end the call inside the first band that
-    # re-grows (one band on the synthetic puzzle wrote 10438 boards in its 7
-    # s): so every band runs, and each keeps FIN_BOARDS/bands of its boards.
-    # That also tells lap 1 every band that re-grows, each a frame for lap 2.
-    awk -F, -v pre="$pre" -v max="$FIN_BOARDS" -v nb="$nb" -v par="$d/parents.txt" 'BEGIN {OFS = ","}
-        FNR == NR { if (!/^[#%]/ && NF) P[n++] = $1; next }
-        FNR == 1 { cap = int((max + nb - 1) / nb) }
-        !/^[#%]/ && NF && m < max && match($1, /^p[0-9]+/) {
-            line = substr($1, 2, RLENGTH - 1) + 0
-            if (c[line]++ >= cap) next
-            $1 = pre (++m); print $1 "," P[line] > par; print }' "$d/turned.csv" "$d/raw.csv" > "$d/next.csv"
-    rm -f "$d/raw.csv"
     [ "$(count_boards "$d/next.csv")" -gt 0 ] || { WHY="$label re-grew nothing"; return 1; }
     # The finalizer re-grows a band whose blocks did not all freeze without
     # them (its [freeze] lines in fin.log say why); such boards are dropped.
     if [ "$FREEZE" != 0 ]; then
-        held_blocks "$d/next.csv" "$d/held.csv"; mv "$d/held.csv" "$d/next.csv"
+        held_blocks "$d/next.csv"
         [ "$(count_boards "$d/next.csv")" -gt 0 ] ||
             { WHY="$label: the clue blocks did not hold (see [freeze] in fin.log)"; return 1; }
     fi
@@ -644,24 +578,19 @@ grow() {
 # The laps form a tree around s1, sharing only what a jewel must share, the
 # frame (and, FREEZE, the five clue blocks):
 #
-#   lap-1 bands   s1's top-left corner and the frame (lap1_bands, lending)
-#   lap-2 bands   s1's top-right corner (--reverse, lending), cut from s1 with
-#                 a lap-1 band's frame left of column K+1 and its clue blocks;
-#                 it builds the rest of the frame itself: a lap-1 band builds
-#                 it only to close the frame, and on 435 real K=4 bands that
-#                 frame let no top-right corner close (the synthetic puzzle:
-#                 0 of 12; with that part freed, all of them)
+#   lap-1 bands   s1's top-left corner and the frame (lap1_bands)
+#   lap-2 bands   s1's top-right corner (--reverse), cut from s1 with a lap-1
+#                 band's frame left of column K+1 and its blocks; they build the
+#                 rest of the frame themselves, which lets far more corners
+#                 close than under the lap-1 band's whole frame
 #   lap 1         a lap-1 band under a lap-2 band's frame, turned
 #                 counter-clockwise                                     -> s2
 #   lap 2         that lap-2 band, turned clockwise                     -> s3
 #   lap 3         s3's right band, turned clockwise                     -> s4
 #                 or else s2's left band, turned counter-clockwise      -> s4
 #
-# so s2 and s3 lock the two side bands of s1 (each with its own corner, which
-# may reuse a piece of the other's), and s4 has s1's top side at its bottom
-# either way. A lap-1 band fits every lap-2 band cut from its start: they
-# meet only on the frame, whose pieces never go inside, and on the blocks the
-# start holds.
+# A lap-1 band fits every lap-2 band cut from its start: they meet only on the
+# frame, whose pieces never go inside, and on the blocks the start holds.
 #
 # whirl K POOL SIDE NAME re-grows POOL's bands (laps 1 and 2; lap 3 first cuts
 # them on SIDE), the most different first, BANDS_GROWN at a time in
@@ -676,25 +605,17 @@ DEEPEST=1
 # band paired with it is <lap-2 band>_<n>. Fails with WHY when there is none.
 side_bands() {
     local d=$BOARD_DIR
-    # lap 2's starts: each lap-1 band's frame left of column K+1, the frame
-    # cells s1 already holds and (FREEZE) its blocks, overlaid with s1; one per
-    # distinct start, and class.txt maps every lap-1 band to its start
-    awk -F, -v kc="$K" -v freeze="$([ "$FREEZE" = 0 ] && echo 0 || echo 1)" -v cls="$d/class.txt" 'BEGIN {OFS = ","}
-        FILENAME == ARGV[1] { if (!/^[#%]/ && NF) { n = NF - 512
-            for (p = 1; p <= 256; p++) { c = $(n + p) + 0; if (c != 999) H[c] = 1 } }; next }
-        !/^[#%]/ && NF {
-            n = NF - 512; id = $1
-            for (p = 1; p <= 256; p++) {
-                c = $(n + p) + 0; if (c == 999) continue
-                r = int(c / 16); k = c % 16
-                fr = (r == 0 || r == 15 || k == 0 || k == 15)
-                bl = (((r >= 1 && r <= 2) || (r >= 13 && r <= 14)) && ((k >= 1 && k <= 2) || (k >= 13 && k <= 14))) ||
-                     ((r == 7 || r == 8) && (k == 7 || k == 8))
-                if (!((fr && (k <= kc || (c in H))) || (bl && freeze))) $(n + p) = 999
-            }
+    # lap 2's starts: each lap-1 band with only its frame left of column K+1
+    # and (FREEZE) its blocks (masks/share.csv lifts the rest), s1's own cells
+    # put back around them; one per distinct start, and class.txt maps every
+    # lap-1 band to its start
+    "$BIN/E555_diver" "$SEED" "$1" "$d/cut.csv" --holes "$MASKS/share.csv" --end_dive 0 \
+        --emit_score 0 --threads "$THREADS" > "$d/cut.log" 2>&1 || : > "$d/cut.csv"
+    : > "$d/class.txt"
+    awk -F, -v cls="$d/class.txt" '!/^[#%]/ && NF {
             key = $0; sub(/^[^,]*,[^,]*,/, "", key); gsub(/ /, "", key)
-            if (!(key in S)) { S[key] = id; print }
-            print id "," S[key] > cls }' "$d/s1raw.csv" "$1" > "$d/share.csv"
+            if (!(key in S)) { S[key] = $1; print }
+            print $1 "," S[key] > cls }' "$d/cut.csv" > "$d/share.csv"
     overlay "$d/share.csv" "$d/s1raw.csv" "$d/start.csv" "$SEED"
     cut_bands "$d/start.csv" "$d/l2.csv" "$(left)" right
     [ "$(count_boards "$d/l2.csv")" -gt 0 ] ||
@@ -722,9 +643,9 @@ side_bands() {
 }
 
 whirl() {
-    local k=$1 pool=$2 side=$3 d=$BOARD_DIR/$4 bands n g turn=1 label="lap $1" pre="L$1g" e
+    local k=$1 pool=$2 side=$3 d=$BOARD_DIR/$4 bands n g turn=1 label="lap $1" e
     [ "$side" = right ] || turn=3
-    [ "$4" != lap3s2 ] || { label="lap 3 from s2"; pre="L3sg"; }
+    [ "$4" != lap3s2 ] || label="lap 3 from s2"
     rm -rf "$d"; mkdir -p "$d"
     if [ "$k" -le 2 ]; then
         bands=$pool
@@ -740,24 +661,25 @@ whirl() {
         e=$d/g$g
         awk -v a=$(( (g - 1) * BANDS_GROWN )) -v b=$(( g * BANDS_GROWN )) \
             '!/^[#%]/ && NF { i++; if (i > a && i <= b) print }' "$d/picked.csv" > "$d/group$g.csv"
-        grow "$label" "$pre${g}_" "$d/group$g.csv" "$e" "$turn" || continue
+        grow "$label" "$d/group$g.csv" "$e" "$turn" || continue
         NEXT[$((k + 1))]=$e
         [ "$((k + 1))" -le "$DEEPEST" ] || DEEPEST=$((k + 1))
         case "$k" in
-            1)  # lap 2 grows the lap-2 bands whose lap-1 partner re-grew
-                awk -F, 'FILENAME == ARGV[1] { b = $2; sub(/_[0-9]+$/, "", b); G[b] = 1; next }
-                         !/^[#%]/ && NF && ($1 in G)' "$e/parents.txt" "$BOARD_DIR/l2.csv" > "$e/l2.csv"
+            1)  # lap 2 grows the lap-2 bands whose lap-1 partner re-grew (an s2
+                # is <lap-2 band>_<j>.<n>)
+                sed 's/,.*//; s/\.[0-9]*$//; s/_[0-9]*$//' "$e/next.csv" > "$e/b2.txt"
+                select_ids "$e/b2.txt" "$BOARD_DIR/l2.csv" > "$e/l2.csv"
                 whirl 2 "$e/l2.csv" right lap2 && return 0 ;;
             2)  whirl 3 "$e/next.csv" right lap3 && return 0
                 # else s1's top from the other side: the s2s whose lap-2 band
-                # re-grew an s3 here, each tried once per board
-                awk -F, 'FILENAME == ARGV[1] { B[$2] = 1; next }
-                         FILENAME == ARGV[2] { T[$1] = 1; next }
-                         FILENAME == ARGV[3] { b = $2; sub(/_[0-9]+$/, "", b)
-                                               if ((b in B) && !($1 in T)) S[$1] = 1; next }
-                         !/^[#%]/ && NF && ($1 in S)' \
-                    "$e/parents.txt" "$BOARD_DIR/s2_tried.txt" "${NEXT[2]}/parents.txt" \
-                    "${NEXT[2]}/next.csv" > "$e/s2.csv"
+                # re-grew an s3 here (an s3 is <lap-2 band>.<n>), each tried
+                # once per board
+                sed 's/,.*//; s/\.[0-9]*$//' "$e/next.csv" > "$e/b2.txt"
+                awk -F, 'FILENAME == ARGV[1] { B[$1]; next }
+                         FILENAME == ARGV[2] { T[$1]; next }
+                         !/^[#%]/ && NF { b = $1; sub(/\.[0-9]+$/, "", b); sub(/_[0-9]+$/, "", b)
+                                          if ((b in B) && !($1 in T)) print }' \
+                    "$e/b2.txt" "$BOARD_DIR/s2_tried.txt" "${NEXT[2]}/next.csv" > "$e/s2.csv"
                 cut -d, -f1 "$e/s2.csv" >> "$BOARD_DIR/s2_tried.txt"
                 [ "$(count_boards "$e/s2.csv")" -gt 0 ] || continue
                 whirl 3 "$e/s2.csv" left lap3s2 && return 0 ;;
@@ -767,31 +689,43 @@ whirl() {
     return 1
 }
 
-# dive_jewel -- E555_diver on the four boards of the jewel just written to
-# jewels.csv, DIVE_TIME/4 seconds each; appends them to dived.csv and sets
-# DIVE_NOTE to their scores and the best of the four
+# dive_jewel -- E555_diver on each of the four boards of the jewel just written
+# to jewels.csv; appends them to dived.csv and sets DIVE_NOTE to their scores
+# and the best of the four
 dive_jewel() {
-    local j t=$(( DIVE_TIME / 4 > 1 ? DIVE_TIME / 4 : 1 )) s scores= best=0
+    local j d=$BOARD_DIR s scores= best=0
     for j in 1 2 3 4; do
-        tail -n 4 jewels.csv | sed -n "${j}p" > "$BOARD_DIR/to_dive.csv"
-        rm -f "$BOARD_DIR/dived.csv"
-        "$BIN/E555_diver" "$SEED" "$BOARD_DIR/to_dive.csv" "$BOARD_DIR/dived.csv" \
-            --end_dive 10000 --end_polish 20000 --emit_score 0 \
-            --threads "$THREADS" --wall_time "$t" --print_cmd > "$BOARD_DIR/dive$j.log" 2>&1 || true
-        # a complete board has nothing to dive: its own score stands
-        [ -s "$BOARD_DIR/dived.csv" ] && [ "$(count_boards "$BOARD_DIR/dived.csv")" -gt 0 ] ||
-            python3 "$TOOLS/E555_rank.py" "$BOARD_DIR/to_dive.csv" --seed_file "$SEED" --top 1 \
-                --out "$BOARD_DIR/dived.csv" --rescore > /dev/null 2>&1 || :
-        s=$(awk -F, '!/^[#%]/ && NF { s = $2 + 0; exit } END { print s + 0 }' "$BOARD_DIR/dived.csv" 2> /dev/null || echo 0)
-        [ ! -s "$BOARD_DIR/dived.csv" ] || awk '!/^[#%]/ && NF' "$BOARD_DIR/dived.csv" >> dived.csv
-        scores=$scores${scores:+/}$s; [ "$s" -le "$best" ] || best=$s
+        tail -n 4 jewels.csv | sed -n "${j}p" > "$d/to_dive.csv"
+        rm -f "$d/dived.csv"
+        "$BIN/E555_diver" "$SEED" "$d/to_dive.csv" "$d/dived.csv" \
+            --end_dive "$DIVE_DIVES" --end_polish "$DIVE_POLISH" --copies "$DIVE_COPIES" \
+            --emit_score 0 --threads "$THREADS" --print_cmd > "$d/dive$j.log" 2>&1 || true
+        # a complete board has nothing to dive: it is re-dived as it is
+        [ -s "$d/dived.csv" ] && [ "$(count_boards "$d/dived.csv")" -gt 0 ] ||
+            cp "$d/to_dive.csv" "$d/dived.csv"
+        # then its most damaged band, two rows deeper than the damage reaches,
+        # dived again and again until DIVE_REOPEN seconds are spent; the board
+        # written is never worse than the one read
+        if [ "$DIVE_REOPEN" -gt 0 ]; then
+            rm -f "$d/redived.csv"
+            "$BIN/E555_diver" "$SEED" "$d/dived.csv" "$d/redived.csv" --reopen auto+2 \
+                --rounds 1000000 --wall_time "$DIVE_REOPEN" --copies 8 --end_dive 1000 \
+                --end_polish 10000 --emit_score 0 --threads "$THREADS" --print_cmd \
+                > "$d/redive$j.log" 2>&1 || true
+            if [ -s "$d/redived.csv" ] && [ "$(count_boards "$d/redived.csv")" -gt 0 ]; then
+                mv "$d/redived.csv" "$d/dived.csv"
+            fi
+        fi
+        s=$(python3 "$TOOLS/E555_rank.py" "$d/dived.csv" --seed_file "$SEED" --field score 2> /dev/null) || s=
+        grep -v '^[#%]' "$d/dived.csv" >> dived.csv || :
+        s=${s:-0}; scores=$scores${scores:+/}$s; [ "$s" -le "$best" ] || best=$s
     done
     DIVE_NOTE="dive=$scores max=$best"
 }
 
 # whirl_board N FILE -- whirl one board; on a jewel with a new frame, keep it
 whirl_board() {
-    local nb=$1 t0=$SECONDS key j id from b2 b1 s2 s3 p shared
+    local nb=$1 t0=$SECONDS j id from b2 b1 s2 s3 s4 p shared
     BOARD_DIR=$RUN_DIR/boards/$nb; rm -rf "$RUN_DIR/boards"; mkdir -p "$BOARD_DIR"
     BOARD_END=$((SECONDS + BOARD_TIME)); DEEPEST=1; WHY=
     cp "$2" "$BOARD_DIR/s1raw.csv"; : > "$BOARD_DIR/s2_tried.txt"; id=$(cut -d, -f1 "$2")
@@ -801,20 +735,16 @@ whirl_board() {
     if ! side_bands "bands1/$id.csv" || ! whirl 1 "$BOARD_DIR/l1.csv" left lap1; then
         log "[board $nb] reached s$DEEPEST; last: $WHY ($((SECONDS - t0)) s)"; return
     fi
-    # The tree, from s4 back: a cut band's id is <the board it was cut from>.<n>,
-    # parents.txt maps each re-grown board to its band, and the lap-1 band of
-    # a pair is <lap-2 band>_<n>.
+    # The tree, from s4 back, by the ids alone: a band is <the board it was cut
+    # from>.<n>, a re-grown board <its band>.<n>, a paired lap-1 band <lap-2
+    # band>_<n>
     nth_board "${NEXT[4]}/next.csv" 1 > "$BOARD_DIR/s4.csv"
-    p=$(awk -F, -v id="$(cut -d, -f1 "$BOARD_DIR/s4.csv")" '$1 == id {print $2; exit}' "${NEXT[4]}/parents.txt")
-    p=${p%.*}
-    case "$p" in
-        L2*) from=s3; s3=$p
-             b2=$(awk -F, -v id="$s3" '$1 == id {print $2; exit}' "${NEXT[3]}/parents.txt")
-             read -r s2 b1 <<< "$(awk -F, -v b="$b2" '{ c = $2; sub(/_[0-9]+$/, "", c) }
-                 c == b { print $1, $2; exit }' "${NEXT[2]}/parents.txt")" ;;
-        *)   from=s2; s2=$p
-             b1=$(awk -F, -v id="$s2" '$1 == id {print $2; exit}' "${NEXT[2]}/parents.txt"); b2=${b1%_*}
-             s3=$(awk -F, -v b="$b2" '$2 == b {print $1; exit}' "${NEXT[3]}/parents.txt") ;;
+    s4=$(cut -d, -f1 "$BOARD_DIR/s4.csv"); p=${s4%.*}; p=${p%.*}
+    case "${NEXT[4]}" in
+        */lap3s2/*) from=s2; s2=$p; b1=${s2%.*}; b2=${b1%_*}
+                    s3=$(first_child "${NEXT[3]}/next.csv" "$b2") ;;
+        *)          from=s3; s3=$p; b2=${s3%.*}
+                    s2=$(first_child "${NEXT[2]}/next.csv" "$b2" paired); b1=${s2%.*} ;;
     esac
     board_by_id "${NEXT[2]}/next.csv" "$s2" > "$BOARD_DIR/s2.csv"
     board_by_id "${NEXT[3]}/next.csv" "$s3" > "$BOARD_DIR/s3.csv"
@@ -825,19 +755,14 @@ whirl_board() {
     board_by_id "$BOARD_DIR/l2.csv" "$b2" > "$BOARD_DIR/b2.csv"
     overlay "$BOARD_DIR/b1.csv" "$BOARD_DIR/s1raw.csv" "$BOARD_DIR/x.csv" "$SEED"
     overlay "$BOARD_DIR/b2.csv" "$BOARD_DIR/x.csv" "$BOARD_DIR/s1.csv" "$SEED"
-    cat "$BOARD_DIR"/s[1-4].csv > "$BOARD_DIR/chain.csv"
-    key=$(jewel_key "$BOARD_DIR/chain.csv")
-    if [ -z "$key" ]; then
+    if ! is_jewel; then
         log "[board $nb] reached s4 (from $from), but the frame was not held ($((SECONDS - t0)) s)"; return
     fi
-    if grep -qxF "$key" frames.txt; then
+    if ! new_frame "$BOARD_DIR/s1.csv"; then
         log "[board $nb] jewel, frame already found ($((SECONDS - t0)) s)"; return
     fi
-    echo "$key" >> frames.txt; NJ=$((NJ + 1))
-    for j in 1 2 3 4; do
-        awk -F, -v id="b${nb}_s$j" 'BEGIN {OFS = ","} !/^[#%]/ && NF {$1 = id; print; exit}' \
-            "$BOARD_DIR/s$j.csv" >> jewels.csv
-    done
+    NJ=$((NJ + 1))
+    for j in 1 2 3 4; do sed "s/^[^,]*/b${nb}_s$j/" "$BOARD_DIR/s$j.csv" >> jewels.csv; done
     # interior cells kept: s1->s2 (counter-clockwise), s1->s3 (clockwise),
     # s4's parent->s4, and s1->s4 (two turns)
     shared=$(shared_cells "$BOARD_DIR/s1.csv" "$BOARD_DIR/s2.csv" 3)/$(shared_cells "$BOARD_DIR/s1.csv" "$BOARD_DIR/s3.csv" 1)
@@ -845,19 +770,30 @@ whirl_board() {
     else shared=$shared/$(shared_cells "$BOARD_DIR/s2.csv" "$BOARD_DIR/s4.csv" 3); fi
     shared=$shared/$(shared_cells "$BOARD_DIR/s1.csv" "$BOARD_DIR/s4.csv" 2)
     DIVE_NOTE=; [ "$DIVE" != 1 ] || dive_jewel
-    echo "board=$nb jewel=$NJ from=$from frame=$key shared=$shared${DIVE_NOTE:+ $DIVE_NOTE} seconds=$((SECONDS - T0))" >> jewels.log
+    echo "board=$nb jewel=$NJ from=$from shared=$shared${DIVE_NOTE:+ $DIVE_NOTE} seconds=$((SECONDS - T0))" >> jewels.log
     log "[board $nb] JEWEL $NJ (s4 from $from), new frame, shared $shared cells${DIVE_NOTE:+, $DIVE_NOTE} ($((SECONDS - t0)) s)"
 }
 
 # ---- main loop -----------------------------------------------------------------------
 log "[cfg] run_dir=$RUN_DIR threads=$THREADS wall=$WALL board_time=$BOARD_TIME rng_seed=$RNG_SEED db_file=${DB_FILE:-<rebuilt each call>}"
-log "[cfg] clues=$CLUES freeze=$FREEZE K=$K borders=$BORDERS beam: stop_row=$BEAM_STOP_ROW min_col=$BEAM_MIN_COL bottoms=$BEAM_BOTTOMS columns=$BEAM_COLUMNS tau=$BEAM_TAU corners=$BEAM_CORNERS; bands: $BANDS per board, $BANDS_GROWN x $LAP_TRIES grown; finalizer: stop_row=$FIN_STOP_ROW lap_time=$LAP_TIME pool=$FIN_BOARDS"
+log "[cfg] clues=$CLUES freeze=$FREEZE K=$K borders=$BORDERS beam: stop_row=$BEAM_STOP_ROW min_col=$BEAM_MIN_COL bottoms=$BEAM_BOTTOMS columns=$BEAM_COLUMNS tau=$BEAM_TAU corners=$BEAM_CORNERS; bands: $BANDS per board, $BANDS_GROWN x $LAP_TRIES grown; finalizer: stop_row=$FIN_STOP_ROW lap_time=$LAP_TIME pool=$FIN_BOARDS; dive=$DIVE ($DIVE_DIVES/$DIVE_POLISH x $DIVE_COPIES, reopen ${DIVE_REOPEN} s)"
 T0=$SECONDS; NB=0; NJ=0; NP=0; EMPTY=0
+# The regions the tools are asked about (rank --group_box/--complete, diver
+# --holes), as mask files
+MASKS=$RUN_DIR/masks; mkdir -p "$MASKS"
+FRAME='(r == 0 || r == 15 || c == 0 || c == 15)'
+BLOCKS="((r == 1 || r == 2 || r == 13 || r == 14) && (c == 1 || c == 2 || c == 13 || c == 14) || $FROZEN_CENTRE && (r == 7 || r == 8) && (c == 7 || c == 8))"
+FROZEN=$([ "$FREEZE" = 0 ] && echo 0 || echo 1)
+C0=$([ "$BORDERS" = random ] && echo 0 || echo 1)
+mask "$MASKS/frame.csv" "$FRAME"                                   # one board per frame
+mask "$MASKS/held.csv"  "$BLOCKS"                                  # the frozen blocks
+mask "$MASKS/jewel.csv" "$FRAME || $FROZEN && $BLOCKS"             # what a jewel shares
+mask "$MASKS/open.csv"  "r > $BEAM_STOP_ROW && (c >= $C0 && c <= $K || c >= 15 - $K && c <= 14)"
+mask "$MASKS/share.csv" "!($FRAME && c <= $K) && !($FROZEN && $BLOCKS)"   # lifted for lap 2's starts
 # The beamer maps the database file into memory and reads only the pages it
-# touches, in random order. From a cold disk (after a reboot) that kept one
-# produce call busy for 10 minutes with nothing emitted; one sequential read
-# first (1.5 to 8 min for 6.8 GB, measured, depending on the disk; it counts
-# against WALL) puts the whole file in the page cache.
+# touches, in random order, which from a cold disk can stall a produce call for
+# minutes; one sequential read first (it counts against WALL) puts the whole
+# file in the page cache.
 if [ -z "$INPUT" ] && [ -s "$DB_FILE" ]; then
     cat "$DB_FILE" > /dev/null
     log "[init] database read into the page cache ($((SECONDS - T0)) s)"
@@ -895,5 +831,5 @@ log "[done] $NB boards, $NJ jewels in $((SECONDS - T0)) s -> $RUN_DIR/jewels.csv
 
 if [ "$DIVE" = 1 ] && [ -s dived.csv ]; then
     python3 "$TOOLS/E555_rank.py" dived.csv --seed_file "$SEED" --top 20 --out best.csv --rescore > /dev/null || true
-    log "[dive] $(count_boards dived.csv) boards dived, best $(awk -F, '!/^[#%]/ && NF && $2 + 0 > b {b = $2 + 0} END {print b + 0}' dived.csv) -> $RUN_DIR/best.csv"
+    log "[dive] $(count_boards dived.csv) boards dived, best $(python3 "$TOOLS/E555_rank.py" dived.csv --seed_file "$SEED" --field score 2> /dev/null || echo "?") -> $RUN_DIR/best.csv"
 fi

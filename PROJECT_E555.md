@@ -1718,44 +1718,27 @@ Four laps are one full turn. At `T = 11` a lap keeps 72 cells in place (rows
   (`--rotate -1 --rounds 3 --strip_width 4`), then the backtracker's dives.
 
 `pipeline/run_whirlpool_jewels.sh` runs the whirlpool one board at a time under
-one fixed frame, re-growing a beamer board s1 from each side in turn and
-locking a band of it every time. A **jewel** is a tree of four boards holding
-the same complete 60-cell frame: s2, s1's left columns 0..K (K=4 by default)
-turned counter-clockwise to rows 0..K and re-grown; s3, s1's right columns
-15-K..15 turned clockwise and re-grown; s4, s3's right band turned clockwise or,
-failing that, s2's left band turned counter-clockwise, so s1's top side is
-its bottom. A band is an exact filling by `E555_backtracker --stop_column K
---with_frame` (the right one with `--reverse`; the other inner columns
-cleared, their pieces lent) that closes a top corner block: s1's rows above
-the beamer's stop row for s2 and s3, the rows above `FIN_STOP_ROW` for s4. The
-two side bands of s1 are cut separately and share only the frame and the
-clue blocks: the right band is cut under the left band's frame left of column
-K+1 and builds the rest itself (under the left band's whole frame no
-top-right corner closed, 0 of 435 real K=4 bands), and each may borrow a piece
-the other uses (both corners in one board closed on 0 of 11 real K=4 boards).
-Each band is turned and re-grown exhaustively with `--finalize_from K
---backtrack_row K --keep_ring --no_fanout_sort` (the same boards as a beam, in
-the same time; the sort would triple it and only reorders an exhaustive
-search), every band of a call in its share of the time; depth-first, one
-board per frame, the tree traced back through band ids. The beamer stops at
-row 8: the side bands close against s1's own rows, and at row 10 lap-2 bands
-existed on 0 of 11 real K=4 boards, at row 8 on 4. Each produce call starts
-from a Stage A border (`--double_decker ALL`, beamer `--lambda_reserve`), a
-rotations file's next row, or `--random_edges`. With `CLUES=all` (the
-default) a 1 s `--lambda_corners` probe reads the exact catalog of clued
-top-corner blocks per clue orientation; the annealed border used is the best
-by `Score_dd` with both top-corner blocks in some orientation, and the beam
-runs pinned (`--pin_clue`) in those orientations only. `FREEZE=1` (the
-default) cuts with `--with_clue_regions` and re-grows with `--freeze_clues`,
-so a jewel also holds the five 2x2 clue blocks; a frozen lap stops at row
-11-K (`FIN_STOP_ROW=auto`), the rows the frozen centre block leaves it.
-`FREEZE=corners` holds the four corner blocks only. `DIVE=1` dives each
-jewel's four boards with `E555_diver` as it is found and logs the best.
-Measured on 4 cores, end to end: K=3 made 6 frozen jewels in an hour, all
-with s4 from s3, as many as the earlier chain of laps, and s1 shares 26-31
-interior cells with s4 where the chain kept none; K=4 (the default) made none
-in 45 minutes, where lap 2 is the wall.
-Settings and measurements: pipeline/README.md.
+one fixed frame. A **jewel** is four boards holding the same complete 60-cell
+frame: a beamer board s1; s2, its left columns 0..K (K=4 by default) turned
+counter-clockwise to rows 0..K and re-grown; s3, its right columns turned
+clockwise and re-grown; s4, s3's right band turned clockwise or, failing that,
+s2's left band turned counter-clockwise, so s1's top side is its bottom. A band
+is an exact filling by `E555_backtracker --stop_column K --with_frame`
+(`--reverse` for a right one; the other inner columns cleared, their pieces
+lent) that closes a top corner block. s1's two bands are cut separately and
+share only the frame and the clue blocks. Each band is turned and re-grown
+exhaustively with `E555_finalizer --finalize_from K --backtrack_row K
+--keep_ring`; `--keep_ids` names each board after its band, which traces a
+jewel back to s1, and `--max_per_line` gives every band of a call an equal
+share. `E555_rank.py` regions given as masks keep one board per frame
+(`--group_box`), test that the four boards hold one frame (`--complete`,
+`--group_box`) and count what they share (`--diversity_box`); `E555_diver
+--holes MASK --end_dive 0` cuts boards to a region. Borders come from Stage A's
+`--double_decker`; with `CLUES=all` a `--lambda_corners` probe picks the clue
+orientations whose two top corner blocks exist. `FREEZE=1` (the default) also
+holds the five 2x2 clue blocks (`--with_clue_regions`, `--freeze_clues`); a
+frozen lap stops at row 11-K. `DIVE=1` finishes each jewel's four boards with
+`E555_diver` as it is found. Settings: pipeline/README.md.
 
 ---
 
