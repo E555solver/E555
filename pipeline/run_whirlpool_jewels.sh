@@ -3,7 +3,7 @@
 # keeping a band of it through every turn.
 #
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour: all five clues, blocks frozen, K=4
-#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3              # the highest K that made frozen jewels on 4 cores
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3              # 6 frozen jewels an hour on 4 cores
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3 FREEZE=corners  # centre block re-grown: 3x the jewels
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1  # 10 min, then dive
 #   bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv RUN_DIR=w1      # whirl your boards
@@ -77,9 +77,10 @@
 # lap: lap-1 bands of real boards (CLUES=all, left column kept) reached row 9
 # frozen on 0 of 10 boards at K=4 (no band past row 7) and 0 of 18 at K=3 (10
 # of them past row 8), where K=2 gave 4 jewels from 8 boards. Stopped at
-# 11-K, K=3 made 5 jewels from 20 boards; K=4 passed lap 1 on 4 of 11 and
-# then found no lap-2 corner that closes (rows 8-14 x columns 1-4). The
-# higher K, the larger that corner. FREEZE=corners holds only the four
+# 11-K, K=3 made 5 jewels from 20 boards; K=4 passed lap 1 on 4 of 11, and
+# its lap-2 corner (rows 8-14 x columns 1-4) is the wall: the larger K, the
+# larger it. End to end on 4 cores K=3 made 6 jewels in an hour and the
+# defaults (K=4) 1 in 45 minutes. FREEZE=corners holds only the four
 # corner blocks and re-grows the centre one, its clue still on its cell:
 # K=3 then made 13 jewels from 20 boards, K=4 passed lap 1 on 5 of 11 and
 # none lap 2.

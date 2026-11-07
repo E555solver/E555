@@ -354,7 +354,7 @@ cells, and none of its sides is a leftover of the beamer's early guesses.
 ```bash
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour: all five clues, blocks frozen, K=4
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1  # then dive the jewels
-bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3              # the highest K that made frozen jewels on 4 cores
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3              # 6 frozen jewels an hour on 4 cores (K=4: 1 in 45 min)
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3 FREEZE=corners  # centre block re-grown: 13 jewels from 20 boards
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db BORDERS=random   # the beamer's sampled borders
 bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl your own boards
@@ -458,14 +458,25 @@ the higher K is: `FIN_STOP_ROW=auto` is 11-K with `FREEZE=1` (9 with
 | 4 | corners | 9 | 11 | 5 | 0 | 0 |
 
 At K=4, lap 1 passes once the stop row leaves room (7, or the centre block
-re-grown), but no lap-2 band closed: the corner it must close against the
-fixed frame is rows `FIN_STOP_ROW+1`..14 x columns 1-4, and its pool is small
-(the exhaustive lap-1 search found 4-12 boards per band group). The K=3
+re-grown), and lap 2 is the wall: the corner it must close against the fixed
+frame is rows `FIN_STOP_ROW+1`..14 x columns 1-4, and its pool is small (the
+exhaustive lap-1 search found 4-12 boards per band group).
+
+End to end on 4 cores (fresh annealed borders, the probe, `ANNEAL_RESTARTS=8`,
+`BEAM_TIME=300`, everything else default):
+
+| run | time | boards whirled | past lap 1 | past lap 2 | jewels |
+|---|---|---|---|---|---|
+| `K=3` (stop row 8) | 60 min | 452 | 17 | 9 | 6 |
+| defaults, K=4 (stop row 7) | 45 min | 753 | 8 | 3 | 1 |
+
+Every jewel was checked: all placed edges matched, the five clues on their
+cells, the frame and the blocks the same on s1..s4. Lap-1 bands came at 0-6%
+of the frames per border, so the border drawn matters as much as K. The K=3
 jewels took 1-3 minutes each and shared 40-50 interior cells per lap
 (all five frozen) or 36-49 (`corners`); on the s2 boards 54-60 of the 60
-frame pieces sat on their annealed sides. The defaults (`FREEZE=1 K=4`) are
-for long runs on many cores; `K=3` is the highest K that made frozen jewels
-here.
+frame pieces sat on their annealed sides. The defaults (`FREEZE=1 K=4`) made
+one jewel in 45 minutes on 4 cores, `K=3` six in an hour.
 
 `jewels.log` gives each jewel's frame key and `shared=a/b/c`: the interior
 cells each lap kept from its parent, the measure of what a jewel shares.

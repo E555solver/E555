@@ -1735,8 +1735,9 @@ in those orientations only (6x the lap-1 bands of an unpinned beam, measured).
 `--freeze_clues`, so a jewel also holds the five 2x2 clue blocks; a frozen lap
 stops at row 11-K (`FIN_STOP_ROW=auto`), the rows the frozen centre block
 leaves it. `FREEZE=corners` holds the four corner blocks only. Measured on 4
-cores: K=3 made jewels (5 of 20 boards frozen, 13 of 20 with `corners`), K=4
-none (no lap-2 corner closed).
+cores, end to end: K=3 made 6 frozen jewels in an hour, K=4 (the default) 1 in
+45 minutes, where lap 2's corner is the wall; with `corners` K=3 turned 13 of 20
+banded boards into jewels.
 Settings and measurements: pipeline/README.md.
 
 ---
