@@ -1476,11 +1476,18 @@ E555_finalizer seed bt.csv.stop_row5.csv --finalize_from 5 --backtrack_row 5 \
 
 Boards are appended to `<out_dir>/beam_completions_finalized_<stop_row>.csv`
 with ids `p<line>r<repeat>l<column>`; each line is one atomic append, so several
-processes may share the file. A board carries rows `0..stop_row`, the locked top
-rows, the ring under `--keep_ring`, and (known sides) the left column and the
-top-right corner, and the frozen clue regions under `--freeze_clues`.
+processes may share the file. `--keep_ids` writes `<input id>.<n>` instead,
+numbered from 1 per input id in write order (lines sharing an id continue one
+sequence), so a board can be traced back through several stages by its id. A
+board carries rows `0..stop_row`, the locked top rows, the ring under
+`--keep_ring`, and (known sides) the left column and the top-right corner, and
+the frozen clue regions under `--freeze_clues`.
 `--max_emitted` stops the run after N boards (the stop-row beam in flight is
-written in full).
+written in full). `--max_per_line N` caps each input line instead: a line
+writes its first N boards in write order, then the next line starts. For the
+backtrack, write order is root order and DFS order, so the capped file holds the
+first N boards of each line of the uncapped one, at any thread count. Neither
+`--keep_ids` nor `--max_per_line` combines with `--end_dive`.
 
 ### 6.9 Choosing `--finalize_from`
 
@@ -1519,6 +1526,8 @@ enumeration grows explosively as rows are freed; 7 is a practical value.
 | `--top_columns N` | 12 | sampled columns per repeat; <= 0 enumerates all |
 | `--tau_columns T`, `--bail_columns N` | 0, 0 | column sampling temperature; abandon a line after N barren columns |
 | `--time_limit S`, `--wall_time S`, `--max_emitted N` | 600, 0, 0 | budgets; SIGINT/SIGTERM stop cleanly, a second signal kills |
+| `--max_per_line N` | 0 = off | at most N boards per input line (6.8) |
+| `--keep_ids` | off | ids `<input id>.<n>` (6.8) |
 | `--threads N`, `--rng_seed S`, `--verbose`, `--print_cmd` | all, random, off, off | |
 
 ---

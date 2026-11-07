@@ -1660,6 +1660,19 @@ EOF
     [ "$nb" -ge 50 ] || fail "the free-mode backtrack wrote only $nb boards (want >= 50)"
     cmp -s "$d/low1/beam_completions_finalized_10.csv" "$d/low4/beam_completions_finalized_10.csv" \
         || fail "the free-mode backtrack differs between 1 and 4 threads"
+    # --max_per_line keeps a line's first boards in write order, across its
+    # sampled columns; --keep_ids numbers them after the input's id.
+    tl_run lowcap "$d/low.csv" --finalize_from 7 --backtrack_row 7 --stop_row 10 --top_columns 20 \
+        --threads 4 --max_per_line 7 --keep_ids
+    cmp -s <(head -7 "$d/low4/beam_completions_finalized_10.csv" | cut -d, -f3-) \
+           <(cut -d, -f3- "$d/lowcap/beam_completions_finalized_10.csv") \
+        || fail "--max_per_line 7 did not write the uncapped run's first 7 boards"
+    [ "$(cut -d, -f1 "$d/lowcap/beam_completions_finalized_10.csv" | tr '\n' ' ')" = \
+      "low.1 low.2 low.3 low.4 low.5 low.6 low.7 " ] || fail "--keep_ids did not write ids low.1 .. low.7"
+    if bin/E555_finalizer data/synth_seed.txt "$d/low.csv" --keep_ids --end_dive 100 \
+           --out_dir "$d/refused" > "$d/refused.log" 2>&1; then
+        fail "--keep_ids was accepted with --end_dive"
+    fi
 
     # --backtrack_row_factor: the roots are the beam's own selection of row N,
     # so M = 1 at row 8 selects the very boards a factor-0 run at row 9 grows

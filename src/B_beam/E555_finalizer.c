@@ -129,6 +129,8 @@ static uint32_t g_finalize_repeats = 1;   /* full sweeps per input partial */
 static double   g_config_time_sec  = 600.0;
 static double   g_max_wall_sec     = 0.0;
 static uint64_t g_max_partials     = 0;   /* reported-board budget; 0 = unlimited */
+static uint64_t g_max_per_line     = 0;   /* --max_per_line: boards a line may write; 0 = no cap */
+static bool     g_keep_ids         = false;  /* --keep_ids: write <input id>.<n> */
 static long     g_top_columns      = 12;  /* sampled left columns per partial (free mode) */
 static uint32_t g_bail_columns     = 0;   /* give up on a line after N barren columns */
 /* Selection temperature for the left-column rank, as in the beamer. 0 = off,
@@ -300,6 +302,51 @@ static struct {
    only (g_partial_total is mutated inside the emission critical section).
    The announcement is deferred to _announce() so that it never lands ahead of
    the [sweep] line of the config that triggered it. */
+/* --max_per_line: the boards the current input line has written, counted as
+   --max_emitted counts (completions plus --incomplete_top partials). Reset when
+   a line starts; every writer stops once it reaches the cap, and the line's
+   remaining roots, columns, repeats and orientations are skipped. */
+static uint64_t g_line_written = 0;
+static uint64_t g_lines_capped = 0;
+static inline bool fin_line_full(void) {
+    if (!g_max_per_line) return false;
+    uint64_t w;
+    #pragma omp atomic read
+    w = g_line_written;
+    return w >= g_max_per_line;
+}
+
+/* --keep_ids: every distinct input id numbers the boards written from it 1, 2,
+   ... in write order, across both output files; lines sharing an id (the
+   backtracker's bands of one board) continue one sequence. A linear search with
+   a last-hit shortcut: each line costs a database rebuild, so this is never the
+   bottleneck. */
+typedef struct { char id[64]; uint64_t n; } FinIdCount;
+static FinIdCount *g_idc = NULL;
+static size_t      g_idc_n = 0, g_idc_cap = 0, g_idc_cur = 0;
+static void fin_ids_line(const char *id) {
+    if (g_idc_n && !strcmp(g_idc[g_idc_cur].id, id)) return;
+    for (size_t i = 0; i < g_idc_n; i++)
+        if (!strcmp(g_idc[i].id, id)) { g_idc_cur = i; return; }
+    if (g_idc_n == g_idc_cap) {
+        g_idc_cap = g_idc_cap ? 2 * g_idc_cap : 64;
+        g_idc = xrealloc(g_idc, g_idc_cap * sizeof *g_idc);
+    }
+    snprintf(g_idc[g_idc_n].id, sizeof g_idc[g_idc_n].id, "%s", id);
+    g_idc[g_idc_n].n = 0;
+    g_idc_cur = g_idc_n++;
+}
+
+/* The leading "id, index" of a written board: the configuration's name, or
+   under --keep_ids the input line's id and the board's number. */
+static void fin_write_id(FILE *fp, uint64_t sol_idx) {
+    if (!g_keep_ids) { fprintf(fp, "%s, %" PRIu64, g_config_id_str, sol_idx); return; }
+    uint64_t n;
+    #pragma omp atomic capture
+    n = ++g_idc[g_idc_cur].n;
+    fprintf(fp, "%s.%" PRIu64 ", %" PRIu64, g_idc[g_idc_cur].id, n, sol_idx);
+}
+
 static bool g_budget_hit = false;
 static bool partials_budget_spent(void) {
     /* With --end_dive the budget caps the sorted dived output instead. */
@@ -917,8 +964,10 @@ static void emit_board_line(const char *slot, size_t len) {
         dv_add(pid, (const uint8_t *)slot + sizeof pid);
         return;
     }
-    fprintf(g_completions_fp, "%s, %" PRIu64, g_config_id_str, g_solution_idx++);
+    fin_write_id(g_completions_fp, g_solution_idx++);
     fwrite(slot, 1, len, g_completions_fp);
+    #pragma omp atomic
+    g_line_written++;
 }
 
 /* Emit one --incomplete_top partial: the parent's ancestry plus the two stop-row
@@ -961,13 +1010,15 @@ static void emit_incomplete(const BeamCtx *ctx, const BeamEntry *parent,
 
     #pragma omp critical(e555_incomplete)
     {
-        if (g_partial_fp && partial_htable_insert(fp)) {
+        if (g_partial_fp && !fin_line_full() && partial_htable_insert(fp)) {
             if      (colmask == ROWMASK_AB) g_part_ab++;
             else if (colmask == ROWMASK_AC) g_part_ac++;
             else                            g_part_bc++;
             uint64_t sol_idx = g_partial_total++;
-            fprintf(g_partial_fp, "%s, %" PRIu64, g_config_id_str, sol_idx);
+            fin_write_id(g_partial_fp, sol_idx);
             fwrite(line, 1, (size_t)len, g_partial_fp);
+            #pragma omp atomic
+            g_line_written++;
         }
     }
 }
@@ -2111,7 +2162,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
         g_emit_corner = xmalloc((size_t)EMIT_TILE);
     }
     int nt = g_nthreads > 0 ? g_nthreads : omp_get_max_threads();
-    for (uint32_t base = 0; base < n_emit && !g_stop; base += EMIT_TILE) {
+    for (uint32_t base = 0; base < n_emit && !g_stop && !fin_line_full(); base += EMIT_TILE) {
         uint32_t tile = n_emit - base < (uint32_t)EMIT_TILE
                       ? n_emit - base : (uint32_t)EMIT_TILE;
         #pragma omp parallel for schedule(static) num_threads(nt)
@@ -2125,7 +2176,7 @@ static void emit_stop_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept, in
                                            g_emit_lines + (size_t)k * EMIT_LINE_MAX);
             if (g_corners_on) g_emit_corner[k] = corner_code_of(&beam[pe->parent], &pe->mv, row);
         }
-        for (uint32_t k = 0; k < tile; k++) {
+        for (uint32_t k = 0; k < tile && !fin_line_full(); k++) {
             if (!htable_insert(g_emit_fps[k])) continue;
             emit_board_line(g_emit_lines + (size_t)k * EMIT_LINE_MAX, (size_t)g_emit_lens[k]);
             g_stats.emitted_total++;
@@ -2543,6 +2594,7 @@ static void bt_emit_node(const BtNode *o, uint64_t *boards) {
         while (k < o->nkid && o->kid_at[k] == i) bt_emit_node(o->kid[k++], boards);
         if (i == o->n) break;
         (*boards)++;
+        if (fin_line_full()) continue;          /* --max_per_line: the line has its boards */
         if (!htable_insert(o->fp[i])) continue;
         const size_t end = (i + 1 < o->n) ? o->off[i + 1] : o->len;
         emit_board_line(o->buf + o->off[i], end - o->off[i]);
@@ -2552,10 +2604,12 @@ static void bt_emit_node(const BtNode *o, uint64_t *boards) {
 }
 
 /* --max_emitted counts written boards; under --end_dive it caps the dived
-   output instead and never stops the search. */
+   output instead and never stops the search. A line that has written its
+   --max_per_line boards is spent the same way, for that line only. */
 static inline bool bt_budget_spent(void) {
-    return g_max_partials && !g_end_dive
-        && g_stats.emitted_total + (uint64_t)g_partial_total >= g_max_partials;
+    return (g_max_partials && !g_end_dive
+            && g_stats.emitted_total + (uint64_t)g_partial_total >= g_max_partials)
+        || fin_line_full();
 }
 
 /* Write root r -- or, once the budget is spent, drop it: the written count then
@@ -3002,7 +3056,11 @@ static bool fin_parse_fields(char *s, char id_out[64],
     if (n < 2 + 2 * NUM_PIECES) return false;
     char *id = f[0];
     while (*id == ' ') id++;
-    if (id_out) snprintf(id_out, 64, "%s", id);
+    if (id_out) {
+        if (g_keep_ids && strlen(id) >= 64)
+            fatal("--keep_ids: the input id '%.40s...' is longer than 63 characters", id);
+        snprintf(id_out, 64, "%s", id);
+    }
     char **board = f + n - 2 * NUM_PIECES;
     for (int k = 0; k < 2 * NUM_PIECES; k++) {
         long v = strtol(board[k], NULL, 10);
@@ -4089,6 +4147,7 @@ static void fin_enum_rec(BeamCtx *ctx, Scratch **scratch, double t_start,
             printf("[sweep] max_wall reached.\n"); g_stop = 1; return;
         }
         if (partials_budget_spent()) { partials_budget_announce(); return; }
+        if (fin_line_full()) return;
         fin_left_prefix(lo);                 /* locked rows; lo->used = locked only */
         for (int rr = (int)g_finalize_from + 1; rr <= (int)g_stop_row; rr++) {
             s_left_store[rr] = seq[rr];
@@ -4101,7 +4160,7 @@ static void fin_enum_rec(BeamCtx *ctx, Scratch **scratch, double t_start,
         run_left_config(ctx, scratch, t_start, line, 0, (*count)++, lo);
         return;
     }
-    for (int k = 0; k < s_leftz_n && !g_stop; k++) {
+    for (int k = 0; k < s_leftz_n && !g_stop && !fin_line_full(); k++) {
         const Oriented *o = &s_leftz[k];
         if (used_test(used, o->piece_id)) continue;
         if (o->bottom != prev_top) continue;
@@ -4223,6 +4282,9 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
     } else {
         printf("[sum] emitted unique boards: %" PRIu64 "\n", g_stats.emitted_total);
     }
+    if (g_max_per_line)
+        printf("[sum] max_per_line %" PRIu64 ": %" PRIu64 " line(s) reached it\n",
+               g_max_per_line, g_lines_capped);
     if (g_incomplete_top)
         printf("[sum] incomplete-top partials: %zu  (A+B %zu, A+C %zu, B+C %zu)\n",
                g_partial_total, g_part_ab, g_part_ac, g_part_bc);
@@ -4270,6 +4332,10 @@ static void usage(const char *a0) {
 "\n"
 "Input / output:\n"
 "  --out_dir DIR          output directory for the completions CSV (default beam_out)\n"
+"  --keep_ids             write each board's id as its input line's id and a number,\n"
+"                         <id>.1, <id>.2, ... (lines sharing an id continue one\n"
+"                         sequence), instead of p<line>r<repeat>l<column>. Not with\n"
+"                         --end_dive\n"
 "  --start_row N          first data line of partials.csv to load (default 0)\n"
 "  --num_rows N           number of consecutive lines to load (default 0 = every\n"
 "                         line from --start_row to the end of the file)\n"
@@ -4505,6 +4571,9 @@ static void usage(const char *a0) {
 "                         beam in flight is always reported in full, so the final\n"
 "                         count can overshoot N by up to one beam width\n"
 "                         (0 = unlimited; default 0)\n"
+"  --max_per_line N       each input line writes at most N boards, counted as\n"
+"                         --max_emitted counts, its first N in write order; then\n"
+"                         the next line starts. Not with --end_dive (0 = off)\n"
 "\n"
 "Misc:\n"
 "  --threads N            OpenMP threads (default: all cores)\n"
@@ -4570,6 +4639,8 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_end_dive && g_corners_req && g_corner_seeds != 4) printf(" --corner_seeds %d", g_corner_seeds);
     printf(" --time_limit %g --wall_time %g --max_emitted %" PRIu64 " --threads %d",
            g_config_time_sec, g_max_wall_sec, g_max_partials, g_nthreads);
+    if (g_max_per_line)   printf(" --max_per_line %" PRIu64, g_max_per_line);
+    if (g_keep_ids)       printf(" --keep_ids");
     printf(" --out_dir %s", g_out_dir);
     if (g_verbose)        printf(" --verbose");
     if (g_print_cmd)      printf(" --print_cmd");
@@ -4668,6 +4739,12 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--time_limit")  && i+1 < argc) g_config_time_sec = atof(argv[++i]);
         else if (!strcmp(argv[i], "--wall_time")       && i+1 < argc) g_max_wall_sec = atof(argv[++i]);
         else if (!strcmp(argv[i], "--max_emitted")     && i+1 < argc) g_max_partials = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--max_per_line")    && i+1 < argc) {
+            unsigned long long v;
+            if (!parse_u64_token(argv[++i], &v)) fatal("--max_per_line needs a count, got '%s'", argv[i]);
+            g_max_per_line = (uint64_t)v;
+        }
+        else if (!strcmp(argv[i], "--keep_ids"))        g_keep_ids = true;
         else if (!strcmp(argv[i], "--print_cmd"))       g_print_cmd = true;
         else if (!strcmp(argv[i], "--verbose"))         g_verbose = true;
         else { fprintf(stderr, "Unknown argument: %s\n\n", argv[i]); usage(argv[0]); return 1; }
@@ -4713,6 +4790,9 @@ int main(int argc, char *argv[]) {
         fatal("--freeze_clues pins the clue regions in the backtrack only, so it needs "
               "--backtrack_row N with N <= %d, below the centre block (rows 7-8)", FRZ_MAX_BT_ROW);
     if (g_emit_score < 0 || g_emit_score > 480) fatal("--emit_score must be in 0..480");
+    if (g_end_dive && (g_max_per_line || g_keep_ids))
+        fatal("--max_per_line and --keep_ids do not work with --end_dive: the dives "
+              "write each configuration's boards themselves");
     if (g_end_polish >= 0 && !g_end_dive)
         fprintf(stderr, "[warn] --end_polish has no effect without --end_dive\n");
     if (g_emit_score_set && !g_end_dive)
@@ -4925,6 +5005,8 @@ int main(int argc, char *argv[]) {
         int got = fin_load_partial(csv_path, line, src_id);
         if (got < 0) { printf("[sweep] partials line %u not found; stopping.\n", line); break; }
         if (got == 0) continue;
+        g_line_written = 0;
+        if (g_keep_ids) fin_ids_line(src_id);
 
         /* Side mode for this line. A complete border fixes the sides (and the
            column) from the partial itself; otherwise a rotations row that matches
@@ -5010,7 +5092,7 @@ int main(int argc, char *argv[]) {
            move between orientations, the excluded pieces do not (fin_clue_reserve).
            g_stop, --wall_time and the partials budget are tested inside, so a
            budget still stops the line part-way through its orientations. */
-        for (int oi = 0; oi < (g_fin_orient_n ? g_fin_orient_n : 1) && !g_stop; oi++) {
+        for (int oi = 0; oi < (g_fin_orient_n ? g_fin_orient_n : 1) && !g_stop && !fin_line_full(); oi++) {
             g_fin_orient = g_fin_orient_n ? g_fin_orient_cand[oi] : -1;
             if (g_corners_on) {
                 /* The catalog of this line's sides in this pass's clue frame, and
@@ -5075,10 +5157,10 @@ int main(int argc, char *argv[]) {
                            "the search from the lock is exhaustive, so one pass\n", line, reps);
                     reps = 1;
                 }
-                for (uint32_t rep = 0; rep < reps && !g_stop; rep++) {
+                for (uint32_t rep = 0; rep < reps && !g_stop && !fin_line_full(); rep++) {
                     size_t tried_n = 0;
                     LeftOrder lft;
-                    for (size_t li = 0; li < run_l && !g_stop; li++) {
+                    for (size_t li = 0; li < run_l && !g_stop && !fin_line_full(); li++) {
                         if (g_max_wall_sec > 0.0 && omp_get_wtime() - t_start >= g_max_wall_sec) {
                             printf("[sweep] max_wall reached.\n"); g_stop = 1; break;
                         }
@@ -5123,6 +5205,13 @@ int main(int argc, char *argv[]) {
                 }
                 free(tried);
             }
+        }
+        if (fin_line_full()) {
+            sweep_flush();
+            printf("[sweep] line %u: max_per_line reached (%" PRIu64 " boards)\n",
+                   line, g_line_written);
+            fflush(stdout);
+            g_lines_capped++;
         }
     }
 
