@@ -31,6 +31,8 @@ THE MEASURES
                 placed, break-free frame. Higher is better. `--border_only` keeps
                 just the border==60 boards -- the clean start E555_finalizer needs
                 in fixed mode (a placed-but-broken seam would poison the search).
+                `--complete REGION` keeps the boards that place every cell of a
+                region, broken or not.
 
     break_rows  how many distinct ROWS hold a break. Breaks confined to rows
                 14-15 give 2. THE compactness measure: lower is better.
@@ -69,7 +71,12 @@ STRUCTURAL GROUPING  (--group_box, --per_group, --unique)
         --group_box 0:11,0:15       one representative per 12-row foundation
         --group_box 4:11,0:11       W4 rounds-3 CCW retained core
         --group_box 4:11,4:15       W4 rounds-3 CW retained core
+        --group_box frame.csv       one representative per frame (a mask)
         --unique                    exact whole-board deduplication
+
+    REGION, here and for --diversity_box and --complete, is an inclusive
+    rectangle R0:R1,C0:C1 or a 16x16 0/1 mask file in the --holes format
+    ('#' comments, first data line = row 0, 1 = in the region).
 
 CHOOSING INDEPENDENT ROOTS  (--diverse, --max_agree, --diversity_box)
 
@@ -149,6 +156,8 @@ USAGE
     python3 tools/E555_rank.py huge.csv --top 100 --max_agree 0.9
     python3 tools/E555_rank.py raw.csv --group_box 0:11,0:15 --per_group 1 --out roots.csv
     python3 tools/E555_rank.py pool.csv --top 5000 --diverse 500 --diversity_box 0:9,0:15
+    python3 tools/E555_rank.py boards.csv --group_box frame.csv --out one_per_frame.csv
+    python3 tools/E555_rank.py boards.csv --complete 0:8,0:15 --out rows_0_8.csv
     python3 tools/E555_rank.py boards.csv --split score 460 high.csv low.csv
 
     --sort takes a comma-separated list of measure names, applied in order,
@@ -161,7 +170,7 @@ USAGE
     appears and --out merges them into one ranked CSV.
 """
 from __future__ import annotations
-import argparse, csv, heapq, os, sys
+import argparse, csv, heapq, os, re, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -377,6 +386,37 @@ def parse_box(spec):
                  for c in range(c0, c1 + 1))
 
 
+BOX_SPEC = re.compile(r"^\s*\d+\s*:\s*\d+\s*,\s*\d+\s*:\s*\d+\s*$")
+
+
+def parse_region(spec):
+    """A region: an `r0:r1,c0:c1` box, or a 16x16 0/1 mask file in the --holes
+    format ('#'/'%' comment lines, first data line = row 0, 1 = in the region).
+    Either way the cells come back in row-major order."""
+    if BOX_SPEC.match(spec):
+        return parse_box(spec)
+    path = Path(spec)
+    if not path.is_file():
+        raise SystemExit(f"[ERROR] region '{spec}' is neither r0:r1,c0:c1 nor a mask file")
+    grid = []
+    for line in path.read_text().splitlines():
+        s = line.strip()
+        if not s or s[0] in "#%":
+            continue
+        row = s.replace(",", " ").split()
+        if len(row) != SIDE or any(x not in ("0", "1") for x in row):
+            raise SystemExit(f"[ERROR] {spec}: mask row {len(grid)} must be {SIDE} "
+                             "entries of 0 or 1")
+        grid.append(row)
+    if len(grid) != SIDE:
+        raise SystemExit(f"[ERROR] {spec}: mask of {len(grid)} rows, need {SIDE}")
+    cells = tuple(r * SIDE + c for r in range(SIDE) for c in range(SIDE)
+                  if grid[r][c] == "1")
+    if not cells:
+        raise SystemExit(f"[ERROR] {spec}: the mask selects no cell")
+    return cells
+
+
 def region_key(pos, rot, cells):
     """Compact exact piece+spin contents of `cells`, including empty cells."""
     inv = [0xFFFF] * N_PIECES
@@ -400,7 +440,8 @@ def fingerprint(line, cells=None):
                      if pos[p] != 999 and (allowed is None or pos[p] in allowed))
 
 
-def read_boards(paths, seed, skipped, progress_every=0, group_cells=None):
+def read_boards(paths, seed, skipped, progress_every=0, group_cells=None,
+                complete_cells=None):
     """Yield one light record per board row of every input file.
 
     The record keeps the input LINE, not the parsed field list and not the
@@ -415,6 +456,9 @@ def read_boards(paths, seed, skipped, progress_every=0, group_cells=None):
     exits nonzero when `skipped` is non-empty. This mirrors what the C tools do
     with a board they cannot use (see the [skip] lines in E555_roundhouse.c and
     E555_finalizer.c).
+
+    With `complete_cells`, each record also says whether the board places every
+    one of those cells (`complete`, for --complete).
     """
     n = 0
     for path in paths:
@@ -445,6 +489,9 @@ def read_boards(paths, seed, skipped, progress_every=0, group_cells=None):
                 if progress_every and n % progress_every == 0:
                     print(f"[rank] measured {n} boards", file=sys.stderr)
                 extra = {"group": region_key(pos, rot, group_cells)} if group_cells else {}
+                if complete_cells is not None:
+                    placed = {cell for cell in pos if cell != 999}
+                    extra["complete"] = all(cell in placed for cell in complete_cells)
                 yield dict(file=Path(path).name, row=idx, id=cid,
                            canon_id=canon_id, line=line, **extra, **m)
                 idx += 1
@@ -758,9 +805,14 @@ def main():
     ap.add_argument("--border_only", action="store_true",
                     help="keep only boards with a fully clean, complete external "
                          "border (border == 60)")
-    ap.add_argument("--group_box", metavar="R0:R1,C0:C1",
+    ap.add_argument("--complete", metavar="REGION",
+                    help="keep only boards that place every cell of REGION: an "
+                         "inclusive rectangle R0:R1,C0:C1 or a 16x16 0/1 mask "
+                         "file (the --holes format, 1 = in the region)")
+    ap.add_argument("--group_box", metavar="REGION",
                     help="before global --top, group by exact piece+spin contents "
-                         "of this inclusive rectangle")
+                         "of REGION: an inclusive rectangle R0:R1,C0:C1 or a "
+                         "16x16 0/1 mask file")
     ap.add_argument("--per_group", type=int, default=1, metavar="N",
                     help="with --group_box/--unique, retain the best N from each "
                          "group before global ranking (default 1)")
@@ -777,9 +829,10 @@ def main():
                     help="drop any board agreeing with an already-kept board on "
                          "more than fraction P of its placed cells (0..1). A plain "
                          "near-duplicate filter; runs before --diverse")
-    ap.add_argument("--diversity_box", metavar="R0:R1,C0:C1",
-                    help="compute --max_agree/--diverse only in this rectangle; "
-                         "use 0:9,0:15 to demand lower-board diversity")
+    ap.add_argument("--diversity_box", metavar="REGION",
+                    help="compute --max_agree/--diverse only in REGION, a "
+                         "rectangle or a mask file as for --group_box; use "
+                         "0:9,0:15 to demand lower-board diversity")
     ap.add_argument("--diversity_metric", choices=("cells", "fraction"),
                     default="cells", help="farthest-first similarity: raw shared "
                          "cells (default) or fraction of the smaller placement")
@@ -812,8 +865,8 @@ def main():
         if len(args.inputs) != 1:
             raise SystemExit("[ERROR] --split accepts exactly one input CSV")
         if (args.out or args.rescore or args.csv or args.count or args.field or
-                args.border_only or args.group_box or args.unique or args.diverse or
-                args.max_agree is not None or args.top):
+                args.border_only or args.complete or args.group_box or args.unique or
+                args.diverse or args.max_agree is not None or args.top):
             raise SystemExit("[ERROR] --split is a standalone mode; do not combine it "
                              "with ranking, grouping, diversity, or --out options")
         key, threshold_text, at_least_path, below_path = args.split
@@ -859,14 +912,16 @@ def main():
         return 0
 
     group_cells = (parse_box("0:15,0:15") if args.unique else
-                   parse_box(args.group_box) if args.group_box else None)
-    diversity_cells = parse_box(args.diversity_box) if args.diversity_box else None
+                   parse_region(args.group_box) if args.group_box else None)
+    diversity_cells = parse_region(args.diversity_box) if args.diversity_box else None
+    complete_cells = parse_region(args.complete) if args.complete else None
 
     check_memory(args.inputs, args, group_cells)
     seed = V.load_seed(V.find_seed(args.seed_file))
     skipped = []
     keys = parse_sort_spec(args.sort)
-    stream = read_boards(args.inputs, seed, skipped, progress_every=12500, group_cells=group_cells)
+    stream = read_boards(args.inputs, seed, skipped, progress_every=12500,
+                         group_cells=group_cells, complete_cells=complete_cells)
     # Counted as it streams, so --border_only can still report "N of M" without
     # a second pass and without holding the boards it rejects.
     seen = [0]
@@ -883,6 +938,14 @@ def main():
                     border_kept[0] += 1
                     yield r
         stream = _border(stream)
+    complete_kept = [0]
+    if complete_cells is not None:
+        def _complete(it):
+            for r in it:
+                if r["complete"]:
+                    complete_kept[0] += 1
+                    yield r
+        stream = _complete(stream)
     if group_cells is not None:
         stream = iter(collect_grouped(stream, keys, args.per_group))
     # --field is exactly --top 1 with printing suppressed.
@@ -890,6 +953,9 @@ def main():
     if args.border_only and seen[0]:
         print(f"[border] {border_kept[0]} of {seen[0]} boards have a complete, "
               f"break-free external border", file=sys.stderr)
+    if complete_cells is not None and seen[0]:
+        print(f"[complete] {complete_kept[0]} of {seen[0]} boards place all "
+              f"{len(complete_cells)} cells of {args.complete}", file=sys.stderr)
     if not records:
         # --field is meant to be captured in a shell variable, so an empty
         # input has to leave that variable empty rather than printing an error

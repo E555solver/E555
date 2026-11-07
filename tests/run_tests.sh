@@ -296,6 +296,31 @@ step_rank() {
     cmp -s data/board_example_462.csv "$OUT/rank_emit.csv" \
         || fail "rank --out did not reproduce the input row verbatim"
     echo "ok: rank agrees with the viewer (18 breaks, 229 solid), --out is verbatim"
+
+    # A region given as a mask file is the same region as the rectangle it draws;
+    # --complete keeps a board only if it places every cell of the region.
+    local r c line
+    for ((r = 0; r < 16; r++)); do
+        line=
+        for ((c = 0; c < 16; c++)); do line+="${line:+,}$(( r >= 4 && r <= 11 && c <= 11 ))"; done
+        echo "$line"
+    done > "$OUT/rank_mask.csv"
+    sed 's/^\([^,]*,[^,]*\),[^,]*,/\1,999,/' data/board_example_462.csv > "$OUT/rank_holed.csv"
+    cat data/board_example_462.csv "$OUT/rank_holed.csv" > "$OUT/rank_two.csv"
+    python3 tools/E555_rank.py "$OUT/rank_two.csv" --diverse 2 --diversity_box 4:11,0:11 \
+        --csv > "$OUT/rank_box.txt" 2> /dev/null
+    python3 tools/E555_rank.py "$OUT/rank_two.csv" --diverse 2 --diversity_box "$OUT/rank_mask.csv" \
+        --csv > "$OUT/rank_mask.txt" 2> /dev/null
+    cmp -s "$OUT/rank_box.txt" "$OUT/rank_mask.txt" \
+        || fail "a mask file and the rectangle it draws gave different agreements"
+    python3 tools/E555_rank.py "$OUT/rank_two.csv" --complete "$OUT/rank_mask.csv" \
+        --quiet --out "$OUT/rank_c1.csv" 2> /dev/null
+    python3 tools/E555_rank.py "$OUT/rank_two.csv" --complete 0:15,0:15 \
+        --quiet --out "$OUT/rank_c2.csv" 2> /dev/null
+    [ "$(grep -c . "$OUT/rank_c1.csv")" = 2 ] && [ "$(grep -c . "$OUT/rank_c2.csv")" = 1 ] &&
+        cmp -s "$OUT/rank_c2.csv" data/board_example_462.csv \
+        || fail "--complete did not keep exactly the boards that place the whole region"
+    echo "ok: a mask region equals its rectangle; --complete drops the board with a hole"
 }
 
 # A quarter-turn must move the board without changing it: same breaks, same

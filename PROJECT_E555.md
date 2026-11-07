@@ -2296,9 +2296,12 @@ the identifier third; the run ends with the min/max/mean/std/median score), plus
   them canonically with the score recomputed. `--diverse K` picks K boards
   farthest-first on cell agreement; `--max_agree P` drops near-duplicates;
   `--diversity_box` and `--diversity_metric {cells,fraction}` set where and how
-  agreement is measured. `--group_box R0:R1,C0:C1` / `--unique` group boards by a
-  rectangle's (or the whole board's) contents and keep `--per_group` per group
-  before ranking; `--border_only` keeps boards with a clean complete border.
+  agreement is measured. `--group_box` / `--unique` group boards by a region's
+  (or the whole board's) contents and keep `--per_group` per group before
+  ranking; `--border_only` keeps boards with a clean complete border,
+  `--complete REGION` those that place every cell of a region. A region
+  (`--group_box`, `--diversity_box`, `--complete`) is a rectangle
+  `R0:R1,C0:C1` or a 16x16 0/1 mask file in the `--holes` format.
   Output: a table (`--no_id`, `--quiet`) or CSV (`--csv`); `--count`,
   `--field NAME` and `--split KEY N A.csv B.csv` serve scripts; `--seed_file`.
   `--top N` streams with bounded
