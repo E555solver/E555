@@ -107,7 +107,8 @@ INPUT=                  # whirl these boards instead of producing them
 DIVE=0                  # 1 = dive the jewels at the end
 CLUES=all               # none | center | all: the Eternity II clues every tool holds
 FREEZE=1                # 1 = the band also fills the five 2x2 clue blocks and every
-                        # lap holds them, like the frame; 0 = off
+                        # lap holds them, like the frame; corners = the four corner
+                        # blocks only, the centre block re-grown every lap; 0 = off
 K=4                     # band width: columns 0..K of s_k become rows 0..K of s_k+1
                         # (the finalizer's --finalize_from); at most 6 with FREEZE
 
@@ -169,10 +170,12 @@ esac
 # Frozen blocks: the band fills them (--with_clue_regions) and the finalizer
 # holds them (--freeze_clues), which its exhaustive search from the lock sees.
 REGION_ARG=(); FREEZE_ARG=()
+FROZEN_CENTRE=0         # FREEZE=1 also holds the centre block; corners re-grows it
 case "$FREEZE" in
     0) ;;
-    1) REGION_ARG=(--with_clue_regions); FREEZE_ARG=(--freeze_clues) ;;
-    *) die "FREEZE must be 0 or 1 (got: $FREEZE)" ;;
+    1) REGION_ARG=(--with_clue_regions); FREEZE_ARG=(--freeze_clues); FROZEN_CENTRE=1 ;;
+    corners) REGION_ARG=(--with_clue_regions); FREEZE_ARG=(--freeze_clues) ;;
+    *) die "FREEZE must be 0, 1 or corners (got: $FREEZE)" ;;
 esac
 # Checked here, because a bad value would otherwise fail every lap quietly.
 for v in K BOARD_TIME ANNEAL_RESTARTS ANNEAL_STEPS DD_RESERVE BEAM_MIN_COL BEAM_STOP_ROW BEAM_BACKTRACK \
@@ -271,9 +274,9 @@ function region_set(line,   x, n, p, c, r, k, s, m) {
         c = x[n + 1 + p]; if (c == 999) continue
         r = int(c / 16); k = c % 16
         if (((r == 1 || r == 2 || r == 13 || r == 14) && (k == 1 || k == 2 || k == 13 || k == 14)) ||
-            ((r == 7 || r == 8) && (k == 7 || k == 8))) s = s (m++ ? "." : "") p
+            (centre && (r == 7 || r == 8) && (k == 7 || k == 8))) s = s (m++ ? "." : "") p
     }
-    return m == 20 ? s : ""
+    return m == (centre ? 20 : 16) ? s : ""
 }
 BEGIN { ring_cells() }'
 
@@ -312,7 +315,7 @@ one_per_frame() {
 # exactly matched (no breaks), rows 0..FIN_STOP_ROW are complete, and each lap
 # locks its parent's band.
 jewel_key() {
-    awk -v freeze="$FREEZE" "$RING"' !/^[#%]/ && NF { R[++k] = ring_of($0); Q[k] = region_set($0) }
+    awk -v freeze="$([ "$FREEZE" = 0 ] && echo 0 || echo 1)" -v centre="$FROZEN_CENTRE" "$RING"' !/^[#%]/ && NF { R[++k] = ring_of($0); Q[k] = region_set($0) }
         END {
             if (k != 4) exit
             for (j = 2; j <= 4; j++) if (R[j] ~ /-/) exit           # frame complete
@@ -325,9 +328,26 @@ jewel_key() {
         }' "$1"
 }
 
-# held_blocks IN OUT -- the boards of IN that hold all five frozen clue blocks
+# held_blocks IN OUT -- the boards of IN that hold all the frozen clue blocks
 held_blocks() {
-    awk "$RING"' !/^[#%]/ && NF && region_set($0) != ""' "$1" > "$2"
+    awk -v centre="$FROZEN_CENTRE" "$RING"' !/^[#%]/ && NF && region_set($0) != ""' "$1" > "$2"
+}
+
+# free_centre FILE -- FREEZE=corners: clear the centre 2x2 block of the turned
+# bands but for the centre clue, so the finalizer re-grows the block instead of
+# freezing it. At K=4 the frozen centre block let no lap-1 band past row 7 (0
+# of 80 bands, 10 boards); re-grown, 5 of the 10 boards passed lap 1.
+free_centre() {
+    awk -F, -v keep="$([ "$CLUES" = none ] && echo -1 || echo 138)" 'BEGIN {OFS = ","}
+        !/^[#%]/ && NF {
+            n = NF - 512
+            for (p = 1; p <= 256; p++) {
+                c = $(n + p) + 0; if (c == 999 || p - 1 == keep) continue
+                r = int(c / 16); k = c % 16
+                if ((r == 7 || r == 8) && (k == 7 || k == 8)) $(n + p) = 999
+            }
+        }
+        { print }' "$1" > "$1.tmp" && mv "$1.tmp" "$1"
 }
 
 # shared_cells A B -- interior cells where board A, turned counter-clockwise,
@@ -496,6 +516,7 @@ grow() {
     local k=$1 g=$2 bands=$3 d=$4 t nb
     rm -rf "$d"; mkdir -p "$d"      # the finalizer appends to its output
     python3 "$TOOLS/E555_rotate.py" "$bands" 3 --out "$d/turned.csv" --seed_file "$SEED" > /dev/null
+    [ "$FREEZE" != corners ] || free_centre "$d/turned.csv"
     nb=$(count_boards "$d/turned.csv")
     t=$(cap "$LAP_TIME"); [ "$t" -gt 5 ] || { WHY="out of time"; return 1; }
     # An exhaustive search from the lock (--backtrack_row = --finalize_from: the
@@ -525,7 +546,7 @@ grow() {
     [ "$(count_boards "$d/next.csv")" -gt 0 ] || { WHY="lap $k re-grew nothing"; return 1; }
     # The finalizer re-grows a band whose blocks did not all freeze without
     # them (its [freeze] lines in fin.log say why); such boards are dropped.
-    if [ "$FREEZE" = 1 ]; then
+    if [ "$FREEZE" != 0 ]; then
         held_blocks "$d/next.csv" "$d/held.csv"; mv "$d/held.csv" "$d/next.csv"
         [ "$(count_boards "$d/next.csv")" -gt 0 ] ||
             { WHY="lap $k: the clue blocks did not hold (see [freeze] in fin.log)"; return 1; }
