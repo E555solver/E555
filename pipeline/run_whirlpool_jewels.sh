@@ -5,7 +5,7 @@
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour, all five clues, K=4
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1  # 10 min, then dive
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=2 FREEZE=1 \
-#       FIN_STOP_ROW=9 LAP_TIME=480 BANDS_GROWN=8                          # the 2x2 clue blocks frozen too
+#       FIN_STOP_ROW=9 LAP_TIME=480                                        # the 2x2 clue blocks frozen too
 #   bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv RUN_DIR=w1      # whirl your boards
 #
 # The beamer grows a board upward from row 0, so its bottom rows were chosen
@@ -42,8 +42,10 @@
 #   turn               tools/E555_rotate.py 3 (counter-clockwise): the band
 #                      becomes rows 0..K and the frame
 #   re-grow            E555_finalizer --finalize_from K --keep_ring up to row
-#                      FIN_STOP_ROW: the frame is held in place, so every lap
-#                      keeps the ring lap 1 completed
+#                      FIN_STOP_ROW, exhaustively (--backtrack_row K: a DFS
+#                      from the lock, no beam to cut options): the frame is
+#                      held in place, so every lap keeps the ring lap 1
+#                      completed
 #
 # A lap picks BANDS_GROWN x LAP_TRIES of its bands, most different first
 # (tools/E555_rank.py --diverse), and re-grows them BANDS_GROWN at a time. The
@@ -137,11 +139,10 @@ BANDS=60                # fillings kept per board
 BAND_TIME=15            # seconds per board
 
 # the re-grow: E555_finalizer --finalize_from K
-BANDS_GROWN=2           # bands per finalizer call (frozen: 8)
+BANDS_GROWN=8           # bands per finalizer call
 LAP_TRIES=3             # finalizer calls a lap may make before it gives up
 FIN_STOP_ROW=10         # s2..s4 are re-grown up to this row (frozen: 9)
-FIN_WIDTH=20000
-LAP_TIME=90             # seconds per finalizer call (frozen: 480)
+LAP_TIME=240            # seconds per finalizer call, shared by its bands (frozen: 480)
 FIN_BOARDS=200          # boards a finalizer call writes: the next lap's pool
 # -----------------------------------------------------------------------------
 for arg in "$@"; do
@@ -158,9 +159,7 @@ case "$CLUES" in
     *) die "CLUES must be none, center or all (got: $CLUES)" ;;
 esac
 # Frozen blocks: the band fills them (--with_clue_regions) and the finalizer
-# holds them (--freeze_clues). Only the finalizer's backtrack sees them, so it
-# searches exhaustively from its lock (--backtrack_row K), each band with an
-# equal share of LAP_TIME.
+# holds them (--freeze_clues), which its exhaustive search from the lock sees.
 REGION_ARG=(); FREEZE_ARG=()
 case "$FREEZE" in
     0) ;;
@@ -399,7 +398,8 @@ produce() {    # produce N -> queue.csv
         --max_emitted "$BEAM_BOARDS" --wall_time "$BEAM_TIME" "${db[@]}" \
         --threads "$THREADS" --rng_seed "$((RNG_SEED + $1))" --out_dir "$d" --print_cmd \
         > "$d.log" 2>&1 || log "[produce] the beamer exited non-zero (see $d.log)"
-    xargs -r cat < "$d/outputs.txt" > "$d/all.csv" 2> /dev/null || : > "$d/all.csv"
+    : > "$d/all.csv"                # a killed beamer leaves no outputs.txt
+    [ ! -s "$d/outputs.txt" ] || xargs -r cat < "$d/outputs.txt" > "$d/all.csv" 2> /dev/null || :
     open_corner "$d/all.csv" "$d/open.csv"
     one_per_frame "$d/open.csv" "$d/one.csv"
     PRODUCED=$(count_boards "$d/all.csv")
@@ -432,15 +432,23 @@ grow() {
     python3 "$TOOLS/E555_rotate.py" "$bands" 3 --out "$d/turned.csv" --seed_file "$SEED" > /dev/null
     nb=$(count_boards "$d/turned.csv")
     t=$(cap "$LAP_TIME"); [ "$t" -gt 5 ] || { WHY="out of time"; return 1; }
-    local lock=()
-    [ "$FREEZE" = 0 ] || lock=(--backtrack_row "$K" --time_limit "$(( t / nb > 1 ? t / nb : 1 ))")
+    # An exhaustive search from the lock (--backtrack_row = --finalize_from: the
+    # locked band is the single root, no beam row runs), each band with an
+    # equal share of LAP_TIME. Measured on 8 real K=4 bands: the same 20
+    # boards as beams of width 20000 and 200000 (the narrower one was full on
+    # one band), in the same 24 s -- nearly all of it the reduced database's
+    # rebuild, ~3 s a band. The beam width then only sizes an unused
+    # workspace (1000: 0.01 GB instead of 1.4). --no_fanout_sort: the sort
+    # took 7 s a band, three times the rest, and an exhaustive search finds
+    # the same boards without it, only in another order.
     timeout -k 5 "$(left)" "$BIN/E555_finalizer" "$SEED" "$d/turned.csv" --out_dir "$d/fin" \
         --finalize_from "$K" --stop_row "$FIN_STOP_ROW" --keep_ring --no_fanout_sort \
-        "${CLUE_ARG[@]}" "${FREEZE_ARG[@]}" "${lock[@]}" \
-        --beam_width "$FIN_WIDTH" --lambda_Mahalanobis 0 \
-        --frac_rand 0.0 --max_emitted "$FIN_BOARDS" --wall_time "$t" --rng_seed "$((RNG_SEED + NB))" \
+        "${CLUE_ARG[@]}" "${FREEZE_ARG[@]}" \
+        --backtrack_row "$K" --time_limit "$(( t / nb > 1 ? t / nb : 1 ))" --beam_width 1000 \
+        --max_emitted "$FIN_BOARDS" --wall_time "$t" --rng_seed "$((RNG_SEED + NB))" \
         --threads "$THREADS" --print_cmd > "$d/fin.log" 2>&1 || true
-    xargs -r cat < "$d/fin/outputs.txt" > "$d/raw.csv" 2> /dev/null || : > "$d/raw.csv"
+    : > "$d/raw.csv"                # a killed finalizer leaves no outputs.txt
+    [ ! -s "$d/fin/outputs.txt" ] || xargs -r cat < "$d/fin/outputs.txt" > "$d/raw.csv" 2> /dev/null || :
     # The finalizer names a board p<line>r<repeat>l<column>, line counted from 0
     # over the data lines of its input: that line's id is the board's parent.
     awk -F, -v pre="L${k}g${g}_" -v max="$FIN_BOARDS" -v par="$d/parents.txt" 'BEGIN {OFS = ","}

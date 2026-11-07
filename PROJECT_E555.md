@@ -1718,8 +1718,10 @@ cleared, their pieces lent), on every board the previous lap wrote, so it
 selects the boards whose top-left corner block closes; on lap 1 it closes s1's
 rows above the stop row in columns 0..K, cleared first, frame cells included
 (an annealed border's left column, fixed to row 14, let no band close). It then
-turns the band counter-clockwise and re-grows it with `--finalize_from K
---keep_ring --no_fanout_sort`; depth-first, one board per frame, the chain
+turns the band counter-clockwise and re-grows it exhaustively with
+`--finalize_from K --backtrack_row K --keep_ring --no_fanout_sort` (the same
+boards as a beam, in the same time, nearly all of it the rebuild; the sort
+would triple it and only reorders an exhaustive search); depth-first, one board per frame, the chain
 traced back through board ids. Each produce call starts from a Stage A border
 (`--double_decker ALL`, the best of `ANNEAL_RESTARTS` by `Score_dd`, beamer
 `--lambda_reserve`), a rotations file's next row, or `--random_edges`.

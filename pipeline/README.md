@@ -355,7 +355,7 @@ cells, and none of its sides is a leftover of the beamer's early guesses.
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour, all five clues, K=4
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1  # then dive the jewels
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=2 FREEZE=1 \
-    FIN_STOP_ROW=9 LAP_TIME=480 BANDS_GROWN=8                          # the 2x2 clue blocks frozen too
+    FIN_STOP_ROW=9 LAP_TIME=480                                        # the 2x2 clue blocks frozen too
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db BORDERS=random   # the beamer's sampled borders
 bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl your own boards
 ```
@@ -379,8 +379,15 @@ bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl y
    selects the boards that can.
 2. *Turn* counter-clockwise (`E555_rotate.py 3`): the band becomes rows 0..K.
 3. *Re-grow* with `E555_finalizer --finalize_from K --keep_ring
-   --no_fanout_sort` up to `FIN_STOP_ROW`. `--keep_ring` holds the frame in
-   place, so the ring lap 1 completed is the ring every later lap keeps.
+   --no_fanout_sort` up to `FIN_STOP_ROW`, exhaustively (`--backtrack_row K`:
+   a DFS from the lock, so no beam cuts an option). `--keep_ring` holds the
+   frame in place, so the ring lap 1 completed is the ring every later lap
+   keeps. Measured on 8 real K=4 bands: the exhaustive search found the same
+   20 boards as beams of width 20000 and 200000 (the narrower beam was full
+   on one band), in the same 24 s, nearly all of it the reduced database's
+   rebuild (~3 s a band on 4 cores). The fan-out sort would add 7 s a band,
+   three times the rest, and an exhaustive search finds the same boards
+   without it (`--no_fanout_sort`), only in another order.
 
 A lap picks `BANDS_GROWN x LAP_TRIES` of its bands, most different first
 (`E555_rank.py --diverse`), and grows them `BANDS_GROWN` per finalizer call.
