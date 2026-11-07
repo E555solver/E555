@@ -2,10 +2,10 @@
 # run_whirlpool_jewels.sh -- grow a board from all four sides under one border,
 # keeping a band of it through every turn.
 #
-#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour, all five clues, K=4
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour: all five clues, blocks frozen, K=4
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1  # 10 min, then dive
-#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=2 FREEZE=1 \
-#       FIN_STOP_ROW=9 LAP_TIME=480                                        # the 2x2 clue blocks frozen too
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db FREEZE=0 \
+#       FIN_STOP_ROW=10 LAP_TIME=240                                       # the 2x2 clue blocks re-grown each lap
 #   bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv RUN_DIR=w1      # whirl your boards
 #
 # The beamer grows a board upward from row 0, so its bottom rows were chosen
@@ -13,8 +13,9 @@
 # whirlpool turns the board a quarter turn and re-grows it, so a different side
 # becomes the bottom. This runner looks for JEWELS:
 #
-#   s1   a beamer board, rows 0..BEAM_STOP_ROW complete; whatever it holds
-#        above them in columns 0..K is cleared, and lap 1's band closes it
+#   s1   a beamer board, rows 0..BEAM_STOP_ROW complete, with the annealed
+#        left column; what it holds above them in columns 1..K is cleared, and
+#        lap 1's band closes it
 #   s2   s1 turned counter-clockwise and re-grown to row FIN_STOP_ROW
 #   s3   s2 turned counter-clockwise and re-grown
 #   s4   s3 turned counter-clockwise and re-grown
@@ -31,9 +32,10 @@
 #   close the band     E555_backtracker --stop_column K --with_frame: every exact
 #                      filling of columns 0..K plus the frame. It closes the
 #                      top-left corner block: on lap 1 rows above
-#                      BEAM_STOP_ROW x columns 0..K with the frame still open,
-#                      on laps 2-3 rows above FIN_STOP_ROW x columns 1..K
-#                      under the fixed frame.
+#                      BEAM_STOP_ROW x columns 1..K against the annealed left
+#                      column, building the rest of the frame, on laps 2-3
+#                      rows above FIN_STOP_ROW x columns 1..K under the fixed
+#                      frame.
 #                      Columns K+1..14 are cleared first and lend it their
 #                      pieces; the finalizer frees them anyway. It runs on
 #                      every board the batch or the previous lap wrote:
@@ -65,14 +67,14 @@
 # CLUES: every tool holds all five Eternity II clues (CLUES=all, the default),
 # the centre one (center) or none. Clued boards keep each clue on its own cell
 # through every lap; INPUT boards must carry the clues they are run with.
-# FREEZE=1: the band also fills the five 2x2 clue blocks -- the centre and the
-# four inner corners, rows/columns 1-2 and 13-14 -- and every lap holds them as
-# it holds the frame (finalizer --freeze_clues, searched exhaustively from the
-# lock). The four boards of such a jewel share 80 pieces: the frame and the 20
-# block pieces. A frozen lap re-grows only from a low lock, so FREEZE needs
-# K <= 2: from K = 4 none of 28 lap-1 boards re-grew frozen (they died at rows
-# 5-6, the same bands re-grew unfrozen), and the earlier runner measured a lock
-# at row 3 reaching no row past 8. A frozen lap reaches row 9, not 10.
+# FREEZE=1 (the default): the band also fills the five 2x2 clue blocks -- the
+# centre and the four inner corners, rows/columns 1-2 and 13-14 -- and every
+# lap holds them as it holds the frame (finalizer --freeze_clues). The four
+# boards of such a jewel share 80 pieces: the frame and the 20 block pieces.
+# A frozen lap reaches row 9 rather than 10, hence FIN_STOP_ROW=9. It is the
+# strictest setting: re-growing around the frozen centre block from a lock at
+# row K succeeds less often the higher K is (on 4 cores, no frozen lap re-grew
+# from row 4), so it is meant for long runs on many cores.
 #
 # NEEDS about 8 GB of RAM for the beamer, and DB_FILE: the beamer's 6.4 GB chain
 # database is written there on the first call (~2 min) and loaded in seconds by
@@ -99,15 +101,15 @@ RUN_DIR=whirlpool_jewels
 THREADS=$(nproc)
 DB_FILE=                # the beamer's chain database cache; strongly recommended
 WALL=3600               # seconds to run
-BOARD_TIME=600          # seconds at most per board (its three laps)
+BOARD_TIME=1800         # seconds at most per board (its three laps)
 RNG_SEED=0              # 0 = random, different for every copy started
 INPUT=                  # whirl these boards instead of producing them
 DIVE=0                  # 1 = dive the jewels at the end
 CLUES=all               # none | center | all: the Eternity II clues every tool holds
-FREEZE=0                # 1 = the band also fills the five 2x2 clue blocks and every
-                        # lap holds them, like the frame (needs K <= 2); 0 = off
+FREEZE=1                # 1 = the band also fills the five 2x2 clue blocks and every
+                        # lap holds them, like the frame; 0 = off
 K=4                     # band width: columns 0..K of s_k become rows 0..K of s_k+1
-                        # (the finalizer's --finalize_from); at most 2 with FREEZE
+                        # (the finalizer's --finalize_from); at most 6 with FREEZE
 
 # borders: one per produce call
 BORDERS=anneal          # anneal | random | a rotations file (its next row each call)
@@ -141,8 +143,8 @@ BAND_TIME=15            # seconds per board
 # the re-grow: E555_finalizer --finalize_from K
 BANDS_GROWN=8           # bands per finalizer call
 LAP_TRIES=3             # finalizer calls a lap may make before it gives up
-FIN_STOP_ROW=10         # s2..s4 are re-grown up to this row (frozen: 9)
-LAP_TIME=240            # seconds per finalizer call, shared by its bands (frozen: 480)
+FIN_STOP_ROW=9          # s2..s4 are re-grown up to this row (unfrozen: 10)
+LAP_TIME=480            # seconds per finalizer call, shared by its bands (unfrozen: 240)
 FIN_BOARDS=200          # boards a finalizer call writes: the next lap's pool
 # -----------------------------------------------------------------------------
 for arg in "$@"; do
@@ -179,8 +181,8 @@ done
     die "need BEAM_BACKTRACK < BEAM_STOP_ROW <= 14"
 [ "$FIN_STOP_ROW" -le 14 ] || die "FIN_STOP_ROW is at most 14"
 [ "$K" -ge 1 ] && [ "$K" -lt "$FIN_STOP_ROW" ] || die "need 1 <= K < FIN_STOP_ROW (got K=$K)"
-[ "$FREEZE" = 0 ] || [ "$K" -le 2 ] ||
-    die "with FREEZE, K is at most 2 (a frozen lap re-grows only from a low lock; none did from row 4)"
+[ "$FREEZE" = 0 ] || [ "$K" -le 6 ] ||
+    die "with FREEZE, K is at most 6 (--freeze_clues backtracks from row 6 or lower)"
 [ "$BEAM_MIN_COL" -le "$K" ] || die "need BEAM_MIN_COL <= K (got BEAM_MIN_COL=$BEAM_MIN_COL, K=$K)"
 [ "$BANDS_GROWN" -ge 1 ] && [ "$LAP_TRIES" -ge 1 ] && [ "$FIN_BOARDS" -ge 1 ] && [ "$BANDS" -ge 1 ] ||
     die "BANDS, BANDS_GROWN, LAP_TRIES and FIN_BOARDS must be 1 or more"
@@ -270,16 +272,22 @@ function region_set(line,   x, n, p, c, r, k, s, m) {
 BEGIN { ring_cells() }'
 
 # open_corner IN OUT -- clear the top-left corner the lap-1 band closes: rows
-# above BEAM_STOP_ROW x columns 0..K, the frame cells included. A rotations
-# border fixes the left column up to row 14 and the top-left corner, and no
-# band closed against them (0 of 628 beamer boards, CLUES=all, K=4); cleared,
-# 44 of the 628 got a band. The band puts a cleared clue back on its own cell.
+# above BEAM_STOP_ROW x columns 1..K, top row included. A rotations border's
+# left column and top-left corner stay as annealed, so the bottom row and the
+# whole left column keep their sides; the band then fills the top row and the
+# right column above the stop row from the edges left, which may trade places
+# between those two sides (the backtracker has no side restriction). That
+# costs yield: on 628 beamer boards (CLUES=all, frozen) 1 got a K=4 band with
+# the left column kept, 44 with it cleared. Under BORDERS=random the column
+# above the stop row is the extension's own choice, so it is cleared too. The
+# band puts a cleared clue back on its own cell.
 open_corner() {
-    awk -F, -v s="$BEAM_STOP_ROW" -v kc="$K" 'BEGIN {OFS = ","} !/^[#%]/ && NF {
+    awk -F, -v s="$BEAM_STOP_ROW" -v kc="$K" -v c0="$([ "$BORDERS" = random ] && echo 0 || echo 1)" '
+        BEGIN {OFS = ","} !/^[#%]/ && NF {
         n = NF - 512
         for (p = 1; p <= 256; p++) {
             c = $(n + p) + 0; if (c == 999) continue
-            if (int(c / 16) > s && c % 16 <= kc) $(n + p) = 999
+            if (int(c / 16) > s && c % 16 >= c0 && c % 16 <= kc) $(n + p) = 999
         }
         print }' "$1" > "$2"
 }
