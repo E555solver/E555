@@ -1709,17 +1709,25 @@ Four laps are one full turn. At `T = 11` a lap keeps 72 cells in place (rows
   (`--rotate -1 --rounds 3 --strip_width 4`), then the backtracker's dives.
 
 `pipeline/run_whirlpool_jewels.sh` runs the whirlpool one board at a time under
-one fixed frame. A **jewel** is a beamer board s1 and three clockwise laps
-s2..s4, each re-grown to row 10, all holding the same complete 60-cell frame.
-Each lap keeps only rows 1..BR x columns 1..KC of the turned board (cut 3:4 on
-lap 1; 4:3, then 3:4 on laps 2-3), cuts rows 0..BR with `--with_frame`, and
-re-grows with `--keep_ring --no_fanout_sort`; depth-first, one board per frame
-(rates and the reasons for these choices: pipeline/README.md).
-`CLUES` (default `center`; `all`, `none`) passes the clue flags to all three
-tools. `FREEZE` (on with `CLUES=all`) cuts with `--with_clue_regions` and
-re-grows with `--freeze_clues`, exhaustively from the lock, so a jewel also
-holds the five 2x2 clue blocks; frozen laps reach row 9, not 10 (every search
-complete), so the cuts become 2:4 then 2:3, grown to row 9.
+one fixed frame, keeping a band of the board through every turn. A **jewel**
+is a beamer board s1 and three counter-clockwise laps s2..s4, all holding the
+same complete 60-cell frame, each board's rows 0..K being its parent's columns
+0..K. A lap closes the band before it turns: `E555_backtracker --stop_column K
+--with_frame` fills s_k's columns 0..K and the frame exactly (columns K+1..14
+cleared, their pieces lent), on every board the previous lap wrote, so it
+selects the boards whose top-left corner block closes; on lap 1 the beamer's
+extension (`--backtrack_min_col BEAM_MIN_COL`, default 2) already built s1's
+columns 1..BEAM_MIN_COL, and the band closes the rest of 0..K. It then
+turns the band counter-clockwise and re-grows it with `--finalize_from K
+--keep_ring --no_fanout_sort`; depth-first, one board per frame, the chain
+traced back through board ids. Each produce call starts from a Stage A border
+(`--double_decker ALL`, the best of `ANNEAL_RESTARTS` by `Score_dd`, beamer
+`--lambda_reserve`), a rotations file's next row, or `--random_edges`.
+`CLUES` (default `all`; `center`, `none`) passes the clue flags to all three
+tools. `FREEZE=1` (default) cuts with `--with_clue_regions` and re-grows with
+`--freeze_clues`, exhaustively from the lock (so K <= 6), so a jewel also holds
+the five 2x2 clue blocks; frozen laps reach row 9, not 10 (`FIN_STOP_ROW=9`).
+Settings and the earlier clockwise runner's measurements: pipeline/README.md.
 
 ---
 
