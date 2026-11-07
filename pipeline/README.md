@@ -342,7 +342,7 @@ and keeps the chains that make it -- the jewels:
 
 ```
 s1  beamer board: rows 0..10                                -> close the band, turn counter-clockwise, re-grow -> s2
-s2  rows 0..K = s1's columns 0..K, re-grown to row 9        -> close the band, turn, re-grow -> s3
+s2  rows 0..K = s1's columns 0..K, re-grown to row 10       -> close the band, turn, re-grow -> s3
 s3                                                          -> close the band, turn, re-grow -> s4
 ```
 
@@ -352,10 +352,10 @@ all four sides under one border, consecutive boards share 14 x K interior
 cells, and none of its sides is a leftover of the beamer's early guesses.
 
 ```bash
-bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour, all five clues, blocks frozen
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour, all five clues, K=4
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1  # then dive the jewels
-bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db CLUES=center FREEZE=0 \
-    FIN_STOP_ROW=10 LAP_TIME=90 BANDS_GROWN=2 BOARD_TIME=180           # centre clue only, unfrozen
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=2 FREEZE=1 \
+    FIN_STOP_ROW=9 LAP_TIME=480 BANDS_GROWN=8                          # the 2x2 clue blocks frozen too
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db BORDERS=random   # the beamer's sampled borders
 bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl your own boards
 ```
@@ -403,12 +403,15 @@ them (`BORDERS=w1/borders.csv`).
 
 **Clues.** Every tool holds all five clues by default (`CLUES=all`; `center`,
 `none`). A clued run keeps its own database cache (`E555.db.center`,
-`E555.db.all`). **Frozen blocks** (`FREEZE=1`, the default): the band also
-fills the five 2x2 clue blocks and every lap holds them (`--with_clue_regions`,
-`--freeze_clues`, searched exhaustively from the lock, so K is at most 6), so a
-jewel's boards share the frame, the 20 block pieces and all five clues.
-Frozen laps reach row 9, hence `FIN_STOP_ROW=9`. For an unfrozen run, pass the
-values of the third example above: those the earlier runner measured.
+`E555.db.all`). The clues stay on their own cells through every lap.
+**Frozen blocks** (`FREEZE=1`): the band also fills the five 2x2 clue blocks
+and every lap holds them (`--with_clue_regions`, `--freeze_clues`, searched
+exhaustively from the lock), so a jewel's boards share the frame, the 20 block
+pieces and all five clues. A frozen lap re-grows only from a low lock, so
+`FREEZE=1` needs K <= 2 and the settings of the third example above (row 9,
+longer laps, more bands). From K = 4, none of 28 lap-1 boards re-grew frozen:
+they died at rows 5-6, and the same bands re-grew unfrozen. The earlier runner
+had measured the same: frozen, a lock at row 3 reached no row past 8.
 
 `jewels.log` gives each jewel's frame key and `shared=a/b/c`: the interior
 cells each lap kept from its parent, the measure of what a jewel shares.

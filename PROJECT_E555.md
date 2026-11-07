@@ -1724,9 +1724,10 @@ traced back through board ids. Each produce call starts from a Stage A border
 (`--double_decker ALL`, the best of `ANNEAL_RESTARTS` by `Score_dd`, beamer
 `--lambda_reserve`), a rotations file's next row, or `--random_edges`.
 `CLUES` (default `all`; `center`, `none`) passes the clue flags to all three
-tools. `FREEZE=1` (default) cuts with `--with_clue_regions` and re-grows with
-`--freeze_clues`, exhaustively from the lock (so K <= 6), so a jewel also holds
-the five 2x2 clue blocks; frozen laps reach row 9, not 10 (`FIN_STOP_ROW=9`).
+tools. `FREEZE=1` cuts with `--with_clue_regions` and re-grows with
+`--freeze_clues`, exhaustively from the lock, so a jewel also holds the five 2x2
+clue blocks; a frozen lap re-grows only from a low lock, so it needs K <= 2
+(K = 4, the default, re-grew none of 28 frozen) and reaches row 9, not 10.
 Settings and the earlier clockwise runner's measurements: pipeline/README.md.
 
 ---

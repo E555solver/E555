@@ -2,10 +2,10 @@
 # run_whirlpool_jewels.sh -- grow a board from all four sides under one border,
 # keeping a band of it through every turn.
 #
-#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour, all five clues, blocks frozen
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour, all five clues, K=4
 #   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db WALL=600 DIVE=1  # 10 min, then dive
-#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db CLUES=center FREEZE=0 \
-#       FIN_STOP_ROW=10 LAP_TIME=90 BANDS_GROWN=2 BOARD_TIME=180           # centre clue only, unfrozen
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=2 FREEZE=1 \
+#       FIN_STOP_ROW=9 LAP_TIME=480 BANDS_GROWN=8                          # the 2x2 clue blocks frozen too
 #   bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv RUN_DIR=w1      # whirl your boards
 #
 # The beamer grows a board upward from row 0, so its bottom rows were chosen
@@ -63,12 +63,14 @@
 # CLUES: every tool holds all five Eternity II clues (CLUES=all, the default),
 # the centre one (center) or none. Clued boards keep each clue on its own cell
 # through every lap; INPUT boards must carry the clues they are run with.
-# FREEZE=1 (the default): the band also fills the five 2x2 clue blocks -- the
-# centre and the four inner corners, rows/columns 1-2 and 13-14 -- and every
-# lap holds them as it holds the frame (finalizer --freeze_clues, searched
-# exhaustively from the lock, which needs K <= 6). The four boards of such a
-# jewel share 80 pieces: the frame and the 20 block pieces. A frozen lap
-# reaches row 9 rather than 10, hence FIN_STOP_ROW=9.
+# FREEZE=1: the band also fills the five 2x2 clue blocks -- the centre and the
+# four inner corners, rows/columns 1-2 and 13-14 -- and every lap holds them as
+# it holds the frame (finalizer --freeze_clues, searched exhaustively from the
+# lock). The four boards of such a jewel share 80 pieces: the frame and the 20
+# block pieces. A frozen lap re-grows only from a low lock, so FREEZE needs
+# K <= 2: from K = 4 none of 28 lap-1 boards re-grew frozen (they died at rows
+# 5-6, the same bands re-grew unfrozen), and the earlier runner measured a lock
+# at row 3 reaching no row past 8. A frozen lap reaches row 9, not 10.
 #
 # NEEDS about 8 GB of RAM for the beamer, and DB_FILE: the beamer's 6.4 GB chain
 # database is written there on the first call (~2 min) and loaded in seconds by
@@ -95,15 +97,15 @@ RUN_DIR=whirlpool_jewels
 THREADS=$(nproc)
 DB_FILE=                # the beamer's chain database cache; strongly recommended
 WALL=3600               # seconds to run
-BOARD_TIME=1800         # seconds at most per board (its three laps)
+BOARD_TIME=600          # seconds at most per board (its three laps)
 RNG_SEED=0              # 0 = random, different for every copy started
 INPUT=                  # whirl these boards instead of producing them
 DIVE=0                  # 1 = dive the jewels at the end
 CLUES=all               # none | center | all: the Eternity II clues every tool holds
-FREEZE=1                # 1 = the band also fills the five 2x2 clue blocks and every
-                        # lap holds them, like the frame; 0 = off
+FREEZE=0                # 1 = the band also fills the five 2x2 clue blocks and every
+                        # lap holds them, like the frame (needs K <= 2); 0 = off
 K=4                     # band width: columns 0..K of s_k become rows 0..K of s_k+1
-                        # (the finalizer's --finalize_from); at most 6 with FREEZE
+                        # (the finalizer's --finalize_from); at most 2 with FREEZE
 
 # borders: one per produce call
 BORDERS=anneal          # anneal | random | a rotations file (its next row each call)
@@ -135,11 +137,11 @@ BANDS=60                # fillings kept per board
 BAND_TIME=15            # seconds per board
 
 # the re-grow: E555_finalizer --finalize_from K
-BANDS_GROWN=8           # bands per finalizer call
+BANDS_GROWN=2           # bands per finalizer call (frozen: 8)
 LAP_TRIES=3             # finalizer calls a lap may make before it gives up
-FIN_STOP_ROW=9          # s2..s4 are re-grown up to this row (unfrozen: 10)
+FIN_STOP_ROW=10         # s2..s4 are re-grown up to this row (frozen: 9)
 FIN_WIDTH=20000
-LAP_TIME=480            # seconds per finalizer call (unfrozen: 90)
+LAP_TIME=90             # seconds per finalizer call (frozen: 480)
 FIN_BOARDS=200          # boards a finalizer call writes: the next lap's pool
 # -----------------------------------------------------------------------------
 for arg in "$@"; do
@@ -178,8 +180,8 @@ done
     die "need BEAM_BACKTRACK < BEAM_STOP_ROW <= 14"
 [ "$FIN_STOP_ROW" -le 14 ] || die "FIN_STOP_ROW is at most 14"
 [ "$K" -ge 1 ] && [ "$K" -lt "$FIN_STOP_ROW" ] || die "need 1 <= K < FIN_STOP_ROW (got K=$K)"
-[ "$FREEZE" = 0 ] || [ "$K" -le 6 ] ||
-    die "with FREEZE, K is at most 6 (--freeze_clues backtracks from row 6 or lower)"
+[ "$FREEZE" = 0 ] || [ "$K" -le 2 ] ||
+    die "with FREEZE, K is at most 2 (a frozen lap re-grows only from a low lock; none did from row 4)"
 [ "$BEAM_MIN_COL" -le "$K" ] || die "need BEAM_MIN_COL <= K (got BEAM_MIN_COL=$BEAM_MIN_COL, K=$K)"
 [ "$BANDS_GROWN" -ge 1 ] && [ "$LAP_TRIES" -ge 1 ] && [ "$FIN_BOARDS" -ge 1 ] && [ "$BANDS" -ge 1 ] ||
     die "BANDS, BANDS_GROWN, LAP_TRIES and FIN_BOARDS must be 1 or more"
