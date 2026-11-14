@@ -258,76 +258,84 @@ A classic side score says nothing about whether the inner ring under it can be
 filled. `--double_decker` (sides: comma list of `TOP`, `RIGHT`, `BOTTOM`,
 `LEFT`, or `ALL`; bare = `ALL`) scores each named side by its **two rows**: the
 number of layouts of the 14 edge pieces plus an inner piece under each
-(cols/rows 2..13 of the second ring), chaining legally, drawn from a per-side
-**reserve** of `--decker_reserve K` inner pieces (default 16, 12..32) that the
-search chooses. The corner cells of the second ring belong to fixed 2x2
-**corner blocks** (corner, the two edges beside it, the inner piece diagonal),
-between which each strip runs. Clue pieces are never reserved.
+(cols/rows 2..13 of the second ring), chaining legally. The corner cells of the
+second ring belong to fixed 2x2 **corner blocks** (corner, the two edges beside
+it, the inner piece diagonal), between which each strip runs.
 
-- **Counting** is exact: a memoized walk over (placed-edge mask, used-piece
-  mask, frontier), ~1 ms at K = 24. The result is the side's `Decker=` count.
+- **Count (default: the whole pool).** Every free inner piece may go under
+  every edge: all inner pieces but the five clues and the corner blocks' own.
+  A piece may repeat within a row, which overcounts little with ~190 pieces for
+  12 cells. It is the side's `Decker=` figure, typically 10^6-10^7 on a cold
+  border; a walk over the placed-edge masks, 5-25 ms a side. Nothing is
+  reserved and nothing is marked.
 - **Objective** `Score_dd` = mean over the four sides of each side's log
-  count (the `Decker=` count on two-tall sides, the trail count elsewhere).
-- **Seeding.** For a border, 4 sets of corner blocks are built; for each, every
-  two-tall side's reserve is **peeled** from the free pool: the pieces taking
-  part in the fewest of the pool's layouts are dropped, a share at a time, down
-  to K + 6, then one at a time the piece whose loss costs the exact count
-  least. The best set by `Score_dd` is the start. A peel takes 1-3 s a side and
-  alone beats what the annealing reached from a single grown inner row.
-- **Moves**: reserve swaps (85% biased to pieces that chain with the current
-  reserve), trades between two-tall sides, block changes, edge swaps between
-  sides. `--decker_keep_border` forbids every move that changes a side's edge
-  set, so the output spins equal the input's.
-- **Schedule.** A cold restart first runs the classic walk for
+  count (the `Decker=` count on two-tall sides, the trail count elsewhere),
+  under the side weights. With `ALL` the search maximizes the number of ways
+  the two outer rings can be filled on all four sides.
+- **Moves**: edge swaps between sides and corner-block changes (a new block
+  piece leaves the pool, so every two-tall side is counted again).
+  `--decker_keep_border` forbids every move that changes a side's edge set, so
+  the output spins equal the input's.
+- **Steps and schedule.** A cold restart first runs the classic walk for
   `--decker_warmup` of its steps (default 0.5) to find a feasible border and
-  fixes its corners; the double-decker phase then runs on a schedule probed per
-  restart and printed (`restart N: double-decker schedule T0=... Tf=...`).
-  `--T0/--Tf` set only that phase; a probe on a flat plateau gets
-  `T0 = 0.1, Tf = 0.005`. From a peeled start the probed schedule (`T0`
-  0.05-0.1) is the one to use: `T0` 0.2 and above loses the start. The walk
-  settles within ~30k steps and the border decides the count, so spend the
-  time on restarts: 40k steps each is enough.
+  fixes its corners. The double-decker walk then takes `--decker_steps`, by
+  default a quarter of the steps left (a step is ~9 ms): `--steps 40000` is
+  20000 classic and 5000 double-decker steps, ~22 s a restart. On a warm start
+  it is a quarter of `--steps`. `T0 = 0.3, Tf = 0.01`; `--T0/--Tf` set this
+  phase only.
 
-Measured, cold, 8 restarts, 4 cores (geometric mean of `Decker=` per side):
+Measured, cold, `ALL`, 8 restarts (mean / best `Score_dd`; 15 is ~3.3e6 layouts
+a side, 16 ~8.9e6, 17 ~2.4e7):
 
-| sides, K | before the peel (steps) | with it (steps) | time with it |
-|---|---|---|---|
-| `ALL`, 16 | 4 (100k) | 12-19 (40k) | 36 s |
-| `TOP`, 16 | ~14 (250k) | 45 (30k) | 24 s |
-| `TOP`, 24 | ~140 (250k) | 374, best 1,424 (40k) | 84 s |
+| double-decker steps | `T0` | mean | best | time (4 cores) |
+|---|---|---|---|---|
+| 1000 | 0.3 | 15.16 | 16.17 | 10 s |
+| 5000 | 0.3 | 15.59 | 16.09 | 49 s |
+| 5000 | 0.1 | 15.64 | 16.29 | 51 s |
+| 20000 | 0.3 | 15.81 | 16.75 | 187 s |
 
-On one border with a rich classic top (`TOP=483840`), K = 16: 16 layouts before
-at any step count (the probed `T0` of 0.008 froze the walk after a few
-thousand steps), 672 from the peel, 912-2,304 after 30k steps. A rich classic
-side gives several times the count of a cold run's border (~5,000 trails a
-side), so `--input` of a classic pool is the stronger start when one exists.
+Restarts differ by more (14.5-16.8) than steps buy, so spend the time on
+restarts (24 of 40k steps: mean 15.69, best 16.43, 135 s). A border with a rich classic side starts higher: eight rows of
+`data/annealer_MaxSides.csv` refined with `--input` (2000 steps, 2 restarts)
+reached 15.8-17.4, mean 16.7.
 
-The reserve is larger than the 12-cell strip on purpose: the 12 pieces of one
-layout admit few other layouts, and K = 16 / 20 / 24 gave 45 / 162 / 374 on
-the same cold borders. With all four sides two tall the reserves compete for
-the same pieces (64 of 191 at K = 16), so each side's count is lower than with
-one side alone. A reserved piece that no counted layout uses is not written:
-a side may list and mark fewer than K pieces.
+**`--decker_reserve K`** (12..32) counts each side from a **reserve** of K
+inner pieces the search picks for it, each used at most once, instead of the
+whole pool. The count is exact (a memoized walk over placed-edge mask,
+used-piece mask and frontier, ~1 ms at K = 24) and far smaller: 12-19 a side at
+`ALL`, K = 16; ~45 / ~370 at `TOP`, K = 16 / 24. Use it to name a small set of
+pieces a later stage can hold back (the beamer's `--lambda_reserve`, TOP only).
+
+- Each reserve starts **peeled** from the free pool: the pieces taking part in
+  the fewest of the pool's layouts are dropped, a share at a time, down to
+  K + 6, then one at a time the piece whose loss costs the exact count least;
+  4 sets of corner blocks are tried and the best kept.
+- Moves add reserve swaps and trades between sides; the schedule is probed per
+  restart (`T0` 0.05-0.1) and the walk takes all the steps left.
+- With all four sides the reserves compete for the same pieces (64 of 191 at
+  K = 16). A reserved piece that no counted layout uses is not written, so a
+  side may list fewer than K. `DeckerPool=` gives the whole-pool count beside
+  the reserve's.
 
 Limits: each corner block holds one fixed inner piece, so only the strips
-between blocks are flexible; K stops at 32 because the exact count grows with
-it; clue orientation is not modelled (row 14, cols 2 and 13, sit on the row-13
-clues in two orientations). Downstream, only the beamer's `--lambda_reserve`
-reads a reserve (TOP), and the finalizer keeps a witness's complete rows.
+between blocks are flexible; clue orientation is not modelled (row 14, cols 2
+and 13, sit on the row-13 clues in two orientations); the finalizer keeps a
+witness's complete rows.
 
 **What each border carries:**
 
 - the comment: the classic counts (`TOP=...`), `Score=` (the classic score under
-  the weights in force), `Score_dd=`, `Decker=T/R/B/L` (exact counts, `-` for a
-  classic side), `DeckerPool=` (the count if the whole free pool were allowed,
-  with repeats: an upper bound), and `Board=<name>`, the witness board's id;
-- the rotations row: every reserved piece that some layout uses and every
-  block's inner piece carries
+  the weights in force), `Score_dd=`, `Decker=T/R/B/L` (the counts, `-` for a
+  classic side), `DeckerPool=` (the whole-pool count: the same figure unless a
+  reserve is used), and `Board=<name>`, the witness board's id;
+- the rotations row, with `--decker_reserve` only: every reserved piece that
+  some layout uses and every block's inner piece carries
   its side code in place of spin 0: **1 = TOP** (row 14), **2 = BOTTOM**
   (row 1), **3 = LEFT or RIGHT** (cols 1 and 14);
 - a **witness board** in `--decker_out` (default `<out stem>_decker.csv`), in
   the beamer's board format: the border ring plus one layout of each two-tall
-  side's inner ring. It is a finalizer input (§6.6).
+  side's inner ring (with no reserve, one found in the free pool, every piece
+  used once). It is a finalizer input (§6.6).
 
 Rows with side codes are not turned by `E555_sort_rotations.py` and refused by
 `E555_rotate.py --rotations`.
@@ -360,7 +368,8 @@ in restart order, so the thread count never changes the output.
 | `--tabu N` | 128 | tabu list length (0 = off) |
 | `--fix_corners {0,1,2}` | 0 | 0 random corners, 1 edge-commutativity, 2 corner-commutativity |
 | `--double_decker [SIDES]` | off | two-tall sides (4.5) |
-| `--decker_reserve K` | 16 | reserve per two-tall side, 12..32 (pieces in no layout are dropped) |
+| `--decker_reserve K` | off | count each two-tall side from a reserve of K pieces, 12..32, and mark them |
+| `--decker_steps N` | derived | double-decker steps per restart (4.5) |
 | `--decker_keep_border` | off | keep every side's edge set |
 | `--decker_warmup F` | 0.5 | share of a cold restart spent in the classic walk |
 | `--decker_out FILE` | `<stem>_decker.csv` | witness boards |
@@ -1076,8 +1085,8 @@ reports alive blocks per corner at the stop row and how many boards keep a
 piece-disjoint TL+TR pair. In the backtracker a path ends when neither corner
 stays buildable.
 
-**`--lambda_reserve F`** reads the TOP reserve that Stage A's `--double_decker`
-marked with side code 1 (only on border rows whose `Decker=` shows TOP two
+**`--lambda_reserve F`** reads the TOP reserve that Stage A's `--double_decker
+--decker_reserve K` marked with side code 1 (only on border rows whose `Decker=` shows TOP two
 tall) and charges `F * u_row` per reserve piece a board has placed. Nothing is
 held, and the backtracker and the dives ignore it. Measured (16
 configurations, width 20000, 26 marked pieces): at F = 2 the boards reaching

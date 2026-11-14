@@ -1130,7 +1130,7 @@ pieces = A.read_pieces("data/seed_Edge5.txt")
 pbi = {p.id: p for p in pieces}
 corners, edges = A.classify_boundary_pieces(pieces)
 rows = A.read_rotations("data/annealer_MaxSides.csv")
-cfg = replace(A.AnnealingConfig(), decker_sides=(0, 1, 2, 3))
+cfg = replace(A.AnnealingConfig(), decker_sides=(0, 1, 2, 3), decker_reserve=16)
 ctx = A.decker_context(pbi, corners, edges, cfg)
 
 def exhaustive(s, mids, start, end, reserve):
@@ -1188,7 +1188,8 @@ EOF
     # decker. Rows 0 and 1 are complete, so the finalizer takes it at
     # --finalize_from 1.
     for t in 1 2; do
-        python3 -u "$A" data/seed_Edge5.txt --double_decker --restarts 2 --steps 6000 \
+        python3 -u "$A" data/seed_Edge5.txt --double_decker --decker_reserve 16 \
+            --restarts 2 --steps 6000 \
             --rng_seed 11 --threads "$t" --out "$OUT/decker/cold$t.csv" \
             > "$OUT/decker/cold$t.log" 2>&1 \
             || { cat "$OUT/decker/cold$t.log"; fail "the cold --double_decker run failed"; }
@@ -1208,6 +1209,23 @@ EOF
             || fail "--threads 1 and 2 wrote different ${f}.csv"
     done
     echo "ok: 1 and 2 workers write identical rows and boards"
+
+    # The default, no reserve: every side counted over the whole free pool,
+    # nothing marked; the count is recounted by check_decker.py.
+    for t in 1 2; do
+        python3 -u "$A" data/seed_Edge5.txt --double_decker --restarts 2 --steps 2000 \
+            --rng_seed 11 --threads "$t" --out "$OUT/decker/pool$t.csv" \
+            > "$OUT/decker/pool$t.log" 2>&1 \
+            || { cat "$OUT/decker/pool$t.log"; fail "the whole-pool --double_decker run failed"; }
+    done
+    python3 tests/check_decker.py "$OUT/decker/pool1.csv" "$OUT/decker/pool1_decker.csv" \
+        ALL 1 || fail "the whole-pool double-decker outputs do not check out"
+    for f in pool pool_decker; do
+        cmp -s <(grep -v '^# run' "$OUT/decker/${f/pool/pool1}.csv") \
+               <(grep -v '^# run' "$OUT/decker/${f/pool/pool2}.csv") \
+            || fail "--threads 1 and 2 wrote different whole-pool ${f}.csv"
+    done
+    grep -q "reserve=none" "$OUT/decker/pool1.csv" || fail "the whole-pool run names a reserve"
 
     # The real loader, not a copy of it: the finalizer reads, validates and
     # locks the first witness, then starts building its database -- which is
@@ -1236,7 +1254,7 @@ EOF
 
     # TOP only, refining one row: row 14 is the whole second ring, 14 flags.
     python3 -u "$A" data/seed_Edge5.txt --input data/borders_annealed_fix12.csv --row 4 \
-        --double_decker TOP --restarts 2 --steps 3000 --rng_seed 42 \
+        --double_decker TOP --decker_reserve 16 --restarts 2 --steps 3000 --rng_seed 42 \
         --out "$OUT/decker/top.csv" > "$OUT/decker/top.log" 2>&1 \
         || { cat "$OUT/decker/top.log"; fail "the --double_decker TOP refine failed"; }
     grep -q "2/2 restarts matched or beat the seeded double decker" "$OUT/decker/top.log" \
@@ -1257,7 +1275,7 @@ EOF
     # --decker_keep_border searches the blocks and the reserve only: the spins
     # that come back are the input row's, to the last one.
     python3 -u "$A" data/seed_Edge5.txt --input data/borders_annealed_fix12.csv --row 4 \
-        --double_decker TOP --decker_keep_border --restarts 2 --steps 3000 --rng_seed 42 \
+        --double_decker TOP --decker_reserve 16 --decker_keep_border --restarts 2 --steps 3000 --rng_seed 42 \
         --out "$OUT/decker/keep.csv" > "$OUT/decker/keep.log" 2>&1 \
         || { cat "$OUT/decker/keep.log"; fail "the --decker_keep_border refine failed"; }
     python3 tests/check_decker.py "$OUT/decker/keep.csv" "$OUT/decker/keep_decker.csv" TOP 0 \
@@ -1276,6 +1294,7 @@ EOF
     # input, one row and one board per input row, in input order.
     cp data/borders_annealed_fix12.csv "$OUT/decker/in.csv"
     python3 -u "$A" data/seed_Edge5.txt --input "$OUT/decker/in.csv" --double_decker TOP,LEFT \
+        --decker_reserve 16 \
         --restarts 1 --steps 800 --rng_seed 42 --threads 3 > "$OUT/decker/rows.log" 2>&1 \
         || { cat "$OUT/decker/rows.log"; fail "the whole-file --double_decker run failed"; }
     python3 tests/check_decker.py "$OUT/decker/in_refined.csv" "$OUT/decker/in_refined_decker.csv" \

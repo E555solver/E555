@@ -394,14 +394,13 @@ s4 ends the board.
 
 **Borders.** Each produce call starts from a fresh border.
 - `BORDERS=anneal` (the default) runs Stage A with `--double_decker DD_SIDES`
-  and sorts the borders by `Score_dd`. The defaults (`DD_SIDES=ALL`,
-  `DD_RESERVE=16`, 24 restarts of 40k steps, ~2 min on 4 cores) score all four
-  sides' two outer rings, for a border that grows from every side: 12-19
-  layouts a side. Only the TOP reserve is read downstream (the beamer's
-  `--lambda_reserve`); `RESERVE_F=0` keeps the scoring and holds nothing back.
-  `DD_SIDES=TOP DD_RESERVE=24 DD_W_TOP=3` gives the top side one large reserve
-  instead (~450 layouts a border, ~2000 on the best of 24); `DD_W_TOP` makes
-  `Score_dd` follow it, where at 1 the three classic sides decide the ranking.
+  and sorts the borders by `Score_dd`. The defaults (`DD_SIDES=ALL`, no
+  reserve, 24 restarts of 40k steps, ~2.5 min on 4 cores) maximize the number
+  of ways the two outer rings can be filled on all four sides, counted over
+  every free inner piece: ~6e6 layouts a side on a typical border, ~1.4e7 on
+  the best of 24. `DD_RESERVE=K` (12..32) counts each side from K named pieces
+  instead and marks them; the beamer then spends the TOP ones last
+  (`RESERVE_F`, `--lambda_reserve`).
 - With `CLUES=all`, a 1 s beamer probe (`--lambda_corners`) reads, for each clue
   orientation, the exact catalog of top-left and top-right corner blocks the
   border allows.

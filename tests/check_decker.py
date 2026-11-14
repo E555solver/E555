@@ -14,6 +14,9 @@ flag or ALL). For every rotations row and the witness board beside it, it checks
   - every placed piece fits its cell and faces the frame the way the
     finalizer's fin_load_partial demands, every placed neighbour pair matches,
     and rows 0..FINALIZE_FROM are complete -- so the finalizer will load it;
+  - with no reserve (`reserve  none`, the default) nothing is marked and
+    Decker= is the count over every free inner piece but the clues and the
+    corner blocks' own, repeats allowed; with --decker_reserve:
   - the side codes (spin 1 = TOP, 2 = BOTTOM, 3 = LEFT or RIGHT) mark exactly
     the reserves plus the corner blocks' inner pieces, each with its own side's code (a block
     piece: its row's, 14 -> 1, 1 -> 2), and the board's second-ring pieces all
@@ -100,6 +103,30 @@ def layouts(s, edges, start, end, reserve):
     return go(frozenset(), frozenset(), start[0], start[1])
 
 
+def pool_layouts(s, edges, start, end, free):
+    """The same with no reserve: every piece of `free` may go under every edge,
+    repeats included. A plain memoized search over (placed edges, frontier)."""
+    fits = {}
+    for p in free:
+        for r in range(4):
+            P = A.rotate_sides(pbi[p].sides, r)
+            fits.setdefault((P[s], P[SRC[s]]), []).append(P[DST[s]])
+
+    @lru_cache(maxsize=None)
+    def go(done, frame, inner):
+        if len(done) == len(edges):
+            return 1 if (frame, inner) == end else 0
+        total = 0
+        for i, (fin, fout, inw) in enumerate(edges):
+            if i in done or fin != frame:
+                continue
+            for out in fits.get((inw, inner), ()):
+                total += go(done | {i}, fout, out)
+        return total
+
+    return go(frozenset(), start[0], start[1])
+
+
 for k, ((spins, comment, lineno), line, res_line) in enumerate(zip(rows, boards, reserves)):
     # 1. the comment's classic counts are the spins' own
     state = A._build_run_state(pbi, *A.border_from_spins(pbi, spins), cap, cfg)
@@ -118,7 +145,9 @@ for k, ((spins, comment, lineno), line, res_line) in enumerate(zip(rows, boards,
     assert fields[0] == m_bd.group(1), f"board {k}: id {fields[0]} but comment says {m_bd.group(1)}"
     assert res_line and res_line[0] == fields[0], f"board {k}: no reserve line for {fields[0]}"
     reserve = res_line[1]
-    assert set(reserve) == DD, f"board {k}: reserves for {sorted(reserve)}, sides are {sorted(DD)}"
+    no_reserve = not reserve                    # `reserve  none`: the whole pool is counted
+    assert no_reserve or set(reserve) == DD, \
+        f"board {k}: reserves for {sorted(reserve)}, sides are {sorted(DD)}"
     pos = list(map(int, fields[2:258]))
     rot = list(map(int, fields[258:514]))
     grid, where = {}, {}
@@ -150,14 +179,14 @@ for k, ((spins, comment, lineno), line, res_line) in enumerate(zip(rows, boards,
         for p in rs:
             want_code[p] = {T: 1, B: 2, L: 3, R: 3}[s]
     for cell, b in blocked.items():
-        if b:
+        if b and not no_reserve:
             qr, qc = Q_CELL[cell]
             want_code[where[qr * 16 + qc]] = 1 if qr == 14 else 2
     got_code = {i + 1: spins[i] for i in range(60, 256) if spins[i]}
     assert all(spins[i] in (0, 1, 2, 3) for i in range(60, 256)), f"row {k}: inner spin outside 0..3"
     assert got_code == want_code, \
         f"row {k}: side codes {sorted(got_code.items())[:6]}.. != {sorted(want_code.items())[:6]}.."
-    for s in DD:
+    for s in (() if no_reserve else DD):
         di, dj = INWARD[s]
         for (r, c) in CELLS[s][1:13]:
             assert where[(r + di) * 16 + c + dj] in reserve[s], \
@@ -177,9 +206,15 @@ for k, ((spins, comment, lineno), line, res_line) in enumerate(zip(rows, boards,
         (r0, c0), (r1, c1) = CELLS[s][0], CELLS[s][13]
         start = (cellof(r0, c0)[DST[s]], cellof(r0 + di, c0 + dj)[DST[s]])
         end = (cellof(r1, c1)[SRC[s]], cellof(r1 + di, c1 + dj)[SRC[s]])
-        n = layouts(s, edges, start, end, reserve[s])
+        if no_reserve:
+            qs = {where[qr * 16 + qc] for cell, (qr, qc) in Q_CELL.items() if blocked[cell]}
+            free = [p.id for p in pieces if p.zero_count == 0
+                    and p.id not in A.CLUE_PIECES and p.id not in qs]
+            n = pool_layouts(s, edges, start, end, free)
+        else:
+            n = layouts(s, edges, start, end, reserve[s])
         assert want == str(n), f"row {k}: {A.SIDE_NAMES[s]} Decker={want}, recount gives {n}"
-        assert n >= 1 and float(pool[int(s)]) >= n * 0.999, \
+        assert n >= 1 and float(pool[int(s)]) >= n * 0.99, \
             f"row {k}: {A.SIDE_NAMES[s]} DeckerPool={pool[int(s)]} below Decker={n}"
 print(f"ok: {len(rows)} rows -- classic counts, board ids, reserves, frame, matches, flags "
       f"and Decker= all agree ({sides_arg or 'none'} two tall)")

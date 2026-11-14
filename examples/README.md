@@ -94,8 +94,8 @@ a wide beam guided by the colour heuristic.
   beam's work partition follows the thread count.
 - **Borders.** `tools/E555_sort_rotations.py` orders and turns a Stage A file.
   The annealer refines a chosen row with `--input FILE --row K`, and scores a
-  two-row top with `--double_decker TOP`. The beamer's `--lambda_reserve` then
-  keeps that row's reserve pieces for last.
+  two-row top with `--double_decker TOP`. With `--decker_reserve K` it names K
+  pieces for that row, which the beamer's `--lambda_reserve` keeps for last.
 
 ## 02 -- finalizer
 

@@ -48,9 +48,11 @@
 # <lap-2 band>_<n>.
 #
 # BORDERS: each produce call starts from a fresh border. anneal (the default)
-# runs Stage A with --double_decker DD_SIDES and takes the best by Score_dd
-# whose two top corner blocks exist in some clue orientation (a 1 s beamer
-# probe, CLUES=all); the beamer spends the TOP reserve last (--lambda_reserve).
+# runs Stage A with --double_decker DD_SIDES, which maximizes the ways every
+# side's two outer rings can be filled, and takes the best by Score_dd whose
+# two top corner blocks exist in some clue orientation (a 1 s beamer probe,
+# CLUES=all). With DD_RESERVE the annealer names a reserve per side and the
+# beamer spends the TOP one last (--lambda_reserve).
 # A path takes its next row from that rotations file each call; random uses the
 # beamer's own --random_edges. Every border used is appended to borders.csv.
 #
@@ -112,16 +114,16 @@ K=4                     # band width: columns 0..K of s_k become rows 0..K of s_
 # borders: one per produce call
 BORDERS=anneal          # anneal | random | a rotations file (its next row each call)
 ANNEAL_RESTARTS=24      # Stage A restarts, run in parallel; the best by Score_dd is used
-ANNEAL_STEPS=40000      # steps per restart: the walk settles by ~30k, restarts buy more
-DD_SIDES=ALL            # --double_decker sides: ALL scores every side's two outer rings,
-                        # for a border that grows from all four sides (12-19 layouts a
-                        # side); TOP alone gives one large top reserve instead
-DD_RESERVE=16           # --decker_reserve: inner pieces reserved per two-tall side, 12..32
-                        # (a strip has 12 cells, so fewer cannot be counted)
-DD_W_TOP=1              # --w_top: the top side's weight in Score_dd (1 = every side
-                        # alike; 3 with DD_SIDES=TOP, to rank by the TOP reserve)
-RESERVE_F=2             # beamer --lambda_reserve: cost of placing a TOP reserve piece
-                        # (0 = off; never with BORDERS=random)
+ANNEAL_STEPS=40000      # steps per restart: half a classic warm-up, then 5000 whole-pool
+                        # steps; restarts differ by more than further steps buy
+DD_SIDES=ALL            # --double_decker sides: every side's two outer rings are counted
+                        # over the whole free pool, for a border that grows from all four
+DD_RESERVE=0            # K = 12..32: count each side from a reserve of K pieces instead
+                        # (--decker_reserve), which the annealer marks; 0 = no reserve
+DD_W_TOP=1              # --w_top: the top side's weight in Score_dd (1 = every side alike)
+RESERVE_F=2             # beamer --lambda_reserve: the cost of placing a TOP reserve piece,
+                        # for borders that mark one (DD_RESERVE, or a rotations file);
+                        # 0 = off
 
 # s1: the beamer, then one board per frame, shuffled
 BEAM_WIDTH=10000
@@ -460,9 +462,10 @@ border() {
         random)
             BORDER_ARGS=(--random_edges --samples 0); BORDER_NOTE="random edges"; return ;;
         anneal)
+            local dd=(); [ "$DD_RESERVE" = 0 ] || dd=(--decker_reserve "$DD_RESERVE")
             python3 "$REPO/src/A_border/E555_edge_annealer.py" "$SEED" --out "$d/borders.csv" \
                 --restarts "$ANNEAL_RESTARTS" --steps "$ANNEAL_STEPS" \
-                --double_decker "$DD_SIDES" --decker_reserve "$DD_RESERVE" --w_top "$DD_W_TOP" \
+                --double_decker "$DD_SIDES" "${dd[@]}" --w_top "$DD_W_TOP" \
                 --threads "$THREADS" --rng_seed "$((RNG_SEED + n))" > "$d/anneal.log" 2>&1 ||
                 { BORDER_ARGS=(); BORDER_NOTE="the annealer failed (see $d/anneal.log)"; return; }
             python3 "$TOOLS/E555_sort_rotations.py" "$d/borders.csv" --sort score_dd \
@@ -493,7 +496,8 @@ border() {
     esac
     [ -z "$CORNER_NOTE" ] || BORDER_NOTE="$BORDER_NOTE; $CORNER_NOTE; beamed in orientation pins: $PINS"
     BORDER_ARGS+=(--top_bottoms "$BEAM_BOTTOMS" --tau_bottoms "$BEAM_TAU")
-    [ "$RESERVE_F" = 0 ] || BORDER_ARGS+=(--lambda_reserve "$RESERVE_F")
+    [ "$RESERVE_F" = 0 ] || { [ "$BORDERS" = anneal ] && [ "$DD_RESERVE" = 0 ]; } ||
+        BORDER_ARGS+=(--lambda_reserve "$RESERVE_F")
     [ "$probe" = 0 ] || BORDER_ARGS+=(--lambda_corners "$BEAM_CORNERS")
 }
 
