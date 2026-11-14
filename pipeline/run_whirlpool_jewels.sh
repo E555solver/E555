@@ -2,10 +2,10 @@
 # run_whirlpool_jewels.sh -- re-grow a beamer board from its other three sides
 # under one fixed frame, and keep the boards that make it: the jewels.
 #
-#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour: all five clues, blocks frozen, K=4
-#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3              # a narrower band: more jewels
-#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3 FREEZE=corners  # centre block re-grown
-#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3 DIVE=1       # each jewel dived as it is found
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour: all five clues, blocks frozen, K=3
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=4              # a wider band: more of s1 kept, fewer jewels
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db FREEZE=corners   # centre block re-grown
+#   bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db DIVE=1           # each jewel dived as it is found
 #   bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv RUN_DIR=w1      # whirl your boards
 #
 # The beamer grows a board upward from row 0, so its bottom rows were chosen
