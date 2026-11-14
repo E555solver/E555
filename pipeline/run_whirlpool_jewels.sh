@@ -61,8 +61,8 @@
 # must carry the clues they are run with. FREEZE=1 (the default): the bands
 # also fill the five 2x2 clue blocks -- the centre and the four inner corners
 # -- and every lap holds them like the frame (finalizer --freeze_clues). A
-# frozen lap stops lower the higher K is (FIN_STOP_ROW=auto: 11-K), and K=3
-# finds more jewels than K=4. FREEZE=corners holds only the four corner blocks.
+# frozen lap stops lower the higher K is (FIN_STOP_ROW=auto: 11-K; the default
+# is 9, with K=3). FREEZE=corners holds only the four corner blocks.
 #
 # DIVE=1 finishes each jewel's four boards with E555_diver as soon as it is
 # found: DIVE_DIVES dives and DIVE_POLISH polish rounds (DIVE_COPIES copies),
@@ -108,7 +108,7 @@ CLUES=all               # none | center | all: the Eternity II clues every tool 
 FREEZE=1                # 1 = the band also fills the five 2x2 clue blocks and every
                         # lap holds them, like the frame; corners = the four corner
                         # blocks only, the centre block re-grown every lap; 0 = off
-K=4                     # band width: columns 0..K of s_k become rows 0..K of s_k+1
+K=3                     # band width: columns 0..K of s_k become rows 0..K of s_k+1
                         # (the finalizer's --finalize_from); at most 6 with FREEZE
 
 # borders: one per produce call
@@ -126,15 +126,15 @@ RESERVE_F=2             # beamer --lambda_reserve: the cost of placing a TOP res
                         # 0 = off
 
 # s1: the beamer, then one board per frame, shuffled
-BEAM_WIDTH=10000
-BEAM_STOP_ROW=8         # s1 is complete up to this row
+BEAM_WIDTH=50000
+BEAM_STOP_ROW=10        # s1 is complete up to this row (9 leaves the bands more room)
 BEAM_BACKTRACK=6        # exhaustive from this row (--backtrack_row)
 BEAM_MIN_COL=0          # N > 0: the beamer writes only boards whose columns 1..N grow
                         # whole to row 14 (--backtrack_min_col, 0..K): a pre-filter
                         # for BORDERS=random (a rotations border fixes the left column)
 BEAM_BOTTOMS=0          # bottom orderings tried per border, sampled with BEAM_TAU;
                         # 0 = all, until BEAM_TIME or BEAM_BOARDS (not with random)
-BEAM_COLUMNS=16         # left columns tried per bottom
+BEAM_COLUMNS=50         # left columns tried per bottom
 BEAM_TAU=0.1            # randomness in picking bottoms and columns; 0 = the best-ranked
 BEAM_CORNERS=0.5        # CLUES=all: --lambda_corners; a 1 s probe first reads the
                         # beamer's exact catalog of clued top-corner blocks per clue
@@ -142,18 +142,23 @@ BEAM_CORNERS=0.5        # CLUES=all: --lambda_corners; a 1 s probe first reads t
                         # whose top-left and top-right catalogs are both non-empty
                         # (--pin_clue), one call each; the annealed border used is
                         # the best by Score_dd that has one. 0 = off: one unpinned call
+BEAM_OPTS="--beam_expand 1 --lambda_J 2 --lambda_Mahalanobis 2 --bc_window 7,7 --pool_factor 64 --backtrack_row_factor 4"
+                        # further beamer options: no late widening (the beam ends at
+                        # BEAM_BACKTRACK), heavier closure and Mahalanobis terms, a
+                        # wider completion window and pool, 4 x width roots
 BEAM_BOARDS=2000        # boards per produce call, shared by its beamer calls
 BEAM_TIME=570           # seconds per produce call, shared by its beamer calls
 
 # the band: E555_backtracker --stop_column K before each turn
 BANDS=60                # fillings kept per board
-BAND_TIME=15            # seconds per board
+BAND_TIME=30            # seconds per board
 
 # the re-grow: E555_finalizer --finalize_from K
-BANDS_GROWN=8           # bands per finalizer call
+BANDS_GROWN=16          # bands per finalizer call
 LAP_TRIES=3             # finalizer calls a lap may make before it gives up
-FIN_STOP_ROW=auto       # s2..s4 are re-grown up to this row; auto = 11-K with FREEZE=1
+FIN_STOP_ROW=9          # s2..s4 are re-grown up to this row; auto = 11-K with FREEZE=1
                         # (K=2: 9, K=3: 8, K=4: 7), 9 with FREEZE=corners, 10 unfrozen
+FIN_WIDTH=250000        # finalizer --beam_width
 LAP_TIME=480            # seconds per finalizer call, shared by its bands (unfrozen: 240)
 FIN_BOARDS=200          # boards a finalizer call writes: the next lap's pool
 # -----------------------------------------------------------------------------
@@ -192,9 +197,10 @@ if [ "$FIN_STOP_ROW" = auto ]; then
 fi
 for v in K BOARD_TIME DIVE_DIVES DIVE_POLISH DIVE_COPIES DIVE_REOPEN ANNEAL_RESTARTS ANNEAL_STEPS DD_RESERVE BEAM_MIN_COL BEAM_STOP_ROW BEAM_BACKTRACK \
          BEAM_BOTTOMS BEAM_COLUMNS BEAM_BOARDS BEAM_TIME BANDS BAND_TIME BANDS_GROWN \
-         LAP_TRIES FIN_STOP_ROW LAP_TIME FIN_BOARDS; do
+         LAP_TRIES LAP_TIME FIN_BOARDS FIN_WIDTH BEAM_WIDTH; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
 done
+[[ $FIN_STOP_ROW =~ ^[0-9]+$ ]] || die "FIN_STOP_ROW must be a whole number or auto (got: $FIN_STOP_ROW)"
 for v in BEAM_TAU RESERVE_F BEAM_CORNERS DD_W_TOP; do
     [[ ${!v} =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$v must be a number, 0 or more (got: ${!v})"
 done
@@ -517,7 +523,7 @@ produce() {    # produce N -> queue.csv; NOBORDER=1 when no border was usable
         timeout -k 10 $((t + 60)) "$BIN/E555_beamer" "$SEED" "${BORDER_ARGS[@]}" "${pin_arg[@]}" \
             --top_columns "$BEAM_COLUMNS" --tau_columns "$BEAM_TAU" "${CLUE_ARG[@]}" \
             --beam_width "$BEAM_WIDTH" --backtrack_row "$BEAM_BACKTRACK" --stop_row "$BEAM_STOP_ROW" \
-            --backtrack_min_col "$BEAM_MIN_COL" \
+            --backtrack_min_col "$BEAM_MIN_COL" $BEAM_OPTS \
             --max_emitted "$b" --wall_time "$t" "${db[@]}" \
             --threads "$THREADS" --rng_seed "$((RNG_SEED + $1))" --out_dir "$d/o$pin" --print_cmd \
             > "$d.o$pin.log" 2>&1 || log "[produce] the beamer exited non-zero (see $d.o$pin.log)"
@@ -569,7 +575,7 @@ grow() {
     timeout -k 5 "$(left)" "$BIN/E555_finalizer" "$SEED" "$d/turned.csv" --out_dir "$d/fin" \
         --finalize_from "$K" --stop_row "$FIN_STOP_ROW" --keep_ring --no_fanout_sort \
         "${CLUE_ARG[@]}" "${FREEZE_ARG[@]}" \
-        --backtrack_row "$K" --time_limit "$(( t / nb > 1 ? t / nb : 1 ))" --beam_width 1000 \
+        --backtrack_row "$K" --time_limit "$(( t / nb > 1 ? t / nb : 1 ))" --beam_width "$FIN_WIDTH" \
         --keep_ids --max_per_line "$(( (FIN_BOARDS + nb - 1) / nb ))" --wall_time "$t" \
         --rng_seed "$((RNG_SEED + NB))" --threads "$THREADS" --print_cmd > "$d/fin.log" 2>&1 || true
     : > "$d/next.csv"               # a killed finalizer leaves no outputs.txt

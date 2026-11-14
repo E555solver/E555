@@ -353,10 +353,10 @@ early guesses. s2 and s3 both keep a band of s1 itself, and s4 keeps one of
 s1's top corners through its parent.
 
 ```bash
-bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour: all five clues, blocks frozen, K=4
-bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3              # a narrower band: more jewels
-bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3 DIVE=1       # each jewel dived as it is found
-bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=3 FREEZE=corners  # centre block re-grown
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db                  # an hour: all five clues, blocks frozen, K=3
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db K=4              # a wider band: more of s1 kept, fewer jewels
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db DIVE=1           # each jewel dived as it is found
+bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db FREEZE=corners   # centre block re-grown
 bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db BORDERS=random   # the beamer's sampled borders
 bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl your own boards
 ```
@@ -417,8 +417,8 @@ s4 ends the board.
 - **`FREEZE=1`** (the default) also holds the five 2x2 clue blocks
   (`--with_clue_regions`, `--freeze_clues`). A jewel's boards then share the
   frame, the 20 block pieces and the clues.
-- **A frozen lap stops at `FIN_STOP_ROW=auto`, 11-K**, the rows the frozen
-  centre block leaves it.
+- **A frozen lap** re-grows to `FIN_STOP_ROW=9` by default. `auto` is 11-K,
+  the rows the frozen centre block leaves it (8 at `K=3`).
 - **`FREEZE=corners`** holds only the four corner blocks.
 - **Database.** A clued run keeps its own database cache (`E555.db.center`,
   `E555.db.all`).
@@ -428,8 +428,13 @@ s4 ends the board.
   bigger corner to close. With the blocks frozen, `K=3` finds jewels steadily,
   while at `K=4` most boards stop at lap 2.
 - **The stop row.** The side bands close their corners against s1's own rows,
-  so a lower beamer stop row (`BEAM_STOP_ROW=8`) leaves the corners more
-  pieces.
+  so a lower beamer stop row leaves the corners more pieces. The default is
+  `BEAM_STOP_ROW=10`; 9 is the alternative.
+- **The beamer** runs 50000 wide with `BEAM_OPTS` (`--beam_expand 1
+  --lambda_J 2 --lambda_Mahalanobis 2 --bc_window 7,7 --pool_factor 64
+  --backtrack_row_factor 4`) and tries 50 left columns per bottom; the
+  finalizer's `--beam_width` is `FIN_WIDTH=250000`. A band gets 30 s
+  (`BAND_TIME`) and a lap grows 16 at a time (`BANDS_GROWN`).
 
 **Dives (`DIVE=1`).** `E555_diver` finishes each jewel's four boards as soon as
 the jewel is found:

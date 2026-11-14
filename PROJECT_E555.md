@@ -1752,7 +1752,7 @@ Four laps are one full turn. At `T = 11` a lap keeps 72 cells in place (rows
 
 `pipeline/run_whirlpool_jewels.sh` runs the whirlpool one board at a time under
 one fixed frame. A **jewel** is four boards holding the same complete 60-cell
-frame: a beamer board s1; s2, its left columns 0..K (K=4 by default) turned
+frame: a beamer board s1; s2, its left columns 0..K (K=3 by default) turned
 counter-clockwise to rows 0..K and re-grown; s3, its right columns turned
 clockwise and re-grown; s4, s3's right band turned clockwise or, failing that,
 s2's left band turned counter-clockwise, so s1's top side is its bottom. A band
@@ -1770,7 +1770,7 @@ share. `E555_rank.py` regions given as masks keep one board per frame
 `--double_decker`; with `CLUES=all` a `--lambda_corners` probe picks the clue
 orientations whose two top corner blocks exist. `FREEZE=1` (the default) also
 holds the five 2x2 clue blocks (`--with_clue_regions`, `--freeze_clues`); a
-frozen lap stops at row 11-K. `DIVE=1` finishes each jewel's four boards with
+frozen lap stops at row 9 (`FIN_STOP_ROW`; `auto` = 11-K). `DIVE=1` finishes each jewel's four boards with
 `E555_diver` as it is found. Settings: pipeline/README.md.
 
 ---
