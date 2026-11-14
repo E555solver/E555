@@ -113,12 +113,13 @@ K=4                     # band width: columns 0..K of s_k become rows 0..K of s_
 BORDERS=anneal          # anneal | random | a rotations file (its next row each call)
 ANNEAL_RESTARTS=24      # Stage A restarts, run in parallel; the best by Score_dd is used
 ANNEAL_STEPS=40000      # steps per restart: the walk settles by ~30k, restarts buy more
-DD_SIDES=TOP            # --double_decker sides. TOP: the one reserve a tool reads (the
-                        # beamer), ~450 layouts of rows 14-15 a border and ~2000 on the
-                        # best of 24; ALL: four reserves of 16 with 12-19 layouts each
-DD_RESERVE=24           # --decker_reserve: inner pieces reserved per two-tall side
-DD_W_TOP=3              # --w_top: the top side's weight in Score_dd, so that the
-                        # ranking follows the TOP reserve (1 = every side alike)
+DD_SIDES=ALL            # --double_decker sides: ALL scores every side's two outer rings,
+                        # for a border that grows from all four sides (12-19 layouts a
+                        # side); TOP alone gives one large top reserve instead
+DD_RESERVE=16           # --decker_reserve: inner pieces reserved per two-tall side, 12..32
+                        # (a strip has 12 cells, so fewer cannot be counted)
+DD_W_TOP=1              # --w_top: the top side's weight in Score_dd (1 = every side
+                        # alike; 3 with DD_SIDES=TOP, to rank by the TOP reserve)
 RESERVE_F=2             # beamer --lambda_reserve: cost of placing a TOP reserve piece
                         # (0 = off; never with BORDERS=random)
 
