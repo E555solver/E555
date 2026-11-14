@@ -433,7 +433,7 @@ s4 ends the board.
 - **The beamer** runs 50000 wide with `BEAM_OPTS` (`--beam_expand 1
   --lambda_J 2 --lambda_Mahalanobis 2 --bc_window 7,7 --pool_factor 64
   --backtrack_row_factor 4`) and tries 50 left columns per bottom; the
-  finalizer's `--beam_width` is `FIN_WIDTH=250000`. A band gets 30 s
+  finalizer's `--beam_width` is `FIN_WIDTH=100000`. A band gets 30 s
   (`BAND_TIME`) and a lap grows 16 at a time (`BANDS_GROWN`).
 
 **Dives (`DIVE=1`).** `E555_diver` finishes each jewel's four boards as soon as

@@ -158,7 +158,7 @@ BANDS_GROWN=16          # bands per finalizer call
 LAP_TRIES=3             # finalizer calls a lap may make before it gives up
 FIN_STOP_ROW=9          # s2..s4 are re-grown up to this row; auto = 11-K with FREEZE=1
                         # (K=2: 9, K=3: 8, K=4: 7), 9 with FREEZE=corners, 10 unfrozen
-FIN_WIDTH=250000        # finalizer --beam_width
+FIN_WIDTH=100000        # finalizer --beam_width (pass FIN_WIDTH=N to change it)
 LAP_TIME=480            # seconds per finalizer call, shared by its bands (unfrozen: 240)
 FIN_BOARDS=200          # boards a finalizer call writes: the next lap's pool
 # -----------------------------------------------------------------------------
@@ -805,7 +805,7 @@ whirl_board() {
 
 # ---- main loop -----------------------------------------------------------------------
 log "[cfg] run_dir=$RUN_DIR threads=$THREADS wall=$WALL board_time=$BOARD_TIME rng_seed=$RNG_SEED db_file=${DB_FILE:-<rebuilt each call>}"
-log "[cfg] clues=$CLUES freeze=$FREEZE K=$K borders=$BORDERS beam: stop_row=$BEAM_STOP_ROW min_col=$BEAM_MIN_COL bottoms=$BEAM_BOTTOMS columns=$BEAM_COLUMNS tau=$BEAM_TAU corners=$BEAM_CORNERS; bands: $BANDS per board, $BANDS_GROWN x $LAP_TRIES grown; finalizer: stop_row=$FIN_STOP_ROW lap_time=$LAP_TIME pool=$FIN_BOARDS; dive=$DIVE ($DIVE_DIVES/$DIVE_POLISH x $DIVE_COPIES, reopen ${DIVE_REOPEN} s)"
+log "[cfg] clues=$CLUES freeze=$FREEZE K=$K borders=$BORDERS beam: stop_row=$BEAM_STOP_ROW min_col=$BEAM_MIN_COL bottoms=$BEAM_BOTTOMS columns=$BEAM_COLUMNS tau=$BEAM_TAU corners=$BEAM_CORNERS; bands: $BANDS per board, $BANDS_GROWN x $LAP_TRIES grown; finalizer: stop_row=$FIN_STOP_ROW width=$FIN_WIDTH lap_time=$LAP_TIME pool=$FIN_BOARDS; dive=$DIVE ($DIVE_DIVES/$DIVE_POLISH x $DIVE_COPIES, reopen ${DIVE_REOPEN} s)"
 T0=$SECONDS; NB=0; NJ=0; NP=0; EMPTY=0
 # The regions the tools are asked about (rank --group_box/--complete, diver
 # --holes), as mask files
