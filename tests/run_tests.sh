@@ -1157,6 +1157,7 @@ def exhaustive(s, mids, start, end, reserve):
 
 rng = random.Random(4)
 checked = several = 0
+A.DD_SEED_STARTS = 1          # the seed is only a source of layouts here
 for k in (1, 3, 12):
     st = A.dd_seed(ctx, *A.border_from_spins(pbi, rows[k][0]), random.Random(k), cfg)
     assert st is not None and st.hard == 0.0, f"row {k}: no feasible seed"

@@ -268,6 +268,12 @@ between which each strip runs. Clue pieces are never reserved.
   mask, frontier), ~1 ms at K = 24. The result is the side's `Decker=` count.
 - **Objective** `Score_dd` = mean over the four sides of each side's log
   count (the `Decker=` count on two-tall sides, the trail count elsewhere).
+- **Seeding.** For a border, 4 sets of corner blocks are built; for each, every
+  two-tall side's reserve is **peeled** from the free pool: the pieces taking
+  part in the fewest of the pool's layouts are dropped, a share at a time, down
+  to K + 6, then one at a time the piece whose loss costs the exact count
+  least. The best set by `Score_dd` is the start. A peel takes 1-3 s a side and
+  alone beats what the annealing reached from a single grown inner row.
 - **Moves**: reserve swaps (85% biased to pieces that chain with the current
   reserve), trades between two-tall sides, block changes, edge swaps between
   sides. `--decker_keep_border` forbids every move that changes a side's edge
@@ -277,14 +283,31 @@ between which each strip runs. Clue pieces are never reserved.
   fixes its corners; the double-decker phase then runs on a schedule probed per
   restart and printed (`restart N: double-decker schedule T0=... Tf=...`).
   `--T0/--Tf` set only that phase; a probe on a flat plateau gets
-  `T0 = 0.1, Tf = 0.005`. Measured best range: `T0` 0.03-0.1; 0.3 and above is
-  clearly worse. Run cold restarts at 250k steps or more.
+  `T0 = 0.1, Tf = 0.005`. From a peeled start the probed schedule (`T0`
+  0.05-0.1) is the one to use: `T0` 0.2 and above loses the start. The walk
+  settles within ~30k steps and the border decides the count, so spend the
+  time on restarts: 40k steps each is enough.
+
+Measured, cold, 8 restarts, 4 cores (geometric mean of `Decker=` per side):
+
+| sides, K | before the peel (steps) | with it (steps) | time with it |
+|---|---|---|---|
+| `ALL`, 16 | 4 (100k) | 12-19 (40k) | 36 s |
+| `TOP`, 16 | ~14 (250k) | 45 (30k) | 24 s |
+| `TOP`, 24 | ~140 (250k) | 374, best 1,424 (40k) | 84 s |
+
+On one border with a rich classic top (`TOP=483840`), K = 16: 16 layouts before
+at any step count (the probed `T0` of 0.008 froze the walk after a few
+thousand steps), 672 from the peel, 912-2,304 after 30k steps. A rich classic
+side gives several times the count of a cold run's border (~5,000 trails a
+side), so `--input` of a classic pool is the stronger start when one exists.
 
 The reserve is larger than the 12-cell strip on purpose: the 12 pieces of one
-layout admit few other layouts (24 on a measured strip), while a searched set of
-20 / 24 / 30 admits ~208 / ~256 / ~1,094. With all four sides two tall the
-reserves compete for the same pieces (64 of 191 at K = 16), so each side's count
-is lower than with one side alone.
+layout admit few other layouts, and K = 16 / 20 / 24 gave 45 / 162 / 374 on
+the same cold borders. With all four sides two tall the reserves compete for
+the same pieces (64 of 191 at K = 16), so each side's count is lower than with
+one side alone. A reserved piece that no counted layout uses is not written:
+a side may list and mark fewer than K pieces.
 
 Limits: each corner block holds one fixed inner piece, so only the strips
 between blocks are flexible; K stops at 32 because the exact count grows with
@@ -298,7 +321,8 @@ reads a reserve (TOP), and the finalizer keeps a witness's complete rows.
   the weights in force), `Score_dd=`, `Decker=T/R/B/L` (exact counts, `-` for a
   classic side), `DeckerPool=` (the count if the whole free pool were allowed,
   with repeats: an upper bound), and `Board=<name>`, the witness board's id;
-- the rotations row: every reserved piece and every block's inner piece carries
+- the rotations row: every reserved piece that some layout uses and every
+  block's inner piece carries
   its side code in place of spin 0: **1 = TOP** (row 14), **2 = BOTTOM**
   (row 1), **3 = LEFT or RIGHT** (cols 1 and 14);
 - a **witness board** in `--decker_out` (default `<out stem>_decker.csv`), in
@@ -336,7 +360,7 @@ in restart order, so the thread count never changes the output.
 | `--tabu N` | 128 | tabu list length (0 = off) |
 | `--fix_corners {0,1,2}` | 0 | 0 random corners, 1 edge-commutativity, 2 corner-commutativity |
 | `--double_decker [SIDES]` | off | two-tall sides (4.5) |
-| `--decker_reserve K` | 16 | reserve per two-tall side, 12..32 |
+| `--decker_reserve K` | 16 | reserve per two-tall side, 12..32 (pieces in no layout are dropped) |
 | `--decker_keep_border` | off | keep every side's edge set |
 | `--decker_warmup F` | 0.5 | share of a cold restart spent in the classic walk |
 | `--decker_out FILE` | `<stem>_decker.csv` | witness boards |

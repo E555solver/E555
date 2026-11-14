@@ -93,6 +93,13 @@ DOUBLE DECKER -- two-tall border segments (--double_decker [SIDES])
     that block's edge fixed at its end. The five clue pieces, whose cells lie
     elsewhere, are never reserved.
 
+    Each reserve starts PEELED from the free pool: the pieces that take part
+    in the fewest of the pool's layouts are dropped until K are left, for a
+    few choices of corner blocks, and the best start is kept. A reserved piece
+    that no counted layout uses is not written, so a side may list fewer than
+    K. The walk settles within ~30k steps; more restarts buy more than more
+    steps.
+
     The moves swap reserve pieces (mostly for ones that chain with what is
     already reserved), trade them between sides, change a block, or move edges
     between sides; --decker_keep_border forbids the last, so the spins that
@@ -107,8 +114,8 @@ DOUBLE DECKER -- two-tall border segments (--double_decker [SIDES])
         stay the CLASSIC counts of the spins, so every reader of the file
         reads it as before; Score= is the border's classic score, as in any
         row, and Score_dd= the double-decker objective;
-      - a side code instead of spin 0 on every reserved piece and every
-        block's inner piece: 1 = TOP (row 14), 2 = BOTTOM (row 1), 3 = LEFT or
+      - a side code instead of spin 0 on every reserved piece a layout uses
+        and every block's inner piece: 1 = TOP (row 14), 2 = BOTTOM (row 1), 3 = LEFT or
         RIGHT (columns 1 and 14); a block piece takes its row's code. The
         beamer's --lambda_reserve reads the TOP marks to spend those pieces
         last; every other reader skips inner spins;
@@ -343,6 +350,9 @@ class AnnealingConfig:
     # double-decker phase of a cold restart (None = probed in the worker).
     decker_sides:         Tuple[int, ...] = ()
     decker_reserve:       int = 16
+    # A warm start's seeded DeckerState, built once in the parent (seeding
+    # costs seconds) and handed to every restart of the row.
+    decker_start:         Optional[object] = None
     decker_keep_border:   bool = False
     decker_warmup:        float = 0.5
     block_penalty_weight: float = 10.0
@@ -1396,6 +1406,8 @@ def print_header(pieces: Sequence[Piece], corner_ids: List[int], edge_ids: List[
             if not config.decker_sides and (k.startswith("decker_")
                                             or k == "block_penalty_weight"):
                 continue                    # a classic run's dump stays as it was
+            if k == "decker_start":
+                continue
             if per_row and k in ("T0", "Tf", "start_spins"):
                 v = "<per row>"
             elif k == "start_spins" and v is not None:
@@ -1991,6 +2003,110 @@ def dd_grow(ctx: DeckerContext, st: DeckerState, s: Side, base: List[int],
         res.append(best_p)
     return tuple(res)
 
+def pool_participation(ctx: "DeckerContext", s: Side, middle: Sequence[int],
+                       start: int, end: int, pool: Sequence[int]
+                       ) -> Tuple[int, Dict[int, int]]:
+    """pool_bound over the pieces of `pool` alone, and for each of them the
+    number of those layouts it takes part in (a layout that repeats a piece
+    counts it once per use): a forward and a backward pass over the same
+    (placed-edge mask, node) states. What dd_peel ranks pieces by."""
+    src, dst = DD_SRC[s], DD_DST[s]
+    edges = [(ctx.edge_rot[e][s][src], ctx.edge_rot[e][s][dst], ctx.inward[e]) for e in middle]
+    by: Dict[Tuple[int, int], Dict[int, List[int]]] = {}
+    for p in pool:
+        for iw, si, di in ctx.opts[s][p]:
+            by.setdefault((iw, si), {}).setdefault(di, []).append(p)
+    n = len(edges)
+    full = (1 << n) - 1
+    layers: List[Dict[Tuple[int, int], int]] = [dict() for _ in range(n + 1)]
+    layers[0][(0, start)] = 1
+    for d in range(n):
+        nxt = layers[d + 1]
+        for (m, node), w in layers[d].items():
+            fn, inn = node >> 5, node & 31
+            for i, (ef, et, iw) in enumerate(edges):
+                if m >> i & 1 or ef != fn:
+                    continue
+                for di, ps in by.get((iw, inn), {}).items():
+                    key = (m | 1 << i, (et << 5) | di)
+                    nxt[key] = nxt.get(key, 0) + w * len(ps)
+    total = layers[n].get((full, end), 0)
+    back = {(full, end): 1}
+    acc: Dict[Tuple[int, int, int], int] = defaultdict(int)
+    for d in range(n - 1, -1, -1):
+        here: Dict[Tuple[int, int], int] = {}
+        for (m, node), w in layers[d].items():
+            fn, inn = node >> 5, node & 31
+            ways = 0
+            for i, (ef, et, iw) in enumerate(edges):
+                if m >> i & 1 or ef != fn:
+                    continue
+                for di, ps in by.get((iw, inn), {}).items():
+                    b = back.get((m | 1 << i, (et << 5) | di))
+                    if b:
+                        ways += b * len(ps)
+                        acc[(iw, inn, di)] += w * b
+            if ways:
+                here[(m, node)] = ways
+        back = here
+    part: Dict[int, int] = defaultdict(int)
+    for (iw, si, di), v in acc.items():
+        for p in by[(iw, si)][di]:
+            part[p] += v
+    return total, part
+
+# dd_peel: the share of the pool kept per round while it is large, and how far
+# above K the exact leave-one-out rounds start (each costs one exact count per
+# piece left).
+DD_PEEL_KEEP  = 0.85
+DD_PEEL_EXACT = 6
+DD_PEEL_EXACT_MAX = 30
+
+def dd_peel(ctx: DeckerContext, st: DeckerState, s: Side, k: int
+            ) -> Optional[Tuple[int, ...]]:
+    """A reserve of k pieces for side s, by peeling the free pool: drop the
+    pieces that take part in the fewest of the pool's layouts, a share at a
+    time, then one at a time the piece whose loss costs the exact count least.
+    None when the pool lays the strip out in no way at all.
+
+    Measured on TOP strips of eight borders (K = 16 / 24), against the old
+    seeding (one inner row grown piece by piece) followed by 100k annealing
+    steps: the peel alone, 1-3 s, gave 192 32 18 12 16 3 40 56 / 1215 208 117 39
+    114 5 289 528 layouts where the annealed old seed reached 12-112 / 25-460."""
+    middle = dd_middle(ctx, st, s)
+    k0, k1 = DD_ENDS[s]
+    start, end = dd_endpoint(ctx, st, s, k0), dd_endpoint(ctx, st, s, k1)
+    pool = [p for p in ctx.pool if p not in st.used]
+    exact_at = max(k, min(k + DD_PEEL_EXACT, DD_PEEL_EXACT_MAX))
+    while len(pool) > exact_at:
+        total, part = pool_participation(ctx, s, middle, start, end, pool)
+        if total == 0:
+            return None
+        pool.sort(key=lambda p: (-part.get(p, 0), p))
+        live = sum(1 for p in pool if part.get(p, 0) > 0)
+        keep = min(live, max(exact_at, int(len(pool) * DD_PEEL_KEEP)))
+        pool = pool[:min(keep, len(pool) - 1)]
+    if len(pool) < k:
+        # fewer live pieces than k: fill up with pieces that at least fit an edge
+        spare = [p for p in dd_useful(ctx, st, s) if p not in st.used and p not in pool]
+        spare += [p for p in ctx.pool if p not in st.used and p not in pool and p not in spare]
+        pool += spare[:k - len(pool)]
+    while len(pool) > k:
+        best_j, best_n = 0, -1
+        for j in range(len(pool)):
+            n = ReserveCounter(ctx, s, middle, start, end, pool[:j] + pool[j + 1:]).count()
+            if n > best_n:
+                best_j, best_n = j, n
+        pool.pop(best_j)
+    if ReserveCounter(ctx, s, middle, start, end, pool).count() == 0:
+        return None
+    return tuple(pool)
+
+# Block sets dd_seed builds and peels reserves for; the best by score is the
+# start. The strip's ends are the blocks' inner pieces, and the peeled count
+# swings ~10x with them (192 against 32, 18 against 12 on two borders).
+DD_SEED_STARTS = 4
+
 def dd_seed(ctx: DeckerContext, edge_side: Dict[int, Side],
             corner_pos: Dict[int, Corner], rng: random.Random,
             config: AnnealingConfig) -> Optional[DeckerState]:
@@ -1999,10 +2115,12 @@ def dd_seed(ctx: DeckerContext, edge_side: Dict[int, Side],
     Each side gets a random classic trail; its end arcs become the block edges,
     which therefore meet their corner's frame colours by construction, and q
     comes from the index of pieces whose two faces fit them. Each two-tall
-    side's reserve starts from one inner row that fits its trail (so it counts
-    at least 1) and grows to --decker_reserve by dd_grow. When no attempt
-    succeeds -- the border itself not being a usable one, most often -- blocks
-    and reserves are drawn at random and the search has to repair them."""
+    side's reserve is peeled from the free pool (dd_peel), or, when the peel
+    finds none, grown by dd_grow from one inner row that fits the side's
+    trail. DD_SEED_STARTS such block sets are built and the best kept. When no
+    attempt succeeds -- the
+    border itself not being a usable one, most often -- blocks and reserves
+    are drawn at random and the search has to repair them."""
     seat = {k: pid for pid, k in corner_pos.items()}
     K = config.decker_reserve
     plain = {}
@@ -2020,6 +2138,7 @@ def dd_seed(ctx: DeckerContext, edge_side: Dict[int, Side],
                            edge_side=dict(edge_side), block={}, reserve={}, used=set())
 
     trails: Dict[Side, List[int]] = {}
+    starts: List[DeckerState] = []
     for _ in range(DD_SEED_TRIES):
         trails = {}
         for s in Side:
@@ -2044,28 +2163,35 @@ def dd_seed(ctx: DeckerContext, edge_side: Dict[int, Side],
             q, qr = opts[rng.randrange(len(opts))]
             st.used.add(q)
             st.block[k] = (a, b, q, qr)
-        rows: Dict[Side, List[int]] = {}
-        for s in ctx.dd_sides:
-            if not ok:
-                break
-            ends = []
-            for k in DD_ENDS[s]:
-                g = DD_CORNERS[k]
-                _, _, q, qr = st.block[k]
-                ends.append(ctx.rot[q][qr][g.a_dir if g.a_side == s else g.b_dir])
-            row = dd_fill_strip(ctx, st.used, s, trails[s][1:-1], ends[0], ends[1], rng)
-            if row is None:
-                ok = False
-                break
-            rows[s] = [p for _, p, _ in row]
-            st.used.update(rows[s])
+        # Each reserve is peeled from what the others left, the first side
+        # changing with the start. Where the peel finds nothing, one inner row
+        # under the side's trail is grown instead; a side with neither fails
+        # the attempt.
+        n = len(ctx.dd_sides)
+        for j in range(n if ok else 0):
+            s = ctx.dd_sides[(j + len(starts)) % n]
+            res = dd_peel(ctx, st, s, K)
+            if res is None:
+                ends = []
+                for k in DD_ENDS[s]:
+                    g = DD_CORNERS[k]
+                    _, _, q, qr = st.block[k]
+                    ends.append(ctx.rot[q][qr][g.a_dir if g.a_side == s else g.b_dir])
+                row = dd_fill_strip(ctx, st.used, s, trails[s][1:-1], ends[0], ends[1], rng)
+                if row is None:
+                    ok = False
+                    break
+                res = dd_grow(ctx, st, s, [p for _, p, _ in row], K, rng)
+            st.reserve[s] = res
+            st.used.update(res)
         if not ok:
             continue
-        for s in ctx.dd_sides:
-            st.reserve[s] = dd_grow(ctx, st, s, rows[s], K, rng)
-            st.used.update(st.reserve[s])
         dd_refresh(ctx, st, list(Side), ctx.blocked_corners, config)
-        return st
+        starts.append(st)
+        if len(starts) == DD_SEED_STARTS:
+            break
+    if starts:
+        return max(starts, key=lambda c: (c.hard == 0.0, c.score))
 
     # Repair start: blocks from the trail ends where there are trails, else any
     # edge of the side; q and the reserves at random among fitting pieces.
@@ -2330,15 +2456,22 @@ def dd_best_record(ctx: DeckerContext, st: DeckerState, step: int,
             for s in ctx.dd_sides}
     # Side codes: a reserve takes its side's, a corner block's inner piece the
     # code of the row it sits in (TL/TR on row 14, BL/BR on row 1).
+    # A reserved piece that no counted layout uses is dropped from what is
+    # written: holding it back buys nothing. The count is the same without it.
+    live: Dict[Side, Tuple[int, ...]] = {}
+    for s, r in st.reserve.items():
+        n = st.evals[s].euler_count
+        live[s] = tuple(p for p in r
+                        if dd_counter(ctx, st, s, reserve=[x for x in r if x != p]).count() != n)
     code = {Side.TOP: 1, Side.BOTTOM: 2, Side.LEFT: 3, Side.RIGHT: 3}
-    flags = {p: code[s] for s, r in st.reserve.items() for p in r}
+    flags = {p: code[s] for s, r in live.items() for p in r}
     for k, (_, _, q, _) in st.block.items():
         flags[q] = 1 if k in (Corner.TL, Corner.TR) else 2
     flags = sorted(flags.items())
     return BestRecord(score=st.score, euler_counts=rs.euler_counts(),
                       rot_vec=rotation_vector(ctx.pieces_by_id, rs), step=step,
                       dd_counts=dd_counts(st), board=(pos, rot), flags=tuple(flags),
-                      dd_pool=pool, reserve={s: tuple(sorted(r)) for s, r in st.reserve.items()},
+                      dd_pool=pool, reserve={s: tuple(sorted(r)) for s, r in live.items()},
                       classic_score=rs.score)
 
 def dd_state_str(st: DeckerState, config: AnnealingConfig) -> str:
@@ -2412,8 +2545,8 @@ def anneal_decker_restart(restart: int, pieces_by_id: Dict[int, Piece],
     Cold: a classic walk over the first --decker_warmup of the steps finds a
     usable border, dd_seed builds the double decker on it, and the schedule for
     the rest is probed right here (a cold restart's border is its own, so there
-    is nothing for the parent to decide it from). Warm: the row is seeded the
-    way the parent seeded it to probe, and the parent's T0/Tf are used."""
+    is nothing for the parent to decide it from). Warm: the state the parent
+    seeded to probe (config.decker_start) and the parent's T0/Tf are used."""
     t_start = time.perf_counter()
     log: List[str] = []
     ctx = decker_context(pieces_by_id, corner_ids, edge_ids, config)
@@ -2453,9 +2586,11 @@ def anneal_decker_restart(restart: int, pieces_by_id: Dict[int, Piece],
                 log.append(f"  restart {restart}: double-decker schedule T0={t0:.3g} "
                            f"Tf={tf:.3g} ({'--T0/--Tf' if given else 'probed, ' + kind})")
     else:
-        edge_side, corner_pos = border_from_spins(pieces_by_id, config.start_spins)
-        st = dd_seed(ctx, edge_side, corner_pos,
-                     random.Random(restart_seed(seed, 1)), config)
+        st = config.decker_start
+        if st is None:
+            edge_side, corner_pos = border_from_spins(pieces_by_id, config.start_spins)
+            st = dd_seed(ctx, edge_side, corner_pos,
+                         random.Random(restart_seed(seed, 1)), config)
         steps = config.steps_per_restart
         rng = random.Random(restart_seed(seed, restart))
         t0, tf = config.T0, config.Tf
@@ -3150,10 +3285,10 @@ def decker_warm_plan(config: AnnealingConfig, pieces_by_id: Dict[int, Piece],
                      corner_ids: List[int], edge_ids: List[int],
                      inner_capacity: Counter, t0_given: Optional[float],
                      tf_given: Optional[float]
-                     ) -> Tuple[float, float, List[str], str, Optional[float]]:
-    """A warm start's double decker, seeded exactly as each of its restarts will
-    seed it, and the schedule probed from it: (T0, Tf, header lines, schedule
-    kind, the seed's score when it is a usable witness, else None)."""
+                     ) -> Tuple[float, float, List[str], str, Optional[float], "DeckerState"]:
+    """A warm start's double decker, seeded once for all its restarts, and the
+    schedule probed from it: (T0, Tf, header lines, schedule kind, the seed's
+    score when it is a usable witness, else None, the seeded state)."""
     ctx = decker_context(pieces_by_id, corner_ids, edge_ids, config)
     edge_side, corner_pos = border_from_spins(pieces_by_id, config.start_spins)
     st = dd_seed(ctx, edge_side, corner_pos,
@@ -3169,7 +3304,7 @@ def decker_warm_plan(config: AnnealingConfig, pieces_by_id: Dict[int, Piece],
     head = [f"[cfg] double decker: seeded on this border  {dd_state_str(st, config)}  "
             + (f"score={st.score:.4f}" if baseline is not None
                else f"not yet usable (hard={st.hard:g}); the search repairs it first")]
-    return t0, tf, head + lines, kind, baseline
+    return t0, tf, head + lines, kind, baseline, st
 
 def warm_start_report(path: str, row: int, lineno: int, comment: Optional[str],
                       state: RunState, config: AnnealingConfig,
@@ -3216,6 +3351,9 @@ def warm_start_report(path: str, row: int, lineno: int, comment: Optional[str],
                  "every restart refines this same border")
     return lines, state.score
 
+def _decker_warm_job(job):
+    return decker_warm_plan(*job)
+
 def plan_rows(path: str, rows: Sequence[Tuple[List[int], Optional[str], int]],
               config: AnnealingConfig, pieces_by_id: Dict[int, Piece],
               corner_ids: List[int], edge_ids: List[int], inner_capacity: Counter,
@@ -3228,11 +3366,24 @@ def plan_rows(path: str, rows: Sequence[Tuple[List[int], Optional[str], int]],
     draw the same seeds, which is what makes any row of the result
     reproducible on its own. A row that fails a check stops the run here,
     where it has cost nothing: the probe is ~0.08s a row, and no restart
-    starts until every row has passed."""
+    starts until every row has passed. A double decker's rows are seeded here
+    too, seconds each, so on the worker pool."""
     seed  = config.random_seed
     plans: List[RowPlan] = []
+    cfgs = [replace(config, start_spins=tuple(spins), swap_corners=False)
+            for spins, _, _ in rows]
+    warm: List[tuple] = []
+    if config.decker_sides:
+        jobs = [(cfg, pieces_by_id, corner_ids, edge_ids, inner_capacity, t0_given, tf_given)
+                for cfg in cfgs]
+        workers = min(config.threads or os.cpu_count() or 1, len(jobs))
+        if workers > 1:
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                warm = list(ex.map(_decker_warm_job, jobs))
+        else:
+            warm = [_decker_warm_job(j) for j in jobs]
     for row, (spins, comment, lineno) in enumerate(rows):
-        cfg = replace(config, start_spins=tuple(spins), swap_corners=False)
+        cfg = cfgs[row]
         try:
             state = initial_state(pieces_by_id, corner_ids, edge_ids,
                                   random.Random(restart_seed(seed, 1)), cfg, inner_capacity)
@@ -3243,9 +3394,8 @@ def plan_rows(path: str, rows: Sequence[Tuple[List[int], Optional[str], int]],
         report, baseline = warm_start_report(path, row, lineno, comment,
                                              state, cfg, inner_capacity)
         if cfg.decker_sides:
-            t0, tf, sched, kind, baseline = decker_warm_plan(
-                cfg, pieces_by_id, corner_ids, edge_ids, inner_capacity,
-                t0_given, tf_given)
+            t0, tf, sched, kind, baseline, seeded = warm[row]
+            cfg = replace(cfg, decker_start=seeded)
         else:
             t0, tf, sched, kind = resolve_schedule(
                 cfg, state, pieces_by_id, edge_ids, inner_capacity,
@@ -3379,7 +3529,7 @@ def main(argv=None) -> int:
         blocked = [CORNER_NAMES[k] for k, g in DD_CORNERS.items()
                    if g.a_side in decker_sides or g.b_side in decker_sides]
         header_extra.append(
-            f"[cfg] double decker: {names} two tall, {reserve} inner pieces reserved "
+            f"[cfg] double decker: {names} two tall, up to {reserve} inner pieces reserved "
             f"each; corner blocks at {' '.join(blocked)}"
             + ("; border kept" if args.decker_keep_border else "")
             + ("" if args.input else
@@ -3421,8 +3571,9 @@ def main(argv=None) -> int:
     if decker_sides and start_spins is not None:
         # A warm double decker: seeded here exactly as each restart will seed
         # it, so the schedule and the no-loss baseline are the witness's own.
-        t0, tf, sched_lines, _, baseline = decker_warm_plan(
+        t0, tf, sched_lines, _, baseline, seeded = decker_warm_plan(
             config, pieces_by_id, corner_ids, edge_ids, inner_capacity, args.T0, args.Tf)
+        config = replace(config, decker_start=seeded)
     elif decker_sides:
         # A cold double decker: this schedule is only its classic warm-up's,
         # which has to cross the border's feasibility cliff, so --T0/--Tf do

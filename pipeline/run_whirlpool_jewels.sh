@@ -111,10 +111,14 @@ K=4                     # band width: columns 0..K of s_k become rows 0..K of s_
 
 # borders: one per produce call
 BORDERS=anneal          # anneal | random | a rotations file (its next row each call)
-ANNEAL_RESTARTS=20      # Stage A restarts, run in parallel; the best by Score_dd is used
-ANNEAL_STEPS=250000     # steps per restart
-DD_SIDES=ALL            # --double_decker sides: the second rings the annealer scores
-DD_RESERVE=16           # --decker_reserve: inner pieces reserved per two-tall side
+ANNEAL_RESTARTS=24      # Stage A restarts, run in parallel; the best by Score_dd is used
+ANNEAL_STEPS=40000      # steps per restart: the walk settles by ~30k, restarts buy more
+DD_SIDES=TOP            # --double_decker sides. TOP: the one reserve a tool reads (the
+                        # beamer), ~450 layouts of rows 14-15 a border and ~2000 on the
+                        # best of 24; ALL: four reserves of 16 with 12-19 layouts each
+DD_RESERVE=24           # --decker_reserve: inner pieces reserved per two-tall side
+DD_W_TOP=3              # --w_top: the top side's weight in Score_dd, so that the
+                        # ranking follows the TOP reserve (1 = every side alike)
 RESERVE_F=2             # beamer --lambda_reserve: cost of placing a TOP reserve piece
                         # (0 = off; never with BORDERS=random)
 
@@ -188,7 +192,7 @@ for v in K BOARD_TIME DIVE_DIVES DIVE_POLISH DIVE_COPIES DIVE_REOPEN ANNEAL_REST
          LAP_TRIES FIN_STOP_ROW LAP_TIME FIN_BOARDS; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
 done
-for v in BEAM_TAU RESERVE_F BEAM_CORNERS; do
+for v in BEAM_TAU RESERVE_F BEAM_CORNERS DD_W_TOP; do
     [[ ${!v} =~ ^[0-9]+([.][0-9]+)?$ ]] || die "$v must be a number, 0 or more (got: ${!v})"
 done
 [ "$BEAM_BACKTRACK" -lt "$BEAM_STOP_ROW" ] && [ "$BEAM_STOP_ROW" -le 14 ] ||
@@ -457,7 +461,7 @@ border() {
         anneal)
             python3 "$REPO/src/A_border/E555_edge_annealer.py" "$SEED" --out "$d/borders.csv" \
                 --restarts "$ANNEAL_RESTARTS" --steps "$ANNEAL_STEPS" \
-                --double_decker "$DD_SIDES" --decker_reserve "$DD_RESERVE" \
+                --double_decker "$DD_SIDES" --decker_reserve "$DD_RESERVE" --w_top "$DD_W_TOP" \
                 --threads "$THREADS" --rng_seed "$((RNG_SEED + n))" > "$d/anneal.log" 2>&1 ||
                 { BORDER_ARGS=(); BORDER_NOTE="the annealer failed (see $d/anneal.log)"; return; }
             python3 "$TOOLS/E555_sort_rotations.py" "$d/borders.csv" --sort score_dd \
