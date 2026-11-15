@@ -366,26 +366,33 @@ beamer on it for `BEAM_TIME`.
 - **Many starts, few boards each.** The beam is narrow (`BEAM_WIDTH=1000`), so
   one start (a bottom and a left column) writes few boards and the call's
   boards come from many starts. `BEAM_BOARDS=100000` only protects the disk.
-- **`BEAM_MIN_COL=1`** makes the beamer write only boards whose column 1 grows
-  whole to row 14 against the annealed left column, which a lap-1 band needs.
-  It does not test the right band or the top frame. Raise it towards K for a
-  stricter filter, 0 turns it off.
+- **`BEAM_MIN_COL=3`** makes the beamer write only boards whose columns 1..3
+  grow whole to row 14 against the annealed left column, which is most of what
+  a lap-1 band needs. It does not test the right band or the top frame. A
+  lower value filters less, 0 turns it off.
 - **Distinct boards.** Boards that agree on the frame, both side bands' columns
   and the frozen blocks give the same bands, so one of each is kept.
 - **`PER_FRAME=10`** boards are kept per frame, the most different in the side
   bands' columns (`E555_rank.py --group_box frame --per_group 10
   --group_diverse`).
 - **The band test.** One backtracker call cuts the lap-1 bands of all of them.
-  Every board that has a band is whirled, the most different first; the others
-  are only counted in the log.
+  The boards that have a band are whirled, the most different first; the
+  others are only counted in the log.
+- **`QUEUE=30`** boards per border may reach a finalizer (both side bands
+  exist); then the next border is annealed. A board that fails a band test
+  costs about a second and does not count.
 
 **One lap:**
 
 1. *Close the band.* `E555_backtracker --stop_column K --with_frame` writes
    every exact filling of the band's columns and the frame (`--reverse` for a
    right band). Consecutive fillings differ in a few cells, so it writes
-   5 x `BANDS` per board and the `BANDS` (100) most different in the band's
-   columns are kept (`E555_rank.py --group_id --group_diverse`). With the blocks frozen, it fills the
+   5 x `BANDS` per board and `BANDS` (100) of them are kept. For lap 1 the
+   choice is by what lap 2 starts from, the band's blocks and left frame: as
+   many distinct starts as there are, an equal share of bands each
+   (`E555_rank.py --group_box --group_diverse`). The lap-1 band fixes the frame
+   and the five blocks for every later lap, so its blocks decide whether the
+   right band can close. Later bands are chosen by their own columns. With the blocks frozen, it fills the
    five 2x2 clue blocks too. Each filling closes a top corner block:
    - above `BEAM_STOP_ROW` for laps 1 and 2;
    - above `FIN_STOP_ROW` for lap 3.
@@ -461,7 +468,7 @@ cuts boards to them.
   jewels are that much shorter.
 - **The beamer** runs 1000 wide with `BEAM_OPTS` (`--beam_expand 1
   --lambda_J 2 --lambda_Mahalanobis 2 --bc_window 7,7 --pool_factor 64
-  --backtrack_row_factor 4`) and tries 50 left columns per bottom; the
+  --backtrack_row_factor 1`) and tries 50 left columns per bottom; the
   finalizer's `--beam_width` is `FIN_WIDTH=100000`. A band gets 30 s
   (`BAND_TIME`) and a lap grows 16 at a time (`BANDS_GROWN`).
 

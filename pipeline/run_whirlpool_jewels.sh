@@ -130,8 +130,8 @@ BEAM_WIDTH=1000         # narrow: few boards per start, so a call's boards come 
                         # many starts (bottom x left column)
 BEAM_STOP_ROW=9         # s1 is complete up to this row (8 leaves the bands more room)
 BEAM_BACKTRACK=6        # exhaustive from this row (--backtrack_row)
-BEAM_MIN_COL=1          # N > 0: the beamer writes only boards whose columns 1..N grow
-                        # whole to row 14 (--backtrack_min_col, 0..K): part of what a
+BEAM_MIN_COL=3          # N > 0: the beamer writes only boards whose columns 1..N grow
+                        # whole to row 14 (--backtrack_min_col, 0..K): most of what a
                         # lap-1 band needs, and fewer boards written; 0 = off
 BEAM_BOTTOMS=0          # bottom orderings tried per border, sampled with BEAM_TAU;
                         # 0 = all, until BEAM_TIME or BEAM_BOARDS (not with random)
@@ -143,15 +143,18 @@ BEAM_CORNERS=0.5        # CLUES=all: --lambda_corners; a 1 s probe first reads t
                         # whose top-left and top-right catalogs are both non-empty
                         # (--pin_clue), one call each; the annealed border used is
                         # the best by Score_dd that has one. 0 = off: one unpinned call
-BEAM_OPTS="--beam_expand 1 --lambda_J 2 --lambda_Mahalanobis 2 --bc_window 7,7 --pool_factor 64 --backtrack_row_factor 4"
+BEAM_OPTS="--beam_expand 1 --lambda_J 2 --lambda_Mahalanobis 2 --bc_window 7,7 --pool_factor 64 --backtrack_row_factor 1"
                         # further beamer options: no late widening (the beam ends at
                         # BEAM_BACKTRACK), heavier closure and Mahalanobis terms, a
-                        # wider completion window and pool, 4 x width roots
+                        # wider completion window and pool, 1 x width roots
 BEAM_BOARDS=100000      # boards per produce call, shared by its beamer calls: only a
                         # guard for the disk (about 150 MB, deleted after the call)
+QUEUE=30                # boards per produce call that may reach a finalizer (both side
+                        # bands exist); then the next border. A board that fails a band
+                        # test costs about a second and does not count
 PER_FRAME=10            # boards kept per frame, the most different in the columns the
                         # side bands hold (1..K and 15-K..14)
-BEAM_TIME=570           # seconds per produce call, shared by its beamer calls
+BEAM_TIME=120           # seconds per produce call, shared by its beamer calls
 
 # the band: E555_backtracker --stop_column K before each turn
 BANDS=100               # fillings kept per board: the most different in the band's
@@ -200,7 +203,7 @@ if [ "$FIN_STOP_ROW" = auto ]; then
         *) FIN_STOP_ROW=10 ;;
     esac
 fi
-for v in PER_FRAME K BOARD_TIME DIVE_DIVES DIVE_POLISH DIVE_COPIES DIVE_REOPEN ANNEAL_RESTARTS ANNEAL_STEPS DD_RESERVE BEAM_MIN_COL BEAM_STOP_ROW BEAM_BACKTRACK \
+for v in QUEUE PER_FRAME K BOARD_TIME DIVE_DIVES DIVE_POLISH DIVE_COPIES DIVE_REOPEN ANNEAL_RESTARTS ANNEAL_STEPS DD_RESERVE BEAM_MIN_COL BEAM_STOP_ROW BEAM_BACKTRACK \
          BEAM_BOTTOMS BEAM_COLUMNS BEAM_BOARDS BEAM_TIME BANDS BAND_TIME BANDS_GROWN \
          LAP_TRIES LAP_TIME FIN_BOARDS FIN_WIDTH BEAM_WIDTH; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
@@ -797,12 +800,25 @@ whirl_board() {
     if [ ! -s "bands1/$id.csv" ]; then
         log "[board $nb] reached s1; last: lap 1: no band (the frame and columns 0..$K do not close) (0 s)"; return
     fi
-    # the BANDS most different of this board's lap-1 bands (their ids are
-    # already <board>.<n>)
-    rank_to "bands1/$id.csv" "$BOARD_DIR/b1pick.csv" --diverse "$BANDS" --diversity_box "$MASKS/left.csv" &&
-        mv "$BOARD_DIR/b1pick.csv" "bands1/$id.csv"
-    if ! side_bands "bands1/$id.csv" || ! whirl 1 "$BOARD_DIR/l1.csv" left lap1; then
-        log "[board $nb] reached s$DEEPEST; last: $WHY ($((SECONDS - t0)) s)"; return
+    # BANDS of this board's lap-1 bands. Lap 2 starts from a band's blocks and
+    # left frame (masks/start.csv), so first as many distinct starts as there
+    # are, an equal share of bands each, the most different in the left columns;
+    # then, if still too many, the most different starts.
+    local ns=1 b=$BOARD_DIR/b1
+    if rank_to "bands1/$id.csv" "$b.one.csv" --group_box "$MASKS/start.csv" --per_group 1; then
+        ns=$(count_boards "$b.one.csv")
+        rank_to "bands1/$id.csv" "$b.per.csv" --group_box "$MASKS/start.csv" \
+            --per_group $(( BANDS / ns > 1 ? BANDS / ns : 1 )) --group_diverse \
+            --diversity_box "$MASKS/left.csv" &&
+            rank_to "$b.per.csv" "$b.pick.csv" --diverse "$BANDS" --diversity_box "$MASKS/start.csv" &&
+            mv "$b.pick.csv" "bands1/$id.csv"
+    fi
+    if ! side_bands "bands1/$id.csv"; then
+        log "[board $nb] reached s1; last: $WHY; $ns start(s) ($((SECONDS - t0)) s)"; return
+    fi
+    NBOTH=$((NBOTH + 1))
+    if ! whirl 1 "$BOARD_DIR/l1.csv" left lap1; then
+        log "[board $nb] reached s$DEEPEST; last: $WHY; $ns start(s) ($((SECONDS - t0)) s)"; return
     fi
     # The tree, from s4 back, by the ids alone: a band is <the board it was cut
     # from>.<n>, a re-grown board <its band>.<n>, a paired lap-1 band <lap-2
@@ -845,8 +861,8 @@ whirl_board() {
 
 # ---- main loop -----------------------------------------------------------------------
 log "[cfg] run_dir=$RUN_DIR threads=$THREADS wall=$WALL board_time=$BOARD_TIME rng_seed=$RNG_SEED db_file=${DB_FILE:-<rebuilt each call>}"
-log "[cfg] clues=$CLUES freeze=$FREEZE K=$K borders=$BORDERS beam: stop_row=$BEAM_STOP_ROW min_col=$BEAM_MIN_COL per_frame=$PER_FRAME bottoms=$BEAM_BOTTOMS columns=$BEAM_COLUMNS tau=$BEAM_TAU corners=$BEAM_CORNERS; bands: $BANDS per board, $BANDS_GROWN x $LAP_TRIES grown; finalizer: stop_row=$FIN_STOP_ROW width=$FIN_WIDTH lap_time=$LAP_TIME pool=$FIN_BOARDS; dive=$DIVE ($DIVE_DIVES/$DIVE_POLISH x $DIVE_COPIES, reopen ${DIVE_REOPEN} s)"
-T0=$SECONDS; NB=0; NJ=0; NP=0; EMPTY=0
+log "[cfg] clues=$CLUES freeze=$FREEZE K=$K borders=$BORDERS beam: stop_row=$BEAM_STOP_ROW min_col=$BEAM_MIN_COL per_frame=$PER_FRAME queue=$QUEUE bottoms=$BEAM_BOTTOMS columns=$BEAM_COLUMNS tau=$BEAM_TAU corners=$BEAM_CORNERS; bands: $BANDS per board, $BANDS_GROWN x $LAP_TRIES grown; finalizer: stop_row=$FIN_STOP_ROW width=$FIN_WIDTH lap_time=$LAP_TIME pool=$FIN_BOARDS; dive=$DIVE ($DIVE_DIVES/$DIVE_POLISH x $DIVE_COPIES, reopen ${DIVE_REOPEN} s)"
+T0=$SECONDS; NB=0; NJ=0; NP=0; EMPTY=0; NBOTH=0
 # The regions the tools are asked about (rank --group_box/--complete, diver
 # --holes), as mask files
 MASKS=$RUN_DIR/masks; mkdir -p "$MASKS"
@@ -858,6 +874,7 @@ mask "$MASKS/frame.csv" "$FRAME"                                   # PER_FRAME b
 SIDES="(c >= 1 && c <= $K || c >= 15 - $K && c <= 14)"
 mask "$MASKS/sides.csv" "$FRAME || $SIDES || $FROZEN && $BLOCKS"   # what the laps see of s1
 mask "$MASKS/bandbox.csv" "r >= 1 && r <= 14 && $SIDES"            # both side bands, for diversity
+mask "$MASKS/start.csv" "$FRAME && c <= $K || $FROZEN && $BLOCKS"  # what lap 2 starts from
 mask "$MASKS/left.csv"  "c <= $K"                                  # a left band's columns
 mask "$MASKS/right.csv" "c >= 15 - $K"                             # a right band's columns
 mask "$MASKS/held.csv"  "$BLOCKS"                                  # the frozen blocks
@@ -891,7 +908,7 @@ while [ $((SECONDS - T0)) -lt "$WALL" ]; do
         # a round whose annealed borders all lack a usable corner is not a
         # broken beamer: the next round anneals afresh
         [ "$NOBORDER" = 0 ] || continue
-        log "[produce $NP] $PRODUCED boards written, $NDISTINCT distinct for the laps, $nk kept (at most $PER_FRAME per frame); $NBANDED with a lap-1 band, whirled ($((SECONDS - T0)) s)"
+        log "[produce $NP] $PRODUCED boards written, $NDISTINCT distinct for the laps, $nk kept (at most $PER_FRAME per frame); $NBANDED with a lap-1 band ($((SECONDS - T0)) s)"
     fi
     # only boards with a lap-1 band are whirled (lap1_bands cut queue.csv to them)
     nq=$([ "$nk" = 0 ] && echo 0 || count_boards queue.csv)
@@ -899,11 +916,12 @@ while [ $((SECONDS - T0)) -lt "$WALL" ]; do
         EMPTY=$((EMPTY + 1)); [ "$EMPTY" -lt 20 ] && continue
         log "20 empty produce calls in a row: stopping"; break
     fi
-    EMPTY=0
-    for ((i = 1; i <= nq && SECONDS - T0 < WALL; i++)); do
+    EMPTY=0; NBOTH=0; nj=$NJ
+    for ((i = 1; i <= nq && SECONDS - T0 < WALL && NBOTH < QUEUE; i++)); do
         NB=$((NB + 1)); nth_board queue.csv "$i" > board.csv
         whirl_board "$NB" board.csv
     done
+    log "[produce $NP] done: $((i - 1)) of $nq boards tried, $NBOTH with both bands, $((NJ - nj)) jewel(s) ($((SECONDS - T0)) s)"
 done
 rm -rf boards bands1 board.csv queue.csv
 log "[done] $NB boards, $NJ jewels in $((SECONDS - T0)) s -> $RUN_DIR/jewels.csv"
