@@ -366,8 +366,8 @@ beamer on it for `BEAM_TIME`.
 - **Many starts, few boards each.** The beam is moderate (`BEAM_WIDTH=10000`, 2 x width roots), so
   one start (a bottom and a left column) writes few boards and the call's
   boards come from many starts. `BEAM_BOARDS=100000` only protects the disk.
-- **`BEAM_MIN_COL=3`** makes the beamer write only boards whose columns 1..3
-  grow whole to row 14 against the annealed left column, which is most of what
+- **`BEAM_MIN_COL=2`** makes the beamer write only boards whose columns 1..2
+  grow whole to row 14 against the annealed left column, which is much of what
   a lap-1 band needs. It does not test the right band or the top frame. A
   lower value filters less, 0 turns it off.
 - **Distinct boards.** Boards that agree on the frame, both side bands' columns

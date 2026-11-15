@@ -130,8 +130,8 @@ BEAM_WIDTH=10000        # moderate: a start writes few boards, so a call's board
                         # many starts (bottom x left column)
 BEAM_STOP_ROW=9         # s1 is complete up to this row (8 leaves the bands more room)
 BEAM_BACKTRACK=6        # exhaustive from this row (--backtrack_row)
-BEAM_MIN_COL=3          # N > 0: the beamer writes only boards whose columns 1..N grow
-                        # whole to row 14 (--backtrack_min_col, 0..K): most of what a
+BEAM_MIN_COL=2          # N > 0: the beamer writes only boards whose columns 1..N grow
+                        # whole to row 14 (--backtrack_min_col, 0..K): much of what a
                         # lap-1 band needs, and fewer boards written; 0 = off
 BEAM_BOTTOMS=0          # bottom orderings tried per border, sampled with BEAM_TAU;
                         # 0 = all, until BEAM_TIME or BEAM_BOARDS (not with random)
