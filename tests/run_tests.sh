@@ -320,7 +320,14 @@ step_rank() {
     [ "$(grep -c . "$OUT/rank_c1.csv")" = 2 ] && [ "$(grep -c . "$OUT/rank_c2.csv")" = 1 ] &&
         cmp -s "$OUT/rank_c2.csv" data/board_example_462.csv \
         || fail "--complete did not keep exactly the boards that place the whole region"
-    echo "ok: a mask region equals its rectangle; --complete drops the board with a hole"
+    # --group_diverse: of three boards with one id, two of them identical, the
+    # two kept are the ones that differ, not the best two.
+    cat data/board_example_462.csv "$OUT/rank_two.csv" > "$OUT/rank_three.csv"
+    python3 tools/E555_rank.py "$OUT/rank_three.csv" --group_id --per_group 2 --group_diverse \
+        --quiet --out "$OUT/rank_gd.csv" 2> /dev/null
+    [ "$(grep -c . "$OUT/rank_gd.csv")" = 2 ] && grep -qxFf "$OUT/rank_holed.csv" "$OUT/rank_gd.csv" \
+        || fail "--group_diverse did not keep the two different boards of the group"
+    echo "ok: a mask region equals its rectangle; --complete drops the board with a hole; --group_diverse keeps a group's most different"
 }
 
 # A quarter-turn must move the board without changing it: same breaks, same

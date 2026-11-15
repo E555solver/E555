@@ -340,7 +340,7 @@ re-grows it from each of its other sides, and keeps the four boards that make
 it, a **jewel**:
 
 ```
-s1  beamer board, rows 0..8, annealed bottom and left column
+s1  beamer board, up to row BEAM_STOP_ROW, annealed bottom and left column
 s2  lap 1: s1's left band (columns 0..K)       turned counter-clockwise, re-grown
 s3  lap 2: s1's right band (columns 15-K..15)  turned clockwise, re-grown
 s4  lap 3: s3's right band turned clockwise, or else s2's left band turned
@@ -361,11 +361,31 @@ bash pipeline/run_whirlpool_jewels.sh DB_FILE=E555.db BORDERS=random   # the bea
 bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl your own boards
 ```
 
+**Choosing the s1 boards.** One produce call anneals a border and runs the
+beamer on it for `BEAM_TIME`.
+- **Many starts, few boards each.** The beam is narrow (`BEAM_WIDTH=1000`), so
+  one start (a bottom and a left column) writes few boards and the call's
+  boards come from many starts. `BEAM_BOARDS=100000` only protects the disk.
+- **`BEAM_MIN_COL=1`** makes the beamer write only boards whose column 1 grows
+  whole to row 14 against the annealed left column, which a lap-1 band needs.
+  It does not test the right band or the top frame. Raise it towards K for a
+  stricter filter, 0 turns it off.
+- **Distinct boards.** Boards that agree on the frame, both side bands' columns
+  and the frozen blocks give the same bands, so one of each is kept.
+- **`PER_FRAME=10`** boards are kept per frame, the most different in the side
+  bands' columns (`E555_rank.py --group_box frame --per_group 10
+  --group_diverse`).
+- **The band test.** One backtracker call cuts the lap-1 bands of all of them.
+  Every board that has a band is whirled, the most different first; the others
+  are only counted in the log.
+
 **One lap:**
 
 1. *Close the band.* `E555_backtracker --stop_column K --with_frame` writes
-   every exact filling of the band's columns and the frame, up to `BANDS` per
-   board (`--reverse` for a right band). With the blocks frozen, it fills the
+   every exact filling of the band's columns and the frame (`--reverse` for a
+   right band). Consecutive fillings differ in a few cells, so it writes
+   5 x `BANDS` per board and the `BANDS` (100) most different in the band's
+   columns are kept (`E555_rank.py --group_id --group_diverse`). With the blocks frozen, it fills the
    five 2x2 clue blocks too. Each filling closes a top corner block:
    - above `BEAM_STOP_ROW` for laps 1 and 2;
    - above `FIN_STOP_ROW` for lap 3.
@@ -380,9 +400,16 @@ bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl y
      bands and paired bands traces a jewel back to s1.
    - `--max_per_line` gives each band an equal share of `FIN_BOARDS`.
 
-Each lap tries up to `LAP_TRIES` groups of `BANDS_GROWN` bands, the most
-different first (`E555_rank.py --diverse`). The search is depth-first: the first
-s4 ends the board.
+Each lap tries up to `LAP_TRIES` groups of `BANDS_GROWN` bands (3 x 16 = 48
+bands, one finalizer call of up to `LAP_TIME` per group), the most different
+in the band's columns first (`E555_rank.py --diverse --diversity_box`). A group
+that re-grows goes on to the next lap; if that lap fails, the next group is
+tried. The search is depth-first: the first s4 ends the board.
+
+The regions the tools are asked about are 16x16 mask files in `RUN_DIR/masks`:
+`E555_rank.py` groups, compares and tests boards on them (`--group_box`,
+`--diversity_box`, `--complete`) and `E555_diver --holes MASK --end_dive 0`
+cuts boards to them.
 
 **s1's two side bands** share only the frame and the clue blocks.
 - Lap 2's bands are cut from s1 with a lap-1 band's frame left of column K+1,
@@ -417,7 +444,7 @@ s4 ends the board.
 - **`FREEZE=1`** (the default) also holds the five 2x2 clue blocks
   (`--with_clue_regions`, `--freeze_clues`). A jewel's boards then share the
   frame, the 20 block pieces and the clues.
-- **A frozen lap** re-grows to `FIN_STOP_ROW=9` by default. `auto` is 11-K,
+- **A frozen lap** re-grows to `FIN_STOP_ROW=8` by default. `auto` is 11-K,
   the rows the frozen centre block leaves it (8 at `K=3`).
 - **`FREEZE=corners`** holds only the four corner blocks.
 - **Database.** A clued run keeps its own database cache (`E555.db.center`,
@@ -429,8 +456,10 @@ s4 ends the board.
   while at `K=4` most boards stop at lap 2.
 - **The stop row.** The side bands close their corners against s1's own rows,
   so a lower beamer stop row leaves the corners more pieces. The default is
-  `BEAM_STOP_ROW=10`; 9 is the alternative.
-- **The beamer** runs 50000 wide with `BEAM_OPTS` (`--beam_expand 1
+  `BEAM_STOP_ROW=9`; 8 closes more corners and hands the laps a shorter s1.
+  The finalizer stops at row 8: a lower row re-grows more boards, and the
+  jewels are that much shorter.
+- **The beamer** runs 1000 wide with `BEAM_OPTS` (`--beam_expand 1
   --lambda_J 2 --lambda_Mahalanobis 2 --bc_window 7,7 --pool_factor 64
   --backtrack_row_factor 4`) and tries 50 left columns per bottom; the
   finalizer's `--beam_width` is `FIN_WIDTH=100000`. A band gets 30 s

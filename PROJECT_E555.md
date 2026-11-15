@@ -1752,26 +1752,10 @@ Four laps are one full turn. At `T = 11` a lap keeps 72 cells in place (rows
 
 `pipeline/run_whirlpool_jewels.sh` runs the whirlpool one board at a time under
 one fixed frame. A **jewel** is four boards holding the same complete 60-cell
-frame: a beamer board s1; s2, its left columns 0..K (K=3 by default) turned
-counter-clockwise to rows 0..K and re-grown; s3, its right columns turned
-clockwise and re-grown; s4, s3's right band turned clockwise or, failing that,
-s2's left band turned counter-clockwise, so s1's top side is its bottom. A band
-is an exact filling by `E555_backtracker --stop_column K --with_frame`
-(`--reverse` for a right one; the other inner columns cleared, their pieces
-lent) that closes a top corner block. s1's two bands are cut separately and
-share only the frame and the clue blocks. Each band is turned and re-grown
-exhaustively with `E555_finalizer --finalize_from K --backtrack_row K
---keep_ring`; `--keep_ids` names each board after its band, which traces a
-jewel back to s1, and `--max_per_line` gives every band of a call an equal
-share. `E555_rank.py` regions given as masks keep one board per frame
-(`--group_box`), test that the four boards hold one frame (`--complete`,
-`--group_box`) and count what they share (`--diversity_box`); `E555_diver
---holes MASK --end_dive 0` cuts boards to a region. Borders come from Stage A's
-`--double_decker`; with `CLUES=all` a `--lambda_corners` probe picks the clue
-orientations whose two top corner blocks exist. `FREEZE=1` (the default) also
-holds the five 2x2 clue blocks (`--with_clue_regions`, `--freeze_clues`); a
-frozen lap stops at row 9 (`FIN_STOP_ROW`; `auto` = 11-K). `DIVE=1` finishes each jewel's four boards with
-`E555_diver` as it is found. Settings: pipeline/README.md.
+frame: a beamer board s1 and three boards re-grown from its left band, its
+right band and its top side, so each side of s1 is the bottom of one of them.
+Borders come from Stage A's `--double_decker`. Its laps, settings and files:
+pipeline/README.md.
 
 ---
 
@@ -2321,9 +2305,10 @@ the identifier third; the run ends with the min/max/mean/std/median score), plus
   them canonically with the score recomputed. `--diverse K` picks K boards
   farthest-first on cell agreement; `--max_agree P` drops near-duplicates;
   `--diversity_box` and `--diversity_metric {cells,fraction}` set where and how
-  agreement is measured. `--group_box` / `--unique` group boards by a region's
-  (or the whole board's) contents and keep `--per_group` per group before
-  ranking; `--border_only` keeps boards with a clean complete border,
+  agreement is measured. `--group_box` / `--unique` / `--group_id` group boards by a region's
+  (or the whole board's) contents, or by id, and keep `--per_group` per group
+  before ranking (`--group_diverse`: the most different in `--diversity_box`,
+  not the best); `--border_only` keeps boards with a clean complete border,
   `--complete REGION` those that place every cell of a region. A region
   (`--group_box`, `--diversity_box`, `--complete`) is a rectangle
   `R0:R1,C0:C1` or a 16x16 0/1 mask file in the `--holes` format.

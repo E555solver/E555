@@ -1800,8 +1800,12 @@ static void reserve_row(uint32_t row, const char *comment, const uint8_t spins[N
         if (*d == '/') d++;
     }
     if (n != 4 || !two[0]) return;
-    bool coded = false;
-    for (int i = 0; i < EXPECTED_INNER; i++) coded |= spins[g_inner_ids[i]] >= 2;
+    bool coded = false, marked = false;
+    for (int i = 0; i < EXPECTED_INNER; i++) {
+        coded |= spins[g_inner_ids[i]] >= 2;
+        marked |= spins[g_inner_ids[i]] != 0;
+    }
+    if (!marked) return;                 /* counted over the whole pool: no reserve */
     if ((two[1] || two[2] || two[3]) && !coded) {
         printf("[reserve] border row %u: marks from an older --double_decker with another "
                "two-tall side -- the TOP reserve cannot be told apart, so it is not tracked\n", row);

@@ -125,13 +125,14 @@ RESERVE_F=2             # beamer --lambda_reserve: the cost of placing a TOP res
                         # for borders that mark one (DD_RESERVE, or a rotations file);
                         # 0 = off
 
-# s1: the beamer, then one board per frame, shuffled
-BEAM_WIDTH=50000
-BEAM_STOP_ROW=10        # s1 is complete up to this row (9 leaves the bands more room)
+# s1: the beamer, then at most PER_FRAME boards per frame
+BEAM_WIDTH=1000         # narrow: few boards per start, so a call's boards come from
+                        # many starts (bottom x left column)
+BEAM_STOP_ROW=9         # s1 is complete up to this row (8 leaves the bands more room)
 BEAM_BACKTRACK=6        # exhaustive from this row (--backtrack_row)
-BEAM_MIN_COL=0          # N > 0: the beamer writes only boards whose columns 1..N grow
-                        # whole to row 14 (--backtrack_min_col, 0..K): a pre-filter
-                        # for BORDERS=random (a rotations border fixes the left column)
+BEAM_MIN_COL=1          # N > 0: the beamer writes only boards whose columns 1..N grow
+                        # whole to row 14 (--backtrack_min_col, 0..K): part of what a
+                        # lap-1 band needs, and fewer boards written; 0 = off
 BEAM_BOTTOMS=0          # bottom orderings tried per border, sampled with BEAM_TAU;
                         # 0 = all, until BEAM_TIME or BEAM_BOARDS (not with random)
 BEAM_COLUMNS=50         # left columns tried per bottom
@@ -146,17 +147,21 @@ BEAM_OPTS="--beam_expand 1 --lambda_J 2 --lambda_Mahalanobis 2 --bc_window 7,7 -
                         # further beamer options: no late widening (the beam ends at
                         # BEAM_BACKTRACK), heavier closure and Mahalanobis terms, a
                         # wider completion window and pool, 4 x width roots
-BEAM_BOARDS=2000        # boards per produce call, shared by its beamer calls
+BEAM_BOARDS=100000      # boards per produce call, shared by its beamer calls: only a
+                        # guard for the disk (about 150 MB, deleted after the call)
+PER_FRAME=10            # boards kept per frame, the most different in the columns the
+                        # side bands hold (1..K and 15-K..14)
 BEAM_TIME=570           # seconds per produce call, shared by its beamer calls
 
 # the band: E555_backtracker --stop_column K before each turn
-BANDS=60                # fillings kept per board
+BANDS=100               # fillings kept per board: the most different in the band's
+                        # columns of the 5 x BANDS the backtracker finds
 BAND_TIME=30            # seconds per board
 
 # the re-grow: E555_finalizer --finalize_from K
 BANDS_GROWN=16          # bands per finalizer call
 LAP_TRIES=3             # finalizer calls a lap may make before it gives up
-FIN_STOP_ROW=9          # s2..s4 are re-grown up to this row; auto = 11-K with FREEZE=1
+FIN_STOP_ROW=8          # s2..s4 are re-grown up to this row; auto = 11-K with FREEZE=1
                         # (K=2: 9, K=3: 8, K=4: 7), 9 with FREEZE=corners, 10 unfrozen
 FIN_WIDTH=100000        # finalizer --beam_width (pass FIN_WIDTH=N to change it)
 LAP_TIME=480            # seconds per finalizer call, shared by its bands (unfrozen: 240)
@@ -195,7 +200,7 @@ if [ "$FIN_STOP_ROW" = auto ]; then
         *) FIN_STOP_ROW=10 ;;
     esac
 fi
-for v in K BOARD_TIME DIVE_DIVES DIVE_POLISH DIVE_COPIES DIVE_REOPEN ANNEAL_RESTARTS ANNEAL_STEPS DD_RESERVE BEAM_MIN_COL BEAM_STOP_ROW BEAM_BACKTRACK \
+for v in PER_FRAME K BOARD_TIME DIVE_DIVES DIVE_POLISH DIVE_COPIES DIVE_REOPEN ANNEAL_RESTARTS ANNEAL_STEPS DD_RESERVE BEAM_MIN_COL BEAM_STOP_ROW BEAM_BACKTRACK \
          BEAM_BOTTOMS BEAM_COLUMNS BEAM_BOARDS BEAM_TIME BANDS BAND_TIME BANDS_GROWN \
          LAP_TRIES LAP_TIME FIN_BOARDS FIN_WIDTH BEAM_WIDTH; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
@@ -289,11 +294,18 @@ open_corner() {
         --threads "$THREADS" > "${2%.csv}.log" 2>&1 || : > "$2"
 }
 
-# one_per_frame IN OUT -- the best board of each distinct frame
-one_per_frame() {
-    : > "$2"
+# pick_boards IN OUT -- the boards the laps get: one of each that differ in
+# what the laps see (the frame, both side bands' columns, the frozen blocks:
+# masks/sides.csv; NDISTINCT), then at most PER_FRAME per frame, the most
+# different in the side bands' columns (masks/bandbox.csv)
+pick_boards() {
+    : > "$2"; NDISTINCT=0
     [ "$(count_boards "$1")" -gt 0 ] || return 0
-    rank_to "$1" "$2" --group_box "$MASKS/frame.csv" --per_group 1 || [ -f "$2" ] || : > "$2"
+    rank_to "$1" "$2.distinct" --group_box "$MASKS/sides.csv" --per_group 1 || : > "$2.distinct"
+    NDISTINCT=$(count_boards "$2.distinct")
+    [ "$NDISTINCT" -gt 0 ] || return 0
+    rank_to "$2.distinct" "$2" --group_box "$MASKS/frame.csv" --per_group "$PER_FRAME" \
+        --group_diverse --diversity_box "$MASKS/bandbox.csv" || [ -f "$2" ] || : > "$2"
 }
 
 # overlay BANDS BOARDS OUT [SEED] -- every line of BANDS, keeping its own
@@ -410,7 +422,15 @@ cap()  { local a=$1 b; b=$(left); echo $(( a < b ? a : b )); }   # min(a, time l
 # frame (FREEZE: and the clue blocks). Each band gets the id <board id>.<n>,
 # so the board it was cut from is its id up to the last dot. The other inner
 # columns are cleared and lend their pieces. Most corners have no filling,
-# and mrv proves that fastest. LIMIT caps the whole call, in seconds.
+# and mrv proves that fastest. Consecutive fillings differ in a few cells, so
+# the backtracker writes 5 x BANDS per board and the BANDS most different in the
+# band's columns are kept. LIMIT caps the whole call, in seconds.
+# pick_bands FILE SIDE -- cut FILE to the BANDS most different fillings of
+# each board (boards share an id) in the band's columns
+pick_bands() {
+    rank_to "$1" "$1.kept" --group_id --per_group "$BANDS" --group_diverse \
+        --diversity_box "$MASKS/$2.csv" && mv "$1.kept" "$1" || rm -f "$1.kept"
+}
 cut_bands() {
     local pool=$1 out=$2 limit=$3 bt=${2%.csv}.bt.csv f rev=() suf=
     [ "$4" = left ] || { rev=(--reverse); suf=_rev; }
@@ -418,17 +438,21 @@ cut_bands() {
     timeout -k 5 "$limit" "$BIN/E555_backtracker" "$SEED" "$pool" "$bt" \
         --stop_column "$K" "${rev[@]}" --with_frame "${REGION_ARG[@]}" "${CLUE_ARG[@]}" \
         --order mrv --break_mode any --breaks 0 \
-        --max_emitted "$BANDS" --time_limit "$BAND_TIME" --threads "$THREADS" \
+        --max_emitted "$((5 * BANDS))" --time_limit "$BAND_TIME" --threads "$THREADS" \
         --print_cmd > "${bt%.csv}.log" 2>&1 || true
     f=$bt.stop_col$K$suf.csv
     : > "$out"
+    # RAW=1 (lap1_bands, every board of a produce call at once): the choice
+    # is left to whirl_board, one board at a time
+    [ ! -s "$f" ] || [ -n "${RAW:-}" ] || pick_bands "$f" "$4"
     [ ! -s "$f" ] || awk -F, 'BEGIN {OFS = ","} !/^[#%]/ && NF {$1 = $1 "." (++n[$1]); print}' "$f" > "$out"
     rm -f "$bt" "$bt".*
 }
 
-# ---- produce: a border, beamer boards, one per frame, and their lap-1 bands -----
+# ---- produce: a border, beamer boards, PER_FRAME per frame, their lap-1 bands ----
 # Consecutive beamer boards differ in a few interior cells and share their ring,
-# so lap 1 would find the same frame again; one board per frame avoids that.
+# so lap 1 would find the same bands again; pick_boards keeps the ones that
+# differ where the bands are.
 
 # probe_corners FILE ROW DIR -- the beamer's exact catalog of top-left and
 # top-right corner blocks for border ROW of FILE, per clue orientation (the
@@ -512,7 +536,7 @@ produce() {    # produce N -> queue.csv; NOBORDER=1 when no border was usable
     rm -rf "$d"; mkdir "$d"
     [ -z "$DB_FILE" ] || db=(--db_file "$DB_FILE")
     border "$1" "$d"
-    PRODUCED=0; NOBORDER=0; : > queue.csv; : > "$d/all.csv"
+    PRODUCED=0; NDISTINCT=0; NOBORDER=0; : > queue.csv; : > "$d/all.csv"
     [ "${#BORDER_ARGS[@]}" -gt 0 ] || { NOBORDER=1; return; }    # keeps $d/anneal.log
     # one beamer call per clue orientation to beam, sharing BEAM_TIME and
     # BEAM_BOARDS; one unpinned call when no orientation was chosen
@@ -531,25 +555,37 @@ produce() {    # produce N -> queue.csv; NOBORDER=1 when no border was usable
         [ ! -s "$d/o$pin/outputs.txt" ] || xargs -r cat < "$d/o$pin/outputs.txt" >> "$d/all.csv" 2> /dev/null || :
     done
     open_corner "$d/all.csv" "$d/open.csv"
-    one_per_frame "$d/open.csv" "$d/one.csv"
+    pick_boards "$d/open.csv" "$d/picked.csv"
     PRODUCED=$(count_boards "$d/all.csv")
-    shuf --random-source=<(yes "$RNG_SEED.$1") "$d/one.csv" > "$d/shuf.csv"
-    tag_ids "$d/shuf.csv" queue.csv "q$1_"
+    tag_ids "$d/picked.csv" queue.csv "q$1_"
     rm -rf "$d"
 }
 
 # lap1_bands -- the lap-1 bands of every board in queue.csv, in one backtracker
-# call (one board per thread), split by board id into bands1/<id>.csv
+# call (one board per thread), split by board id into bands1/<id>.csv; queue.csv
+# is then cut to the boards that have a band, the most different in the side
+# bands' columns first (farthest-first over the first 2000; the rest follow)
 lap1_bands() {
     local t=$(( WALL - (SECONDS - T0) ))
     rm -rf bands1; mkdir bands1
-    cut_bands queue.csv bands1.csv "$t" left
+    RAW=1 cut_bands queue.csv bands1.csv "$t" left
     awk -F, '!/^[#%]/ && NF {
         id = $1; sub(/\.[0-9]+$/, "", id)
         if (id != last) { if (f) close(f); last = id; f = "bands1/" id ".csv" }
         print >> f }' bands1.csv
     NBANDED=$(find bands1 -name '*.csv' | wc -l)
     rm -f bands1.csv
+    find bands1 -name '*.csv' | sed 's|.*/||; s|\.csv$||' > banded.txt
+    select_ids banded.txt queue.csv > banded.csv
+    if [ "$NBANDED" -gt 2 ] &&
+       rank_to banded.csv ordered.csv --diverse $(( NBANDED - 1 < 2000 ? NBANDED - 1 : 2000 )) \
+           --diversity_box "$MASKS/bandbox.csv"; then
+        cut -d, -f1 ordered.csv > ordered.txt
+        { cat ordered.csv; awk -F, 'FILENAME == ARGV[1] { k[$1]; next } !($1 in k)' ordered.txt banded.csv; } > queue.csv
+    else
+        cp banded.csv queue.csv
+    fi
+    rm -f banded.txt banded.csv ordered.csv ordered.txt
 }
 
 # ---- one lap ----------------------------------------------------------------------
@@ -672,7 +708,7 @@ whirl() {
     fi
     [ "$(count_boards "$bands")" -gt 0 ] || { WHY="$label: no band (no corner closes)"; return 1; }
     python3 "$TOOLS/E555_rank.py" "$bands" --seed_file "$SEED" --diverse $(( BANDS_GROWN * LAP_TRIES )) \
-        --out "$d/picked.csv" > /dev/null 2>&1 || cp "$bands" "$d/picked.csv"
+        --diversity_box "$MASKS/$side.csv" --out "$d/picked.csv" > /dev/null 2>&1 || cp "$bands" "$d/picked.csv"
     n=$(count_boards "$d/picked.csv")
     for ((g = 1; (g - 1) * BANDS_GROWN < n; g++)); do
         [ "$(left)" -gt 10 ] || { WHY="out of time"; return 1; }
@@ -761,6 +797,10 @@ whirl_board() {
     if [ ! -s "bands1/$id.csv" ]; then
         log "[board $nb] reached s1; last: lap 1: no band (the frame and columns 0..$K do not close) (0 s)"; return
     fi
+    # the BANDS most different of this board's lap-1 bands (their ids are
+    # already <board>.<n>)
+    rank_to "bands1/$id.csv" "$BOARD_DIR/b1pick.csv" --diverse "$BANDS" --diversity_box "$MASKS/left.csv" &&
+        mv "$BOARD_DIR/b1pick.csv" "bands1/$id.csv"
     if ! side_bands "bands1/$id.csv" || ! whirl 1 "$BOARD_DIR/l1.csv" left lap1; then
         log "[board $nb] reached s$DEEPEST; last: $WHY ($((SECONDS - t0)) s)"; return
     fi
@@ -805,7 +845,7 @@ whirl_board() {
 
 # ---- main loop -----------------------------------------------------------------------
 log "[cfg] run_dir=$RUN_DIR threads=$THREADS wall=$WALL board_time=$BOARD_TIME rng_seed=$RNG_SEED db_file=${DB_FILE:-<rebuilt each call>}"
-log "[cfg] clues=$CLUES freeze=$FREEZE K=$K borders=$BORDERS beam: stop_row=$BEAM_STOP_ROW min_col=$BEAM_MIN_COL bottoms=$BEAM_BOTTOMS columns=$BEAM_COLUMNS tau=$BEAM_TAU corners=$BEAM_CORNERS; bands: $BANDS per board, $BANDS_GROWN x $LAP_TRIES grown; finalizer: stop_row=$FIN_STOP_ROW width=$FIN_WIDTH lap_time=$LAP_TIME pool=$FIN_BOARDS; dive=$DIVE ($DIVE_DIVES/$DIVE_POLISH x $DIVE_COPIES, reopen ${DIVE_REOPEN} s)"
+log "[cfg] clues=$CLUES freeze=$FREEZE K=$K borders=$BORDERS beam: stop_row=$BEAM_STOP_ROW min_col=$BEAM_MIN_COL per_frame=$PER_FRAME bottoms=$BEAM_BOTTOMS columns=$BEAM_COLUMNS tau=$BEAM_TAU corners=$BEAM_CORNERS; bands: $BANDS per board, $BANDS_GROWN x $LAP_TRIES grown; finalizer: stop_row=$FIN_STOP_ROW width=$FIN_WIDTH lap_time=$LAP_TIME pool=$FIN_BOARDS; dive=$DIVE ($DIVE_DIVES/$DIVE_POLISH x $DIVE_COPIES, reopen ${DIVE_REOPEN} s)"
 T0=$SECONDS; NB=0; NJ=0; NP=0; EMPTY=0
 # The regions the tools are asked about (rank --group_box/--complete, diver
 # --holes), as mask files
@@ -814,7 +854,12 @@ FRAME='(r == 0 || r == 15 || c == 0 || c == 15)'
 BLOCKS="((r == 1 || r == 2 || r == 13 || r == 14) && (c == 1 || c == 2 || c == 13 || c == 14) || $FROZEN_CENTRE && (r == 7 || r == 8) && (c == 7 || c == 8))"
 FROZEN=$([ "$FREEZE" = 0 ] && echo 0 || echo 1)
 C0=$([ "$BORDERS" = random ] && echo 0 || echo 1)
-mask "$MASKS/frame.csv" "$FRAME"                                   # one board per frame
+mask "$MASKS/frame.csv" "$FRAME"                                   # PER_FRAME boards per frame
+SIDES="(c >= 1 && c <= $K || c >= 15 - $K && c <= 14)"
+mask "$MASKS/sides.csv" "$FRAME || $SIDES || $FROZEN && $BLOCKS"   # what the laps see of s1
+mask "$MASKS/bandbox.csv" "r >= 1 && r <= 14 && $SIDES"            # both side bands, for diversity
+mask "$MASKS/left.csv"  "c <= $K"                                  # a left band's columns
+mask "$MASKS/right.csv" "c >= 15 - $K"                             # a right band's columns
 mask "$MASKS/held.csv"  "$BLOCKS"                                  # the frozen blocks
 mask "$MASKS/jewel.csv" "$FRAME || $FROZEN && $BLOCKS"             # what a jewel shares
 mask "$MASKS/open.csv"  "r > $BEAM_STOP_ROW && (c >= $C0 && c <= $K || c >= 15 - $K && c <= 14)"
@@ -835,22 +880,24 @@ while [ $((SECONDS - T0)) -lt "$WALL" ]; do
     if [ -n "$INPUT" ]; then
         [ "$NP" = 0 ] || break                  # INPUT: one pass over its boards
         NP=1; tag_ids "$INPUT" queue.csv "in_"
-        nq=$(count_boards queue.csv)
+        nk=$(count_boards queue.csv)
         lap1_bands
-        log "[input] $nq boards, $NBANDED with a lap-1 band ($((SECONDS - T0)) s)"
+        log "[input] $nk boards, $NBANDED with a lap-1 band ($((SECONDS - T0)) s)"
     else
         NP=$((NP + 1)); produce "$NP"
-        nq=$(count_boards queue.csv)
-        [ "$nq" = 0 ] || lap1_bands
+        nk=$(count_boards queue.csv)
+        [ "$nk" = 0 ] || lap1_bands
         log "[produce $NP] border: $BORDER_NOTE"
         # a round whose annealed borders all lack a usable corner is not a
         # broken beamer: the next round anneals afresh
         [ "$NOBORDER" = 0 ] || continue
-        log "[produce $NP] $nq of the $PRODUCED boards written: one per frame; $NBANDED with a lap-1 band ($((SECONDS - T0)) s)"
+        log "[produce $NP] $PRODUCED boards written, $NDISTINCT distinct for the laps, $nk kept (at most $PER_FRAME per frame); $NBANDED with a lap-1 band, whirled ($((SECONDS - T0)) s)"
     fi
-    if [ "$nq" = 0 ]; then
-        EMPTY=$((EMPTY + 1)); [ "$EMPTY" -lt 2 ] && continue
-        log "two empty produce calls in a row: stopping"; break
+    # only boards with a lap-1 band are whirled (lap1_bands cut queue.csv to them)
+    nq=$([ "$nk" = 0 ] && echo 0 || count_boards queue.csv)
+    if [ "$nk" = 0 ]; then
+        EMPTY=$((EMPTY + 1)); [ "$EMPTY" -lt 20 ] && continue
+        log "20 empty produce calls in a row: stopping"; break
     fi
     EMPTY=0
     for ((i = 1; i <= nq && SECONDS - T0 < WALL; i++)); do

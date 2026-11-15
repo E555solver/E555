@@ -73,6 +73,11 @@ STRUCTURAL GROUPING  (--group_box, --per_group, --unique)
         --group_box 4:11,4:15       W4 rounds-3 CW retained core
         --group_box frame.csv       one representative per frame (a mask)
         --unique                    exact whole-board deduplication
+        --group_id                  group by the board id (field 1) instead
+
+    `--group_diverse` changes which N a group keeps: not its best N, but N
+    chosen farthest-first in `--diversity_box` (its best board first), so a
+    group is represented by members that differ where it matters.
 
     REGION, here and for --diversity_box and --complete, is an inclusive
     rectangle R0:R1,C0:C1 or a 16x16 0/1 mask file in the --holes format
@@ -441,7 +446,7 @@ def fingerprint(line, cells=None):
 
 
 def read_boards(paths, seed, skipped, progress_every=0, group_cells=None,
-                complete_cells=None):
+                complete_cells=None, group_id=False):
     """Yield one light record per board row of every input file.
 
     The record keeps the input LINE, not the parsed field list and not the
@@ -488,7 +493,8 @@ def read_boards(paths, seed, skipped, progress_every=0, group_cells=None,
                 n += 1
                 if progress_every and n % progress_every == 0:
                     print(f"[rank] measured {n} boards", file=sys.stderr)
-                extra = {"group": region_key(pos, rot, group_cells)} if group_cells else {}
+                extra = ({"group": cid} if group_id else
+                         {"group": region_key(pos, rot, group_cells)} if group_cells else {})
                 if complete_cells is not None:
                     placed = {cell for cell in pos if cell != 999}
                     extra["complete"] = all(cell in placed for cell in complete_cells)
@@ -624,10 +630,33 @@ def collect(records, keys, top):
     return [r for _, r in sorted(heap, reverse=True)]
 
 
-def collect_grouped(records, keys, per_group):
-    """Keep the best `per_group` records for every exact structural group."""
+def collect_grouped(records, keys, per_group, diverse=None):
+    """Keep the best `per_group` records for every exact structural group.
+
+    With `diverse` = (cells, metric), a group keeps `per_group` members chosen
+    farthest-first in those cells, its best-ranked board first (--group_diverse).
+    """
     groups = {}
     seen = 0
+    if diverse is not None:
+        for seq, r in enumerate(records):
+            seen += 1
+            groups.setdefault(r["group"], []).append((sort_key_of(keys, r, seq), r))
+        kept = []
+        for members in groups.values():
+            members.sort(key=lambda m: m[0])
+            g = [r for _, r in members]
+            if len(g) > per_group:
+                g = select_diverse(g, per_group, diverse[0], diverse[1])
+            kept.extend(g)
+        for r in kept:                       # a later --diverse measures afresh
+            r.pop("fp", None)
+            r.pop("agree", None)
+        kept.sort(key=lambda r: sort_key_of(keys, r, r["row"]))
+        print(f"[group] kept {len(kept)} of {seen} boards from {len(groups)} exact "
+              f"group(s), at most {per_group} per group, the most different",
+              file=sys.stderr)
+        return kept
     for seq, r in enumerate(records):
         seen += 1
         nk = tuple(-x for x in sort_key_of(keys, r, seq))
@@ -737,7 +766,8 @@ def check_memory(paths, args, group_cells=None):
     every input row is its own group. Account for that rather than claiming the
     later --top makes the grouping pass bounded.
     """
-    grouping = group_cells is not None
+    grouping = group_cells is not None or args.group_id
+    group_cells = group_cells or ()
     if args.top > 0 and not grouping:
         return
     size = sum(Path(p).stat().st_size for p in paths)
@@ -819,6 +849,13 @@ def main():
     ap.add_argument("--unique", action="store_true",
                     help="exact whole-board deduplication; shorthand for grouping "
                          "on 0:15,0:15 with --per_group")
+    ap.add_argument("--group_id", action="store_true",
+                    help="group by the board id (the first field) instead of a "
+                         "region: with --per_group, N boards per id")
+    ap.add_argument("--group_diverse", action="store_true",
+                    help="with a grouping and --per_group N: keep the N members "
+                         "of each group chosen farthest-first in --diversity_box "
+                         "(the best-ranked first), not its best N")
     ap.add_argument("--diverse", type=int, default=0, metavar="K",
                     help="after ranking, keep K boards chosen farthest-first on "
                          "cell agreement -- independent roots to post-process, "
@@ -866,6 +903,7 @@ def main():
             raise SystemExit("[ERROR] --split accepts exactly one input CSV")
         if (args.out or args.rescore or args.csv or args.count or args.field or
                 args.border_only or args.complete or args.group_box or args.unique or
+                args.group_id or
                 args.diverse or args.max_agree is not None or args.top):
             raise SystemExit("[ERROR] --split is a standalone mode; do not combine it "
                              "with ranking, grouping, diversity, or --out options")
@@ -897,8 +935,10 @@ def main():
         raise SystemExit("[ERROR] --diverse wants a positive count")
     if args.per_group < 1:
         raise SystemExit("[ERROR] --per_group must be >= 1")
-    if args.group_box and args.unique:
-        raise SystemExit("[ERROR] use either --group_box or --unique, not both")
+    if bool(args.group_box) + args.unique + args.group_id > 1:
+        raise SystemExit("[ERROR] use one of --group_box, --unique and --group_id")
+    if args.group_diverse and not (args.group_box or args.unique or args.group_id):
+        raise SystemExit("[ERROR] --group_diverse needs --group_box, --unique or --group_id")
     if args.max_agree is not None and not 0.0 <= args.max_agree <= 1.0:
         raise SystemExit("[ERROR] --max_agree is a fraction of placed cells, 0..1")
 
@@ -921,7 +961,8 @@ def main():
     skipped = []
     keys = parse_sort_spec(args.sort)
     stream = read_boards(args.inputs, seed, skipped, progress_every=12500,
-                         group_cells=group_cells, complete_cells=complete_cells)
+                         group_cells=group_cells, complete_cells=complete_cells,
+                         group_id=args.group_id)
     # Counted as it streams, so --border_only can still report "N of M" without
     # a second pass and without holding the boards it rejects.
     seen = [0]
@@ -946,8 +987,10 @@ def main():
                     complete_kept[0] += 1
                     yield r
         stream = _complete(stream)
-    if group_cells is not None:
-        stream = iter(collect_grouped(stream, keys, args.per_group))
+    if group_cells is not None or args.group_id:
+        stream = iter(collect_grouped(
+            stream, keys, args.per_group,
+            (diversity_cells, args.diversity_metric) if args.group_diverse else None))
     # --field is exactly --top 1 with printing suppressed.
     records = collect(stream, keys, 1 if args.field else args.top)
     if args.border_only and seen[0]:
