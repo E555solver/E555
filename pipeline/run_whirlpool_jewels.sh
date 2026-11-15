@@ -126,7 +126,7 @@ RESERVE_F=2             # beamer --lambda_reserve: the cost of placing a TOP res
                         # 0 = off
 
 # s1: the beamer, then at most PER_FRAME boards per frame
-BEAM_WIDTH=1000         # narrow: few boards per start, so a call's boards come from
+BEAM_WIDTH=10000        # moderate: a start writes few boards, so a call's boards come from
                         # many starts (bottom x left column)
 BEAM_STOP_ROW=9         # s1 is complete up to this row (8 leaves the bands more room)
 BEAM_BACKTRACK=6        # exhaustive from this row (--backtrack_row)
@@ -143,10 +143,10 @@ BEAM_CORNERS=0.5        # CLUES=all: --lambda_corners; a 1 s probe first reads t
                         # whose top-left and top-right catalogs are both non-empty
                         # (--pin_clue), one call each; the annealed border used is
                         # the best by Score_dd that has one. 0 = off: one unpinned call
-BEAM_OPTS="--beam_expand 1 --lambda_J 2 --lambda_Mahalanobis 2 --bc_window 7,7 --pool_factor 64 --backtrack_row_factor 1"
+BEAM_OPTS="--beam_expand 1 --lambda_J 2 --lambda_Mahalanobis 2 --bc_window 7,7 --pool_factor 64 --backtrack_row_factor 2"
                         # further beamer options: no late widening (the beam ends at
                         # BEAM_BACKTRACK), heavier closure and Mahalanobis terms, a
-                        # wider completion window and pool, 1 x width roots
+                        # wider completion window and pool, 2 x width roots
 BEAM_BOARDS=100000      # boards per produce call, shared by its beamer calls: only a
                         # guard for the disk (about 150 MB, deleted after the call)
 QUEUE=30                # boards per produce call that may reach a finalizer (both side

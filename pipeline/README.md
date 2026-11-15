@@ -363,7 +363,7 @@ bash pipeline/run_whirlpool_jewels.sh INPUT=boards.csv                 # whirl y
 
 **Choosing the s1 boards.** One produce call anneals a border and runs the
 beamer on it for `BEAM_TIME`.
-- **Many starts, few boards each.** The beam is narrow (`BEAM_WIDTH=1000`), so
+- **Many starts, few boards each.** The beam is moderate (`BEAM_WIDTH=10000`, 2 x width roots), so
   one start (a bottom and a left column) writes few boards and the call's
   boards come from many starts. `BEAM_BOARDS=100000` only protects the disk.
 - **`BEAM_MIN_COL=3`** makes the beamer write only boards whose columns 1..3
@@ -466,9 +466,9 @@ cuts boards to them.
   `BEAM_STOP_ROW=9`; 8 closes more corners and hands the laps a shorter s1.
   The finalizer stops at row 8: a lower row re-grows more boards, and the
   jewels are that much shorter.
-- **The beamer** runs 1000 wide with `BEAM_OPTS` (`--beam_expand 1
+- **The beamer** runs 10000 wide with `BEAM_OPTS` (`--beam_expand 1
   --lambda_J 2 --lambda_Mahalanobis 2 --bc_window 7,7 --pool_factor 64
-  --backtrack_row_factor 1`) and tries 50 left columns per bottom; the
+  --backtrack_row_factor 2`) and tries 50 left columns per bottom; the
   finalizer's `--beam_width` is `FIN_WIDTH=100000`. A band gets 30 s
   (`BAND_TIME`) and a lap grows 16 at a time (`BANDS_GROWN`).
 
