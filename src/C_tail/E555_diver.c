@@ -77,6 +77,13 @@
  * do not combine, nor do --reopen and --backtrack: --holes and the backtrack
  * turn every board into a partial with no incumbent.
  *
+ * LOCAL SEARCH. --local_search SPEC takes the --reopen path with no dives:
+ * the cells SPEC names (all: every cell) are opened only to mark the region,
+ * and the engine (dv_local_search) climbs the incumbent over them and starts
+ * every kick-and-polish walk from it. So the walks reach the pieces a re-dive
+ * leaves alone -- the whole board under all -- and the board written is never
+ * worse. Clue pieces on their clue cells stay, as under --reopen.
+ *
  * SCOPE. The diver finishes boards for score; its search is the beamer's
  * zero-break trajectory and nothing else. Break-tolerant, reordered or
  * enumerating searches (all solutions of a band, bounded mismatch, Hall
@@ -105,6 +112,7 @@
 #define DR_AUTO_COVER     0.9      /* --reopen auto: share of its side's damage the band holds */
 #define DR_AUTO_CAP       5        /* ... and at most this deep before the extra rows */
 #define DR_MAX_SPECS      16       /* --reopen A --reopen B ...: round r reopens spec r mod n */
+#define DR_LS_KICKS       10000    /* --local_search: --end_polish when not given */
 
 /* One --reopen spec: the auto band, a side's band, or a set of cells. */
 typedef struct {
@@ -132,6 +140,8 @@ static uint8_t     g_orders[64];             /* --orders LIST */
 static int         g_norders      = 0;
 static float       g_order_weight = 0.0f;    /* --order_weight W; 0 = the engine's */
 static const char *g_reopen       = NULL;    /* --reopen SPEC, the first one given */
+static bool        g_local        = false;   /* --local_search SPEC: the specs are its regions */
+static const char *g_spec_flag    = "--reopen";  /* the flag that gave the specs */
 static int         g_rounds       = 1;       /* --rounds N */
 static bool        g_plateau      = false;   /* --plateau */
 static float       g_prior        = 0.0f;    /* --prior A */
@@ -368,11 +378,15 @@ static void dr_parse_spec(const char *spec, DrSpec *sp) {
     static const char *const sides[4] = { "top:", "bottom:", "left:", "right:" };
     memset(sp, 0, sizeof *sp);
     sp->side = -1;
+    if (g_local && !strcmp(spec, "all")) {             /* --local_search all: every cell */
+        for (int x = 0; x < NUM_PIECES; x++) sp->cell[x] = true;
+        return;
+    }
     if (!strcmp(spec, "auto") || !strncmp(spec, "auto+", 5)) {
         sp->auto_band = true;
         sp->depth = spec[4] ? atoi(spec + 5) : 0;
         if (sp->depth < 0 || sp->depth > PUZZLE_SIDE / 2)
-            fatal("--reopen auto+E: E must be in 0..%d", PUZZLE_SIDE / 2);
+            fatal("%s auto+E: E must be in 0..%d", g_spec_flag, PUZZLE_SIDE / 2);
         return;
     }
     for (int k = 0; k < 4; k++) {
@@ -381,22 +395,23 @@ static void dr_parse_spec(const char *spec, DrSpec *sp) {
         sp->side = k;
         sp->depth = atoi(spec + n);
         if (sp->depth < 1 || sp->depth > PUZZLE_SIDE)
-            fatal("--reopen %s: K must be in 1..%d", spec, PUZZLE_SIDE);
+            fatal("%s %s: K must be in 1..%d", g_spec_flag, spec, PUZZLE_SIDE);
         return;
     }
     if (!strncmp(spec, "box:", 4)) {
         int r0, r1, c0, c1;
         if (sscanf(spec + 4, "%d-%d,%d-%d", &r0, &r1, &c0, &c1) != 4 || r0 < 0 || r1 < r0 ||
             r1 >= PUZZLE_SIDE || c0 < 0 || c1 < c0 || c1 >= PUZZLE_SIDE)
-            fatal("--reopen %s: want box:R0-R1,C0-C1 with 0 <= R0 <= R1 <= 15 and "
-                  "0 <= C0 <= C1 <= 15", spec);
+            fatal("%s %s: want box:R0-R1,C0-C1 with 0 <= R0 <= R1 <= 15 and "
+                  "0 <= C0 <= C1 <= 15", g_spec_flag, spec);
         for (int r = r0; r <= r1; r++)
             for (int c = c0; c <= c1; c++) sp->cell[r * PUZZLE_SIDE + c] = true;
         return;
     }
     FILE *fp = fopen(spec, "r");
-    if (!fp) fatal("--reopen %s: not auto, auto+E, top:K, bottom:K, left:K, right:K, "
-                   "or a readable mask file (%s)", spec, strerror(errno));
+    if (!fp) fatal("%s %s: not %sauto, auto+E, top:K, bottom:K, left:K, right:K, box:..., "
+                   "or a readable mask file (%s)", g_spec_flag, spec, g_local ? "all, " : "",
+                   strerror(errno));
     char *line = NULL;
     size_t cap = 0;
     int row = 0, n = 0;
@@ -411,19 +426,24 @@ static void dr_parse_spec(const char *spec, DrSpec *sp) {
             n += *q == '1';
             c++;
         }
-        if (c != PUZZLE_SIDE) fatal("--reopen %s: data line %d has %d cells, not %d",
-                                    spec, row + 1, c, PUZZLE_SIDE);
+        if (c != PUZZLE_SIDE) fatal("%s %s: data line %d has %d cells, not %d",
+                                    g_spec_flag, spec, row + 1, c, PUZZLE_SIDE);
         row++;
     }
     free(line);
     fclose(fp);
-    if (row != PUZZLE_SIDE) fatal("--reopen %s: %d data lines, not %d", spec, row, PUZZLE_SIDE);
-    if (!n) fatal("--reopen %s: the mask opens no cell", spec);
+    if (row != PUZZLE_SIDE) fatal("%s %s: %d data lines, not %d", g_spec_flag, spec, row, PUZZLE_SIDE);
+    if (!n) fatal("%s %s: the mask opens no cell", g_spec_flag, spec);
 }
 
 /* --reopen, given n times: round r of a board reopens the (r mod n)-th spec. */
-static void dr_parse_reopen(const char *arg) {
-    if (g_nspec == DR_MAX_SPECS) fatal("--reopen: at most %d specs", DR_MAX_SPECS);
+static void dr_parse_reopen(const char *arg, bool local) {
+    if (g_nspec && local != g_local)
+        fatal("--reopen and --local_search do not combine: --reopen re-dives a band, "
+              "--local_search walks from the board itself");
+    g_local = local;
+    g_spec_flag = local ? "--local_search" : "--reopen";
+    if (g_nspec == DR_MAX_SPECS) fatal("%s: at most %d specs", g_spec_flag, DR_MAX_SPECS);
     if (!g_nspec) g_reopen = arg;
     g_spec_arg[g_nspec] = arg;
     dr_parse_spec(arg, &g_spec[g_nspec++]);
@@ -910,6 +930,7 @@ static void dr_run(const size_t *idx, size_t n, bool by_side, bool seed) {
     }
     if (nc && !g_stop) {
         dv_keeping(false);
+        dv_local_search(g_local);
         size_t live = nc;
         for (int round = 0; round < g_rounds && live; round++) {
             if (round > 0) {
@@ -958,6 +979,7 @@ static void dr_run(const size_t *idx, size_t n, bool by_side, bool seed) {
         }
         if (live) dv_keep_last();          /* the last round holds every live board's best */
         dv_keeping(true);
+        dv_local_search(false);
         dv_flush(g_out);
         for (size_t i = 0; i < n; i++) {
             const DrBoard *b = &g_batch.b[idx[i]];
@@ -1096,6 +1118,11 @@ static void usage(const char *prog) {
         "  --prior A           dives of a reopened board start pulled toward its clean\n"
         "                      placements (weight A, 0..2; default 0 = off)\n"
         "  --nogo B            ... and pushed off its placements on broken cells (0..2)\n"
+        "  --local_search SPEC instead of --reopen: no dives; kick-and-polish walks start\n"
+        "                      from the complete board itself and move only the pieces of\n"
+        "                      SPEC: all (the whole board) or any --reopen spec. --end_polish\n"
+        "                      R kicks a round (default %d), shared by --polish_top K / 2\n"
+        "                      walks; --rounds, --copies, --plateau as for --reopen\n"
         "\nPreparing boards before the dives (in this order):\n"
         "  --start_row R       read input records R.. only (0-based data rows, not a board row)\n"
         "  --num_rows N        ... and at most N of them (default 0 = the rest)\n"
@@ -1121,11 +1148,13 @@ static void usage(const char *prog) {
         "\n"
         "  --print_cmd         echo the full command line\n"
         "  --verbose           one line per batch\n\n",
-        DR_M_DEFAULT, DR_S_DEFAULT, DR_SEED_DEFAULT, (unsigned long long)DR_BT_NODES);
+        DR_M_DEFAULT, DR_S_DEFAULT, DR_SEED_DEFAULT, DR_LS_KICKS, (unsigned long long)DR_BT_NODES);
 }
 
 static void print_cmd(const char *a0, const char *seed, const char *in, const char *out) {
-    printf("[cmd] %s %s %s %s --end_dive %u --emit_score %d", a0, seed, in, out, g_dives, g_emit);
+    printf("[cmd] %s %s %s %s", a0, seed, in, out);
+    if (!g_local)                     printf(" --end_dive %u", g_dives);
+    printf(" --emit_score %d", g_emit);
     if (g_polish >= 0)                printf(" --end_polish %d", g_polish);
     if (g_polish_top != 64)           printf(" --polish_top %d", g_polish_top);
     if (g_rot_path)                   printf(" --rotations %s", g_rot_path);
@@ -1134,7 +1163,8 @@ static void print_cmd(const char *a0, const char *seed, const char *in, const ch
     printf(" --threads %d --rng_seed %" PRIu64, g_nthreads, g_rng);
     if (g_wall > 0.0)                 printf(" --wall_time %g", g_wall);
     if (g_max_written)                printf(" --max_emitted %" PRIu64, g_max_written);
-    for (int k = 0; k < g_nspec; k++) printf(" --reopen %s", g_spec_arg[k]);
+    for (int k = 0; k < g_nspec; k++)
+        printf(" %s %s", g_local ? "--local_search" : "--reopen", g_spec_arg[k]);
     if (g_reopen)                     printf(" --rounds %d", g_rounds);
     if (g_plateau)                    printf(" --plateau");
     if (g_copies > 1)                 printf(" --copies %u", g_copies);
@@ -1160,12 +1190,14 @@ static void print_cmd(const char *a0, const char *seed, const char *in, const ch
 int main(int argc, char **argv) {
     if (argc < 4) { usage(argv[0]); return 1; }
     const char *seed_path = argv[1], *in_path = argv[2], *out_path = argv[3];
+    bool dives_set = false;
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "--end_dive") && i + 1 < argc) {
             const long v = atol(argv[++i]);
             if ((v < 10 && v != 0) || v > 1000000000L)
                 fatal("--end_dive must be 0 (no dives) or in 10..1e9");
             g_dives = (uint32_t)v;
+            dives_set = true;
         }
         else if (!strcmp(argv[i], "--end_polish") && i + 1 < argc) {
             g_polish = atoi(argv[++i]);
@@ -1214,7 +1246,8 @@ int main(int argc, char **argv) {
             g_order_weight = (float)atof(argv[++i]);
             if (g_order_weight <= 0.0f) fatal("--order_weight must be > 0");
         }
-        else if (!strcmp(argv[i], "--reopen")      && i + 1 < argc) dr_parse_reopen(argv[++i]);
+        else if (!strcmp(argv[i], "--reopen")      && i + 1 < argc) dr_parse_reopen(argv[++i], false);
+        else if (!strcmp(argv[i], "--local_search") && i + 1 < argc) dr_parse_reopen(argv[++i], true);
         else if (!strcmp(argv[i], "--plateau"))    g_plateau = true;
         else if (!strcmp(argv[i], "--rounds")      && i + 1 < argc) {
             g_rounds = atoi(argv[++i]);
@@ -1294,14 +1327,23 @@ int main(int argc, char **argv) {
                "--corner_seeds; ignored\n");
     if (!g_reopen && (g_prior > 0.0f || g_nogo > 0.0f || g_rounds > 1 || g_plateau))
         printf("[warn] --prior, --nogo, --rounds and --plateau act on reopened boards only "
-               "(--reopen)\n");
+               "(--reopen, --local_search)\n");
     if (g_holes_arg && g_reopen)
-        fatal("--holes and --reopen do not combine: --holes makes every board a partial to "
-              "finish, --reopen improves complete boards against themselves");
+        fatal("--holes and %s do not combine: --holes makes every board a partial to "
+              "finish, %s improves complete boards against themselves", g_spec_flag, g_spec_flag);
+    if (g_local) {
+        /* No dives: the walks run from each complete board itself. Partial boards
+           in the input are still dived, as under --reopen. */
+        if (dives_set || g_prior > 0.0f || g_nogo > 0.0f || g_norders || g_seeds)
+            printf("[warn] --end_dive, --prior, --nogo, --orders and --corner_seeds act on dives; "
+                   "--local_search dives only the partial boards of the input\n");
+        if (!g_dives) g_dives = DR_M_DEFAULT;
+        if (g_polish < 0) g_polish = DR_LS_KICKS;
+    }
     if (!g_dives && g_reopen) fatal("--end_dive 0 writes prepared boards; --reopen needs dives");
     if (g_backtrack && g_reopen)
-        fatal("--backtrack/--stop_row rebuild partial boards; --reopen keeps a complete board's "
-              "cells as its incumbent -- use one or the other");
+        fatal("--backtrack/--stop_row rebuild partial boards; %s keeps a complete board's "
+              "cells as its incumbent -- use one or the other", g_spec_flag);
     if (g_ext_set && g_stop_row < 0) fatal("--extend_nodes needs --stop_row");
     if (g_pin) {
         g_orient = clue_orient_for_pin(g_pin);
@@ -1310,7 +1352,7 @@ int main(int argc, char **argv) {
     }
     if (g_print_cmd) print_cmd(argv[0], seed_path, in_path, out_path);
     printf("[cfg] dives=%u polish=%d polish_top=%d emit_score=%d frame=%s corner_seeds=%d%s threads=%d "
-           "rng_seed=%" PRIu64 "\n", g_dives, g_polish, g_polish_top, g_emit,
+           "rng_seed=%" PRIu64 "\n", g_local ? 0u : g_dives, g_polish, g_polish_top, g_emit,
            g_rot_path ? g_rot_path : "(free edges)", g_seeds,
            (g_clue_mask & CLUE_CORNERS) ? " (clue 2x3)" : "", g_nthreads, g_rng);
     if (g_holes_arg || g_pin || g_backtrack || g_rec_start || g_rec_count) {
@@ -1325,7 +1367,12 @@ int main(int argc, char **argv) {
         else if (g_backtrack) printf(" backtrack=rows");
         printf("\n");
     }
-    if (g_reopen || g_copies > 1 || g_norders) {
+    if (g_local) {
+        printf("[cfg] local_search=");
+        for (int k = 0; k < g_nspec; k++) printf("%s%s", k ? " then " : "", g_spec_arg[k]);
+        printf(" rounds=%d copies=%u walks=%d kicks=%d%s\n", g_rounds, g_copies,
+               (g_polish_top + 1) / 2, g_polish, g_plateau ? " plateau" : "");
+    } else if (g_reopen || g_copies > 1 || g_norders) {
         printf("[cfg] reopen=");
         if (!g_nspec) printf("off");
         for (int k = 0; k < g_nspec; k++) printf("%s%s", k ? " then " : "", g_spec_arg[k]);
@@ -1422,11 +1469,13 @@ int main(int argc, char **argv) {
     if (g_st.malformed) printf(", %" PRIu64 " skipped as malformed", g_st.malformed);
     printf("\n");
     if (g_reopen)
-        printf("[sum] reopen %s%s: %" PRIu64 " complete board(s) reopened (%.1f cells lifted on "
+        printf("[sum] %s %s%s: %" PRIu64 " complete board(s) %s (%.1f cells %s on "
                "average), %d round(s) x %u copies; %" PRIu64 " improved (%+" PRId64 " edges in "
-               "all), the rest written %s%s\n", g_reopen,
+               "all), the rest written %s%s\n", g_local ? "local search" : "reopen", g_reopen,
                g_nspec > 1 ? " (and the other specs in turn)" : "", g_st.reopened,
-               g_st.reopened ? (double)g_st.lifted / (double)g_st.reopened : 0.0, g_rounds,
+               g_local ? "searched" : "reopened",
+               g_st.reopened ? (double)g_st.lifted / (double)g_st.reopened : 0.0,
+               g_local ? "free to move" : "lifted", g_rounds,
                g_copies, g_st.better, g_st.gain,
                g_plateau ? "at their old score" : "as they were",
                g_st.solved ? "; SOLVED boards written as they are" : "");

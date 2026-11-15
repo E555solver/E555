@@ -1098,6 +1098,7 @@ static bool      g_dv_multi = false; /* the batch has a board queued in copies *
 static size_t    g_dv_last_n = 0;    /* roots of the last batch run */
 static char      g_dv_last_id[256];
 static bool      g_dv_keeping = true;
+static bool      g_dv_local = false; /* dv_local_search: walks from the incumbents, no dives */
 
 const char *const dv_order_names[DV_NORDERS] = {
     "mrv", "left", "right", "centre", "ends", "top", "bottom"
@@ -1128,6 +1129,7 @@ void dv_init(const DvParams *p) {
 
 void dv_seeding(bool on) { g_p.seed_corners = on; }
 void dv_keeping(bool on) { g_dv_keeping = on; }
+void dv_local_search(bool on) { g_dv_local = on; }
 
 uint64_t dv_written(void) { return g_dv_run.written; }
 int      dv_last_best(void) { return g_dv_run.last_best; }
@@ -1839,8 +1841,8 @@ static void dv_job_s2(DvWork *k, uint32_t ri, uint32_t a, uint32_t cnt) {
    candidates in key order, one job each. */
 static void dv_polish_begin(uint32_t ri) {
     DvRoot *r = &g_dv_q[ri];
-    if (!r->top || !r->top->n || r->best < 0 || r->best < g_p.emit_score - DV_POLISH_MARGIN
-        || dv_time_up())
+    if (!r->top || !r->top->n || r->best < 0 || dv_time_up() ||
+        (!g_dv_local && r->best < g_p.emit_score - DV_POLISH_MARGIN))
         return;
     DvTop *t = r->top;
     for (int a = 1; a < t->n; a++)                 /* insertion sort by key */
@@ -1901,6 +1903,10 @@ static void dv_job_p0(uint32_t ri, uint32_t c) {
         if (at >= 0) { st_t[at] = t; st_h[at] = pl->cand_h[t]; pl->st_s[at] = pl->cand_s[t]; }
     }
     for (int j = 0; j < pl->nst; j++) pl->st[j] = pl->cand[st_t[j]];
+    if (g_dv_local) {                                /* every walk starts from the incumbent */
+        pl->nst = dv_walks();
+        for (int j = 1; j < pl->nst; j++) { pl->st[j] = pl->st[0]; pl->st_s[j] = pl->st_s[0]; }
+    }
     if (g_p.polish <= 0) {                           /* polish only: no walks */
         for (int j = 0; j < pl->nst; j++) { pl->walk[j] = pl->st[j]; pl->walk_s[j] = pl->st_s[j]; }
         dv_polish_end(ri);
@@ -2185,14 +2191,22 @@ void dv_run(const char *id) {
             q[i].best_idx = g_p.plateau ? UINT64_MAX : 0;
             memcpy(q[i].best_pid, q[i].inc_pid, NUM_PIECES);
             memcpy(q[i].best_rot, q[i].inc_rot, NUM_PIECES);
-            if (priors) q[i].w0 = dv_prior(&q[i]);
+            if (priors && !g_dv_local) q[i].w0 = dv_prior(&q[i]);
+            if (g_dv_local && polish) {          /* the incumbent is the only candidate */
+                DvBoard b;
+                uint8_t brd[2 * NUM_PIECES];
+                for (int x = 0; x < NUM_PIECES; x++) b.c[x] = g_dv_or[q[i].inc_pid[x]][q[i].inc_rot[x]];
+                dv_board_bytes(&b, brd);
+                dv_top_offer(q[i].top, q[i].inc_score, 0, dv_board_fp(&b), brd);
+            }
         }
     }
     uint32_t n1 = (uint32_t)(g_p.dives * DV_S1_SHARE + 0.5);
     if (n1 < 1) n1 = 1;
     if (n1 > g_p.dives) n1 = g_p.dives;
+    if (g_dv_local) n1 = 0;                          /* no dives: polish the incumbents */
     g_dv_n1 = n1;
-    g_dv_n2 = g_p.dives - n1;
+    g_dv_n2 = g_dv_local ? 0 : g_p.dives - n1;
     memset(g_dv_jt, 0, sizeof g_dv_jt);
     g_dv_pgain = g_dv_proots = 0;
 

@@ -149,6 +149,13 @@ int      dv_result(size_t i, uint16_t pid[NUM_PIECES], uint8_t rot[NUM_PIECES]);
    batch's with dv_keep_last (returns how many were >= S). */
 void     dv_keeping(bool on);
 uint64_t dv_keep_last(void);
+/* Local search (off, the default): the batches run next dive nothing. Each
+   board queued with an incumbent is polished from the incumbent itself: it is
+   climbed over the board's open cells, and every one of the K/2 walks starts
+   from it, for DvParams.polish rounds in all. The open cells are the region
+   whose pieces may move; the incumbent holds them. Boards without an
+   incumbent get no result. */
+void     dv_local_search(bool on);
 void     dv_print_summary(double wall_total);
 /* The polish's hill-climb on a complete board, in place, over cells[0..n):
    turn one piece or swap two, with frame-legal spins under the current

@@ -63,7 +63,8 @@ Stage C  src/C_tail/E555_topper.py            CP-SAT break minimizer over bands 
          src/C_tail/E555_backtracker.c        greedy dives + exhaustive DFS + ratchet; --holes auto repair;
                                                --stop_row/--stop_column bands
          src/C_tail/E555_diver.c              the beamer's --end_dive/--end_polish on any board file; no DB;
-                                               --holes/--pin_clue/--stop_row rebuild the top like the beamer first
+                                               --holes/--pin_clue/--stop_row rebuild the top like the beamer first;
+                                               --reopen re-dives a complete board's band, --local_search walks from it
          src/C_tail/E555_ender.py             CP-SAT closer, never returns a worse board
 tools/   viewer, rank (--rescore), rotate (--sink), distiller (dive screen -> finish -> redive probe -> ender plan), extract_consensus, sort_rotations, clean_csv
 ```
