@@ -3,6 +3,7 @@
 #
 #   bash examples/11_diver_reopen.sh                    # the 463s of data/best_463.csv, a minute each
 #   bash examples/11_diver_reopen.sh BOARDS=best.csv SECONDS_PER_BOARD=600 THREADS=32
+#   bash examples/11_diver_reopen.sh METHOD=local_search REOPEN=all   # no dives (below)
 #
 # Each board in turn gets SECONDS_PER_BOARD of wall clock, spent in rounds:
 #   1. lift the damaged band (REOPEN=auto: the outer rows or columns of the
@@ -11,6 +12,11 @@
 #      END_POLISH rounds of kick-and-polish local search on the best of them;
 #   3. keep the best copy if it beats the board; the next round starts from
 #      whichever is better.
+# METHOD=local_search replaces steps 1-2: no cells are lifted and nothing is
+# dived. The kick-and-polish walks start from the board itself and may move
+# any piece of the region REOPEN names, all = the whole board (any other spec
+# above too); END_POLISH kicks a round, shared by 32 walks; COPIES and END_DIVE
+# are not used. Still being tried: compare both methods on your own boards.
 # OUT gets one row per board, in the order of BOARDS, and the run ends with a
 # before -> after table. The defaults were the best setting measured at 15 s
 # and at 120 s per board, and the longer budget found more (PROJECT_E555.md,
@@ -27,13 +33,15 @@ SECONDS_PER_BOARD=60                    # wall clock per board; more finds more
 THREADS=8                               # all the cores you can spare
 RNG_SEED=1                              # another value: a fresh run on the same boards
 # The search:
+METHOD=reopen           # reopen (re-dive the band) | local_search (walks only)
 REOPEN=auto             # the band: auto, auto+E (E rows deeper), top:K,
-                        # box:R0-R1,C0-C1, or a 16x16 0/1 mask file
+                        # box:R0-R1,C0-C1, or a 16x16 0/1 mask file; under
+                        # local_search also all (the whole board)
 COPIES=8                # refills per round
 END_DIVE=1000           # dives per copy
 END_POLISH=10000        # kick-and-polish rounds per copy
 # -----------------------------------------------------------------------------
-SETTINGS=" REPO SEED BOARDS OUT SECONDS_PER_BOARD THREADS RNG_SEED REOPEN COPIES END_DIVE END_POLISH "
+SETTINGS=" REPO SEED BOARDS OUT SECONDS_PER_BOARD THREADS RNG_SEED METHOD REOPEN COPIES END_DIVE END_POLISH "
 for arg in "$@"; do
     case "$arg" in
         [A-Za-z_]*=*) [[ "$SETTINGS" == *" ${arg%%=*} "* ]] ||
@@ -42,6 +50,11 @@ for arg in "$@"; do
         *) echo "expected NAME=value, got: $arg" >&2; exit 1 ;;
     esac
 done
+case "$METHOD" in
+    reopen)       SEARCH=(--reopen "$REOPEN" --copies "$COPIES" --end_dive "$END_DIVE") ;;
+    local_search) SEARCH=(--local_search "$REOPEN"); COPIES=1 ;;
+    *) echo "METHOD must be reopen or local_search, got: $METHOD" >&2; exit 1 ;;
+esac
 cd "$REPO"
 [ -d bin ] && [ -d tools ] ||
     { echo "REPO=$REPO is not an E555 checkout -- set REPO at the top" >&2; exit 1; }
@@ -59,15 +72,14 @@ for i, l in enumerate(rows):
     open(f"{sys.argv[2]}/board_{i:04d}.csv", "w").write(l if l.endswith("\n") else l + "\n")
 EOF
 N=$(find "$TMP" -name 'board_*.csv' | wc -l)
-echo "$N board(s) from $BOARDS, $SECONDS_PER_BOARD s each on $THREADS thread(s)"
+echo "$N board(s) from $BOARDS, $SECONDS_PER_BOARD s each on $THREADS thread(s), $METHOD $REOPEN"
 score() { python3 tools/E555_rank.py "$1" --seed_file "$SEED" --csv | awk -F, 'NR == 2 {print $4}'; }
 i=0
 for f in "$TMP"/board_*.csv; do
     i=$((i + 1))
     before=$(score "$f")
-    bin/E555_diver "$SEED" "$f" "$f.out" --reopen "$REOPEN" --rounds 1000000 \
-        --wall_time "$SECONDS_PER_BOARD" --copies "$COPIES" \
-        --end_dive "$END_DIVE" --end_polish "$END_POLISH" --emit_score 0 \
+    bin/E555_diver "$SEED" "$f" "$f.out" "${SEARCH[@]}" --rounds 1000000 \
+        --wall_time "$SECONDS_PER_BOARD" --end_polish "$END_POLISH" --emit_score 0 \
         --threads "$THREADS" --rng_seed "$RNG_SEED" --print_cmd > "$f.log"
     cat "$f.log" >> "$LOG"
     cat "$f.out" >> "$OUT"

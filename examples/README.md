@@ -46,7 +46,7 @@ in seconds.
 | `08_distiller_quickstart.sh` | distiller (+ diver) | distil a corpus to the N boards worth the CP-SAT tail | corpus → N boards + ender command | minutes to hours |
 | `09_backtracker_all_sides.sh` | backtracker | fill break-free as far as possible, from several directions | break-free partials → one board each | minutes |
 | `10_diver_quickstart.sh` | diver | finish partial boards with end dives and polish; HOLES + STOP_ROW rebuild lifted rows first | partials → complete boards | seconds to minutes |
-| `11_diver_reopen.sh` | diver | improve complete boards by re-diving their damaged band, never worse | complete → complete | a minute a board, or more |
+| `11_diver_reopen.sh` | diver | improve complete boards by re-diving their damaged band, never worse; `METHOD=local_search` walks from the board itself instead (being tried) | complete → complete | a minute a board, or more |
 
 ## Which script when
 
@@ -260,6 +260,7 @@ Placed cells never move. The output does not depend on `THREADS`.
 ```bash
 bash examples/11_diver_reopen.sh                                   # the 463s of data/best_463.csv, a minute each
 bash examples/11_diver_reopen.sh BOARDS=best.csv SECONDS_PER_BOARD=600 THREADS=32
+bash examples/11_diver_reopen.sh METHOD=local_search REOPEN=all       # walks from the board, no dives
 ```
 
 Each board gets its own wall clock, spent in rounds: lift the damaged band,
@@ -271,9 +272,10 @@ if it beats the board, and start the next round from the better of the two.
 | `BOARDS`, `OUT` | `data/best_463.csv`, `reopened.csv` | complete boards in; the same boards out, one row each, in order |
 | `SECONDS_PER_BOARD` | 60 | wall clock per board |
 | `THREADS`, `RNG_SEED` | 8, 1 | another seed is a fresh run on the same boards |
-| `REOPEN` | `auto` | the band: `auto` (the damaged side's outer rows, at most 5), `auto+E`, `top:K`, `box:R0-R1,C0-C1`, or a mask file |
+| `METHOD` | `reopen` | `reopen` lifts the band and re-dives it; `local_search` lifts nothing and runs the kick-and-polish walks from the board itself (`E555_diver --local_search`; being tried) |
+| `REOPEN` | `auto` | the band: `auto` (the damaged side's outer rows, at most 5), `auto+E`, `top:K`, `box:R0-R1,C0-C1`, or a mask file; under `local_search` the pieces that may move, and also `all` |
 | `COPIES` | 8 | refills per round |
-| `END_DIVE`, `END_POLISH` | 1000, 10000 | dives and kick-and-polish rounds per copy |
+| `END_DIVE`, `END_POLISH` | 1000, 10000 | dives and kick-and-polish rounds per copy (`local_search`: no dives, no copies; `END_POLISH` kicks a round) |
 
 - **Guarantee.** No board comes back worse. The run prints one line per board
   and ends with a before → after table; the diver's own output goes to

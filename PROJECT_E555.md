@@ -1904,6 +1904,14 @@ A finished board turned 180 degrees, with its top K rows lifted so that a perfec
 
 The breaks a dive leaves in the top rows of a Stage B board are forced by the pieces left against the rows below. A gain needs the row under the damage lifted too.
 
+**Local search on complete boards** (`--local_search SPEC`, being tried). The `--reopen` path without the lift and the dives: each round climbs the complete board itself and starts every kick-and-polish walk (5.11, Polish) from it, `--end_polish R` kicks shared by `--polish_top K` / 2 walks.
+- **SPEC** is the region whose pieces may move: `all` (the whole board) or any `--reopen` spec. A re-dive's walks move only the pieces its dives placed; these may also move the clean pieces around the damage, the beam's core included under `all`.
+- Never worse; clue pieces on their clue cells stay; given n times, round r uses the (r mod n)-th spec.
+- `--rounds`, `--copies`, `--plateau`, `--wall_time` as under `--reopen`. `--end_polish` defaults to 10000; `--end_dive`, `--prior`, `--nogo`, `--orders` and `--corner_seeds` have no effect (a warning). It does not combine with `--reopen`, `--holes` or `--backtrack`/`--stop_row`. Partial boards in the input are dived as usual.
+- **Measured** (4 threads, a quick check only):
+  - 9 unpolished boards (459-461: `data/E565_lowB_baseline.csv` finished with 3000/10000), 20 s each: `--reopen auto --copies 8 --end_dive 1000 --end_polish 10000` +0.89 per board (7 improved), `--local_search auto` +0.67 (5), `--local_search all` +0.44 (3). Then 10 s of `--local_search all` on the reopened boards: nothing.
+  - The 38 boards of `data/best_463.csv`, `--local_search all --end_polish 20000 --rounds 3` (about 0.4 s a board): two reach 464.
+
 | option | default | meaning |
 |---|---|---|
 | `--start_row R`, `--num_rows N` | 0, 0 (all) | input records R..R+N-1 |
@@ -1915,12 +1923,13 @@ The breaks a dive leaves in the top rows of a Stage B board are forced by the pi
 | `--extend_nodes N` | 100000 | node budget of each extension (0 = the first board to reach S) |
 | `--cap_top [N]` | 1 | as the beamer's: of the longest extensions keep the one whose top-left border closes over the most whole columns, and place that closure (0 = off) |
 | `--end_dive M` | 10000 | dives per board; 0 = write the prepared boards |
-| `--end_polish R` | off | polish plus R kick rounds |
+| `--end_polish R` | off | polish plus R kick rounds (`--local_search`: 10000) |
 | `--polish_top K` | 64 | dives polished per board, K/2 walks (1..256) |
 | `--emit_score S` | 450 | write boards whose best is >= S |
 | `--rotations FILE` | free edges | hold edge pieces to their dealt sides |
 | `--corner_seeds N` | 0 | corner-seeded copies (needs `--rotations`) |
 | `--reopen SPEC` | off | re-dive complete boards, never worse |
+| `--local_search SPEC` | off | instead of `--reopen`: walks from complete boards over SPEC (`all` or a `--reopen` spec), never worse |
 | `--rounds N` | 1 | rounds from the best board so far (continue until `--wall_time` if set) |
 | `--copies K` | 1 | dive each board K times on separate streams; keep the best |
 | `--prior A`, `--nogo B` | 0, 0 | starting weights: +A on the incumbent's clean placements, -B on its broken cells (0..2) |
@@ -1937,7 +1946,7 @@ The breaks a dive leaves in the top rows of a Stage B board are forced by the pi
 - `[sum] extension`: extension cells and whole columns, mean and max.
 - Then the dive engine's lines (5.14).
 
-`E555_diver.c` is the front end: input, preparation, batches, frame and reopen. Policies and stages live in `E555_dive.c`, shared with the beamer and the finalizer.
+`E555_diver.c` is the front end: input, preparation, batches, frame, reopen and local search. Policies and stages live in `E555_dive.c`, shared with the beamer and the finalizer.
 
 ### 9.3 `E555_ender.py` -- the closer
 
@@ -2404,7 +2413,7 @@ the roundhouse must rediscover `data/synth_solution_480.csv` from
 | `src/B_beam/E555_finalizer.c` | beam from a partial: locking, reduced database, side modes, locked top rows |
 | `src/B_beam/E555_roundhouse.c` | strip search: width-W database, oracles, spiral geometry |
 | `src/C_tail/E555_dive.{c,h}` | end-dive engine: dives, cross-entropy rounds, polish, corner seeds, copies and incumbents, job queue |
-| `src/C_tail/E555_diver.c` | the dive engine on any board file; `--holes`, `--pin_clue`, `--stop_row`, `--reopen` |
+| `src/C_tail/E555_diver.c` | the dive engine on any board file; `--holes`, `--pin_clue`, `--stop_row`, `--reopen`, `--local_search` |
 | `src/C_tail/E555_ender.py` | exact region re-solves and redive |
 | `src/C_tail/E555_topper.py` | CP-SAT band minimizer |
 | `src/C_tail/E555_backtracker.c` | exact / mismatch DFS, stop bands |
