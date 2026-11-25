@@ -3386,9 +3386,11 @@ step_beamer_micro() {
 step_beamer_resume() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
     gate_db
+    # The beam settings are pinned: the --max_emitted below is sized for them.
     CMD=(bin/E555_beamer data/seed_Edge5.txt data/borders_annealed_fix12.csv
          --start_row 1 --num_rows 2 --top_bottoms 2 --top_columns 3 --beam_width 2000
-         --stop_row 6 --rng_seed 5 --threads 4 --verbose)
+         --stop_row 6 --rng_seed 5 --threads 4 --verbose
+         --bc_window 3,3 --pool_factor 8 --beam_expand 4)
     if [ -n "$GATE_DB" ]; then CMD+=(--db_file "$GATE_DB"); fi
     "${CMD[@]}" --out_dir "$OUT/rs_ref" > "$OUT/rs_ref.log" || fail "reference sweep failed"
     "${CMD[@]}" --out_dir "$OUT/rs_part" --max_emitted 80000 > "$OUT/rs_1.log" || fail "first half failed"
@@ -3784,7 +3786,7 @@ for l in rb if xm.group(1) != "plain" else []:      # a plain fallback uses noth
     assert any(not any(k in seed[p] for p in frame if p not in kept)
                and side(c, STOP * 16, 0) != k and side(c, 15, 0) != k for k in range(1, 6)), \
         "--exhaust_border_color: a frame colour is left outside the written border"
-print(f"ok: --cap_top changes only row 15 ({capped} cap cells over {len(kc)} boards); "
+print(f"ok: --cap_top closes every filled row-14 cell ({capped} cap cells over {len(kc)} boards); "
       f"K=2 writes exactly the K=0 boards filling 2 columns (found {found('mc_k0')} -> "
       f"{found('mc_k2')}); {nd.group(1)} near-dups dropped; random edges: {len(rb)} boards, "
       f"{c0} column-0 edges, exhausted colour {xm.group(1)}; score lines recount")

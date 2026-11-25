@@ -756,72 +756,97 @@ the ender):
   runs with different R append to the same `beam_completions_*` file.
 
 **Used-up inner colours (`--exhaust_inner_color N`).** The inner-colour
-counterpart of `--exhaust_border_color` (5.3): a board completing row S-1 must
-have used up at least N inner colours, i.e. no unplaced inner piece carries
-them. More than N is fine, and any colour counts; none is preferred. Colour
-parity (5.6) then gives `D_c = 0` as well: no top of row S-1, no owed frame face
-and no owed edge shows the colour, so rows S..14 are built from the other
-colours.
+counterpart of `--exhaust_border_color` (5.3), in the spirit of Blackwood's
+solver: choose a few colours in advance and use them up early, so the last
+rows have fewer colours to match. N (usually 1 or 2) colours are marked per
+configuration, the beam is pushed toward them, and checkpoints near the stop
+row cut what did not get there.
 
-- **Where.** A beam that fills row S-1 checks each child, after the parity test
-  (no backtracking, or `--backtrack_row S-1`). The exhaustive search checks once
-  row S-1's last inner piece is placed (column 14, or 15-R under
-  `--backtrack_unlock_right`), before its right edge, so a failing board costs
-  neither the rows above, nor the extension, nor the dives.
-- **Hopeless configurations and roots are skipped**, which never drops a board
-  that could pass. To be used up in time, every unplaced inner piece carrying
-  c must fit in the inner cells left below the check, and every owed edge whose
-  inner face is c in the right column up to row S-1. Some colours can never be
-  used up by row S-1: those on the fixed top border, on column 0 from the stop
-  row up, or on a clue piece above row S-1. Fewer than N colours left that can
-  still make it means nothing can pass:
-  - a configuration is skipped before its beam;
-  - a backtrack-row root is dropped as the beam generates it, so root slots go
-    to roots that can get there. Under `--backtrack_row_factor 0`, where every
-    candidate is a root, and under `--backtrack_unlock_right`, whose rebuilt
-    root gives pieces and edges back, the root is dropped as its search
-    starts instead.
+- **Marking, from the border.** Of the 56 edge pieces, n_c show inner colour c
+  inward (seed_Edge5: 1 to 6 each, printed at startup). The bottom row (cols
+  1..14) and the left column (rows 1..14) hold 28 of them, k_c with colour c.
+  At random k_c is hypergeometric (mean n_c/2, variance 28 p(1-p) 28/55, p =
+  n_c/56); `z_c` is its standard score, i.e. how much the border over-commits
+  c, whose faces it then pulls into row 1 and column 1 at once while the right
+  column and the top owe little of it. The N colours with the largest z_c are
+  marked (ties by a hash of the master seed, the configuration and the
+  colour). Under `--random_edges` a border is used only when N colours reach
+  `--exhaust_inner_z` (default 1.75): left columns are redrawn, each the best
+  of 32 as usual, up to 32 times per bottom, and up to 16 bottoms; after that
+  the bottom is relaxed (plain draws, marks by z alone), with one warning and
+  a count. Rotations mode only marks.
+  - Because n_c is small, z takes a few values: all of a colour's edges on the
+    bottom and left gives 1.00, 1.43, 1.76, 2.06, 2.32, 2.57 for n_c = 1..6.
+    Measured on 2000 plain `--random_edges` borders, the share with N colours
+    at z >= 1.75 (every edge of a colour with n_c >= 3 there) is 63% for N = 1
+    and 20% for N = 2 (65% and 20% with `--exhaust_border_color`); the next
+    step, z >= 2.05, keeps 24% and 1%. A colour with n_c = 1 is never marked
+    by the filter.
+- **The residual.** For a marked colour, from the ledger (5.6):
+  `residual_c = R_c - F_c - Q_c = S_c + T_c - Q_c`, with `R_c` the faces of c
+  on unplaced inner pieces, `T_c` the frontier tops of c (block columns),
+  `F_c = D_c - T_c` the demand the frame (and, under
+  `--backtrack_unlock_right`, the band) still owes -- the left interfaces
+  above, the inner faces of the unplaced edges or the fixed top border -- and
+  `Q_c` the faces of c on clue pieces still to come above the checkpoint
+  (twice when all their neighbours lie above it too). Each frame face takes
+  exactly one inner face, so F_c of the R_c faces are spoken for whatever
+  happens (an edge's own face is not in R_c: the factor is 1). The residual is
+  the colour's free supply: every inner c face placed that does not face the
+  frame lowers it by one, and it never rises. Colour parity (`S_c >= 0`) keeps
+  `R_c >= F_c + T_c`, so the pieces the frame still needs (the left column
+  above the stop row, the right column, the top) always survive for the
+  extension and the dives. Zero at row S-1 means used up: no row S-1 top shows
+  c, and nothing but the frame and the clues needs it.
+- **The bias** (`--lambda_exhaust_inner F`, default 0.15; 0 = off). With
+  `Phi_c(R) = sum_{r=R+1..T_c} min(4, T_c/r)` (T_c the colour's inner faces), a
+  child earns `F * u_row * sum_c Phi_c(R_c)` over the marked colours, in the
+  corner term's unit (5.12): each face placed is worth `min(4, T_c/R_c)`, more
+  as the colour runs low, and the score is a state of the board, so boards
+  with different pasts compare fairly. From row S-2 on, the frontier tops count
+  as not yet placed (a top there only adds to the S-1 residual). The right
+  edge counts through its joint, the column-14 piece's right face. With
+  `--bc_window 7,7` the bias picks among up to 49 B x C children per A record.
+- **Checkpoints** (`--exhaust_check ROW:TOL[,ROW:TOL]`, default `S-2:6,S-1:0`):
+  a board completing a checkpoint row is cut when a marked colour's residual
+  exceeds the tolerance -- by the beam on each child, by the exhaustive search
+  when it closes the row, and on a backtrack root under
+  `--backtrack_unlock_right`, whose rebuilt block gives pieces back. The
+  default lets only boards that have used every marked colour up by row S-1
+  reach the stop row. Needs exact demands: not with `--no_free_demand`.
+- `[sum] exhaust_inner_color N` gives the marks (configurations per colour)
+  and the border acceptance; `[sum] exhaust checkpoints` the boards kept of
+  those tested per row; `[sum] exhaust residual by row` the surviving boards'
+  mean marked residual (beam rows after selection, search rows as they close);
+  `[sum] exhaust outcome` the configurations reaching the stop row, the
+  extinctions, the stop-row boards used up at S-1 and the dives' best and mean.
+  `E555_EXIN_PROBE=1` adds the picker probe (how often a B or C chain past the
+  window carried more marked faces than the kept child's) and the spread of
+  the bonus by row; `E555_EXIN_MEASURE=K` prints the z table of K plain
+  borders and exits.
+- **Measured** (12 `--random_edges` configurations, N = 1, width 1000,
+  `--backtrack_row 6 --stop_row 11 --end_dive 100`, one seed, so the same 12
+  borders in every arm):
 
-  The same test inside the search costs more than it saves. Applied at every
-  row close and every cell of row S-1, it made the search 25% slower than the
-  check alone; from column 12 of row S-1 only, still 3% slower. The subtrees
-  it cuts are a few nodes deep.
-- **The row S-3 rule (heuristic).** Two rows earlier, a board completing row
-  S-3 must keep N colours with at most 5 + N faces left on unplaced inner pieces
-  (a piece showing the colour twice counts twice): 6 faces for N = 1, 7 for
-  N = 2. The row is tested once, by whoever fills it: the beam as it generates
-  children (the backtrack row too, except under `--backtrack_row_factor 0`,
-  where the search tests each root as it starts), or the search when it closes
-  the row. Unlike the cuts above it drops boards that might still pass.
-  - Why: boards that already keep colours scarce lead to more completions of
-    the rows below the check. On 9 random-edges configurations (stop row 11,
-    so the rule tests row 8; 1.63M row-8 boards), N = 1 keeps 4.5% of the
-    row-8 boards, and each leads to 2.5 times as many row-10 boards as the
-    average one; N = 2 keeps 0.12% (2.75 times).
-  - Under uniform random placement a colour still has about 20 faces left
-    after row 8 (the scarcest of the 17 about 14). Scarcity like this is a
-    tail event, which the beam's colour terms already make hundreds of times
-    more common than chance.
-  - Cost: the few boards seen that used a colour up by row 10 still had 7
-    faces of it left at row 8, so N = 1 cut them. End dives on 8,606 row-11
-    boards showed the same mean score (452.2 to 452.7) however scarce their
-    colours were at row 8.
-- **How rare.** These numbers are for random borders, `--stop_row 11`, and
-  predate the row S-3 rule:
-  - Without the flag, from `--backtrack_row 6` (20 configurations at width
-    5000), 1 of the 63,496 boards completing row 11 had a colour used up by
-    row 10.
-  - With N = 1 at width 1000, 23 of 40 configurations (one per `--rng_seed`)
-    had row-10 boards that used a colour up, 1 to 82 each, but none of those
-    boards completed row 11.
+  | lambda | B order | reached row 11 | stop-row boards | mean residual r8 | dives best / mean |
+  |---|---|---|---|---|---|
+  | 0 | -- | 1 | 39 | 18.8 | 452 / 451.0 |
+  | 0.05 | database | 4 | 42 | 12.6 | 453 / 451.5 |
+  | 0.15 | database | 8 | 163 | 7.2 | 456 / 451.3 |
+  | 0.15 | marked faces | 8 | 328 | 6.1 | 454 / 451.0 |
 
-  Breadth (many configurations) is what finds them.
-- `[sum] exhaust_inner_color N:` gives the boards checked at row S-1 and kept,
-  the configurations and roots skipped, the backtracker's boards completing
-  row S-1 by the colours they used up, and how many boards the row S-3 rule
-  kept of those it tested. In the compact log a skipped configuration reads
-  `skipped: fewer than N inner colours can be used up by row S-1` (rotations
-  mode: `skipped:k` on the collapsed line).
+  Every stop-row board had its colour used up at row 10 (the S-1 tolerance is
+  0); row 9 kept 62-76% of the boards it tested, row 10 1.7-3%. The picker
+  probe found a conflict-free B chain past the window with more marked faces
+  in 49% of the window picks (a C chain in 9%), so under the bias the window
+  takes its B chains in order of their marked faces, from the first 24
+  conflict-free ones (stable: ties keep the database order); C keeps the
+  database order. `E555_EXIN_PROBE` turns the ordering off to measure.
+  With N = 2 on the same 12 borders (15% of left draws passed, no bottom
+  relaxed) no board survived the default row-10 tolerance of 0 (0 of 324 k
+  tested); `--exhaust_check 9:8,10:2` let 1 configuration reach row 11 with 2
+  boards. N = 2 needs more breadth (configurations, width) or looser
+  checkpoints.
 
 ### 5.10 Column-major extension (`--extend_nodes`, `--backtrack_min_col`)
 
@@ -852,20 +877,18 @@ cell of unknown orientation).
   before columns 2..14. An edge placed in column 0 leaves the top-border pool.
   "Whole columns" still count from column 1.
 - `--cap_top [N]` (on by default; `0` = off) closes the top-left border
-  exactly over the whole columns. The extension's own row-14 test counts top
-  colours only: it never asks whether the top edges chain by frame colour or a
-  corner fits on column 0, so the break there was often decided before the
-  dives. The cap is the TL corner (the fixed one; under `--random_edges` either
-  corner off the board, its bottom on column 0's row-14 top), then top edges
-  on (15,1), (15,2), ..., each unused, frame up, its inner colour the row-14
-  top below and its left frame colour its neighbour's right one. It is only a
-  tie-break: the search, its order and its node cap are unchanged and the most
-  cells still win, so every board keeps its extension length and whole columns
-  and `--backtrack_min_col` writes exactly the same boards; among the fillings
-  of that length the one with the longest cap is kept and the cap is written
-  on row 15. A cap is worked out once per whole column of a path that reaches
-  the best length. `[sum] top cap:` gives the cap cells per board and the share
-  of boards (with a whole column) closed over all of them.
+  inside the extension. The region visits (15,c) right after (14,c): the TL
+  corner on (15,0) (the fixed one; under `--random_edges` either corner off
+  the board, its bottom on column 0's row-14 top, visited after (14,0) and
+  (14,1)), then a top edge on (15,c), unused, frame up, its inner colour the
+  row-14 top below and its left frame colour its neighbour's right one (in
+  rotations mode only the row's top edges, in their own spin). A prefix that
+  ends on a row-14 cell (or on the corner) is never kept, so every filled
+  row-14 cell is closed above and the top-left cannot break against the
+  extension; a column that stops below row 14 still counts. Extensions can be
+  shorter than with `--cap_top 0`, and "whole columns" (`--backtrack_min_col`,
+  the extension lines) are the capped ones. `[sum] top cap:` gives the row-15
+  cells per board. The diver's `--cap_top` is still the older tie-break (9.2).
 
 **The column check** (always on with `--backtrack_min_col K >= 1`). Most
 stop-row boards are otherwise found only to fail the extension. A board can be
@@ -1195,7 +1218,7 @@ roots with boards, nodes, parity and corner cuts, `cut_col` partial rows the
 min-col check cut and `unknown` checks over budget, `near_dups`, boards
 completing each row, extension depth; under `--backtrack_unlock_right` also
 `root_repeats` and, with `--emit_score`, `cut_score`; under `--exhaust_inner_color`
-`cut_exhaust`, `cut_exh_root` and `cut_semi`) and the `[dive]` line, and a `[sweep]`
+`cut_exhaust`) and the `[dive]` line, and a `[sweep]`
 line for every configuration in the older form:
 
 ```
@@ -1232,16 +1255,15 @@ pins the row under it too). `emitted` is the configuration's unique boards,
 
 `backtrack` lists the boards completing each searched row; `corners` the share
 of written boards with a TL / TR block alive, both, and a piece-disjoint pair
-(5.12); `top cap` the row-15 closure `--cap_top` wrote (5.10); under
+(5.12); `top cap` the row-15 cells `--cap_top` placed (5.10); under
 `--backtrack_unlock_right`, `unlock_right` the block, the roots searched and
 dropped as repeats and the boards short of the asked layers or under
 `--emit_score`, and the extension lines count whole layers and band cells
 (5.9, 5.10); `reserve` the
 TOP reserve left free at the stop row; `exhausted colour`
 the configs by the frame colour their border used up (`--exhaust_border_color`,
-5.3); `exhaust_inner_color` the boards checked and kept at row S-1, the
-configurations and roots skipped, the inner colours used up and the row S-3
-rule's kept/tested counts (5.9). `Output boards score` counts the written boards by score, highest first
+5.3); `exhaust_*` the marks, the border acceptance, the checkpoints, the
+residual by row and the outcome (5.9). `Output boards score` counts the written boards by score, highest first
 (at most six, `...` if there are more): the dives' matched edges under
 `--end_dive`, otherwise the matched edges of each written partial board, as
 `E555_rank` scores it. `best boards` says where the five best are: the 0-based
@@ -1279,14 +1301,17 @@ boards or roots they write the same file at any thread count.
 | `--random_edges`, `--samples N` | off, 1 | sample borders (5.3); 0 = unlimited bottoms |
 | `--BL/--BR/--TL/--TR P` | -- | pin a corner piece (`--random_edges`) |
 | `--exhaust_border_color` | off | every random border uses up one frame colour within the bottom row and column 0 rows 1..S (5.3) |
-| `--exhaust_inner_color N` | 0 | boards completing row S-1 must have used up at least N inner colours, and boards completing row S-3 must keep N colours with at most 5+N faces left; hopeless configurations and roots are skipped (5.9) |
+| `--exhaust_inner_color N` | 0 | mark N inner colours per border (the most over-committed on bottom + left), bias the beam toward them, cut at the checkpoints (5.9) |
+| `--exhaust_inner_z Z` | 1.75 | border acceptance under `--random_edges`: N colours with z >= Z |
+| `--lambda_exhaust_inner F` | 0.15 | the bias, in u_row per weighted face; 0 = off |
+| `--exhaust_check ROW:TOL,...` | S-2:6,S-1:0 | checkpoint rows and marked-residual tolerances |
 | `--incomplete_top` | off | also write stop-row boards with two of the three segments (`_partial.csv`) or segment B alone (`_partial_B.csv`); not with `--backtrack_row` |
 | `--beam_width K` | 250000 | boards per row |
 | `--stop_row R` | 11 | last row filled, 1..13 |
 | `--backtrack_row N` | off | exhaustive search from row N (5.9) |
 | `--backtrack_row_factor M` | 2 | roots = best M x width boards of row N; 0 = every candidate, raw (5.9) |
 | `--extend_nodes N` | 100000 | extension budget per board, column-major or layered; 0 = off (5.10) |
-| `--cap_top [N]` | 1 | close the top-left border exactly over the extension's whole columns; 0 = off (5.10) |
+| `--cap_top [N]` | 1 | the extension places the top-left border: every row-14 cell it fills is closed above; 0 = off (5.10) |
 | `--backtrack_min_col K` | 0 | write only boards whose extension fills K columns; cuts partial rows whose column 1 cannot reach row 14 (5.10). Under `--backtrack_unlock_right R`: band columns left open, 0..R, default R (5.9) |
 | `--no_top_dedup` | -- | keep top-row near duplicates (5.9) |
 | `--backtrack_unlock_right R` | 0 | from the backtrack row, the board is the block rows 0..S x columns 0..15-R; rows N+1..S are searched over those columns and the layered extension grows the band (5.9, 5.10) |
@@ -1922,7 +1947,7 @@ The breaks a dive leaves in the top rows of a Stage B board are forced by the pi
 | `--backtrack` | off | zero-break row-major fill of rows 0..14, deepest prefix kept |
 | `--stop_row S` | off | rows up to S, then the column extension; the deepest extension kept (implies `--backtrack`) |
 | `--extend_nodes N` | 100000 | node budget of each extension (0 = the first board to reach S) |
-| `--cap_top [N]` | 1 | as the beamer's: of the longest extensions keep the one whose top-left border closes over the most whole columns, and place that closure (0 = off) |
+| `--cap_top [N]` | 1 | of the longest extensions keep the one whose top-left border closes over the most whole columns, and place that closure (0 = off); the beamer's now commits the cap inside its extension (5.10) |
 | `--end_dive M` | 10000 | dives per board; 0 = write the prepared boards |
 | `--end_polish R` | off | polish plus R kick rounds (`--local_search`: 10000) |
 | `--polish_top K` | 64 | dives polished per board, K/2 walks (1..256) |
