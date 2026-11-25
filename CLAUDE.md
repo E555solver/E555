@@ -25,7 +25,7 @@ pip install ortools       # only needed for src/C_tail/E555_topper.py and E555_e
 `tests/run_tests.sh` holds every check. It runs the selected ones in order, stops at the first failure, and writes everything to `tests/out/`, which is wiped at the start of each run. Run only what a change needs:
 
 ```bash
-ARCH=generic bash tests/run_tests.sh                    # the core checks (~30 s on 4 cores, half of it compile): run for any change
+ARCH=generic bash tests/run_tests.sh                    # the core checks (~20 s on 4 cores, most of it compile): run for any change
 ARCH=generic bash tests/run_tests.sh beamer             # every check of one tool (+ compile, no_stray_output)
 ARCH=generic SKIP_BEAMER=1 bash tests/run_tests.sh --all   # the release gate without the 6.4 GB DB (~4 min)
 bash tests/run_tests.sh --list                          # numbered list: tier, name, tags, label
@@ -41,7 +41,7 @@ bash tests/run_tests.sh 6 8-11 roundhouse_cache         # by number, range or na
 - Key regressions: the finalizer and roundhouse must rediscover `data/synth_solution_480.csv` (seed `data/synth_seed.txt`), and `viewer` must score it 480/480.
 - Checks that need OR-Tools print `SKIPPED` and **pass** when it is missing. That includes the core regression `ender_repair`. A fresh cloud container has no OR-Tools, so run `pip install ortools` before trusting a green run that touches the ender, topper or diver.
 - `no_stray_output` fails if any check leaves a file in the repo root, so tools that write to the working directory must run from inside `tests/out`.
-- `scripts_parse` (`tests/check_script_flags.py`) collects each binary's accepted flags from its `strcmp(argv[i], "--x")` sites. Every `--flag` that a script in `pipeline/`, `examples/` or `tests/` passes must be in that set. If you rename or remove a C flag, update every script that uses it. The check also fails when a tool's hand-written `print_cmd()` doesn't mention every flag its parser accepts, or when a comment sits between two backslash-continued lines.
+- `scripts_parse` (`tests/check_script_flags.py`) collects each binary's accepted flags from every `strcmp`/`strncmp(…, "--x")` literal in its parser source (plus `E555_database.c` for the three Stage B tools), whatever the first argument is named: the roundhouse parses `strcmp(a, …)` and a corner-flag helper. Every `--flag` that a script in `pipeline/`, `examples/` or `tests/` passes must be in that set. If you rename or remove a C flag, update every script that uses it. The check also fails when a tool's hand-written `print_cmd()` doesn't mention every flag its parser accepts, or when a comment sits between two backslash-continued lines.
 - Bash idiom used in the gate (`set -euo pipefail`): don't write `$(ls GLOB | head -1)`; use `first_match`. Don't pipe a tool's long output into `grep -q`, because SIGPIPE plus pipefail causes false failures. Write to a file and grep that instead.
 
 ## Architecture
