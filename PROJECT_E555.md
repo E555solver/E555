@@ -494,7 +494,7 @@ edge serve the top border later) instead of only the rotations row's right side.
 
 Per configuration, one beam of up to `--beam_width` K boards advances one full
 row at a time. The width grows late: K*E/2 at row R-1 and K*E from row R on
-(E = `--beam_expand`, default 4; R = `--beam_expand_row`, default 7), and the
+(E = `--beam_expand`, default 1, i.e. no widening; R = `--beam_expand_row`, default 7), and the
 per-parent cap doubles there.
 
 1. **Expand.** Each board fills its next row A, B, C from the database with
@@ -502,7 +502,7 @@ per-parent cap doubles there.
    order; a second visits the records the first did not reach in a random
    full-cycle order (random start, coprime stride), so no record is tried twice
    for one parent. Work per parent is bounded by `--pool_factor` (child quota,
-   x K per row) and a decode budget. **`--bc_window nB,nC`** (default 3,3): while
+   x K per row) and a decode budget. **`--bc_window nB,nC`** (default 7,7): while
    the beam is full, up to nB workable B chains x nC C completions are scored per
    A record and the best child kept; while it is below capacity every completion
    is kept, since selection would discard nothing anyway.
@@ -1290,7 +1290,7 @@ boards or roots they write the same file at any thread count.
 | `--backtrack_min_col K` | 0 | write only boards whose extension fills K columns; cuts partial rows whose column 1 cannot reach row 14 (5.10). Under `--backtrack_unlock_right R`: band columns left open, 0..R, default R (5.9) |
 | `--no_top_dedup` | -- | keep top-row near duplicates (5.9) |
 | `--backtrack_unlock_right R` | 0 | from the backtrack row, the board is the block rows 0..S x columns 0..15-R; rows N+1..S are searched over those columns and the layered extension grows the band (5.9, 5.10) |
-| `--beam_expand E`, `--beam_expand_row R` | 4, 7 | late width multiplier and its row |
+| `--beam_expand E`, `--beam_expand_row R` | 1, 7 | late width multiplier (1 = none) and its row |
 | `--lambda_J F` | 1.0 | closure weight |
 | `--lambda_Mahalanobis F` | 1.0 | Mahalanobis correction, in its own SD units |
 | `--lambda_corners [F]` | off; bare 0.5 | top-corner supply (5.12) |
@@ -1304,8 +1304,8 @@ boards or roots they write the same file at any thread count.
 | `--corner_seeds N` | 4 | corner-seeded copies per board (with `--lambda_corners`) |
 | `--frac_rand F` | 0.10 | random selection band |
 | `--parent_cap N` | 4 | children per parent in the score band; 0 = uncapped |
-| `--pool_factor N` | 8 | candidate pool, x beam width; at least min(8, N) children per parent |
-| `--bc_window nB,nC` | 3,3 | B/C completions scored per A record while the beam is full; each 1..128 |
+| `--pool_factor N` | 64 | candidate pool, x beam width; at least min(8, N) children per parent |
+| `--bc_window nB,nC` | 7,7 | B/C completions scored per A record while the beam is full; each 1..128 |
 | `--bc_window_accept F` | 1 | probability of keeping the window's best child, else its second best |
 | `--no_free_demand` | -- | disable the free-edge demand accounting |
 | `--top_bottoms N`, `--top_columns N` | 10, 12 | bottoms per border row, columns per bottom; < 1 = all |
@@ -1329,8 +1329,9 @@ boards or roots they write the same file at any thread count.
 | 3,3 | 867 / 795 | 147 / 147 | 77% / 69% |
 
 A wider window examines fewer borders per hour but more of them reach the stop
-row, for more foundations per minute; 3,2 and 3,3 are close (the default is
-3,3).
+row, for more foundations per minute; 3,2 and 3,3 are close. The default is now
+7,7, with `--pool_factor 64` and `--beam_expand 1`: the settings in everyday use,
+whose extra scoring costs little time.
 
 ### 5.17 Performance and memory
 

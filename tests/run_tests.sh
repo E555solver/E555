@@ -128,7 +128,7 @@ ALL_STEPS=(
     "ender_repair|core|cpsat,diver|REGRESSION: a scrambled synthetic solution comes back 480/480; a real board redives and comes back no worse"
     "beamer_micro|extra|beamer|random_edges micro-run: builds the real 6.4 GB database; no border runs twice"
     "beamer_backtrack_dive|extra|beamer,diver|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --lambda_reserve keeps the reserve for last"
-    "beamer_min_col|extra|beamer|--backtrack_min_col: the column check drops no written board, random column 0 too; near-duplicate filter; --cap_top changes only row 15; log and score line"
+    "beamer_min_col|extra|beamer|--backtrack_min_col: the column check drops no written board, random column 0 too; near-duplicate filter; --cap_top closes every filled row-14 cell; log and score line"
     "beamer_resume|extra|beamer|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
     "scripts_parse|core|scripts|every shipped script parses, and passes only flags that exist"
     "example_finalizer|extra|finalizer,scripts|examples/02 re-grows the synthetic board"
@@ -3595,11 +3595,14 @@ EOF
 
     # E555_diver --stop_row runs the same extension on the same candidate order:
     # fed the --extend_nodes 0 boards, it must place exactly what the beamer's
-    # extension placed, board for board.
+    # extension placed, board for board. Both with --cap_top 0: the beamer's
+    # cap is committed inside its extension, the diver's is still a tie-break.
+    "${CMD[@]}" --cap_top 0 --out_dir "$OUT/btd_cap0" > "$OUT/btd_cap0.log" \
+        || { tail -5 "$OUT/btd_cap0.log"; fail "--cap_top 0 run exited non-zero"; }
     bin/E555_diver data/seed_Edge5.txt "$OUT/btd_noext/beam_completions_0_10.csv" \
         "$OUT/btd_dvext.csv" --rotations data/borders_annealed_fix12.csv --stop_row 10 \
-        --end_dive 0 --threads 3 > "$OUT/btd_dvext.log" || fail "E555_diver --stop_row exited non-zero"
-    python3 - "$OUT/btd_plain/beam_completions_0_10.csv" "$OUT/btd_dvext.csv" <<'EOF' || exit 1
+        --end_dive 0 --cap_top 0 --threads 3 > "$OUT/btd_dvext.log" || fail "E555_diver --stop_row exited non-zero"
+    python3 - "$OUT/btd_cap0/beam_completions_0_10.csv" "$OUT/btd_dvext.csv" <<'EOF' || exit 1
 import sys
 def rows(p):
     return [[x.strip() for x in l.split(",")][-512:] for l in open(p) if l.strip() and l[0] not in "#%"]
@@ -3625,11 +3628,11 @@ EOF
 #    keeps the plain random path);
 #  - the near-duplicate filter (on by default) writes a subset of the
 #    --no_top_dedup boards and says how many it dropped;
-#  - --cap_top (on by default) only breaks ties between extensions of equal
-#    length: a --cap_top 0 run writes the same boards, line for line, with the
-#    same rows up to the stop row and the same extension cells count; the cap
-#    puts grey-on-top pieces on row 15 that match (a corner first in random
-#    mode);
+#  - --cap_top (on by default) commits the top-left border inside the
+#    extension: a --cap_top 0 run writes the same boards (both at K = 0), with
+#    the same rows up to the stop row and extensions no shorter; under the cap
+#    every filled row-14 cell has a grey-on-top piece above it and nothing
+#    breaks;
 #  - the compact log has no [progress] line, the border line carries the run
 #    time, and the summary's last [sum] line counts the written boards by score
 #    as a recount of their matched edges does;
@@ -3645,7 +3648,7 @@ step_beamer_min_col() {
         "${CMD[@]}" --backtrack_min_col "$k" --no_top_dedup --out_dir "$OUT/mc_k$k" > "$OUT/mc_k$k.log" \
             || { tail -5 "$OUT/mc_k$k.log"; fail "--backtrack_min_col $k run exited non-zero"; }
     done
-    "${CMD[@]}" --backtrack_min_col 2 --no_top_dedup --cap_top 0 --out_dir "$OUT/mc_nocap" > "$OUT/mc_nocap.log" \
+    "${CMD[@]}" --backtrack_min_col 0 --no_top_dedup --cap_top 0 --out_dir "$OUT/mc_nocap" > "$OUT/mc_nocap.log" \
         || { tail -5 "$OUT/mc_nocap.log"; fail "the --cap_top 0 run exited non-zero"; }
     "${CMD[@]}" --backtrack_min_col 2 --out_dir "$OUT/mc_dd" > "$OUT/mc_dd.log" \
         || { tail -5 "$OUT/mc_dd.log"; fail "the near-duplicate run exited non-zero"; }
@@ -3687,19 +3690,22 @@ def ext_cols(l):
     while n < 14 and all(r * 16 + n + 1 in c for r in range(STOP + 1, 15)): n += 1
     return n
 
-nc, kc = [board(l) for l in rows("mc_nocap")], [board(l) for l in rows("mc_k2")]
+nc, kc = [board(l) for l in rows("mc_nocap")], [board(l) for l in rows("mc_k0")]
 assert nc and len(nc) == len(kc), f"--cap_top 0 wrote {len(nc)} boards, the default {len(kc)}"
 capped = 0
 for a, b in zip(nc, kc):
     assert all(a.get(x) == b.get(x) for x in range(16 * (STOP + 1))), "--cap_top changed rows up to the stop row"
     ext = lambda c: sum(1 for x in c if 16 * (STOP + 1) <= x < 240)
-    assert ext(a) == ext(b), "--cap_top changed an extension's length"
+    assert ext(b) <= ext(a), "--cap_top made an extension longer"
     for x in b:
+        if 224 < x < 239:
+            assert x + 16 in b, "--cap_top left a filled row-14 cell without its top edge"
         if x >= 240 and x not in a:
             assert seed[b[x][0]][b[x][1] % 4] == 0, "a cap piece without grey on top"
             capped += 1
+    assert matched_broken(b)[1] == 0, "a --cap_top board has a broken edge"
 assert capped, "--cap_top placed nothing: the check would prove nothing"
-assert re.search(r"^\[sum\] top cap: [0-9.]+ cells per board; \d+% ", log("mc_k2"), re.M), "no top-cap line"
+assert re.search(r"^\[sum\] top cap: [0-9.]+ cells per board on row 15", log("mc_k2"), re.M), "no top-cap line"
 
 want = [content(l) for l in rows("mc_k0") if ext_cols(l) >= 2]
 got = [content(l) for l in rows("mc_k2")]
