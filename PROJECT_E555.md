@@ -771,7 +771,7 @@ row cut what did not get there.
   column and the top owe little of it. The N colours with the largest z_c are
   marked (ties by a hash of the master seed, the configuration and the
   colour). Under `--random_edges` a border is used only when N colours reach
-  `--exhaust_inner_z` (default 1.75): left columns are redrawn, each the best
+  z = 1.75 (fixed): left columns are redrawn, each the best
   of 32 as usual, up to 32 times per bottom, and up to 16 bottoms; after that
   the bottom is relaxed (plain draws, marks by z alone), with one warning and
   a count. Rotations mode only marks.
@@ -1302,7 +1302,6 @@ boards or roots they write the same file at any thread count.
 | `--BL/--BR/--TL/--TR P` | -- | pin a corner piece (`--random_edges`) |
 | `--exhaust_border_color` | off | every random border uses up one frame colour within the bottom row and column 0 rows 1..S (5.3) |
 | `--exhaust_inner_color N` | 0 | mark N inner colours per border (the most over-committed on bottom + left), bias the beam toward them, cut at the checkpoints (5.9) |
-| `--exhaust_inner_z Z` | 1.75 | border acceptance under `--random_edges`: N colours with z >= Z |
 | `--lambda_exhaust_inner F` | 0.15 | the bias, in u_row per weighted face; 0 = off |
 | `--exhaust_check ROW:TOL,...` | S-2:6,S-1:0 | checkpoint rows and marked-residual tolerances |
 | `--incomplete_top` | off | also write stop-row boards with two of the three segments (`_partial.csv`) or segment B alone (`_partial_B.csv`); not with `--backtrack_row` |

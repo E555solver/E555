@@ -255,11 +255,15 @@ static bool     g_exhaust          = false;   /* --exhaust_border_color */
    placing them (--lambda_exhaust_inner, exin_bonus), and boards are cut at the
    checkpoint rows of --exhaust_check (g_exin_tol: per row the residual
    tolerance, -1 where no checkpoint is). See the exin_* section. */
-#define EXIN_Z_DEFAULT      1.75
+/* Border acceptance: N colours with z_c >= EXIN_Z. z takes few values (all of
+   a colour's edges on bottom + left: 1.43, 1.76, 2.06 for n_c = 2, 3, 4), and
+   on 2000 plain --random_edges borders 1.75 passes 63% for N = 1 and 20% for
+   N = 2, the next step (2.05) 24% and 1%: the step nearest half for N = 1.
+   Fixed rather than a flag: it is a property of the seed's edge table. */
+#define EXIN_Z              1.75
 #define EXIN_LAMBDA_DEFAULT 0.15
 #define EXIN_CK_MAX 4
 static uint32_t g_exhaust_inner    = 0;
-static double   g_exin_z           = EXIN_Z_DEFAULT;       /* --exhaust_inner_z */
 static double   g_lambda_exin      = EXIN_LAMBDA_DEFAULT;  /* --lambda_exhaust_inner */
 static int      g_exin_ck_row[EXIN_CK_MAX], g_exin_ck_tol[EXIN_CK_MAX];
 static int      g_exin_ck_n        = -1;    /* --exhaust_check entries; -1 = the default */
@@ -644,7 +648,7 @@ static bool parity_ok(const BeamEntry *p) {
    the top owing little of it. The N colours with the largest z_c are marked
    (ties by a hash of the master seed, the configuration and the colour, so a
    long run tries every colour that qualifies). Under --random_edges a border
-   is used only when N colours reach z_c >= --exhaust_inner_z (exin_pass).
+   is used only when N colours reach z_c >= EXIN_Z (exin_pass).
 
    THE RESIDUAL of a marked colour c, from the ledger:
        R_c = total_c - consumed_c   faces of c on unplaced inner pieces
@@ -757,7 +761,7 @@ static void exin_z(const BottomOrder *bot, const LeftOrder *lft, double z[NUM_IN
 
 static bool exin_pass(const double z[NUM_INNER_COLORS]) {
     uint32_t n = 0;
-    for (int ci = 0; ci < NUM_INNER_COLORS; ci++) n += z[ci] >= g_exin_z - 1e-9;
+    for (int ci = 0; ci < NUM_INNER_COLORS; ci++) n += z[ci] >= EXIN_Z - 1e-9;
     return n >= g_exhaust_inner;
 }
 
@@ -878,7 +882,7 @@ static bool sample_exin_bottom(RNG *rng, BottomOrder *bot) {
     if (!g_exin.warned) {
         g_exin.warned = true;
         fprintf(stderr, "[warn] --exhaust_inner_color: no border with %u colour(s) at z >= %.2f in %d "
-                        "bottoms; relaxed (counted in the summary)\n", g_exhaust_inner, g_exin_z,
+                        "bottoms; relaxed (counted in the summary)\n", g_exhaust_inner, EXIN_Z,
                 EXIN_BOTTOM_TRIES);
     }
     return g_exhaust ? sample_exhaust_bottom(rng, bot) : sample_random_bottom(rng, g_tau_bottoms, bot);
@@ -5679,7 +5683,7 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
     }
     if (g_exhaust_inner) {
         printf("[sum] exhaust_inner_color %u (z >= %.2f, lambda %.3f): marked", g_exhaust_inner,
-               g_exin_z, g_exin_bias ? g_lambda_exin : 0.0);
+               EXIN_Z, g_exin_bias ? g_lambda_exin : 0.0);
         int k = 0;
         for (int ci = 0; ci < NUM_INNER_COLORS; ci++)
             if (g_exin.marked[ci]) printf("%s c%d %" PRIu64, k++ ? "," : "", COLOR_MIN + ci, g_exin.marked[ci]);
@@ -6002,12 +6006,11 @@ static void usage(const char *a0) {
 "                         colours its bottom row and left column over-commit most\n"
 "                         (hypergeometric z of their edge count) are marked; under\n"
 "                         --random_edges the border is redrawn until N colours reach\n"
-"                         --exhaust_inner_z. The beam is biased toward placing them\n"
+"                         z >= 1.75. The beam is biased toward placing them\n"
 "                         (--lambda_exhaust_inner) and every board is cut at the\n"
 "                         --exhaust_check rows when a marked colour's residual -- its\n"
 "                         faces left beyond what the frame and the clues need --\n"
 "                         exceeds the tolerance (default 0 = off)\n"
-"  --exhaust_inner_z Z    border acceptance: N colours with z >= Z (default 1.75)\n"
 "  --lambda_exhaust_inner F\n"
 "                         bias toward the marked colours, in units of the row's\n"
 "                         score SD per weighted face (default 0.15; 0 = off)\n"
@@ -6293,8 +6296,8 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (!g_free_demand)  printf(" --no_free_demand");
     printf(" --stop_row %u", g_stop_row);
     if (g_exhaust_inner) {
-        printf(" --exhaust_inner_color %u --exhaust_inner_z %g --lambda_exhaust_inner %g --exhaust_check ",
-               g_exhaust_inner, g_exin_z, g_lambda_exin);
+        printf(" --exhaust_inner_color %u --lambda_exhaust_inner %g --exhaust_check ",
+               g_exhaust_inner, g_lambda_exin);
         int k = 0;
         for (int r = 1; r <= PUZZLE_SIDE; r++)
             if (g_exin_tol[r] >= 0) printf("%s%d:%d", k++ ? "," : "", r, g_exin_tol[r]);
@@ -6602,11 +6605,6 @@ int main(int argc, char *argv[]) {
                 fatal("--exhaust_inner_color expects an integer in 0..%d, got '%s'",
                       NUM_INNER_COLORS, argv[i]);
             g_exhaust_inner = (uint32_t)v;
-        }
-        else if (!strcmp(argv[i], "--exhaust_inner_z") && i+1 < argc) {
-            char *end; g_exin_z = strtod(argv[++i], &end);
-            if (*end || !(g_exin_z > -10.0 && g_exin_z < 10.0))
-                fatal("--exhaust_inner_z expects a number, got '%s'", argv[i]);
         }
         else if (!strcmp(argv[i], "--lambda_exhaust_inner") && i+1 < argc) {
             char *end; g_lambda_exin = strtod(argv[++i], &end);
@@ -7007,7 +7005,7 @@ int main(int argc, char *argv[]) {
                "cell; the top-right one is left for the dives)\n");
     if (g_exhaust_inner) {
         printf("[cfg] exhaust_inner_color=%u (N colours marked per border, z >= %.2f%s; beam bias "
-               "lambda=%.3f, tops unrewarded from row %d; checkpoints:", g_exhaust_inner, g_exin_z,
+               "lambda=%.3f, tops unrewarded from row %d; checkpoints:", g_exhaust_inner, EXIN_Z,
                g_random_edges ? " by resampling" : ", top N", g_exin_bias ? g_lambda_exin : 0.0,
                g_exin_notop_row);
         for (int r = 1; r <= PUZZLE_SIDE; r++)
