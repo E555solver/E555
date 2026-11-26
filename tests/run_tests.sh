@@ -3643,23 +3643,28 @@ step_beamer_exhaust_exact() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
     gate_db
     # The edge rules are exact under --exhaust_check S:k: a run without them
-    # (E555_EXIN_NO_EDGE, gate only) writes the same boards. They cannot fire on
-    # the beam rows here (S - 4 + k exceeds any count of marked edges), where a
-    # cut would only change the beam's fill.
+    # (E555_EXIN_NO_EDGE, gate only) writes the same boards. On the beam rows
+    # (1..6) a cut would only change the beam's fill, so the check also
+    # requires that no edge cut happened there.
     CMD=(bin/E555_beamer data/seed_Edge5.txt --random_edges --samples 2 --top_columns 1
-         --beam_width 1000 --backtrack_row 4 --stop_row 9 --exhaust_inner_color 2
-         --exhaust_check 9:4 --rng_seed 1 --threads 4)
+         --beam_width 1000 --backtrack_row 6 --stop_row 10 --exhaust_inner_color 2
+         --exhaust_check 10:8 --rng_seed 1 --threads 4)
     if [ -n "$GATE_DB" ]; then CMD+=(--db_file "$GATE_DB"); fi
     "${CMD[@]}" --out_dir "$OUT/exx_on" > "$OUT/exx_on.log" \
         || { tail -5 "$OUT/exx_on.log"; fail "the run with the edge rules exited non-zero"; }
     E555_EXIN_NO_EDGE=1 "${CMD[@]}" --out_dir "$OUT/exx_off" > "$OUT/exx_off.log" \
         || { tail -5 "$OUT/exx_off.log"; fail "the run without the edge rules exited non-zero"; }
     local a b
-    a=$(first_match "$OUT/exx_on/beam_completions_*.csv"); b=$(first_match "$OUT/exx_off/beam_completions_*.csv")
+    a=$(first_match "$OUT"/exx_on/beam_completions_*.csv); b=$(first_match "$OUT"/exx_off/beam_completions_*.csv)
     [ -n "$a" ] && [ -n "$b" ] || fail "no completions file written"
     [ "$(grep -vc '^[#%]' "$a")" -gt 0 ] || fail "no stop-row board written: the comparison would be empty"
     cmp -s "$a" "$b" || fail "the edge rules changed the written boards (diff $a $b)"
-    grep -q '^\[sum\] exhaust cuts by row' "$OUT/exx_on.log" || fail "no [sum] exhaust cuts line"
+    grep '^\[sum\] exhaust cuts by row' "$OUT/exx_on.log" > "$OUT/exx_cuts.txt" || fail "no [sum] exhaust cuts line"
+    python3 - "$OUT/exx_cuts.txt" <<'EOF' || fail "an edge cut on a beam row: the comparison is not exact here"
+import re, sys
+for r, e in re.findall(r" r(\d+) \d+: (\d+)/", open(sys.argv[1]).read()):
+    if int(r) <= 6 and int(e): sys.exit(1)
+EOF
     echo "ok: $(grep -vc '^[#%]' "$a") boards identical with and without the edge rules"
 }
 
