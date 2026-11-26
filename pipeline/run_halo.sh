@@ -98,7 +98,7 @@ STOP_ROW=12             # 13 costs ~2000x more beam time per board (HALO=2, from
 BC_WINDOW=7,7
 POOL=64                 # --pool_factor
 TAU=0.1                 # --tau_bottoms and --tau_columns
-EXHAUST_INNER=0         # --exhaust_inner_color N: mark N colours per border, bias the beam, cut at S-2/S-1 (PROJECT 5.9)
+EXHAUST_INNER=0         # --exhaust_inner_color N: use N colours up, inner and edge pieces, by the stop row (PROJECT 5.9)
 BEAM_WALL=1800          # cap on one beamer call, seconds
 BEAM_EXTRA=             # more beamer flags
 BOARDS=                 # boards a round: the beam stops once it has written them

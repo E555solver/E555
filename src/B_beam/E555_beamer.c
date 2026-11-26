@@ -57,11 +57,10 @@
  *   --backtrack_min_col K a partial row whose column 1 can no longer be
  *   stacked to row 14 is cut on the spot (col_reach), which drops no written
  *   board. --exhaust_inner_color N marks N inner colours per configuration,
- *   those its bottom row and left column over-commit (under --random_edges
- *   the border is resampled until N do), biases the beam toward using them up
- *   and, at the --exhaust_check rows (S-2 and S-1), drops every board whose
- *   residual of a marked colour -- its faces still to be placed beyond what
- *   the frame and the clues need -- exceeds the row's tolerance (exin_*).
+ *   those its bottom row and left column commit most fully (under
+ *   --random_edges each bottom keeps the best of 5 N^2 left columns), biases
+ *   the beam toward using them up, and keeps only boards that have used them
+ *   up completely, inner and edge pieces, by the stop row (exin_*).
  *
  * END DIVES (--end_dive M --emit_score S)
  *   Instead of being written, each stop-row board is completed to 256 pieces
@@ -252,15 +251,10 @@ static uint32_t g_num_rows         = 0;   /* rows to sweep; 0 = every remaining 
 static bool     g_exhaust          = false;   /* --exhaust_border_color */
 /* --exhaust_inner_color N (0 = off): N inner colours are marked per
    configuration from its border (exin_mark), the beam is biased toward
-   placing them (--lambda_exhaust_inner, exin_bonus), and boards are cut at the
-   checkpoint rows of --exhaust_check (g_exin_tol: per row the residual
-   tolerance, -1 where no checkpoint is). See the exin_* section. */
-/* Border acceptance: N colours with z_c >= EXIN_Z. z takes few values (all of
-   a colour's edges on bottom + left: 1.43, 1.76, 2.06 for n_c = 2, 3, 4), and
-   on 2000 plain --random_edges borders 1.75 passes 63% for N = 1 and 20% for
-   N = 2, the next step (2.05) 24% and 1%: the step nearest half for N = 1.
-   Fixed rather than a flag: it is a property of the seed's edge table. */
-#define EXIN_Z              1.75
+   placing them (--lambda_exhaust_inner, exin_bonus), and every board must have
+   used them up completely -- inner and edge pieces -- by the stop row
+   (exin_ok). g_exin_tol: per row the residual tolerance of --exhaust_check,
+   -1 where none is. See the exin_* section. */
 #define EXIN_LAMBDA_DEFAULT 0.15
 #define EXIN_CK_MAX 4
 static uint32_t g_exhaust_inner    = 0;
@@ -268,10 +262,9 @@ static double   g_lambda_exin      = EXIN_LAMBDA_DEFAULT;  /* --lambda_exhaust_i
 static int      g_exin_ck_row[EXIN_CK_MAX], g_exin_ck_tol[EXIN_CK_MAX];
 static int      g_exin_ck_n        = -1;    /* --exhaust_check entries; -1 = the default */
 static int      g_exin_tol[PUZZLE_SIDE + 1];
-static int      g_exin_notop_row   = PUZZLE_SIDE + 1;   /* tops from this beam row on earn nothing */
+static int      g_exin_notop_row   = PUZZLE_SIDE + 1;   /* tops on this row earn nothing */
 static bool     g_exin_bias        = false;  /* the bonus is on */
 static uint32_t g_exin_mark        = 0;      /* this configuration's marked colours, INNER_IDX bits */
-static bool     g_exin_filter      = false;  /* --random_edges: this bottom's lefts must pass */
 static uint64_t g_exhaust_cfgs[MAX_EDGE_SIDE_COLOR + 1];  /* configs run, by colour used up (0 = plain) */
 static int      g_exhaust_ok[MAX_EDGE_SIDE_COLOR];        /* colours that can be used up at all */
 static int      g_exhaust_ok_n = 0;
@@ -637,27 +630,38 @@ static bool parity_ok(const BeamEntry *p) {
 /* -- --exhaust_inner_color --------------------------------------------------- */
 
 /* Blackwood's idea in E555's terms: use a few inner colours up early, so the
-   last rows have fewer colours to match.
+   last rows have fewer colours to match. Here "used up" is complete: by the
+   stop row S, no inner piece and no edge piece still carries a marked colour,
+   so nothing above S -- the extension, the dives, the top border -- ever sees
+   it.
 
-   THE COLOURS. Of the 56 edge pieces, n_c show inner colour c inward. A border
-   puts 28 of them on the bottom row (cols 1..14) and the left column (rows
-   1..14); k_c of them carry c. Drawn at random, k_c is hypergeometric with
-   mean 28 n_c/56 and variance 28 p (1-p) 28/55, p = n_c/56, so
-   z_c = (k_c - mean) / sd says how far the border over-commits c: those faces
-   pull c into rows 1.. and column 1 at once, and leave the right column and
-   the top owing little of it. The N colours with the largest z_c are marked
-   (ties by a hash of the master seed, the configuration and the colour, so a
-   long run tries every colour that qualifies). Under --random_edges a border
-   is used only when N colours reach z_c >= EXIN_Z (exin_pass).
+   THE COLOURS. Of the 56 edge pieces, n_c show inner colour c inward. A
+   border's DEFICIT in c, d_c = n_c - k_c, counts the c edges that are neither
+   on the bottom row (cols 1..14) nor on the left column at or below S (rows
+   1..S): they are left for the right column, which the beam fills up to S, so
+   the deficit is what the beam still has to place there. A colour is ELIGIBLE
+   when it has at least EXIN_MIN_EDGES edges (a colour with one or two is
+   fully committed by chance too often to mean anything), none of them on the
+   left column above S, none on the fixed top border (rotations mode) and none
+   on a clue piece above S: any of those would keep it on the board above S.
+   The N eligible colours with the smallest deficits are marked (ties by a
+   hash of the master seed, the configuration and the colour, so a long run
+   rotates through them). D_N, the sum of those N deficits, scores a border:
+   0 means N colours fully committed to the bottom and left. Under
+   --random_edges each bottom is drawn exactly as without the flag, and of
+   K = 5 N^2 left columns drawn for it -- each the ordinary best of 32 walks
+   under --tau_columns -- the one with the smallest D_N is kept, the first
+   drawn on ties (exin_left_tries).
 
-   THE RESIDUAL of a marked colour c, from the ledger:
+   THE RESIDUAL of a marked colour c, from the ledger, for the loose
+   checkpoints of --exhaust_check below S:
        R_c = total_c - consumed_c   faces of c on unplaced inner pieces
        D_c = req_exposed_c          demands owed: the frontier tops, the left
                                     interfaces still to be met, the inner faces
                                     of the unplaced edges (fixed mode: right pool
-                                    and top border), under unlock_right the band
+                                    and top border)
        T_c = frontier tops of c over the block columns 1..W
-       F_c = D_c - T_c              the frame's (and band's) demand
+       F_c = D_c - T_c              the frame's demand
        residual_c = R_c - F_c - Q_c = S_c + T_c - Q_c
    Each face the frame still shows is met by exactly one inner face, so F_c of
    the R_c faces are spoken for by the frame whatever happens (an edge piece's
@@ -665,32 +669,35 @@ static bool parity_ok(const BeamEntry *p) {
    faces of c on clue pieces still to be placed above the checkpoint, doubled
    when every neighbour of the clue lies above it too. What is left is the
    colour's free supply: faces that will have to meet another inner face.
-   Every inner c face placed that does not face the frame lowers it by one, a
-   face that meets the frame leaves it, so it never rises; parity_ok's S_c >= 0
-   keeps R_c >= F_c + T_c, i.e. the faces the frame needs (the upper left
-   column, the right column, the top) always survive the cut, for the
-   extension and the dives. residual_c = 0 at row S-1 is "used up": no row S-1
-   top shows c and nothing but the frame and the clues still needs it. */
-static int      g_exin_n[NUM_INNER_COLORS];        /* edge pieces, inner face c */
-static double   g_exin_sd[NUM_INNER_COLORS];       /* their hypergeometric sd (0: none) */
+
+   THE EXACT RULES (exin_ok). At the stop row: consumed_c == total_c for every
+   marked colour. parity_ok has just shown S_c = R_c - D_c >= 0 with exact
+   demands, so R_c = 0 forces D_c = 0 as well: no unplaced edge, no left
+   interface above S and no top of row S shows c. At every row r before it, the
+   unplaced edges with inner face c must still fit in the right-column cells
+   r+1..S, the only cells left that can take them; a board that fails cannot
+   pass the stop row, so dropping it changes no written board. */
+#define EXIN_MIN_EDGES 3
 #define EXIN_PHI_MAX 64
 #define EXIN_W_CAP   4.0
+#define EXIN_B_LOOK  24    /* B chains the window orders by marked faces */
+static int      g_exin_n[NUM_INNER_COLORS];        /* edge pieces, inner face c */
+static uint64_t g_exin_emask[NUM_INNER_COLORS][4]; /* ... as a piece mask */
 static double   g_exin_phi[NUM_INNER_COLORS][EXIN_PHI_MAX];
 /* Q_c by checkpoint row and clue frame (orientation + 1; [0] uncommitted: the
    most any enabled frame needs). */
 static int8_t   g_exin_clue[PUZZLE_SIDE + 1][5][NUM_INNER_COLORS];
-#define EXIN_BOTTOM_TRIES 16
-#define EXIN_B_LOOK       24    /* B chains the window orders by marked faces */
-#define EXIN_LEFT_CALLS   32
+static uint32_t g_exin_static_out = 0;   /* never eligible: a clue above S carries it */
+static int      g_exin_K = 0;            /* left columns drawn per border: 5 N^2 */
 
+enum { EXIN_CUT_EDGE, EXIN_CUT_RES, EXIN_CUT_EXACT, EXIN_CUTS };
 static struct {
     uint64_t marked[NUM_INNER_COLORS];             /* configurations per marked colour */
-    uint64_t left_calls, left_pass, bottoms_ok, bottoms_relaxed;
-    uint64_t ck_checked[PUZZLE_SIDE + 1], ck_cut[PUZZLE_SIDE + 1];
+    uint64_t dn[5];                                /* configurations by D_N (4 = 4 or more) */
+    uint64_t short_marks;                          /* configurations with fewer than N eligible */
+    uint64_t ck_checked[PUZZLE_SIDE + 1], ck_cut[EXIN_CUTS][PUZZLE_SIDE + 1];
     double   res_sum[PUZZLE_SIDE + 1];             /* survivors' mean marked residual, summed */
     uint64_t res_n[PUZZLE_SIDE + 1];
-    uint64_t stop_boards, stop_full;               /* backtracker stop-row boards, used up at S-1 */
-    bool     warned;
     /* E555_EXIN_PROBE=1: the picker probe and the bonus spread. */
     uint64_t probe_A, probe_B, probe_C;
     double   bon_sum[PUZZLE_SIDE + 1], bon_sq[PUZZLE_SIDE + 1], bon_n[PUZZLE_SIDE + 1];
@@ -700,22 +707,20 @@ static bool g_exin_probe = false;
 /* Startup: the edge table, the bonus potential and the clue needs. */
 static void exin_init(void) {
     memset(g_exin_n, 0, sizeof g_exin_n);
+    memset(g_exin_emask, 0, sizeof g_exin_emask);
     for (int pc = 0; pc < NUM_PIECES; pc++) {
         const int f[4] = { g_seed_top[pc], g_seed_right[pc], g_seed_bottom[pc], g_seed_left[pc] };
         int grey = -1, ng = 0;
         for (int d = 0; d < 4; d++) if (f[d] == 0) { grey = d; ng++; }
         if (ng != 1) continue;                       /* not an edge piece */
         const int in = f[(grey + 2) & 3];
-        if (color_is_inner(in)) g_exin_n[INNER_IDX(in)]++;
+        if (!color_is_inner(in)) continue;
+        g_exin_n[INNER_IDX(in)]++;
+        g_exin_emask[INNER_IDX(in)][pc >> 6] |= piece_bit((uint16_t)pc);
     }
-    const double N = 56.0, m = 28.0;
     printf("[cfg] exhaust_inner: edge pieces by inner colour n_c:");
-    for (int ci = 0; ci < NUM_INNER_COLORS; ci++) {
-        const double pp = g_exin_n[ci] / N;
-        g_exin_sd[ci] = g_exin_n[ci] ? sqrt(m * pp * (1.0 - pp) * (N - m) / (N - 1.0)) : 0.0;
-        printf(" c%d=%d", COLOR_MIN + ci, g_exin_n[ci]);
-    }
-    printf("\n");
+    for (int ci = 0; ci < NUM_INNER_COLORS; ci++) printf(" c%d=%d", COLOR_MIN + ci, g_exin_n[ci]);
+    printf(" (marked only with n_c >= %d)\n", EXIN_MIN_EDGES);
     /* Phi_c(R) = sum_{r=R+1..T} min(cap, T/r): the bonus of a board with R faces
        of c left, so that the face taking the supply from r to r-1 earns
        min(cap, T/r) -- more as the colour runs low. A state, not a step, so
@@ -746,43 +751,69 @@ static void exin_init(void) {
                 if (g_exin_clue[row][o + 1][ci] > g_exin_clue[row][0][ci])
                     g_exin_clue[row][0][ci] = g_exin_clue[row][o + 1][ci];
         }
+    g_exin_static_out = 0;
+    for (int ci = 0; ci < NUM_INNER_COLORS; ci++)
+        if (g_exin_n[ci] < EXIN_MIN_EDGES || g_exin_clue[g_stop_row][0][ci] > 0) g_exin_static_out |= 1u << ci;
     g_exin_probe = getenv("E555_EXIN_PROBE") != NULL;
 }
 
-/* z_c of a border: bottom cols 1..14 show their inner face up, left rows 1..14
-   to the right. */
-static void exin_z(const BottomOrder *bot, const LeftOrder *lft, double z[NUM_INNER_COLORS]) {
-    int k[NUM_INNER_COLORS] = {0};
-    for (int c = 1; c <= EDGE_LEN; c++) if (color_is_inner(bot->rtop0[c])) k[INNER_IDX(bot->rtop0[c])]++;
-    for (int r = 1; r <= EDGE_LEN; r++) if (color_is_inner(lft->right[r])) k[INNER_IDX(lft->right[r])]++;
+/* A border's deficits d[c] and its eligible colours (INNER_IDX bits). */
+static uint32_t exin_deficits(const BottomOrder *bot, const LeftOrder *lft, int d[NUM_INNER_COLORS]) {
+    uint32_t out = g_exin_static_out;
+    for (int ci = 0; ci < NUM_INNER_COLORS; ci++) d[ci] = g_exin_n[ci];
+    for (int c = 1; c <= EDGE_LEN; c++)
+        if (color_is_inner(bot->rtop0[c])) d[INNER_IDX(bot->rtop0[c])]--;
+    for (int r = 1; r <= EDGE_LEN; r++) {
+        const int c = lft->right[r];
+        if (!color_is_inner(c)) continue;
+        if (r <= (int)g_stop_row) d[INNER_IDX(c)]--;
+        else out |= 1u << INNER_IDX(c);            /* on the left column above S */
+    }
+    if (!g_free_edges)                             /* fixed mode: on the top border */
+        for (int c = COLOR_MIN; c <= COLOR_MAX; c++)
+            if (g_top_border_inner_count[c] > 0) out |= 1u << INNER_IDX(c);
+    uint32_t ok = 0;
     for (int ci = 0; ci < NUM_INNER_COLORS; ci++)
-        z[ci] = g_exin_sd[ci] > 0.0 ? (k[ci] - 0.5 * g_exin_n[ci]) / g_exin_sd[ci] : -1e9;
+        if (g_exin_n[ci] > 0 && !(out >> ci & 1u)) ok |= 1u << ci;
+    return ok;
 }
 
-static bool exin_pass(const double z[NUM_INNER_COLORS]) {
-    uint32_t n = 0;
-    for (int ci = 0; ci < NUM_INNER_COLORS; ci++) n += z[ci] >= EXIN_Z - 1e-9;
-    return n >= g_exhaust_inner;
-}
-
-/* Configuration start: mark the N colours with the largest z_c. */
-static void exin_mark(uint64_t cfg_hash) {
-    double z[NUM_INNER_COLORS];
-    exin_z(g_cur_bottom, g_cur_left, z);
-    uint64_t tb[NUM_INNER_COLORS];
-    for (int ci = 0; ci < NUM_INNER_COLORS; ci++) tb[ci] = splitmix64(cfg_hash ^ (0xE71Bull * (uint64_t)(ci + 1)));
-    g_exin_mark = 0;
+/* The N eligible colours with the smallest deficits (ties by tb, larger
+   first when given, else by colour index), into *mark; returns D_N, their
+   deficit sum, plus 100 per colour short of N. */
+static int exin_pick(const int d[NUM_INNER_COLORS], uint32_t ok, const uint64_t *tb, uint32_t *mark) {
+    uint32_t m = 0;
+    int dn = 0;
     for (uint32_t k = 0; k < g_exhaust_inner; k++) {
         int best = -1;
         for (int ci = 0; ci < NUM_INNER_COLORS; ci++) {
-            if (g_exin_mark >> ci & 1u || g_exin_sd[ci] <= 0.0) continue;
-            if (best < 0 || z[ci] > z[best] + 1e-9 || (fabs(z[ci] - z[best]) <= 1e-9 && tb[ci] > tb[best]))
-                best = ci;
+            if (!(ok >> ci & 1u) || (m >> ci & 1u)) continue;
+            if (best < 0 || d[ci] < d[best] || (d[ci] == d[best] && tb && tb[ci] > tb[best])) best = ci;
         }
-        if (best < 0) break;
-        g_exin_mark |= 1u << best;
-        g_exin.marked[best]++;
+        if (best < 0) { dn += 100; continue; }
+        m |= 1u << best;
+        dn += d[best];
     }
+    if (mark) *mark = m;
+    return dn;
+}
+
+static inline int exin_dn(const BottomOrder *bot, const LeftOrder *lft) {
+    int d[NUM_INNER_COLORS];
+    const uint32_t ok = exin_deficits(bot, lft, d);
+    return exin_pick(d, ok, NULL, NULL);
+}
+
+/* Configuration start: mark the N eligible colours with the smallest deficits. */
+static void exin_mark(uint64_t cfg_hash) {
+    int d[NUM_INNER_COLORS];
+    const uint32_t ok = exin_deficits(g_cur_bottom, g_cur_left, d);
+    uint64_t tb[NUM_INNER_COLORS];
+    for (int ci = 0; ci < NUM_INNER_COLORS; ci++) tb[ci] = splitmix64(cfg_hash ^ (0xE71Bull * (uint64_t)(ci + 1)));
+    const int dn = exin_pick(d, ok, tb, &g_exin_mark);
+    if (dn >= 100) g_exin.short_marks++;
+    g_exin.dn[dn % 100 < 4 ? dn % 100 : 4]++;
+    for (uint32_t m = g_exin_mark; m; m &= m - 1) g_exin.marked[__builtin_ctz(m)]++;
 }
 
 /* Faces of colour ci among the block frontier tops, columns 1..W. */
@@ -812,10 +843,30 @@ static inline int exin_worst(const BeamEntry *t, int W, int row, double *mean) {
     return n ? worst : 0;
 }
 
+/* A board that has completed `row`: -1 if it may go on, else the rule that
+   drops it (EXIN_CUT_*). The edge fit and the stop-row rule are exact; the
+   residual tolerances of --exhaust_check are the loose, heuristic part. */
+static inline int exin_ok(const BeamEntry *t, int W, int row) {
+    const int S = (int)g_stop_row;
+    for (uint32_t m = g_exin_mark; m; m &= m - 1) {
+        const int ci = __builtin_ctz(m);
+        if (row >= S) {
+            if (t->color_consumed[ci] != g_inner_color_total[COLOR_MIN + ci]) return EXIN_CUT_EXACT;
+            continue;
+        }
+        const uint64_t *e = g_exin_emask[ci];
+        const int left = __builtin_popcountll(e[0] & ~t->used[0]) + __builtin_popcountll(e[1] & ~t->used[1])
+                       + __builtin_popcountll(e[2] & ~t->used[2]) + __builtin_popcountll(e[3] & ~t->used[3]);
+        if (left > S - row) return EXIN_CUT_EDGE;
+    }
+    if (row < S && g_exin_tol[row] >= 0 && exin_worst(t, W, row, NULL) > g_exin_tol[row]) return EXIN_CUT_RES;
+    return -1;
+}
+
 /* The bias: lambda * u_row * sum over the marked colours of Phi_c(R'), R' the
-   faces left -- counting the row's tops as not yet placed from S-2 on, where a
-   top only adds to the S-1 residual. The right edge counts through its joint:
-   the column-14 piece's right face, which is in R. */
+   faces left -- counting the stop row's tops as not yet placed, since a top of
+   c there can never pass. The right edge counts through its joint: the
+   column-14 piece's right face, which is in R. */
 static inline double exin_bonus(const BeamEntry *t, int row) {
     double b = 0.0;
     for (uint32_t m = g_exin_mark; m; m &= m - 1) {
@@ -837,11 +888,12 @@ static inline double exin_bonus(const BeamEntry *t, int row) {
     return b;
 }
 
-/* A beam child on a checkpoint row (full width: W = 14). */
+/* A beam child (full width: W = 14). */
 static bool exin_child_ok(const BeamEntry *t, int row, Scratch *sc) {
-    sc->exh_checked++;
-    if (exin_worst(t, EDGE_LEN, row, NULL) <= g_exin_tol[row]) return true;
-    sc->exh_cut++;
+    sc->exin_checked++;
+    const int why = exin_ok(t, EDGE_LEN, row);
+    if (why < 0) return true;
+    sc->exin_cut[why]++;
     return false;
 }
 
@@ -851,66 +903,51 @@ static inline int exin_faces(const Oriented *o) {
          + (int)((g_exin_mark >> INNER_IDX(o->bottom)) & 1u) + (int)((g_exin_mark >> INNER_IDX(o->left)) & 1u);
 }
 
-/* --random_edges: a left column for `bot` whose border passes the z test,
-   the first of up to EXIN_LEFT_CALLS draws (each the best of 32 walks). */
-static bool exin_sample_left(RNG *rng, const BottomOrder *bot, LeftOrder *lft) {
-    for (int k = 0; k < EXIN_LEFT_CALLS; k++) {
-        if (!sample_random_left(rng, g_tau_columns, bot, lft)) return false;
-        g_exin.left_calls++;
-        double z[NUM_INNER_COLORS];
-        exin_z(bot, lft, z);
-        if (exin_pass(z)) { g_exin.left_pass++; return true; }
+/* --random_edges: keep a drawn left column. sample_random_left publishes into
+   static storage that the next draw overwrites, so the pieces are copied here
+   and the pointers moved to the copy; its corners (g_cBL below, g_cTL above)
+   come from the bottom and are the same for every left drawn for it. */
+static Oriented g_exin_left_store[PUZZLE_SIDE];
+static void exin_keep_left(const LeftOrder *src, LeftOrder *dst) {
+    *dst = *src;
+    for (int r = 1; r < PUZZLE_SIDE - 1; r++) {
+        g_exin_left_store[r] = *src->p[r];
+        dst->p[r] = &g_exin_left_store[r];
     }
-    return false;
 }
 
-static bool sample_exhaust_bottom(RNG *rng, BottomOrder *bot);
-
-/* A bottom that admits a passing left, up to EXIN_BOTTOM_TRIES; otherwise the
-   bottom is relaxed: its lefts are drawn plain and the marks are simply its
-   N largest z (warned once, counted). */
-static bool sample_exin_bottom(RNG *rng, BottomOrder *bot) {
-    for (int t = 0; t < EXIN_BOTTOM_TRIES; t++) {
-        const bool ok = g_exhaust ? sample_exhaust_bottom(rng, bot)
-                                  : sample_random_bottom(rng, g_tau_bottoms, bot);
-        if (!ok) continue;
-        LeftOrder probe;
-        if (exin_sample_left(rng, bot, &probe)) { g_exin_filter = true; g_exin.bottoms_ok++; return true; }
-    }
-    g_exin_filter = false;
-    g_exin.bottoms_relaxed++;
-    if (!g_exin.warned) {
-        g_exin.warned = true;
-        fprintf(stderr, "[warn] --exhaust_inner_color: no border with %u colour(s) at z >= %.2f in %d "
-                        "bottoms; relaxed (counted in the summary)\n", g_exhaust_inner, EXIN_Z,
-                EXIN_BOTTOM_TRIES);
-    }
-    return g_exhaust ? sample_exhaust_bottom(rng, bot) : sample_random_bottom(rng, g_tau_bottoms, bot);
-}
-
-/* E555_EXIN_MEASURE=K: K plain borders, the distribution of their largest and
-   second-largest z (what N = 1 and N = 2 need), then exit. */
+/* E555_EXIN_MEASURE=K: on K bottoms drawn as in a run, the distribution of D_N
+   for one left column (plain) and for the best of 5 N^2 (as the run picks),
+   N = 1..4, then exit. Repeats and row-1 checks are left out. */
 static void exin_measure(RNG *rng, long K) {
-    static const double th[] = { 1.00, 1.39, 1.42, 1.71, 1.76, 2.05, 2.32, 2.57 };
-    enum { NT = sizeof th / sizeof th[0] };
-    uint64_t n1[NT] = {0}, n2[NT] = {0}, got = 0;
+    uint64_t pl[5][5] = {{0}}, bk[5][5] = {{0}}, got = 0;
     BottomOrder bot; LeftOrder lft;
+    const uint32_t saveN = g_exhaust_inner;
     for (long i = 0; i < K; i++) {
         if (!(g_exhaust ? sample_exhaust_bottom(rng, &bot) : sample_random_bottom(rng, g_tau_bottoms, &bot))) continue;
-        if (!sample_random_left(rng, g_tau_columns, &bot, &lft)) continue;
-        double z[NUM_INNER_COLORS], a = -1e9, b = -1e9;
-        exin_z(&bot, &lft, z);
-        for (int ci = 0; ci < NUM_INNER_COLORS; ci++) {
-            if (z[ci] > a) { b = a; a = z[ci]; } else if (z[ci] > b) b = z[ci];
-        }
         got++;
-        for (int t = 0; t < NT; t++) { n1[t] += a >= th[t] - 1e-9; n2[t] += b >= th[t] - 1e-9; }
+        for (uint32_t N = 1; N <= 4; N++) {
+            g_exhaust_inner = N;
+            int best = INT_MAX;
+            for (uint32_t k = 0; k < 5 * N * N; k++) {
+                if (!sample_random_left(rng, g_tau_columns, &bot, &lft)) break;
+                const int dn = exin_dn(&bot, &lft);
+                if (k == 0) pl[N][dn < 4 ? dn : 4]++;
+                if (dn < best) best = dn;
+            }
+            if (best != INT_MAX) bk[N][best < 4 ? best : 4]++;
+        }
     }
-    printf("[measure] %" PRIu64 " plain borders%s: share with N colours at z >= threshold\n", got,
-           g_exhaust ? " (--exhaust_border_color)" : "");
-    for (int t = 0; t < NT; t++)
-        printf("[measure]   z >= %.2f   N=1 %5.1f%%   N=2 %5.1f%%\n", th[t],
-               got ? 100.0 * n1[t] / got : 0.0, got ? 100.0 * n2[t] / got : 0.0);
+    g_exhaust_inner = saveN;
+    printf("[measure] %" PRIu64 " bottoms%s: D_N (marked edges left for the right column), one left vs "
+           "the best of 5 N^2\n", got, g_exhaust ? " (--exhaust_border_color)" : "");
+    for (int N = 1; N <= 4; N++) {
+        printf("[measure]   N=%d  plain:", N);
+        for (int d = 0; d < 5; d++) printf(" %s%d %4.1f%%", d == 4 ? ">=" : "", d, got ? 100.0 * pl[N][d] / got : 0.0);
+        printf("   best of %d:", 5 * N * N);
+        for (int d = 0; d < 5; d++) printf(" %s%d %4.1f%%", d == 4 ? ">=" : "", d, got ? 100.0 * bk[N][d] / got : 0.0);
+        printf("\n");
+    }
     fflush(stdout);
     exit(0);
 }
@@ -2570,7 +2607,7 @@ static void expand_clued(BeamCtx *ctx, const BeamEntry *p, uint32_t pi, int row,
                     *t = *p; commit_row(t, row, &mv);
                     t->flags = oflags;          /* before pool_append: it hashes flags */
                     if (!parity_ok(t)) continue;
-                    if (g_exin_tol[row] >= 0 && !exin_child_ok(t, row, sc)) continue;
+                    if (g_exhaust_inner && !exin_child_ok(t, row, sc)) continue;
                     float score;
                     if (at_stop) {
                         score = score_stop(t, row);
@@ -2663,7 +2700,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
                 mv.rterm = rterm;
                 *t = *p; commit_row(t, e->row, &mv);
                 if (!parity_ok(t)) continue;
-                if (g_exin_tol[e->row] >= 0 && !exin_child_ok(t, e->row, sc))
+                if (g_exhaust_inner && !exin_child_ok(t, e->row, sc))
                     continue;
                 /* No lookahead gate at the stop row: every board that completes
                    it is emitted -- whether a row fits above is deliberately the
@@ -2770,7 +2807,7 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
             if (!child_lookahead(mv.ci, rterm, e->row, &nA, &fB, &fC)) continue;
             *t = *p; commit_row(t, e->row, &mv);
             if (!parity_ok(t)) continue;
-            if (g_exin_tol[e->row] >= 0 && !exin_child_ok(t, e->row, sc))
+            if (g_exhaust_inner && !exin_child_ok(t, e->row, sc))
                 continue;
             float score = score_scanned(t, e->row, nA, fB, fC);
             if (e->keep_all) {                  /* starved beam: keep them all */
@@ -3018,11 +3055,11 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
        the wrong beam -- boards that fail parity on rebuild. Drain every buffer
        here so no child can outlive the row that made it. */
     for (int t = 0; t < nt; t++) pool_flush(ctx, scratch[t]);
-    if (g_exin_tol[row] >= 0)
+    if (g_exhaust_inner && row >= 0 && row <= PUZZLE_SIDE)
         for (int t = 0; t < nt; t++) {
             Scratch *sc = scratch[t];
-            g_exin.ck_checked[row] += sc->exh_checked; g_exin.ck_cut[row] += sc->exh_cut;
-            sc->exh_checked = sc->exh_cut = 0;
+            g_exin.ck_checked[row] += sc->exin_checked; sc->exin_checked = 0;
+            for (int k = 0; k < EXIN_CUTS; k++) { g_exin.ck_cut[k][row] += sc->exin_cut[k]; sc->exin_cut[k] = 0; }
         }
     maha_close_row(row);        /* this row's spread calibrates the next one */
     corner_close_row(row);      /* likewise u_row, under --lambda_corners */
@@ -4329,11 +4366,10 @@ typedef struct {
     RowChoice ref;
     bool      ref_ok;
     uint64_t  near_dup;
-    /* --exhaust_inner_color: checkpoint tests and cuts (total and by row), the
-       survivors' mean marked residual by row, and the stop-row boards and
-       those used up at row S-1. */
-    uint64_t  exh_checked, cut_exhaust, exin_stop, exin_full;
-    uint64_t  exin_ck[PUZZLE_SIDE + 1], exin_cut[PUZZLE_SIDE + 1], exin_resn[PUZZLE_SIDE + 1];
+    /* --exhaust_inner_color: boards cut (all rules), tests and cuts by rule
+       and row, and the survivors' mean marked residual by row. */
+    uint64_t  cut_exhaust;
+    uint64_t  exin_ck[PUZZLE_SIDE + 1], exin_cut[EXIN_CUTS][PUZZLE_SIDE + 1], exin_resn[PUZZLE_SIDE + 1];
     double    exin_res[PUZZLE_SIDE + 1];
 } BtCtx;
 
@@ -4606,17 +4642,12 @@ static void bt_close_row(BtCtx *x, int row) {
     if (!parity_ok(t)) { x->cut_parity++; return; }
     if (g_corners_on && !bt_corners_ok(x, row, t)) { x->cut_corner++; return; }
     if (g_exhaust_inner) {
+        x->exin_ck[row]++;
+        const int why = exin_ok(t, g_last_inner, row);
+        if (why >= 0) { x->cut_exhaust++; x->exin_cut[why][row]++; return; }
         double mean;
-        const int worst = exin_worst(t, g_last_inner, row, &mean);
-        if (g_exin_tol[row] >= 0) {
-            x->exh_checked++; x->exin_ck[row]++;
-            if (worst > g_exin_tol[row]) { x->cut_exhaust++; x->exin_cut[row]++; return; }
-        }
+        (void)exin_worst(t, g_last_inner, row, &mean);
         x->exin_res[row] += mean; x->exin_resn[row]++;
-        if ((uint32_t)row == g_stop_row) {
-            x->exin_stop++;
-            x->exin_full += exin_worst(&x->lvl[row - 1], g_last_inner, row - 1, NULL) <= 0;
-        }
     }
     x->fill[row]++;
     if ((uint32_t)row == g_stop_row) {
@@ -4958,15 +4989,6 @@ static void bt_run_job(BtCtx *x, const BtJob *j) {
     if (j->k == N) {
         x->root_row = N;
         if (g_corners_on && !bt_corners_ok(x, N, r)) { x->cut_corner++; return; }
-        if (g_unlock_right && g_exin_tol[N] >= 0) {
-            /* The beam checked the full-width board; the rebuilt block gave
-               pieces back, so the checkpoint is tested again on it. */
-            x->exh_checked++; x->exin_ck[N]++;
-            if (exin_worst(r, g_last_inner, N, NULL) > g_exin_tol[N]) {
-                x->cut_exhaust++; x->exin_cut[N]++;
-                return;
-            }
-        }
         bt_row(x, N + 1);
         return;
     }
@@ -5042,7 +5064,7 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
     for (int t = 0; t < nt; t++) {
         BtCtx *x = g_bt_ctx[t];
         x->nodes = x->cut_parity = x->cut_corner = 0;
-        x->exh_checked = x->cut_exhaust = x->exin_stop = x->exin_full = 0;
+        x->cut_exhaust = 0;
         memset(x->exin_ck, 0, sizeof x->exin_ck); memset(x->exin_cut, 0, sizeof x->exin_cut);
         memset(x->exin_res, 0, sizeof x->exin_res); memset(x->exin_resn, 0, sizeof x->exin_resn);
         x->ext_nodes_cap = x->cut_mincol = x->cut_score = 0;
@@ -5122,10 +5144,10 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
         for (int r = 0; r <= EDGE_LEN; r++) fill[r] += x->fill[r];
         exh_cut += x->cut_exhaust;
         for (int r = 0; r <= PUZZLE_SIDE; r++) {
-            g_exin.ck_checked[r] += x->exin_ck[r]; g_exin.ck_cut[r] += x->exin_cut[r];
+            g_exin.ck_checked[r] += x->exin_ck[r];
+            for (int k = 0; k < EXIN_CUTS; k++) g_exin.ck_cut[k][r] += x->exin_cut[k][r];
             g_exin.res_sum[r] += x->exin_res[r]; g_exin.res_n[r] += x->exin_resn[r];
         }
-        g_exin.stop_boards += x->exin_stop; g_exin.stop_full += x->exin_full;
         if (x->abort) aborted = true;
     }
     const uint64_t roots = g_bt.next, roots_emitting = g_bt.roots_emitting, emitted = g_bt.emitted;
@@ -5682,22 +5704,20 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         printf(" configs\n");
     }
     if (g_exhaust_inner) {
-        printf("[sum] exhaust_inner_color %u (z >= %.2f, lambda %.3f): marked", g_exhaust_inner,
-               EXIN_Z, g_exin_bias ? g_lambda_exin : 0.0);
+        printf("[sum] exhaust_inner_color %u (best of %d left columns, lambda %.3f): marked",
+               g_exhaust_inner, g_random_edges ? g_exin_K : 1, g_exin_bias ? g_lambda_exin : 0.0);
         int k = 0;
         for (int ci = 0; ci < NUM_INNER_COLORS; ci++)
             if (g_exin.marked[ci]) printf("%s c%d %" PRIu64, k++ ? "," : "", COLOR_MIN + ci, g_exin.marked[ci]);
-        printf("%s configs", k ? "" : " none");
-        if (g_random_edges)
-            printf("; borders: %" PRIu64 " of %" PRIu64 " left draws passed (%.0f%%), %" PRIu64
-                   " bottoms accepted, %" PRIu64 " relaxed", g_exin.left_pass, g_exin.left_calls,
-                   g_exin.left_calls ? 100.0 * (double)g_exin.left_pass / (double)g_exin.left_calls : 0.0,
-                   g_exin.bottoms_ok, g_exin.bottoms_relaxed);
-        printf("\n[sum] exhaust checkpoints:");
-        for (int r = 1; r <= PUZZLE_SIDE; r++)
-            if (g_exin_tol[r] >= 0)
-                printf(" row %d (residual <= %d) kept %" PRIu64 " of %" PRIu64 ";", r, g_exin_tol[r],
-                       g_exin.ck_checked[r] - g_exin.ck_cut[r], g_exin.ck_checked[r]);
+        printf("%s configs; edges left for the right column (D_N):", k ? "" : " none");
+        for (int d = 0; d < 5; d++) printf(" %s%d:%" PRIu64, d == 4 ? ">=" : "", d, g_exin.dn[d]);
+        if (g_exin.short_marks) printf("; %" PRIu64 " with fewer than N eligible colours", g_exin.short_marks);
+        printf("\n[sum] exhaust cuts by row (tested: edge fit / residual / not used up at row %u):", g_stop_row);
+        for (int r = 1; r <= PUZZLE_SIDE; r++) {
+            if (!g_exin.ck_checked[r]) continue;
+            printf(" r%d %" PRIu64 ": %" PRIu64 "/%" PRIu64 "/%" PRIu64 ";", r, g_exin.ck_checked[r],
+                   g_exin.ck_cut[EXIN_CUT_EDGE][r], g_exin.ck_cut[EXIN_CUT_RES][r], g_exin.ck_cut[EXIN_CUT_EXACT][r]);
+        }
         printf("\n[sum] exhaust residual by row (mean over the marked colours, surviving boards):");
         for (int r = 1; r <= PUZZLE_SIDE; r++)
             if (g_exin.res_n[r]) printf(" r%d %.1f", r, g_exin.res_sum[r] / (double)g_exin.res_n[r]);
@@ -5705,11 +5725,8 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         uint64_t ext = 0;
         for (int r = 0; r <= EDGE_LEN; r++) ext += g_stats.extinct_at[r];
         printf("[sum] exhaust outcome: %" PRIu64 " of %" PRIu64 " configs reached row %u, %" PRIu64
-               " extinct", g_stats.reached_stop, g_stats.configs, g_stop_row, ext);
-        if (g_backtrack_row)
-            printf("; %" PRIu64 " stop-row boards, %" PRIu64 " (%.0f%%) used up at row %u", g_exin.stop_boards,
-                   g_exin.stop_full, g_exin.stop_boards ? 100.0 * (double)g_exin.stop_full / (double)g_exin.stop_boards : 0.0,
-                   g_stop_row - 1);
+               " extinct; %" PRIu64 " stop-row boards, every marked colour used up", g_stats.reached_stop,
+               g_stats.configs, g_stop_row, ext, g_found_total);
         if (g_end_dive) {
             uint64_t n = 0; double sum = 0.0; int best = -1;
             for (int sc = 0; sc <= DV_EDGES; sc++) {
@@ -6002,21 +6019,25 @@ static void usage(const char *a0) {
 "                         (up to pool_factor x width near-twins; the behaviour\n"
 "                         before this flag) (default 2)\n"
 "  --exhaust_inner_color N\n"
-"                         use N inner colours up by row stop_row-1. Per border the N\n"
-"                         colours its bottom row and left column over-commit most\n"
-"                         (hypergeometric z of their edge count) are marked; under\n"
-"                         --random_edges the border is redrawn until N colours reach\n"
-"                         z >= 1.75. The beam is biased toward placing them\n"
-"                         (--lambda_exhaust_inner) and every board is cut at the\n"
-"                         --exhaust_check rows when a marked colour's residual -- its\n"
-"                         faces left beyond what the frame and the clues need --\n"
-"                         exceeds the tolerance (default 0 = off)\n"
+"                         use N inner colours up completely -- inner and edge\n"
+"                         pieces -- by the stop row, so nothing above it sees them.\n"
+"                         Marked per border: the N colours (3+ edges, none on the\n"
+"                         left column above the stop row) with the fewest edges off\n"
+"                         the bottom row and left column; under --random_edges each\n"
+"                         bottom keeps the best of 5 N^2 ordinary left columns. The\n"
+"                         beam is biased toward placing them (--lambda_exhaust_inner);\n"
+"                         a board is dropped once its unplaced edges of a marked\n"
+"                         colour no longer fit the right column up to the stop row,\n"
+"                         or at the stop row unless every marked colour is gone.\n"
+"                         1..8 (default 0 = off)\n"
 "  --lambda_exhaust_inner F\n"
 "                         bias toward the marked colours, in units of the row's\n"
 "                         score SD per weighted face (default 0.15; 0 = off)\n"
 "  --exhaust_check ROW:TOL[,ROW:TOL]\n"
-"                         checkpoint rows and residual tolerances (default\n"
-"                         S-2:6,S-1:0 with S = --stop_row)\n"
+"                         loose checkpoints below the stop row: a marked colour's\n"
+"                         residual (its faces left beyond what the frame needs) at\n"
+"                         most TOL (default S-1:6 with S = --stop_row)\n"
+
 
 "  --extend_nodes N       with --backtrack_row: every stop-row board goes on,\n"
 "                         cell by cell in COLUMN-major order (column 1 bottom up,\n"
@@ -6601,9 +6622,8 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--exhaust_border_color"))      g_exhaust = true;
         else if (!strcmp(argv[i], "--exhaust_inner_color") && i+1 < argc) {
             char *end; long v = strtol(argv[++i], &end, 10);
-            if (*end || v < 0 || v > NUM_INNER_COLORS)
-                fatal("--exhaust_inner_color expects an integer in 0..%d, got '%s'",
-                      NUM_INNER_COLORS, argv[i]);
+            if (*end || v < 0 || v > 8)
+                fatal("--exhaust_inner_color expects an integer in 0..8, got '%s'", argv[i]);
             g_exhaust_inner = (uint32_t)v;
         }
         else if (!strcmp(argv[i], "--lambda_exhaust_inner") && i+1 < argc) {
@@ -6834,17 +6854,21 @@ int main(int argc, char *argv[]) {
             fatal("--exhaust_inner_color checks row stop_row-1: it needs --stop_row 2 or more");
         if (g_free_edges && !g_free_demand)
             fatal("--exhaust_inner_color needs exact demands: not with --no_free_demand");
-        if (g_exin_ck_n < 0) {                    /* the default: S-2 loose, S-1 tight */
+        if (g_unlock_right)
+            fatal("--exhaust_inner_color uses its colours up by the stop row, right column included: "
+                  "not with --backtrack_unlock_right, whose band is filled later");
+        if (g_exin_ck_n < 0) {                    /* the default: S-1 loose (S itself is exact) */
             g_exin_ck_n = 0;
-            if (g_stop_row >= 3) { g_exin_ck_row[g_exin_ck_n] = (int)g_stop_row - 2; g_exin_ck_tol[g_exin_ck_n++] = 6; }
-            g_exin_ck_row[g_exin_ck_n] = (int)g_stop_row - 1; g_exin_ck_tol[g_exin_ck_n++] = 0;
+            g_exin_ck_row[g_exin_ck_n] = (int)g_stop_row - 1; g_exin_ck_tol[g_exin_ck_n++] = 6;
         }
         for (int k = 0; k < g_exin_ck_n; k++) {
-            if (g_exin_ck_row[k] < 1 || g_exin_ck_row[k] > (int)g_stop_row)
-                fatal("--exhaust_check row %d is not in 1..stop_row (%u)", g_exin_ck_row[k], g_stop_row);
+            if (g_exin_ck_row[k] < 1 || g_exin_ck_row[k] >= (int)g_stop_row)
+                fatal("--exhaust_check row %d is not in 1..stop_row-1 (%u): the stop row itself "
+                      "always requires every marked colour used up", g_exin_ck_row[k], g_stop_row - 1);
             g_exin_tol[g_exin_ck_row[k]] = g_exin_ck_tol[k];
         }
-        if (g_stop_row >= 3) g_exin_notop_row = (int)g_stop_row - 2;
+        g_exin_notop_row = (int)g_stop_row;
+        g_exin_K = 5 * (int)(g_exhaust_inner * g_exhaust_inner);
         g_exin_bias = g_lambda_exin > 0.0;
         g_aux_on = g_aux_on || g_exin_bias;
     }
@@ -7004,12 +7028,13 @@ int main(int argc, char *argv[]) {
         printf("[cfg] free_top_clue=1 (the extension may place the top-left row-13 clue on any "
                "cell; the top-right one is left for the dives)\n");
     if (g_exhaust_inner) {
-        printf("[cfg] exhaust_inner_color=%u (N colours marked per border, z >= %.2f%s; beam bias "
-               "lambda=%.3f, tops unrewarded from row %d; checkpoints:", g_exhaust_inner, EXIN_Z,
-               g_random_edges ? " by resampling" : ", top N", g_exin_bias ? g_lambda_exin : 0.0,
-               g_exin_notop_row);
+        printf("[cfg] exhaust_inner_color=%u (marks the N colours with the fewest edges left for the "
+               "right column%s; beam bias lambda=%.3f; every marked colour used up, inner and edge "
+               "pieces, by row %u", g_exhaust_inner,
+               g_random_edges ? ", best of 5 N^2 left columns per bottom" : "",
+               g_exin_bias ? g_lambda_exin : 0.0, g_stop_row);
         for (int r = 1; r <= PUZZLE_SIDE; r++)
-            if (g_exin_tol[r] >= 0) printf(" row %d residual <= %d", r, g_exin_tol[r]);
+            if (g_exin_tol[r] >= 0) printf("; row %d residual <= %d", r, g_exin_tol[r]);
         printf(")\n");
     }
     if (g_exhaust)
@@ -7219,10 +7244,7 @@ int main(int argc, char *argv[]) {
         if (g_exhaust_inner && getenv("E555_EXIN_MEASURE"))
             exin_measure(&srng, atol(getenv("E555_EXIN_MEASURE")));
         for (size_t bi = 0; bi < run_b && !g_stop; bi++) {
-            if (g_exhaust_inner) {
-                if (!sample_exin_bottom(&srng, &bot))
-                    fatal("random bottom sampling failed; seed edge pool too constrained");
-            } else if (g_exhaust) {
+            if (g_exhaust) {
                 if (!sample_exhaust_bottom(&srng, &bot))
                     fatal("random bottom sampling failed; seed edge pool too constrained");
             } else if (!sample_random_bottom(&srng, g_tau_bottoms, &bot))
@@ -7235,12 +7257,19 @@ int main(int argc, char *argv[]) {
                 if (partials_budget_spent()) { partials_budget_announce(); break; }
                 bool got_left = false, out_of_columns = false;
                 double clue_t0 = omp_get_wtime();
-                unsigned left_tries = (g_clue_mask & CLUE_CORNERS) ? 64u : 1u;
-                unsigned dup = 0;
-                uint64_t bkey = 0;
-                for (unsigned tr = 0; tr < left_tries; ) {
-                    if (!(g_exin_filter ? exin_sample_left(&srng, &bot, &lft)
-                                        : sample_random_left(&srng, g_tau_columns, &bot, &lft))) break;
+                /* --exhaust_inner_color: of g_exin_K left columns that pass
+                   the usual tests, keep the one with the smallest D_N, the
+                   first drawn on ties (no randomness of its own, so tau 0
+                   runs repeat). Without the flag want is 1 and the loop is the
+                   plain one, draw for draw. */
+                const unsigned want = g_exhaust_inner ? (unsigned)g_exin_K : 1u;
+                unsigned left_tries = ((g_clue_mask & CLUE_CORNERS) ? 64u : 1u) * want;
+                unsigned dup = 0, got = 0;
+                int best_dn = INT_MAX;
+                uint64_t bkey = 0, best_key = 0;
+                LeftOrder best_lft;
+                for (unsigned tr = 0; tr < left_tries && got < want; ) {
+                    if (!sample_random_left(&srng, g_tau_columns, &bot, &lft)) break;
                     bkey = border_key(&bot, &lft);
                     if (border_seen(bkey)) {
                         /* A border this run already searched: draw again. After
@@ -7250,6 +7279,7 @@ int main(int argc, char *argv[]) {
                            is left. */
                         g_border_stats.columns_repeated++;
                         if (++dup < BORDER_REPEAT_TRIES) continue;
+                        if (got_left) break;    /* keep the best found so far */
                         if (g_exhaust_colour) {
                             g_exhaust_colour = 0;
                             g_border_stats.plain_fallbacks++;
@@ -7264,9 +7294,14 @@ int main(int argc, char *argv[]) {
                     if (row1_corner_compatible(&bot, &lft)) {
                         g_border_stats.columns_clue_compatible++;
                         got_left = true;
-                        break;
+                        got++;
+                        if (g_exhaust_inner) {
+                            const int dn = exin_dn(&bot, &lft);
+                            if (dn < best_dn) { best_dn = dn; best_key = bkey; exin_keep_left(&lft, &best_lft); }
+                        }
                     }
                 }
+                if (g_exhaust_inner && got_left) { lft = best_lft; bkey = best_key; }
                 g_border_stats.clue_seconds += omp_get_wtime() - clue_t0;
                 if (out_of_columns) { g_border_stats.bottoms_left++; break; }
                 if (!got_left) {
