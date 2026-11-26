@@ -782,25 +782,28 @@ toward them, and every board is held to the rule.
 - **Choosing the border** (`--random_edges`). Each bottom is drawn exactly as
   without the flag (best of 32 walks under `--tau_bottoms`, or the
   `--exhaust_border_color` bottom), so it is never overloaded with a colour.
-  For each left column the run needs, K = 5 N^2 ordinary left columns are
+  For each left column the run needs, K = (N+1)^3 ordinary left columns
+  (2 (N+1)^3 with `--exhaust_border_color`, whose lefts vary less) are
   drawn (each the best of 32 walks under `--tau_columns`, repeats and row-1
   failures skipped as usual) and the one with the smallest D_N is kept, the
   first drawn on ties. The walks are unweighted, so the colours emerge from
   the sampling; every border is a fresh draw, and at tau 0 a seeded run
-  repeats. Measured on 500 bottoms (D_N = 0 share, one left / best of K):
+  repeats. A left draw costs about 0.16 ms (1.9 ms with
+  `--exhaust_border_color`). Measured on 300 bottoms (D_N = 0 share, one left
+  / best of K):
 
-  | N | K | plain | `--exhaust_border_color` |
-  |---|---|---|---|
-  | 1 | 5 | 48% / 90% | 51% / 74% |
-  | 2 | 20 | 8% / 66% | 9% / 38% |
-  | 3 | 45 | 1% / 22% | 0% / 1% |
-  | 4 | 80 | 0% / 1% | 0% / 0% |
+  | N | plain: K | plain | `--exhaust_border_color`: K | `--exhaust_border_color` |
+  |---|---|---|---|---|
+  | 1 | 8 | 45% / 98% | 16 | 53% / 84% |
+  | 2 | 27 | 9% / 76% | 54 | 7% / 44% |
+  | 3 | 64 | 1% / 25% | 128 | 0% / 2% |
+  | 4 | 125 | 0% / 2% | 250 | 0% / 0% |
 
   Almost every other border leaves one or two edges, which the beam places in
   the right column (the bias below rewards it). At tau 0, 50 borders drawn
   this way were 50 distinct and marked 11 different colours. Rotations mode
   only marks.
-- **The rules** (exact; k the stop-row tolerance below, default 0). At every
+- **The rules** (exact; k the stop-row tolerance below, default 2N). At every
   row r < S a board is dropped when
   - *edge fit:* the unplaced marked edges, all marked colours together, exceed
     the right-column cells r+1..S (an edge has one inner face, so edges of
@@ -816,9 +819,10 @@ toward them, and every board is held to the rule.
   of row S shows the colour either. Needs exact demands (not with
   `--no_free_demand`); refused with `--backtrack_unlock_right`, whose band is
   filled after the stop row.
-- **The stop-row tolerance** (`--exhaust_check S:k`, at most 32): up to k
-  marked inner faces may stay above S (the edges never do). For example
-  `--exhaust_check 10:6,11:4` with N = 2 and S = 11. `[sum] exhaust outcome`
+- **The stop-row tolerance** (`--exhaust_check S:k`, at most 32, default
+  `S:2N`; `S:0` is the exact rule): up to k marked inner faces may stay above
+  S (the edges never do). Measured with N = 2, S = 11, width 1000, 12
+  configurations: `S:0` gives no board, `S:4` 31 boards from 3 configurations. `[sum] exhaust outcome`
   then counts the stop-row boards by faces left, 0..k.
 - **The loose checkpoints** (`--exhaust_check ROW:TOL[,ROW:TOL]`, rows below S,
   default `S-1:6`; up to 4 entries with S:k) prune earlier, heuristically, on the residual
@@ -1314,7 +1318,7 @@ boards or roots they write the same file at any thread count.
 | `--exhaust_border_color` | off | every random border uses up one frame colour within the bottom row and column 0 rows 1..S (5.3) |
 | `--exhaust_inner_color N` | 0 | use N inner colours up, inner and edge pieces, by the stop row: marked per border (fewest edges off bottom + left; best of 5 N^2 lefts), beam bias, exact rules (5.9) |
 | `--lambda_exhaust_inner F` | 0.15 | the bias, in u_row per weighted face; 0 = off |
-| `--exhaust_check ROW:TOL,...` | S-1:6 | loose checkpoints below the stop row: marked-residual tolerances; `S:k` lets k marked faces stay at the stop row |
+| `--exhaust_check ROW:TOL,...` | S-1:6,S:2N | loose checkpoints below the stop row: marked-residual tolerances; `S:k` lets k marked faces stay at the stop row (`S:0` exact) |
 | `--incomplete_top` | off | also write stop-row boards with two of the three segments (`_partial.csv`) or segment B alone (`_partial_B.csv`); not with `--backtrack_row` |
 | `--beam_width K` | 250000 | boards per row |
 | `--stop_row R` | 11 | last row filled, 1..13 |

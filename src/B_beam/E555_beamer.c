@@ -58,7 +58,8 @@
  *   stacked to row 14 is cut on the spot (col_reach), which drops no written
  *   board. --exhaust_inner_color N marks N inner colours per configuration,
  *   those its bottom row and left column commit most fully (under
- *   --random_edges each bottom keeps the best of 5 N^2 left columns), biases
+ *   --random_edges each bottom keeps the best of (N+1)^3 left columns, twice
+ *   that many with --exhaust_border_color), biases
  *   the beam toward using them up, and keeps only boards that have used them
  *   up completely, inner and edge pieces, by the stop row (exin_*).
  *
@@ -649,7 +650,8 @@ static bool parity_ok(const BeamEntry *p) {
    rotates through them). D_N, the sum of those N deficits, scores a border:
    0 means N colours fully committed to the bottom and left. Under
    --random_edges each bottom is drawn exactly as without the flag, and of
-   K = 5 N^2 left columns drawn for it -- each the ordinary best of 32 walks
+   K = (N+1)^3 left columns drawn for it (2 (N+1)^3 with --exhaust_border_color,
+   whose lefts vary less) -- each the ordinary best of 32 walks
    under --tau_columns -- the one with the smallest D_N is kept, the first
    drawn on ties (exin_left_tries).
 
@@ -699,7 +701,11 @@ static double   g_exin_phi[NUM_INNER_COLORS][EXIN_PHI_MAX];
    most any enabled frame needs). */
 static int8_t   g_exin_clue[PUZZLE_SIDE + 1][5][NUM_INNER_COLORS];
 static uint32_t g_exin_static_out = 0;   /* never eligible: a clue above S carries it */
-static int      g_exin_K = 0;            /* left columns drawn per border: 5 N^2 */
+static int      g_exin_K = 0;            /* left columns drawn per border: exin_K(N) */
+static inline int exin_K(uint32_t N) {
+    const int c = (int)((N + 1) * (N + 1) * (N + 1));
+    return g_exhaust ? 2 * c : c;
+}
 
 enum { EXIN_CUT_EDGE, EXIN_CUT_CARRY, EXIN_CUT_RES, EXIN_CUT_EXACT, EXIN_CUTS };
 _Static_assert(EXIN_CUTS == 4, "Scratch.exin_cut in E555_beamer.h has 4 slots");
@@ -948,7 +954,7 @@ static void exin_keep_left(const LeftOrder *src, LeftOrder *dst) {
 }
 
 /* E555_EXIN_MEASURE=K: on K bottoms drawn as in a run, the distribution of D_N
-   for one left column (plain) and for the best of 5 N^2 (as the run picks),
+   for one left column (plain) and for the best of exin_K(N) (as the run picks),
    N = 1..4, then exit. Repeats and row-1 checks are left out. */
 static void exin_measure(RNG *rng, long K) {
     uint64_t pl[5][5] = {{0}}, bk[5][5] = {{0}}, got = 0;
@@ -960,7 +966,7 @@ static void exin_measure(RNG *rng, long K) {
         for (uint32_t N = 1; N <= 4; N++) {
             g_exhaust_inner = N;
             int best = INT_MAX;
-            for (uint32_t k = 0; k < 5 * N * N; k++) {
+            for (int k = 0; k < exin_K(N); k++) {
                 if (!sample_random_left(rng, g_tau_columns, &bot, &lft)) break;
                 const int dn = exin_dn(&bot, &lft);
                 if (k == 0) pl[N][dn < 4 ? dn : 4]++;
@@ -971,11 +977,11 @@ static void exin_measure(RNG *rng, long K) {
     }
     g_exhaust_inner = saveN;
     printf("[measure] %" PRIu64 " bottoms%s: D_N (marked edges left for the right column), one left vs "
-           "the best of 5 N^2\n", got, g_exhaust ? " (--exhaust_border_color)" : "");
+           "the best of K\n", got, g_exhaust ? " (--exhaust_border_color)" : "");
     for (int N = 1; N <= 4; N++) {
         printf("[measure]   N=%d  plain:", N);
         for (int d = 0; d < 5; d++) printf(" %s%d %4.1f%%", d == 4 ? ">=" : "", d, got ? 100.0 * pl[N][d] / got : 0.0);
-        printf("   best of %d:", 5 * N * N);
+        printf("   best of %d:", exin_K(N));
         for (int d = 0; d < 5; d++) printf(" %s%d %4.1f%%", d == 4 ? ">=" : "", d, got ? 100.0 * bk[N][d] / got : 0.0);
         printf("\n");
     }
@@ -6062,7 +6068,8 @@ static void usage(const char *a0) {
 "                         Marked per border: the N colours (3+ edges, none on the\n"
 "                         left column above the stop row) with the fewest edges off\n"
 "                         the bottom row and left column; under --random_edges each\n"
-"                         bottom keeps the best of 5 N^2 ordinary left columns. The\n"
+"                         bottom keeps the best of (N+1)^3 ordinary left columns\n"
+"                         (twice that with --exhaust_border_color). The\n"
 "                         beam is biased toward placing them (--lambda_exhaust_inner);\n"
 "                         a board is dropped once its unplaced edges of a marked\n"
 "                         colour no longer fit the right column up to the stop row,\n"
@@ -6076,7 +6083,8 @@ static void usage(const char *a0) {
 "                         residual (its faces left beyond what the frame needs) at\n"
 "                         most TOL (default S-1:6 with S = --stop_row); S:K lets\n"
 "                         K marked faces in all stay unplaced at the stop row\n"
-"                         (default 0; marked edges are always placed by then)\n"
+"                         (default 2N; S:0 = exact; marked edges are always\n"
+"                         placed by then)\n"
 
 
 "  --extend_nodes N       with --backtrack_row: every stop-row board goes on,\n"
@@ -6909,9 +6917,11 @@ int main(int argc, char *argv[]) {
                       g_stop_row, g_exin_ck_tol[k], EXIN_TOLS_MAX);
             g_exin_tol[g_exin_ck_row[k]] = g_exin_ck_tol[k];
         }
-        g_exin_tolS = g_exin_tol[g_stop_row] > 0 ? g_exin_tol[g_stop_row] : 0;
+        if (g_exin_tol[g_stop_row] < 0)           /* the default: 2N marked faces may stay */
+            g_exin_tol[g_stop_row] = (int)(2 * g_exhaust_inner);
+        g_exin_tolS = g_exin_tol[g_stop_row];
         g_exin_notop_row = (int)g_stop_row;
-        g_exin_K = 5 * (int)(g_exhaust_inner * g_exhaust_inner);
+        g_exin_K = exin_K(g_exhaust_inner);
         g_exin_bias = g_lambda_exin > 0.0;
         g_aux_on = g_aux_on || g_exin_bias;
     }
@@ -7073,7 +7083,7 @@ int main(int argc, char *argv[]) {
     if (g_exhaust_inner) {
         printf("[cfg] exhaust_inner_color=%u (marks the N colours with the fewest edges left for the "
                "right column%s; beam bias lambda=%.3f; every marked edge placed by row %u and ",
-               g_exhaust_inner, g_random_edges ? ", best of 5 N^2 left columns per bottom" : "",
+               g_exhaust_inner, g_random_edges ? ", best of K left columns per bottom" : "",
                g_exin_bias ? g_lambda_exin : 0.0, g_stop_row);
         if (g_exin_tolS) printf("at most %d marked faces left there", g_exin_tolS);
         else printf("every marked colour used up there");
