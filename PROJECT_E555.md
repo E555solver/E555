@@ -773,7 +773,9 @@ toward them, and every board is held to the rule.
   (cols 1..14) nor on the left column at or below S: they are left for the
   right column, which the beam fills up to S, so it is what the beam still has
   to place there. A colour is eligible with at least 3 edges (1 or 2 are fully
-  committed by chance too often), none on the left column above S, none on the
+  committed by chance too often), at most k on the left column above S (k the
+  stop-row tolerance below; all marked colours together at most k, each such
+  edge spends one of the k faces), none on the
   fixed top border (rotations mode) and none on a clue piece above S. The N
   eligible colours whose commitment `k_c = n_c - d_c` is least likely by
   chance are marked: smallest `p_c = P(K >= k_c)`, K hypergeometric (56 edge
@@ -812,22 +814,25 @@ toward them, and every board is held to the rule.
 - **The rules** (exact; k the stop-row tolerance below, default 2N). At every
   row r < S a board is dropped when
   - *edge fit:* the unplaced marked edges, all marked colours together, exceed
-    the right-column cells r+1..S (an edge has one inner face, so edges of
-    different marked colours compete for the same cells);
+    the right-column cells r+1..S plus k minus the marked edges on the left
+    column above S (an edge has one inner face, so edges of different marked
+    colours compete for the same cells; each edge left above S owes one demand
+    of its colour, one of the k faces);
   - *carriers:* the unplaced inner pieces carrying any marked colour exceed
     the 14 (S - r) inner cells of rows r+1..S, plus k. This fires mid-beam for
     N = 2, long before the residual checkpoint.
 
-  At the stop row a board is kept only if every marked edge is placed and at
-  most k marked faces are left, summed over the colours (`total_c -
-  consumed_c`). With k = 0, right after colour parity (5.6) with exact
-  demands, `R_c = 0` forces `D_c = 0`, so no left interface above S and no top
-  of row S shows the colour either. Needs exact demands (not with
+  At the stop row a board is kept only if at most k marked faces are left,
+  summed over the colours (`total_c - consumed_c`). Right after colour parity
+  (5.6) with exact demands `R_c >= D_c`, and every marked edge still above S
+  owes a demand, so this one check also leaves at most k marked edges above S:
+  the edge rules are exact for any k. With k = 0, `R_c = 0` forces `D_c = 0`:
+  no edge, no left interface above S and no top of row S shows the colour. Needs exact demands (not with
   `--no_free_demand`); refused with `--backtrack_unlock_right`, whose band is
   filled after the stop row.
 - **The stop-row tolerance** (`--exhaust_check S:k`, at most 32, default
-  `S:2N`; `S:0` is the exact rule): up to k marked inner faces may stay above
-  S (the edges never do). Measured with N = 2, S = 11, width 1000, 12
+  `S:2N`; `S:0` is the exact rule): up to k marked faces may stay above S,
+  edges included. Measured with N = 2, S = 11, width 1000, 12
   configurations: `S:0` gives no board, `S:4` 31 boards from 3 configurations. `[sum] exhaust outcome`
   then counts the stop-row boards by faces left, 0..k.
 - **The loose checkpoints** (`--exhaust_check ROW:TOL[,ROW:TOL]`, rows below S,

@@ -128,6 +128,7 @@ ALL_STEPS=(
     "ender_repair|core|cpsat,diver|REGRESSION: a scrambled synthetic solution comes back 480/480; a real board redives and comes back no worse"
     "beamer_micro|extra|beamer|random_edges micro-run: builds the real 6.4 GB database; no border runs twice"
     "beamer_backtrack_dive|extra|beamer,diver|--backtrack_row then --end_dive/--end_polish: legal cores, scores that recount, E555_diver replays it exactly; --lambda_reserve keeps the reserve for last"
+    "beamer_exhaust_exact|extra|beamer|--exhaust_inner_color with a stop-row tolerance: the edge rules drop no board the faces-left check alone keeps"
     "beamer_min_col|extra|beamer|--backtrack_min_col: the column check drops no written board, random column 0 too; near-duplicate filter; --cap_top closes every filled row-14 cell; log and score line"
     "beamer_resume|extra|beamer|a sweep stopped in its second border row and resumed writes exactly the uninterrupted sweep's boards"
     "scripts_parse|core|scripts|every shipped script parses, and passes only flags that exist"
@@ -3638,6 +3639,30 @@ EOF
 #  - the compact log has no [progress] line, the border line carries the run
 #    time, and the summary's last [sum] line counts the written boards by score
 #    as a recount of their matched edges does;
+step_beamer_exhaust_exact() {
+    if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
+    gate_db
+    # The edge rules are exact under --exhaust_check S:k: a run without them
+    # (E555_EXIN_NO_EDGE, gate only) writes the same boards. They cannot fire on
+    # the beam rows here (S - 4 + k exceeds any count of marked edges), where a
+    # cut would only change the beam's fill.
+    CMD=(bin/E555_beamer data/seed_Edge5.txt --random_edges --samples 2 --top_columns 1
+         --beam_width 1000 --backtrack_row 4 --stop_row 9 --exhaust_inner_color 2
+         --exhaust_check 9:4 --rng_seed 1 --threads 4)
+    if [ -n "$GATE_DB" ]; then CMD+=(--db_file "$GATE_DB"); fi
+    "${CMD[@]}" --out_dir "$OUT/exx_on" > "$OUT/exx_on.log" \
+        || { tail -5 "$OUT/exx_on.log"; fail "the run with the edge rules exited non-zero"; }
+    E555_EXIN_NO_EDGE=1 "${CMD[@]}" --out_dir "$OUT/exx_off" > "$OUT/exx_off.log" \
+        || { tail -5 "$OUT/exx_off.log"; fail "the run without the edge rules exited non-zero"; }
+    local a b
+    a=$(first_match "$OUT/exx_on/beam_completions_*.csv"); b=$(first_match "$OUT/exx_off/beam_completions_*.csv")
+    [ -n "$a" ] && [ -n "$b" ] || fail "no completions file written"
+    [ "$(grep -vc '^[#%]' "$a")" -gt 0 ] || fail "no stop-row board written: the comparison would be empty"
+    cmp -s "$a" "$b" || fail "the edge rules changed the written boards (diff $a $b)"
+    grep -q '^\[sum\] exhaust cuts by row' "$OUT/exx_on.log" || fail "no [sum] exhaust cuts line"
+    echo "ok: $(grep -vc '^[#%]' "$a") boards identical with and without the edge rules"
+}
+
 step_beamer_min_col() {
     if [ "${SKIP_BEAMER:-0}" = "1" ]; then echo "SKIPPED (SKIP_BEAMER=1)"; return 0; fi
     gate_db
