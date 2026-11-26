@@ -99,6 +99,7 @@
 #include <limits.h>
 #include <math.h>
 #include <omp.h>
+#include <float.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -645,14 +646,17 @@ static bool parity_ok(const BeamEntry *p) {
    fully committed by chance too often to mean anything), none of them on the
    left column above S, none on the fixed top border (rotations mode) and none
    on a clue piece above S: any of those would keep it on the board above S.
-   The N eligible colours with the smallest deficits are marked (ties by a
+   The N eligible colours whose commitment k_c = n_c - d_c is least likely
+   by chance are marked -- smallest log P(K >= k_c), K hypergeometric over the
+   edge pieces with 14 + S drawn, so 5 of 6 (p 0.056) beats 3 of 3 (0.083) --
+   (ties by a
    hash of the master seed, the configuration and the colour, so a long run
    rotates through them). D_N, the sum of those N deficits, scores a border:
    0 means N colours fully committed to the bottom and left. Under
    --random_edges each bottom is drawn exactly as without the flag, and of
    K = (N+1)^3 left columns drawn for it (2 (N+1)^3 with --exhaust_border_color,
    whose lefts vary less) -- each the ordinary best of 32 walks
-   under --tau_columns -- the one with the smallest D_N is kept, the first
+   under --tau_columns -- the one with the smallest sum of log p is kept, the first
    drawn on ties (exin_left_tries).
 
    THE RESIDUAL of a marked colour c, from the ledger, for the loose
@@ -693,6 +697,8 @@ static bool parity_ok(const BeamEntry *p) {
 static int      g_exin_n[NUM_INNER_COLORS];        /* edge pieces, inner face c */
 static uint64_t g_exin_emask[NUM_INNER_COLORS][4]; /* ... as a piece mask */
 static uint64_t g_exin_cmask[NUM_INNER_COLORS][4]; /* inner pieces with a face of c */
+#define EXIN_LP_MAX 16
+static double   g_exin_lp[NUM_INNER_COLORS][EXIN_LP_MAX + 1]; /* log P(K >= k), k committed */
 static uint64_t g_exin_eall[4], g_exin_call[4];    /* this configuration's marked edges, carriers */
 static int      g_exin_tolS = 0;                   /* marked faces allowed left at the stop row */
 #define EXIN_TOLS_MAX 32
@@ -742,6 +748,24 @@ static void exin_init(void) {
         if (!color_is_inner(in)) continue;
         g_exin_n[INNER_IDX(in)]++;
         g_exin_emask[INNER_IDX(in)][pc >> 6] |= piece_bit((uint16_t)pc);
+    }
+    {   /* log P(K >= k): K ~ hypergeometric, E edge pieces, n_c of colour c,
+           D = 14 + S of them on the bottom row (cols 1..14) and the left
+           column (rows 1..S). */
+        int E = 0;
+        for (int ci = 0; ci < NUM_INNER_COLORS; ci++) E += g_exin_n[ci];
+        const int D = EDGE_LEN + (int)g_stop_row < E ? EDGE_LEN + (int)g_stop_row : E;
+        #define LC(a, b) (lgamma((double)(a) + 1) - lgamma((double)(b) + 1) - lgamma((double)((a) - (b)) + 1))
+        for (int ci = 0; ci < NUM_INNER_COLORS; ci++) {
+            const int n = g_exin_n[ci];
+            for (int k = 0; k <= EXIN_LP_MAX; k++) {
+                double p = 0.0;
+                for (int j = k; j <= n && j <= D; j++)
+                    if (D - j <= E - n) p += exp(LC(n, j) + LC(E - n, D - j) - LC(E, D));
+                g_exin_lp[ci][k] = p > 0.0 ? log(p) : -1e9;
+            }
+        }
+        #undef LC
     }
     printf("[cfg] exhaust_inner: edge pieces by inner colour n_c:");
     for (int ci = 0; ci < NUM_INNER_COLORS; ci++) printf(" c%d=%d", COLOR_MIN + ci, g_exin_n[ci]);
@@ -803,39 +827,52 @@ static uint32_t exin_deficits(const BottomOrder *bot, const LeftOrder *lft, int 
     return ok;
 }
 
-/* The N eligible colours with the smallest deficits (ties by tb, larger
-   first when given, else by colour index), into *mark; returns D_N, their
-   deficit sum, plus 100 per colour short of N. */
-static int exin_pick(const int d[NUM_INNER_COLORS], uint32_t ok, const uint64_t *tb, uint32_t *mark) {
+/* The N eligible colours least likely committed by chance: smallest
+   log P(K >= n_c - d_c) (ties by tb, larger first when given, else by colour
+   index), into *mark. Returns the sum of their log p, plus 1000 per colour
+   short of N (smaller is better); *dn gets D_N, their deficit sum. */
+static inline double exin_lp(const int d[NUM_INNER_COLORS], int ci) {
+    int k = g_exin_n[ci] - d[ci];
+    if (k < 0) k = 0;
+    return g_exin_lp[ci][k < EXIN_LP_MAX ? k : EXIN_LP_MAX];
+}
+static double exin_pick(const int d[NUM_INNER_COLORS], uint32_t ok, const uint64_t *tb, uint32_t *mark, int *dn) {
     uint32_t m = 0;
-    int dn = 0;
+    double sc = 0.0;
+    int dsum = 0;
     for (uint32_t k = 0; k < g_exhaust_inner; k++) {
         int best = -1;
         for (int ci = 0; ci < NUM_INNER_COLORS; ci++) {
             if (!(ok >> ci & 1u) || (m >> ci & 1u)) continue;
-            if (best < 0 || d[ci] < d[best] || (d[ci] == d[best] && tb && tb[ci] > tb[best])) best = ci;
+            if (best < 0) { best = ci; continue; }
+            const double a = exin_lp(d, ci), b = exin_lp(d, best);
+            if (a < b || (a == b && tb && tb[ci] > tb[best])) best = ci;
         }
-        if (best < 0) { dn += 100; continue; }
+        if (best < 0) { sc += 1000.0; dsum += 100; continue; }
         m |= 1u << best;
-        dn += d[best];
+        sc += exin_lp(d, best);
+        dsum += d[best];
     }
     if (mark) *mark = m;
-    return dn;
+    if (dn) *dn = dsum;
+    return sc;
 }
 
-static inline int exin_dn(const BottomOrder *bot, const LeftOrder *lft) {
+/* A drawn border's score (smaller is better) and its D_N. */
+static inline double exin_score(const BottomOrder *bot, const LeftOrder *lft, int *dn) {
     int d[NUM_INNER_COLORS];
     const uint32_t ok = exin_deficits(bot, lft, d);
-    return exin_pick(d, ok, NULL, NULL);
+    return exin_pick(d, ok, NULL, NULL, dn);
 }
 
-/* Configuration start: mark the N eligible colours with the smallest deficits. */
+/* Configuration start: mark the N eligible colours least likely committed by chance. */
 static void exin_mark(uint64_t cfg_hash) {
     int d[NUM_INNER_COLORS];
     const uint32_t ok = exin_deficits(g_cur_bottom, g_cur_left, d);
     uint64_t tb[NUM_INNER_COLORS];
     for (int ci = 0; ci < NUM_INNER_COLORS; ci++) tb[ci] = splitmix64(cfg_hash ^ (0xE71Bull * (uint64_t)(ci + 1)));
-    const int dn = exin_pick(d, ok, tb, &g_exin_mark);
+    int dn;
+    (void)exin_pick(d, ok, tb, &g_exin_mark, &dn);
     if (dn >= 100) g_exin.short_marks++;
     g_exin.dn[dn % 100 < 4 ? dn % 100 : 4]++;
     memset(g_exin_eall, 0, sizeof g_exin_eall);
@@ -966,11 +1003,13 @@ static void exin_measure(RNG *rng, long K) {
         for (uint32_t N = 1; N <= 4; N++) {
             g_exhaust_inner = N;
             int best = INT_MAX;
+            double best_sc = DBL_MAX;
             for (int k = 0; k < exin_K(N); k++) {
                 if (!sample_random_left(rng, g_tau_columns, &bot, &lft)) break;
-                const int dn = exin_dn(&bot, &lft);
+                int dn;
+                const double sc = exin_score(&bot, &lft, &dn);
                 if (k == 0) pl[N][dn < 4 ? dn : 4]++;
-                if (dn < best) best = dn;
+                if (sc < best_sc) { best_sc = sc; best = dn; }
             }
             if (best != INT_MAX) bk[N][best < 4 ? best : 4]++;
         }
@@ -6066,8 +6105,9 @@ static void usage(const char *a0) {
 "                         use N inner colours up completely -- inner and edge\n"
 "                         pieces -- by the stop row, so nothing above it sees them.\n"
 "                         Marked per border: the N colours (3+ edges, none on the\n"
-"                         left column above the stop row) with the fewest edges off\n"
-"                         the bottom row and left column; under --random_edges each\n"
+"                         left column above the stop row) whose edges the bottom row\n"
+"                         and left column commit least likely by chance\n"
+"                         (hypergeometric tail p); under --random_edges each\n"
 "                         bottom keeps the best of (N+1)^3 ordinary left columns\n"
 "                         (twice that with --exhaust_border_color). The\n"
 "                         beam is biased toward placing them (--lambda_exhaust_inner);\n"
@@ -7081,7 +7121,8 @@ int main(int argc, char *argv[]) {
         printf("[cfg] free_top_clue=1 (the extension may place the top-left row-13 clue on any "
                "cell; the top-right one is left for the dives)\n");
     if (g_exhaust_inner) {
-        printf("[cfg] exhaust_inner_color=%u (marks the N colours with the fewest edges left for the "
+        printf("[cfg] exhaust_inner_color=%u (marks the N colours whose edge commitment to bottom + left is "
+               "least likely by chance, smallest hypergeometric p; the edges left go to the "
                "right column%s; beam bias lambda=%.3f; every marked edge placed by row %u and ",
                g_exhaust_inner, g_random_edges ? ", best of K left columns per bottom" : "",
                g_exin_bias ? g_lambda_exin : 0.0, g_stop_row);
@@ -7312,14 +7353,15 @@ int main(int argc, char *argv[]) {
                 bool got_left = false, out_of_columns = false;
                 double clue_t0 = omp_get_wtime();
                 /* --exhaust_inner_color: of g_exin_K left columns that pass
-                   the usual tests, keep the one with the smallest D_N, the
+                   the usual tests, keep the one with the smallest score
+                   (sum of the marked colours' log p, exin_pick), the
                    first drawn on ties (no randomness of its own, so tau 0
                    runs repeat). Without the flag want is 1 and the loop is the
                    plain one, draw for draw. */
                 const unsigned want = g_exhaust_inner ? (unsigned)g_exin_K : 1u;
                 unsigned left_tries = ((g_clue_mask & CLUE_CORNERS) ? 64u : 1u) * want;
                 unsigned dup = 0, got = 0;
-                int best_dn = INT_MAX;
+                double best_sc = DBL_MAX;
                 uint64_t bkey = 0, best_key = 0;
                 LeftOrder best_lft;
                 for (unsigned tr = 0; tr < left_tries && got < want; ) {
@@ -7350,8 +7392,8 @@ int main(int argc, char *argv[]) {
                         got_left = true;
                         got++;
                         if (g_exhaust_inner) {
-                            const int dn = exin_dn(&bot, &lft);
-                            if (dn < best_dn) { best_dn = dn; best_key = bkey; exin_keep_left(&lft, &best_lft); }
+                            const double sc = exin_score(&bot, &lft, NULL);
+                            if (sc < best_sc) { best_sc = sc; best_key = bkey; exin_keep_left(&lft, &best_lft); }
                         }
                     }
                 }
