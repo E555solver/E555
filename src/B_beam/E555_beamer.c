@@ -258,7 +258,7 @@ static bool     g_exhaust          = false;   /* --exhaust_border_color */
    (exin_ok). g_exin_tol: per row the residual tolerance of --exhaust_check,
    -1 where none is. See the exin_* section. */
 #define EXIN_LAMBDA_DEFAULT 0.15
-#define EXIN_CK_MAX 4
+#define EXIN_CK_MAX 16
 static uint32_t g_exhaust_inner    = 0;
 static double   g_lambda_exin      = EXIN_LAMBDA_DEFAULT;  /* --lambda_exhaust_inner */
 static int      g_exin_ck_row[EXIN_CK_MAX], g_exin_ck_tol[EXIN_CK_MAX];
@@ -267,6 +267,14 @@ static int      g_exin_tol[PUZZLE_SIDE + 1];
 static int      g_exin_notop_row   = PUZZLE_SIDE + 1;   /* tops on this row earn nothing */
 static bool     g_exin_bias        = false;  /* the bonus is on */
 static uint32_t g_exin_mark        = 0;      /* this configuration's marked colours, INNER_IDX bits */
+static uint32_t g_exin_dem_skip    = 0;      /* marked colours the closure's demand term leaves out */
+/* --blackwood: a preset after Joshua Blackwood's record solver
+   (github.com/jblackwood345/EternityII_Solver). It sets existing options and
+   adds one rule, his colour schedule (exin_quota); see PROJECT_E555.md 5.9. */
+static bool     g_blackwood        = false;
+static bool     g_stop_row_set = false, g_end_dive_set = false, g_end_polish_set = false;
+#define BW_C1 14      /* E555 colours of his inner heuristic sides 10 and 16 */
+#define BW_C2 22
 static uint64_t g_exhaust_cfgs[MAX_EDGE_SIDE_COLOR + 1];  /* configs run, by colour used up (0 = plain) */
 static int      g_exhaust_ok[MAX_EDGE_SIDE_COLOR];        /* colours that can be used up at all */
 static int      g_exhaust_ok_n = 0;
@@ -704,7 +712,8 @@ static bool parity_ok(const BeamEntry *p) {
 #define EXIN_MIN_EDGES 3
 #define EXIN_PHI_MAX 64
 #define EXIN_W_CAP   4.0
-#define EXIN_B_LOOK  24    /* B chains the window orders by marked faces */
+#define EXIN_LOOK    32    /* B and C chains the window orders by marked faces */
+#define EXIN_A_LOOK_MAX 1024  /* Scratch.a_ord */
 static int      g_exin_n[NUM_INNER_COLORS];        /* edge pieces, inner face c */
 static uint64_t g_exin_emask[NUM_INNER_COLORS][4]; /* ... as a piece mask */
 static uint64_t g_exin_cmask[NUM_INNER_COLORS][4]; /* inner pieces with a face of c */
@@ -726,8 +735,8 @@ static inline int exin_K(uint32_t N) {
     return g_exhaust ? 2 * c : c;
 }
 
-enum { EXIN_CUT_EDGE, EXIN_CUT_CARRY, EXIN_CUT_RES, EXIN_CUT_EXACT, EXIN_CUTS };
-_Static_assert(EXIN_CUTS == 4, "Scratch.exin_cut in E555_beamer.h has 4 slots");
+enum { EXIN_CUT_EDGE, EXIN_CUT_CARRY, EXIN_CUT_RES, EXIN_CUT_EXACT, EXIN_CUT_QUOTA, EXIN_CUTS };
+_Static_assert(EXIN_CUTS == 5, "Scratch.exin_cut in E555_beamer.h has 5 slots");
 static struct {
     uint64_t marked[NUM_INNER_COLORS];             /* configurations per marked colour */
     uint64_t dn[5];                                /* configurations by D_N (4 = 4 or more) */
@@ -735,6 +744,7 @@ static struct {
     uint64_t ck_checked[PUZZLE_SIDE + 1], ck_cut[EXIN_CUTS][PUZZLE_SIDE + 1];
     uint64_t left_s[EXIN_TOLS_MAX + 1];            /* stop-row boards passing, by marked faces left */
     double   res_sum[PUZZLE_SIDE + 1];             /* survivors' mean marked residual, summed */
+    double   bw_sum[PUZZLE_SIDE + 1];              /* --blackwood: survivors' scheduled sides, summed */
     uint64_t res_n[PUZZLE_SIDE + 1];
     /* E555_EXIN_PROBE=1: the picker probe and the bonus spread. */
     uint64_t probe_A, probe_B, probe_C;
@@ -858,6 +868,19 @@ static double exin_pick(const int d[NUM_INNER_COLORS], const int a[NUM_INNER_COL
     uint32_t m = 0;
     double sc = 0.0;
     int dsum = 0, above = 0;      /* above: marked edges on the left column above S */
+    if (g_blackwood) {            /* the marks are fixed: score those two */
+        const int fx[2] = { INNER_IDX(BW_C1), INNER_IDX(BW_C2) };
+        for (int q = 0; q < 2; q++) {
+            const int ci = fx[q];
+            if (!(ok >> ci & 1u) || above + a[ci] > g_exin_tolS) { sc += 1000.0; dsum += 100; }
+            else { sc += exin_lp(d, ci); dsum += d[ci] - a[ci]; }
+            above += a[ci];
+            m |= 1u << ci;
+        }
+        if (mark) *mark = m;
+        if (dn) *dn = dsum;
+        return sc;
+    }
     for (uint32_t k = 0; k < g_exhaust_inner; k++) {
         int best = -1;
         for (int ci = 0; ci < NUM_INNER_COLORS; ci++) {
@@ -885,7 +908,9 @@ static inline double exin_score(const BottomOrder *bot, const LeftOrder *lft, in
 }
 
 /* Configuration start: mark the N eligible colours least likely committed by chance. */
-static void exin_mark(uint64_t cfg_hash) {
+static void bw_config(const uint64_t root_used[4]);
+static void exin_mark(uint64_t cfg_hash, const uint64_t root_used[4]) {
+    if (g_blackwood) bw_config(root_used);
     int d[NUM_INNER_COLORS], a[NUM_INNER_COLORS];
     const uint32_t ok = exin_deficits(g_cur_bottom, g_cur_left, d, a);
     uint64_t tb[NUM_INNER_COLORS];
@@ -894,6 +919,7 @@ static void exin_mark(uint64_t cfg_hash) {
     (void)exin_pick(d, a, ok, tb, &g_exin_mark, &dn);
     g_exin_above = 0;
     for (uint32_t m = g_exin_mark; m; m &= m - 1) g_exin_above += a[__builtin_ctz(m)];
+    g_exin_dem_skip = g_exin_bias ? g_exin_mark : 0;
     if (dn >= 100) g_exin.short_marks++;
     g_exin.dn[dn % 100 < 4 ? dn % 100 : 4]++;
     memset(g_exin_eall, 0, sizeof g_exin_eall);
@@ -939,8 +965,71 @@ static inline int exin_left4(const uint64_t m[4], const BeamEntry *t) {
     return __builtin_popcountll(m[0] & ~t->used[0]) + __builtin_popcountll(m[1] & ~t->used[1])
          + __builtin_popcountll(m[2] & ~t->used[2]) + __builtin_popcountll(m[3] & ~t->used[3]);
 }
+/* --blackwood's schedule. Blackwood requires, at every depth d of his
+   row-by-row fill, that the pieces placed carry at least heuristic_array[d]
+   sides of his three colours. Here, with only the two inner colours fixed,
+   the count is the sides of c14 and c22 on the pieces placed in rows 0..r,
+   edges included, and the floor at the end of row r is his value at depth
+   min(16 r + 15, 160) scaled by 98/122 (the two colours' sides over his
+   three's). g_bw_h[k]: pieces with k such sides; g_bw_x[r]: pieces the root
+   holds that are not on rows 0..r (the left column above r, the corners off
+   the board, clue pieces), set per configuration. */
+static uint64_t g_bw_h[5][4];
+static uint64_t g_bw_x[PUZZLE_SIDE + 1][4];
+static int      g_bw_floor[PUZZLE_SIDE + 1];
+static int      g_bw_total = 0;
+static void bw_init(void) {
+    int h_arr[256];
+    for (int i = 0; i < 256; i++) {                /* his piecewise-linear ramp, as published */
+        if (i <= 16)       h_arr[i] = 0;
+        else if (i <= 26)  h_arr[i] = (int)(((float)i - 16) * (float)2.8);
+        else if (i <= 56)  h_arr[i] = (int)((((float)i - 26) * (float)1.43333) + 28);
+        else if (i <= 76)  h_arr[i] = (int)((((float)i - 56) * (float)0.9) + 71);
+        else if (i <= 102) h_arr[i] = (int)((((float)i - 76) * (float)0.6538) + 89);
+        else if (i <= 160) h_arr[i] = (int)((((float)i - 102) / (float)4.4615) + 106);
+        else               h_arr[i] = 0;
+    }
+    memset(g_bw_h, 0, sizeof g_bw_h);
+    g_bw_total = 0;
+    for (int pc = 0; pc < NUM_PIECES; pc++) {
+        const int f[4] = { g_seed_top[pc], g_seed_right[pc], g_seed_bottom[pc], g_seed_left[pc] };
+        int k = 0;
+        for (int d = 0; d < 4; d++) k += (f[d] == BW_C1) + (f[d] == BW_C2);
+        if (k) g_bw_h[k][pc >> 6] |= piece_bit((uint16_t)pc);
+        g_bw_total += k;
+    }
+    for (int r = 0; r <= PUZZLE_SIDE; r++) {
+        const int d = 16 * r + 15 < 160 ? 16 * r + 15 : 160;
+        g_bw_floor[r] = r ? (int)((long)h_arr[d] * g_bw_total / 122) : 0;
+    }
+    printf("[cfg] blackwood=1 (fixed marks c%d c%d = Blackwood's 10 16; --exhaust_border_color; "
+           "stop_row %u; backtrack_min_col %u; end_dive %u end_polish %d; explicit flags win)\n",
+           BW_C1, BW_C2, g_stop_row, g_bt_min_col, g_end_dive, g_end_polish);
+    printf("[cfg] blackwood schedule: sides of c%d+c%d (%d) on rows 0..r at the end of row r >=",
+           BW_C1, BW_C2, g_bw_total);
+    for (int r = 1; r < (int)g_stop_row && r <= PUZZLE_SIDE; r++) printf(" r%d %d", r, g_bw_floor[r]);
+    printf("; row %u: %d, and at most %d marked faces left\n", g_stop_row, g_bw_floor[g_stop_row], g_exin_tolS);
+}
+static void bw_config(const uint64_t root_used[4]) {
+    uint64_t keep[4];
+    for (int k = 0; k < 4; k++) keep[k] = g_cur_bottom->used[k];
+    for (int r = 0; r <= PUZZLE_SIDE; r++) {
+        if (r >= 1 && r <= EDGE_LEN) used_set(keep, g_cur_left->p[r]->piece_id);
+        for (int k = 0; k < 4; k++) g_bw_x[r][k] = root_used[k] & ~keep[k];
+    }
+}
+static inline int bw_count(const BeamEntry *t, int row) {
+    const uint64_t *x = g_bw_x[row];
+    int q = 0;
+    for (int k = 1; k <= 4; k++)
+        q += k * (__builtin_popcountll(t->used[0] & g_bw_h[k][0] & ~x[0]) + __builtin_popcountll(t->used[1] & g_bw_h[k][1] & ~x[1])
+                + __builtin_popcountll(t->used[2] & g_bw_h[k][2] & ~x[2]) + __builtin_popcountll(t->used[3] & g_bw_h[k][3] & ~x[3]));
+    return q;
+}
+
 static inline int exin_ok(const BeamEntry *t, int W, int row) {
     const int S = (int)g_stop_row;
+    if (g_blackwood && row <= PUZZLE_SIDE && bw_count(t, row) < g_bw_floor[row]) return EXIN_CUT_QUOTA;
     if (!g_exin_no_edge) {
         const int e = exin_left4(g_exin_eall, t);
         if (row < S ? e > S - row + g_exin_tolS - g_exin_above : (!g_exin_tolS && e > 0)) return EXIN_CUT_EDGE;
@@ -1781,7 +1870,9 @@ static inline double closure_raw(const BeamEntry *t) {
     double conc = 0.0, dem = 0.0;
     for (int ci = 0; ci < NUM_INNER_COLORS; ci++) {
         if (S[ci] > 0) conc += (double)S[ci] * (g_logtab[S[ci]] - logSbar);
-        if (D[ci] > 0) dem  += (double)D[ci] * (g_logtab[R[ci]] - logRbar);
+        /* The marked colours of --exhaust_inner_color are meant to run low
+           while the frontier still shows them: no penalty for that. */
+        if (D[ci] > 0 && !(g_exin_dem_skip >> ci & 1u)) dem += (double)D[ci] * (g_logtab[R[ci]] - logRbar);
     }
     return 0.5 * conc + dem;
 }
@@ -2751,6 +2842,36 @@ static bool expand_clue_row(BeamCtx *ctx, const BeamEntry *p, uint32_t pi, int r
    record: the first conflict-free C under the first workable of up to B_TRY
    conflict-free B chains. The stop row emits every conflict-free completion
    until the work item's quota is spent. */
+/* --exhaust_inner_color with the bias on: the first L slice-local records of a
+   parent slice (global index sl + m * stride) that decode against the parent,
+   in order of their marked faces (stable: ties keep the cell's fan-out order),
+   into ord[]. Returns how many. Records that do not decode would be dropped by
+   try_A anyway. */
+static uint32_t exin_order_A(const Expand *e, uint32_t sl, uint32_t stride, uint32_t L, uint16_t *ord) {
+    const BeamEntry *p = e->parent;
+    const uint8_t *rt = p->rtop;
+    uint16_t cnt[4 * CHAIN_LEN + 2] = {0};
+    uint8_t  fz[EXIN_A_LOOK_MAX];
+    uint16_t ok[EXIN_A_LOOK_MAX];
+    uint32_t n = 0;
+    for (uint32_t m = 0; m < L; m++) {
+        const uint32_t j = sl + m * stride;
+        uint32_t w = rec_load(e->cA->rec, j, g_rec_bytes_inner);
+        uint8_t fA[CHAIN_LEN]; unpack_inner(w, fA, g_lb_bits);
+        uint16_t ciA[CHAIN_LEN]; uint64_t maskA[4] = {0,0,0,0};
+        if (!decode_inner_chain(fA, CHAIN_LEN, e->la_A, rt + 1, ciA, maskA, p->used)) continue;
+        if (masks_intersect4(p->used, maskA)) continue;
+        int f = 0;
+        for (int i = 0; i < CHAIN_LEN; i++) f += exin_faces(&g_cat[ciA[i]]);
+        ok[n] = (uint16_t)m; fz[n] = (uint8_t)f; cnt[f]++; n++;
+    }
+    /* counting sort, most marked faces first */
+    uint32_t start[4 * CHAIN_LEN + 2], pos = 0;
+    for (int f = 4 * CHAIN_LEN + 1; f >= 0; f--) { start[f] = pos; pos += cnt[f]; }
+    for (uint32_t i = 0; i < n; i++) ord[start[fz[i]]++] = ok[i];
+    return n;
+}
+
 static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     const BeamEntry *p = e->parent;
     const uint8_t *rt = p->rtop;
@@ -2860,16 +2981,16 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
     int b_left = B_TRY + (int)g_bc_nB - 1;
     /* --exhaust_inner_color with the bias on: the window takes its B chains in
        order of the marked faces they carry (stable, so ties keep the database
-       order), from the first EXIN_B_LOOK conflict-free ones. Measured with
+       order), from the first EXIN_LOOK conflict-free ones. Measured with
        E555_EXIN_PROBE (which turns this off to see the database order): a
        chain past the window carried more marked faces in about half of the
        window picks. */
-    uint32_t ord[EXIN_B_LOOK];
+    uint32_t ord[EXIN_LOOK];
     int nord = -1;
     if (window && g_exin_bias && g_exin_mark && !g_exin_probe) {
-        int fz[EXIN_B_LOOK];
+        int fz[EXIN_LOOK];
         nord = 0;
-        for (uint32_t jb = 0; jb < cB->n && nord < EXIN_B_LOOK; jb++) {
+        for (uint32_t jb = 0; jb < cB->n && nord < EXIN_LOOK; jb++) {
             uint16_t ciB[CHAIN_LEN]; int la_C;
             if (!pick_segB(cB, jb, rt + 6, forbidA, ciB, la_B, &la_C)) continue;
             int f = 0;
@@ -2896,7 +3017,26 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
         memcpy(&mv.ci[CHAIN_LEN], ciB, CHAIN_LEN * sizeof(uint16_t));  /* B is fixed here */
         uint32_t nc_done = 0;
         const uint32_t nC_lim = e->keep_all ? cC->n : g_bc_nC;
-        for (uint32_t jc = 0; jc < cC->n && nc_done < nC_lim && e->quota > 0; jc++) {
+        /* The same ordering for the C chains (4 pieces; the right edge's inner
+           face is the column-14 piece's right face, already counted). */
+        uint32_t ordC[EXIN_LOOK];
+        int nordC = -1;
+        if (nord >= 0) {
+            int fz[EXIN_LOOK];
+            nordC = 0;
+            for (uint32_t jc = 0; jc < cC->n && nordC < EXIN_LOOK; jc++) {
+                uint16_t ciC[CHAIN_LEN-1]; uint8_t rterm;
+                if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
+                int f = 0;
+                for (int i = 0; i < CHAIN_LEN - 1; i++) f += exin_faces(&g_cat[ciC[i]]);
+                int k = nordC++;
+                while (k > 0 && fz[k - 1] < f) { ordC[k] = ordC[k - 1]; fz[k] = fz[k - 1]; k--; }
+                ordC[k] = jc; fz[k] = f;
+            }
+        }
+        const uint32_t ncloop = nordC >= 0 ? (uint32_t)nordC : cC->n;
+        for (uint32_t itc = 0; itc < ncloop && nc_done < nC_lim && e->quota > 0; itc++) {
+            const uint32_t jc = nordC >= 0 ? ordC[itc] : itc;
             uint16_t ciC[CHAIN_LEN-1]; uint8_t rterm;
             if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
             memcpy(&mv.ci[2*CHAIN_LEN], ciC, (CHAIN_LEN-1) * sizeof(uint16_t));
@@ -3112,6 +3252,21 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
            rest. */
         const uint32_t n_sl = (sl < n) ? ((n - sl + n_slices - 1) / n_slices) : 0;
         uint32_t m_done = 0;
+        /* --exhaust_inner_color with the bias on: the first 4 x quota records
+           of the slice are tried in order of their marked faces, so the
+           parent's quota goes to the colour's chains first; the rest of
+           phase 1 and phase 2 continue past that look-ahead as usual. */
+        if (g_exin_bias && g_exin_mark && !g_exin_probe && !keep_all) {
+            uint32_t L = 4u * quota_slice;
+            if (L > n_sl) L = n_sl;
+            if (L > EXIN_A_LOOK_MAX) L = EXIN_A_LOOK_MAX;
+            const uint32_t no = exin_order_A(&e, sl, n_slices, L, sc->a_ord);
+            for (uint32_t k = 0; k < no; k++) {
+                if (e.quota == 0 || e.budget <= rand_budget) break;
+                try_A(&e, ctx, sl + (uint32_t)sc->a_ord[k] * n_slices, sc);
+            }
+            m_done = L;
+        }
         for (; m_done < n_sl; m_done++) {
             if (e.quota == 0 || e.budget <= rand_budget) break;
             try_A(&e, ctx, sl + m_done * n_slices, sc);
@@ -4470,7 +4625,7 @@ typedef struct {
        and row, and the survivors' mean marked residual by row. */
     uint64_t  cut_exhaust;
     uint64_t  exin_ck[PUZZLE_SIDE + 1], exin_cut[EXIN_CUTS][PUZZLE_SIDE + 1], exin_resn[PUZZLE_SIDE + 1];
-    double    exin_res[PUZZLE_SIDE + 1];
+    double    exin_res[PUZZLE_SIDE + 1], bw_q[PUZZLE_SIDE + 1];
 } BtCtx;
 
 static struct {
@@ -4748,6 +4903,7 @@ static void bt_close_row(BtCtx *x, int row) {
         double mean;
         (void)exin_worst(t, g_last_inner, row, &mean);
         x->exin_res[row] += mean; x->exin_resn[row]++;
+        if (g_blackwood) x->bw_q[row] += bw_count(t, row);
     }
     x->fill[row]++;
     if ((uint32_t)row == g_stop_row) {
@@ -5247,6 +5403,7 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
             g_exin.ck_checked[r] += x->exin_ck[r];
             for (int k = 0; k < EXIN_CUTS; k++) g_exin.ck_cut[k][r] += x->exin_cut[k][r];
             g_exin.res_sum[r] += x->exin_res[r]; g_exin.res_n[r] += x->exin_resn[r];
+            g_exin.bw_sum[r] += x->bw_q[r];
         }
         if (x->abort) aborted = true;
     }
@@ -5340,7 +5497,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
     if (g_aux_on) corner_reset_config();
     if (g_corners_on) (void)tc_config(g_cur_left, cur[0].used);
     g_stats.configs++;
-    if (g_exhaust_inner) exin_mark(cfg_hash);
+    if (g_exhaust_inner) exin_mark(cfg_hash, cur[0].used);
     const uint32_t last_row = gen_stop_row();
     for (int row = 1; (uint32_t)row <= last_row; row++) {
         if (g_stop)                      { res.reason = "interrupted"; break; }
@@ -5433,10 +5590,13 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         beam_n = n_sel; res.width = beam_n;
         if (g_exhaust_inner && g_exin_mark) {
             double sum = 0.0;
+            double q = 0.0;
             for (uint32_t b = 0; b < beam_n; b++) {
                 double mean; (void)exin_worst(&cur[b], EDGE_LEN, row, &mean); sum += mean;
+                if (g_blackwood) q += bw_count(&cur[b], row);
             }
             g_exin.res_sum[row] += sum; g_exin.res_n[row] += beam_n;
+            g_exin.bw_sum[row] += q;
         }
 
         if (g_verbose) {
@@ -5722,33 +5882,22 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
     if (g_end_dive)      printf(", dives %s", fmt_dur(b1, sizeof b1, dv_t));
     printf("\n");
     if (g_stats.configs) {
-        printf("[sum] configs: %" PRIu64 ", %.1f s each; %" PRIu64 " reached row %u\n",
+        printf("[sum] configs: %" PRIu64 ", %.1f s each; %" PRIu64 " reached row %u",
                g_stats.configs, sweep_s / (double)g_stats.configs, g_stats.reached_stop, g_stop_row);
         bool any = false;
         for (int r = 1; r <= (int)g_stop_row; r++) {
             if (!g_stats.extinct_at[r]) continue;
-            printf("%s r%d:%" PRIu64, any ? "" : "[sum] extinct:", r, g_stats.extinct_at[r]);
+            printf("%s r%d:%" PRIu64, any ? "" : "; extinct", r, g_stats.extinct_at[r]);
             any = true;
         }
-        if (any) printf("\n");
+        printf("\n");
     }
     if (g_backtrack_row && g_bt_run.roots) {
-        printf("[sum] backtrack: %s nodes, %.0f M/s;", fmt_cnt(b1, sizeof b1, g_bt_run.nodes),
+        printf("[sum] backtrack: %s nodes, %.0f M/s; boards completing", fmt_cnt(b1, sizeof b1, g_bt_run.nodes),
                g_bt_run.t > 0 ? (double)g_bt_run.nodes / g_bt_run.t / 1e6 : 0.0);
         for (int r = (int)g_backtrack_row + 1; r <= (int)g_stop_row; r++)
             printf(" r%d:%s", r, fmt_cnt(b1, sizeof b1, g_bt_run.fill[r]));
         printf("\n");
-        if (g_extend_nodes) {
-            const uint64_t b = g_bt_run.emitted;
-            printf("[sum] extension: mean %.2f %s, max %d", b ? (double)g_bt_run.ext_cols / (double)b : 0.0,
-                   g_unlock_right ? "layers" : "cols", g_bt_run.ext_cols_max);
-            if (g_bt_run.ext_cap) printf("; node cap hit %" PRIu64, g_bt_run.ext_cap);
-            printf("\n");
-            if (g_cap_top && g_bt_run.cap_boards)
-                printf("[sum] top cap: %.2f cells per board on row 15, every filled row-14 "
-                       "cell closed above\n",
-                       (double)g_bt_run.cap_cells / (double)g_bt_run.cap_boards);
-        }
         if (g_unlock_right) {
             printf("[sum] unlock_right %u: block rows 0..%u x columns 0..%d; %s roots searched, ",
                    g_unlock_right, g_stop_row, g_last_inner, fmt_cnt(b1, sizeof b1, g_bt_run.roots));
@@ -5788,7 +5937,7 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
     if (mincol_cuts())                        printf(", below min_col %" PRIu64, g_bt_run.cut_mincol);
     if (score_cuts())                         printf(", below emit_score %" PRIu64, g_bt_run.cut_score);
     if (g_end_dive)                           printf(", dived %" PRIu64, dv_boards());
-    printf("\n");
+    printf(", written %" PRIu64 "\n", g_written_total);
     if (g_incomplete_top) {
         printf("[sum] partials: %zu (", g_partial_total);
         for (int k = 0; k < PART_N; k++)
@@ -5812,37 +5961,27 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         printf("%s configs; edges left for the right column (D_N):", k ? "" : " none");
         for (int d = 0; d < 5; d++) printf(" %s%d:%" PRIu64, d == 4 ? ">=" : "", d, g_exin.dn[d]);
         if (g_exin.short_marks) printf("; %" PRIu64 " with fewer than N eligible colours", g_exin.short_marks);
-        printf("\n[sum] exhaust cuts by row (tested: edge fit / carriers / residual / not used up at row %u):",
-               g_stop_row);
+        printf("; stop-row boards by marked faces left:");
+        for (int k = 0; k <= g_exin_tolS; k++) printf(" %d:%" PRIu64, k, g_exin.left_s[k]);
+        printf("\n[sum] exhaust cuts by row (tested: %sedge fit / carriers / residual / not used up at row %u):",
+               g_blackwood ? "schedule / " : "", g_stop_row);
         for (int r = 1; r <= PUZZLE_SIDE; r++) {
             if (!g_exin.ck_checked[r]) continue;
-            printf(" r%d %" PRIu64 ": %" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 ";", r, g_exin.ck_checked[r],
+            printf(" r%d %" PRIu64 ": ", r, g_exin.ck_checked[r]);
+            if (g_blackwood) printf("%" PRIu64 "/", g_exin.ck_cut[EXIN_CUT_QUOTA][r]);
+            printf("%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 ";",
                    g_exin.ck_cut[EXIN_CUT_EDGE][r], g_exin.ck_cut[EXIN_CUT_CARRY][r],
                    g_exin.ck_cut[EXIN_CUT_RES][r], g_exin.ck_cut[EXIN_CUT_EXACT][r]);
+        }
+        if (g_blackwood) {
+            printf("\n[sum] blackwood schedule by row (surviving boards' mean sides of c%d+c%d placed / floor):",
+                   BW_C1, BW_C2);
+            for (int r = 1; r <= (int)g_stop_row; r++)
+                if (g_exin.res_n[r]) printf(" r%d %.1f/%d", r, g_exin.bw_sum[r] / (double)g_exin.res_n[r], g_bw_floor[r]);
         }
         printf("\n[sum] exhaust residual by row (mean over the marked colours, surviving boards):");
         for (int r = 1; r <= PUZZLE_SIDE; r++)
             if (g_exin.res_n[r]) printf(" r%d %.1f", r, g_exin.res_sum[r] / (double)g_exin.res_n[r]);
-        printf("\n");
-        uint64_t ext = 0;
-        for (int r = 0; r <= EDGE_LEN; r++) ext += g_stats.extinct_at[r];
-        printf("[sum] exhaust outcome: %" PRIu64 " of %" PRIu64 " configs reached row %u, %" PRIu64
-               " extinct; %" PRIu64 " stop-row boards", g_stats.reached_stop, g_stats.configs, g_stop_row,
-               ext, g_found_total);
-        if (!g_exin_tolS) printf(", every marked colour used up");
-        else {
-            printf(", by marked faces left:");
-            for (int k = 0; k <= g_exin_tolS; k++) printf(" %d:%" PRIu64, k, g_exin.left_s[k]);
-        }
-        if (g_end_dive) {
-            uint64_t n = 0; double sum = 0.0; int best = -1;
-            for (int sc = 0; sc <= DV_EDGES; sc++) {
-                const uint64_t c = dv_score_count(sc);
-                if (!c) continue;
-                n += c; sum += (double)sc * (double)c; if (sc > best) best = sc;
-            }
-            if (n) printf("; dives: best %d, mean %.1f over %" PRIu64 " boards", best, sum / (double)n, n);
-        }
         printf("\n");
         if (g_exin_probe) {
             printf("[sum] exhaust probe: of %" PRIu64 " window picks, a skipped conflict-free B with more "
@@ -5861,22 +6000,31 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         }
     }
     if (g_prefix[0]) printf("[sum] run prefix: %s -> %s\n", g_prefix, g_out_dir);
-    printf("[sum] *** Output boards score:");
+    printf("[sum] scores:");
     int shown = 0;
     bool more = false;
+    uint64_t sn = 0; double ssum = 0.0;
     for (int sc = DV_EDGES; sc >= 0; sc--) {
         const uint64_t n = g_end_dive ? dv_score_count(sc) : g_score_hist[sc];
         if (!n) continue;
-        if (shown == SCORE_LINE_MAX) { more = true; break; }
+        sn += n; ssum += (double)sc * (double)n;
+        if (shown == SCORE_LINE_MAX) { more = true; continue; }
         printf("%s%d:%" PRIu64, shown ? "  " : " ", sc, n);
         shown++;
     }
-    printf("%s%s (%" PRIu64 " written)\n", shown ? "" : " none", more ? " ..." : "", g_written_total);
+    printf("%s%s (%" PRIu64 " written", shown ? "" : " none", more ? " ..." : "", g_written_total);
+    if (sn) printf(", mean %.1f", ssum / (double)sn);
+    printf(")\n");
     print_top_list("best boards", &g_top_score, false);
     if (g_backtrack_row && g_extend_nodes) {
-        if (g_unlock_right) printf("[sum] *** Output boards extension (band cells):");
-        else printf("[sum] *** Output boards extension (cells above row %u, top cap not counted):",
-                    g_stop_row);
+        const uint64_t b = g_bt_run.emitted;
+        printf("[sum] extension: mean %.2f %s, max %d", b ? (double)g_bt_run.ext_cols / (double)b : 0.0,
+               g_unlock_right ? "layers" : "cols", g_bt_run.ext_cols_max);
+        if (g_bt_run.ext_cap) printf(", node cap hit %" PRIu64, g_bt_run.ext_cap);
+        if (g_cap_top && g_bt_run.cap_boards)
+            printf(", top cap %.2f cells per board", (double)g_bt_run.cap_cells / (double)g_bt_run.cap_boards);
+        if (g_unlock_right) printf("; written boards by band cells:");
+        else printf("; written boards by cells above row %u:", g_stop_row);
         shown = 0; more = false;
         for (int n = (int)(sizeof g_ext_hist / sizeof g_ext_hist[0]) - 1; n >= 0; n--) {
             if (!g_ext_hist[n]) continue;
@@ -6034,352 +6182,153 @@ static void verify_segment_enumerator(void) {
 static void usage(const char *a0) {
     fprintf(stderr,
 "Usage: %s seed.txt rotation.csv [options]\n"
+"       %s seed.txt --random_edges [options]\n"
 "\n"
-"Stage B 5-5-5 beam search over Eternity II boards. Reads the piece seed and one\n"
-"Stage A border arrangement, then sweeps ranked (bottom-row x left-column)\n"
-"configurations, each searched by a beam advanced one row at a time. Boards that\n"
-"reach --stop_row are written to <out_dir>/beam_completions_<border>_<stop_row>.csv.\n"
+"Stage B 5-5-5 beam search. Sweeps (bottom row x left column) configurations of a\n"
+"Stage A border (or random borders) and grows each board row by row; boards that\n"
+"reach --stop_row go to <out_dir>/beam_completions_<border>_<stop_row>.csv.\n"
+"Details of every option: PROJECT_E555.md section 5 (Options table 5.16).\n"
 "\n"
 "Input / output:\n"
-"  --out_dir DIR          output directory: completions + checkpoint (default beam_out)\n"
-"  --prefix [NAME]        write every board as NAME_<config> in its first CSV cell,\n"
-"                         to tell runs apart. NAME: letters, digits, '_' '.' '-'\n"
-"                         (no quotes needed). Bare: a random 6-character code for\n"
-"                         the run, printed in [cfg] and the summary; pass that code\n"
-"                         again with --resume to keep the names\n"
-"  --start_row N          first data row of rotation.csv to use (default 0)\n"
-"  --num_rows N           number of consecutive border rows to sweep\n"
-"                         (default 0 = every remaining row of rotation.csv)\n"
-"  --db_file PATH         on-disk cache of the seed-only inner database: built and\n"
-"                         written on first run, mmapped in seconds on later runs\n"
-"  --free_edges           any edge piece may terminate a row on the right (relaxed\n"
-"                         parity; default: only the border row's own right edges)\n"
-"  --random_edges         sample random borders from the seed's edge pieces instead\n"
-"                         of reading a Stage A arrangement (implies --free_edges;\n"
-"                         rotation.csv may be omitted and is ignored if given).\n"
-"                         --samples = number of random bottoms to try (default 1;\n"
-"                         0 = uncapped, run until --wall_time/--max_emitted stops\n"
-"                         you), --top_columns = random left columns per bottom.\n"
-"                         Each bottom is a random legal chain of edges between\n"
-"                         randomly placed corners, the best of 32 such draws by\n"
-"                         fan-out rank (--tau_bottoms softens the choice); each\n"
-"                         left column is drawn the same way from the edges the\n"
-"                         bottom left over (--tau_columns). --exhaust_border_color\n"
-"                         changes how both are drawn: see there. A (bottom,\n"
-"                         column) pair never runs twice in a run: a repeated\n"
-"                         column is redrawn, and after 16 repeats the bottom's\n"
-"                         columns are drawn plain (no exhaust colour), then the\n"
-"                         bottom is left.\n"
-"                         --start_row/--num_rows, --top_bottoms and --resume do\n"
-"                         not apply\n"
-"  --samples N            --random_edges: random bottoms to try (default 1; 0 = until\n"
-"                         --wall_time/--max_emitted); --top_columns lefts each\n"
-"  --exhaust_border_color --random_edges: every border uses up one frame colour\n"
-"                         (drawn per bottom) within the bottom row and column 0\n"
-"                         rows 1..stop_row, so the right column, the top row and\n"
-"                         the left column above the stop row see only the other\n"
-"                         four. The draws are no longer uniform: a colour is\n"
-"                         picked per bottom (only colours that can be used up;\n"
-"                         colour 2 rarely), edges carrying it are drawn 16x as\n"
-"                         often, and draws are rejected and redrawn when the\n"
-"                         corners break the rule, when a bottom leaves more of the\n"
-"                         colour than column 0 rows 1..stop_row can hold, or when\n"
-"                         a left column leaves any unplaced or puts one above the\n"
-"                         stop row. A bottom must admit at least one such column.\n"
-"                         The best of 32 ACCEPTED draws is kept, as above. After 4\n"
-"                         colours fail, the bottom is a plain random one\n"
-"  --BL N / --BR N        pin a seed piece index (0..255) to the Bottom-Left /\n"
-"  --TL N / --TR N        Bottom-Right / Top-Left / Top-Right corner (--random_edges\n"
-"                         only); unpinned corners are sampled, and with 3 pinned the\n"
-"                         4th is forced. Each must be a genuine, distinct corner\n"
-"  --incomplete_top       also emit stop-row boards with only part of the stop row:\n"
-"                         two segments (A+B, A+C, B+C) to <...>_partial.csv and\n"
-"                         segment B alone to <...>_partial_B.csv. A partial is dropped\n"
-"                         when an earlier one of the same kind has the same pieces\n"
-"                         below the stop row and differs in at most one stop-row\n"
-"                         piece. All CSVs are APPENDED, never truncated. In\n"
-"                         rotations mode every emitted board also carries the\n"
-"                         configuration's fixed left column and top-right corner\n"
+"  --out_dir DIR          output directory (default beam_out)\n"
+"  --prefix [NAME]        name every board NAME_<config> (letters, digits, _ . -);\n"
+"                         bare: a random 6-character code, reusable with --resume\n"
+"  --start_row N          first data row of rotation.csv (default 0)\n"
+"  --num_rows N           border rows to sweep (default 0 = all remaining)\n"
+"  --db_file PATH         cache of the inner chain database: built once, then mmapped\n"
+"  --print_cmd            print the full command line, defaults included\n"
 "\n"
-"Beam shape:\n"
+"Borders:\n"
+"  --free_edges           any edge piece may end a row on the right (default: only the\n"
+"                         border row's own right edges)\n"
+"  --random_edges         sample borders from the seed instead of rotation.csv\n"
+"                         (implies --free_edges): each bottom and each left column is\n"
+"                         the best of 32 random legal chains by fan-out rank; a\n"
+"                         (bottom, column) pair never runs twice. --start_row,\n"
+"                         --num_rows, --top_bottoms and --resume do not apply\n"
+"  --samples N            --random_edges: bottoms to try (default 1; 0 = until\n"
+"                         --wall_time/--max_emitted); --top_columns columns each\n"
+"  --exhaust_border_color --random_edges: each border uses up one frame colour (drawn\n"
+"                         per bottom) on the bottom row and column 0 rows 1..stop_row;\n"
+"                         after 4 failed colours the bottom is a plain one\n"
+"  --BL N --BR N --TL N --TR N\n"
+"                         --random_edges: pin a corner piece (0..255); 3 pinned force\n"
+"                         the 4th\n"
+"\n"
+"Beam and search:\n"
 "  --beam_width K         boards kept per row (default 250000)\n"
-"  --stop_row R           last row the beam fills, 1..13; reaching boards are emitted\n"
-"                         (default 11: the beam reliably FILLS row 11 and reliably\n"
-"                         dies attempting 12, so stopping at 11 emits that material\n"
-"                         instead of discarding it -- hand row 12 to the finalizer)\n"
-"  --backtrack_row N      stop the BEAM at row N (1..stop_row-1), then search every\n"
-"                         root (--backtrack_row_factor) EXHAUSTIVELY, cell by cell\n"
-"                         in row-major order, up to --stop_row: the fixed left column,\n"
-"                         right edges from the border's own pool, clue pins enforced\n"
-"                         and colour parity checked at every row; with\n"
-"                         --lambda_corners a path also ends once NEITHER top corner\n"
-"                         can be closed (no TL and no TR block alive). EVERY board\n"
-"                         completing the stop row is emitted (exact duplicates\n"
-"                         dropped); pair with --max_emitted. --incomplete_top is\n"
-"                         ignored with a warning (default 0 = off)\n"
+"  --stop_row R           last row filled, 1..13 (default 11)\n"
+"  --backtrack_row N      beam to row N, then search each root exhaustively, cell by\n"
+"                         cell, to the stop row; every stop-row board is kept (default\n"
+"                         0 = off)\n"
 "  --backtrack_row_factor M\n"
-"                         with --backtrack_row: row N is an ordinary beam row, and\n"
-"                         its best M x (row width) boards -- same dedup, per-parent\n"
-"                         cap and random band as any row -- are the roots, so\n"
-"                         --pool_factor can grow without growing the search. 0 = row\n"
-"                         N expanded as a stop row and EVERY candidate a root, raw\n"
-"                         (up to pool_factor x width near-twins; the behaviour\n"
-"                         before this flag) (default 2)\n"
-"  --exhaust_inner_color N\n"
-"                         use N inner colours up completely -- inner and edge\n"
-"                         pieces -- by the stop row, so nothing above it sees them.\n"
-"                         Marked per border: the N colours (3+ edges, at most k of\n"
-"                         them on the left column above the stop row, k the stop-row\n"
-"                         tolerance of --exhaust_check) whose edges the bottom row\n"
-"                         and left column commit least likely by chance\n"
-"                         (hypergeometric tail p); under --random_edges each\n"
-"                         bottom keeps the best of (N+1)^3 ordinary left columns\n"
-"                         (twice that with --exhaust_border_color). The\n"
-"                         beam is biased toward placing them (--lambda_exhaust_inner);\n"
-"                         a board is dropped once its unplaced edges of a marked\n"
-"                         colour no longer fit the right column up to the stop row,\n"
-"                         or at the stop row unless every marked colour is gone.\n"
-"                         1..8 (default 0 = off)\n"
-"  --lambda_exhaust_inner F\n"
-"                         bias toward the marked colours, in units of the row's\n"
-"                         score SD per weighted face (default 0.15; 0 = off)\n"
-"  --exhaust_check ROW:TOL[,ROW:TOL]\n"
-"                         loose checkpoints below the stop row: a marked colour's\n"
-"                         residual (its faces left beyond what the frame needs) at\n"
-"                         most TOL (default S-1:6 with S = --stop_row); S:K lets\n"
-"                         K marked faces in all stay unplaced at the stop row\n"
-"                         (default 2N, edges included; S:0 = exact)\n"
-
-
-"  --extend_nodes N       with --backtrack_row: every stop-row board goes on,\n"
-"                         cell by cell in COLUMN-major order (column 1 bottom up,\n"
-"                         then column 2, ...) over rows stop+1..14, cols 1..14, with\n"
-"                         no breaks, and is written (or dived) from the deepest\n"
-"                         prefix found -- still one line per stop-row board, its\n"
-"                         open cells in the top-right corner. Row-14 cells must\n"
-"                         show a colour the unplaced top border still carries.\n"
-"                         N caps the search per board (default 100000; 0 = off)\n"
-"  --cap_top [N]          with the extension: place the top-left border inside it --\n"
-"                         the TL corner, then a top edge over each column right after\n"
-"                         its row-14 cell, matching the colour below and its\n"
-"                         neighbour -- and never keep a filled row-14 cell without\n"
-"                         its edge. Extensions may be shorter; --backtrack_min_col\n"
-"                         counts capped columns. N = 0 turns it off; bare or\n"
-"                         nonzero = on (default 1)\n"
-"  --backtrack_min_col K  with --backtrack_row: write only boards whose extension\n"
-"                         fills columns 1..K of rows stop+1..14 whole; lets a lower\n"
-"                         --stop_row run without flooding the output (default 0).\n"
-"                         The search then cuts a partial row as soon as its column 1\n"
-"                         can no longer be stacked to row 14 with unused pieces (and,\n"
-"                         under --random_edges, column 0 above the stop row), and a\n"
-"                         stop-row cell of columns 2..K whose top nothing can sit on:\n"
-"                         the same boards are written, fewer are found, sooner\n"
-"  --no_top_dedup         with --backtrack_row: keep stop-row boards whose top row\n"
-"                         repeats the previous board's columns 1..K and differs from\n"
-"                         it in at most one other cell. By default such a near twin\n"
-"                         is dropped before its extension and dives, whether the\n"
-"                         previous board was written or not\n"
+"                         roots = the best M x width boards of row N; 0 = every\n"
+"                         candidate, raw (default 2)\n"
+"  --extend_nodes N       with --backtrack_row: extend each stop-row board column by\n"
+"                         column over rows stop+1..14, N nodes at most (default\n"
+"                         100000; 0 = off)\n"
+"  --cap_top [N]          the extension also places the top-left border, so every\n"
+"                         filled row-14 cell is closed above (default 1; 0 = off)\n"
+"  --backtrack_min_col K  write only boards whose extension fills columns 1..K whole;\n"
+"                         the search prunes what cannot (default 0)\n"
+"  --no_top_dedup         keep stop-row boards that nearly repeat the previous one\n"
 "  --backtrack_unlock_right R\n"
-"                         with --backtrack_row N (R in 2..13; default 0 = off): the\n"
-"                         board is the block rows 0..S x columns 0..15-R and the rest\n"
-"                         is the band, frame and the three free corners included.\n"
-"                         Each root gives back columns 16-R..15 of rows 1..N, rows\n"
-"                         N+1..S are searched over columns 1..15-R, and the\n"
-"                         extension grows the band in layers hugging the block (up\n"
-"                         column 15-R+k from row 0, then left along row S+k to\n"
-"                         column 0), any edge on any side. --backtrack_min_col K then\n"
-"                         counts the band columns allowed to stay open (default R:\n"
-"                         every board is written with its longest extension), and\n"
-"                         without --end_dive --emit_score S drops boards that\n"
-"                         match fewer edges. Corner clues in the band go home.\n"
-"                         Not with --lambda_corners, --free_top_clue or --cap_top\n"
-"  --beam_expand E      late-search width multiplier (default 1 = no expansion)\n"
-"  --beam_expand_row R    row with the full ExK width; half of the extra width is\n"
-"                         granted one row earlier (default 7)\n"
+"                         leave the right R columns (2..13) and the top as a band\n"
+"                         grown by the extension (default 0 = off; not with\n"
+"                         --lambda_corners, --free_top_clue, --cap_top,\n"
+"                         --exhaust_inner_color)\n"
+"  --incomplete_top       also write stop-row boards with only two segments, or only\n"
+"                         segment B, of the stop row (<...>_partial*.csv)\n"
+"  --beam_expand E        width multiplier late in the search (default 1)\n"
+"  --beam_expand_row R    row with the full E x K width (default 7)\n"
 "\n"
-"Scoring / selection:\n"
-"  --lambda_J F           weight of the CLOSURE term, the objective derived from\n"
-"                         pairing combinatorics: A_tot*KL(free-color mix || flat) plus\n"
-"                         a demand term, in nats like the fan-out terms. The primary\n"
-"                         color objective; 0 turns it off (default 1.0, useful 0.5-1.5)\n"
-"  --lambda_Mahalanobis F weight of the piece-structure CORRECTION, in units of its own\n"
-"                         per-row standard deviation -- the spread is measured live and\n"
-"                         divided out, so F means the same thing at every depth. Small\n"
-"                         by design: it correlates ~0.88 with closure, so only the\n"
-"                         residual is new. The spread is measured per configuration,\n"
-"                         falling back to the run's pooled spread for a thin row\n"
-"                         (default 1.0, useful 0.5-1.5; 0 = off)\n"
-"                         Both terms are always live. --lambda_Mahalanobis 0 is closure\n"
-"                         alone and --lambda_J 0 is Mahalanobis alone, which is why\n"
-"                         there is no --score_model.\n"
-"  --lambda_corners [F]   TOP-CORNER SUPPLY. Per border row,\n"
-"                         enumerates every legal filling of a small block against\n"
-"                         each top corner -- with --clue_corners the 2x3 block the\n"
-"                         row-13 clue closes (one catalog per clue frame), else the\n"
-"                         3 cells next to the corner -- never runs a left column no\n"
-"                         TL block can use, and scores each child by the blocks per\n"
-"                         corner still buildable from unused pieces: -3/+1/+2/+3 for\n"
-"                         0/1/2/3+, times F in units of the row's score SD. Bare flag\n"
-"                         = 0.5; absent = 0 (off). Needs a rotations file (not\n"
-"                         --random_edges) and --stop_row <= 12. With --free_edges\n"
-"                         the top and right edge pieces are pooled: either may fill\n"
-"                         the TR block or witness the top border\n"
-"  --lambda_reserve F     keep Stage A's double-decker TOP reserve for last: every\n"
-"                         inner piece the rotations row marks with spin 1 (the pieces\n"
-"                         --double_decker TOP reserved for row 14) costs F, in units\n"
-"                         of the row's score SD like --lambda_corners, for each one a\n"
-"                         board has placed. Nothing is held: a reserve piece can still\n"
-"                         be used when nothing else fits, and the dives and the\n"
-"                         --backtrack_row search ignore it. Works with or without\n"
-"                         --lambda_corners. The stop-row summary reports how many\n"
-"                         reserve pieces the boards left free, also at F = 0\n"
+"Using colours up (PROJECT_E555.md 5.9):\n"
+"  --exhaust_inner_color N\n"
+"                         use N inner colours up, inner and edge pieces, by the stop\n"
+"                         row (1..8; default 0 = off). Marked per border: the N least\n"
+"                         likely by chance to have so many edges on the bottom and\n"
+"                         left; --random_edges keeps the best of (N+1)^3 left columns\n"
+"                         (x2 with --exhaust_border_color). Exact cuts drop boards\n"
+"                         that can no longer make it\n"
+"  --lambda_exhaust_inner F\n"
+"                         bias toward the marked colours, in row score SDs per face\n"
+"                         (default 0.15; 0 = off)\n"
+"  --exhaust_check ROW:TOL[,...]\n"
+"                         up to 16 entries. Rows below S: a marked colour's residual\n"
+"                         (faces beyond the frame's needs) at most TOL (default\n"
+"                         S-1:6). S:K: at most K marked faces left at the stop row\n"
+"                         (default 2N; 0 = exact)\n"
+"  --blackwood            preset after Joshua Blackwood's solver: marks c14 and c22,\n"
+"                         adds his colour schedule (a floor per row), and sets\n"
+"                         --exhaust_border_color --stop_row 10 --exhaust_check 10:3\n"
+"                         --backtrack_min_col 5 --end_dive 5000 --end_polish 6000;\n"
+"                         explicit flags win. Needs --random_edges\n"
+"\n"
+"Scoring:\n"
+"  --lambda_J F           weight of the closure term, the primary colour objective\n"
+"                         (default 1.0; 0 = off)\n"
+"  --lambda_Mahalanobis F weight of the piece-structure correction, in row score SDs\n"
+"                         (default 1.0; 0 = off)\n"
+"  --lambda_corners [F]   top-corner supply: score children by the corner blocks\n"
+"                         still buildable (bare = 0.5; default 0 = off). Needs a\n"
+"                         rotations file and --stop_row <= 12\n"
+"  --lambda_reserve F     penalty per Stage A double-decker TOP reserve piece placed\n"
 "                         (default 0 = off; not with --random_edges)\n"
-"  --clue_center          force the published center clue piece onto its cell, at its\n"
-"                         orientation's spin (piece 138; one of the 4 center cells)\n"
-"  --clue_corners         force the two published corner clues the beam can reach,\n"
-"                         both on row 2; the row-13 pair is only reserved, never pinned,\n"
-"                         and constrains no searched row. Clue pieces leave the database\n"
-"  --free_top_clue        with --clue_corners and --backtrack_row: the extension above\n"
-"                         the stop row fills both row-13 clue cells like any other and\n"
-"                         may place the top-left clue on any cell (if it does not, the\n"
-"                         clue goes home only where it matches its neighbours). The\n"
-"                         top-right clue stays held through the extension and is then\n"
-"                         left off the board, for the dives to place\n"
-"  --pin_clue N           search ONE of the four clue frames instead of hedging over all\n"
-"                         four. The five clues are one rigid body, so naming where the\n"
-"                         CENTRE clue sits names the whole set. Rows are 0-indexed\n"
-"                         bottom-up, and N runs anticlockwise from the lower left:\n"
-"                           0  not pinned -- all four frames at once (default)\n"
-"                           1  centre clue lower-left   (7,7)\n"
-"                           2  centre clue lower-right  (7,8)\n"
-"                           3  centre clue upper-right  (8,8)\n"
-"                           4  centre clue upper-left   (8,7)\n"
-"                         This is a simplification, not extra constraint machinery:\n"
-"                         unpinned, every clue row expands each parent once per frame\n"
-"                         and the beam carries boards from four frames at once. Pinned,\n"
-"                         it expands once and the beam is one frame throughout.\n"
-"                         Implies --clue_center and NOTHING else -- add --clue_corners\n"
-"                         yourself if you want it, since it costs four more pieces out\n"
-"                         of the chain database. Pinning alone does not, so a pinned run\n"
-"                         reuses an unpinned run's --db_file cache\n"
 "\n"
-"Finishing boards (end dives):\n"
-"  --end_dive [M]         complete every stop-row board (beam or --backtrack_row) to\n"
-"                         256 pieces with greedy random dives that allow broken edges\n"
-"                         (most-constrained cell, exact fit before a break, fewest\n"
-"                         breaks, least-constraining value) and write the best\n"
-"                         completion instead of the stop-row board. Stage 1: M/10\n"
-"                         dives per board. Stage 2: the other M-M/10 in 18\n"
-"                         cross-entropy rounds that learn from the board's own best\n"
-"                         dives, for boards whose stage-1 best is >= S-4 (or the top\n"
-"                         10%% of a configuration when that is under 20%%). Written\n"
-"                         after each configuration, best first, as config_id,\n"
-"                         connected edges, pos, rot; --max_emitted then caps the\n"
-"                         written boards instead of stopping the search. Bare flag =\n"
-"                         10000; absent = off\n"
-"  --end_polish R         with --end_dive: on boards whose best dive is within 6 of S,\n"
-"                         hill-climb the 32 best distinct dives (best swap or\n"
-"                         re-rotation, repeated), then run R kick-and-polish rounds\n"
-"                         (4 sampled swaps, re-polish, annealed accept) over 16\n"
-"                         walks. 0 = polish only; absent = off\n"
-"  --emit_score S         connected edges (of 480) a finished board needs to be\n"
-"                         written (default 450); without --end_dive, under\n"
-"                         --backtrack_unlock_right only, the extended board's\n"
-"                         edges when S is given\n"
-"  --corner_seeds N       with --end_dive and --lambda_corners: every stop-row board\n"
-"                         with an alive top-corner block also dives up to N copies\n"
-"                         with a block and a free pair of top witnesses fixed on\n"
-"                         their cells, so that corner is clean; the unseeded board\n"
-"                         is dived too (default 4, 0 = off)\n"
+"Clues:\n"
+"  --clue_center          pin the centre clue (piece 138)\n"
+"  --clue_corners         pin the two row-2 corner clues; the row-13 pair is reserved\n"
+"  --free_top_clue        with --clue_corners and --backtrack_row: the extension may\n"
+"                         place the top-left clue anywhere; the top-right one is left\n"
+"                         to the dives\n"
+"  --pin_clue N           search one clue frame: 1..4 = centre clue at (7,7) (7,8)\n"
+"                         (8,8) (8,7); 0 = all four (default). Implies --clue_center\n"
 "\n"
-"Selection:\n"
-"  --frac_rand F          fraction of the beam selected at random instead of by\n"
-"                         score, FLAT across rows. Both bands are drawn from the\n"
-"                         same deduplicated pool and sum to the row width, so a\n"
-"                         lower value does not send more states forward -- it sends\n"
-"                         better-chosen ones. Only bites where the pool exceeds the\n"
-"                         width; where it does not, every candidate survives anyway\n"
-"                         (default 0.10; 0 trusts the objective completely)\n"
-"  --parent_cap N         max children per parent in the score-selected band;\n"
-"                         doubled from beam_expand_row-1 on; 0 = uncapped (default 4)\n"
+"Finishing boards:\n"
+"  --end_dive [M]         complete every stop-row board with M greedy dives that allow\n"
+"                         breaks (M/10, then cross-entropy rounds on the promising\n"
+"                         ones) and write the best (bare = 10000; default off)\n"
+"  --end_polish R         with --end_dive: hill-climb the best dives, then R\n"
+"                         kick-and-polish rounds (0 = polish only; default off)\n"
+"  --emit_score S         edges (of 480) a dived board needs to be written (default\n"
+"                         450)\n"
+"  --corner_seeds N       with --end_dive and --lambda_corners: also dive N copies\n"
+"                         with a top corner block fixed (default 4)\n"
 "\n"
-"Feasibility certificates:\n"
-"  --no_free_demand       DISABLE the free-mode demand accounting. On by default: an\n"
-"                         edge piece owes one inner half-edge of its own color whether\n"
-"                         it ends up a right edge or a top border piece, so free mode's\n"
-"                         demands -- and hence the color parity test -- are exact\n"
-"                         without knowing the split. Without this accounting free mode\n"
-"                         carries no color certificate at all\n"
-"\n"
-"Expansion effort:\n"
-"  --pool_factor N        candidate-pool target as a multiple of beam_width; more\n"
-"                         pool = more children scored per row (default 64)\n"
-"  --bc_window nB,nC      per segment-A record, how many B/C completions to consider.\n"
-"                         Two regimes, chosen per row by whether the beam is full:\n"
-"                           beam AT capacity -- score up to nB workable B chains x nC\n"
-"                             C completions and keep the BEST child, so the objective\n"
-"                             picks it instead of the database\'s board-blind sort;\n"
-"                           beam BELOW capacity -- enumerate the B and C cells and keep\n"
-"                             EVERY child, bounded by the per-parent quota alone.\n"
-"                         Selection only discards states while the pool exceeds the row\n"
-"                         width, so where it does not, an extra child costs nothing and\n"
-"                         a discarded sibling is a completion thrown away. 1,1 makes\n"
-"                         the full-beam regime take the first fit (default 7,7)\n"
-"  --bc_window_accept F   full-beam regime: keep the window's best child with\n"
-"                         probability F, else its second best (default 1)\n"
+"Selection and expansion:\n"
+"  --frac_rand F          share of each row chosen at random (default 0.10)\n"
+"  --parent_cap N         children per parent in the score-chosen part; doubled from\n"
+"                         beam_expand_row-1 (default 4; 0 = uncapped)\n"
+"  --pool_factor N        candidate pool, in multiples of beam_width (default 64)\n"
+"  --bc_window nB,nC      while the beam is full: score up to nB B chains x nC C\n"
+"                         chains per segment-A record and keep the best (default 7,7)\n"
+"  --bc_window_accept F   keep the window's best child with probability F, else the\n"
+"                         second best (default 1)\n"
+"  --no_free_demand       turn off free-mode demand accounting (and so the exact\n"
+"                         colour parity test)\n"
 "\n"
 "Sweep control:\n"
-"  --top_bottoms N        bottom-row orderings tried per border row, best-ranked\n"
-"                         first (<1 = all; default 10). A bottom on a NEW border is\n"
-"                         worth more than another bottom on one already tried, so\n"
-"                         spend the budget on --num_rows before raising this\n"
-"  --top_columns N        left-column orderings tried per bottom (<1 = all; default 12).\n"
-"                         Ranked SEPARATELY FOR EACH BOTTOM, since a column's rank is\n"
-"                         conditional on the bottom it shares the board with, so l0\n"
-"                         means the best column for THIS bottom. Columns that cannot\n"
-"                         complete row 1 with it are dropped, which is why the [rank]\n"
-"                         line can show fewer run than asked for\n"
-"  --tau_bottoms T        selection temperature for the bottom ranking: above 0 the\n"
-"                         --top_bottoms tried are a sample without replacement with\n"
-"                         probability proportional to exp(rank/tau) rather than the\n"
-"                         greedy head. The ranks of the leading bottoms differ by\n"
-"                         well under 1 nat, so the scale is small: 0.1 keeps about\n"
-"                         half the picks in the greedy top 10 and measured no yield\n"
-"                         cost; 2 is close to a uniform draw over every bottom and\n"
-"                         measured ~10%% fewer row-11 configurations. 0 = off, the\n"
-"                         greedy head (default 0)\n"
-"  --tau_columns T        the same for the left-column ranking (0.1 measured no\n"
-"                         yield cost; default 0)\n"
-"  --bail_columns N       abandon a bottom after N consecutive columns that emitted\n"
-"                         nothing, instead of running all --top_columns. Most useful\n"
-"                         with --incomplete_top: completions and two-segment partials\n"
-"                         reset the streak, B-only partials do not.\n"
-"                         On completions alone at a high --stop_row emissions are rare\n"
-"                         enough that this acts as a cap of N columns per bottom.\n"
-"                         0 = never bail (default 0)\n"
-"  --time_limit S         wall-time slice per (bottom x left) config; a per-row\n"
-"                         deadline, so it only fires on a config that runs long\n"
-"                         (default 600)\n"
-"  --wall_time S          total wall-time budget; 0 = unlimited (default 0)\n"
-"  --max_emitted N        stop once N boards have been reported, counting both\n"
-"                         completions and --incomplete_top partials; the\n"
-"                         configuration in flight is always reported in full, so the\n"
-"                         final count can overshoot N by that configuration's output\n"
-"                         (0 = unlimited; default 0)\n"
-"  --resume               continue from <out_dir>/sweep_checkpoint.txt. Give the\n"
-"                         original --start_row/--num_rows: the run ends where the\n"
-"                         original would have. A configuration cut by --wall_time or\n"
-"                         a signal before it wrote anything is run again. SIGINT/\n"
-"                         SIGTERM finish the current configuration and print the\n"
-"                         summary; a second signal kills\n"
+"  --top_bottoms N        bottoms per border row, best first (<1 = all; default 10)\n"
+"  --top_columns N        left columns per bottom, ranked for that bottom (<1 = all;\n"
+"                         default 12)\n"
+"  --tau_bottoms T        sample the bottoms with probability ~ exp(rank/T) instead\n"
+"                         of the greedy head (0.1 mild, 2 near uniform; default 0)\n"
+"  --tau_columns T        the same for the left columns (default 0)\n"
+"  --bail_columns N       leave a bottom after N columns in a row emit nothing\n"
+"                         (default 0 = never)\n"
+"  --time_limit S         per-configuration time budget in s (default 600)\n"
+"  --wall_time S          total time budget in s (default 0 = unlimited)\n"
+"  --max_emitted N        stop after N written boards (the configuration in flight\n"
+"                         finishes; under --end_dive it caps the written boards)\n"
+"  --resume               continue from <out_dir>/sweep_checkpoint.txt (same\n"
+"                         --start_row/--num_rows). SIGINT/SIGTERM finish the current\n"
+"                         configuration; a second signal kills\n"
 "\n"
 "Misc:\n"
 "  --threads N            OpenMP threads (default: all cores)\n"
-"  --rng_seed S           RNG seed; omitted = randomized from clock+pid. Explicit\n"
-"                         0 is a valid deterministic seed, like any other integer\n"
-"  --verbose              per-row [beam] traces, every [sweep] line, [rank]/[bail]\n"
-"                         lines and the [dfs]/[dive] lines per configuration\n"
-"  --help                 this text\n", a0);
+"  --rng_seed S           RNG seed (default: clock + pid; 0 is a valid seed)\n"
+"  --verbose              per-row [beam], every [sweep], [rank]/[bail], [dfs]/[dive]\n"
+"  --help                 this text\n", a0, a0);
 }
 
 /* -- --print_cmd ----------------------------------------------------------
@@ -6428,6 +6377,7 @@ static void print_cmd(const char *a0, const char *seed_path, const char *csv_pat
     if (g_lambda_reserve > 0.0) printf(" --lambda_reserve %g", g_lambda_reserve);
     if (!g_free_demand)  printf(" --no_free_demand");
     printf(" --stop_row %u", g_stop_row);
+    if (g_blackwood) printf(" --blackwood");
     if (g_exhaust_inner) {
         printf(" --exhaust_inner_color %u --lambda_exhaust_inner %g --exhaust_check ",
                g_exhaust_inner, g_lambda_exin);
@@ -6699,7 +6649,8 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--db_file")     && i+1 < argc) g_db_file = argv[++i];
         else if (!strcmp(argv[i], "--free_edges"))                g_free_edges = true;
         else if (!strcmp(argv[i], "--beam_width")  && i+1 < argc) g_beam_width = (uint32_t)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--stop_row")    && i+1 < argc) g_stop_row = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--stop_row")    && i+1 < argc) { g_stop_row = (uint32_t)atoi(argv[++i]); g_stop_row_set = true; }
+        else if (!strcmp(argv[i], "--blackwood"))               g_blackwood = true;
         else if (!strcmp(argv[i], "--backtrack_row") && i+1 < argc) {
             int v = atoi(argv[++i]);
             g_backtrack_row = v > 0 ? (uint32_t)v : 0; g_backtrack_row_set = true;
@@ -6792,14 +6743,14 @@ int main(int argc, char *argv[]) {
                 if (end != argv[i + 1] && *end == '\0') { v = w; i++; }
             }
             if (v < 10 || v > 1000000000L) fatal("--end_dive must be in 10..1000000000");
-            g_end_dive = (uint32_t)v;
+            g_end_dive = (uint32_t)v; g_end_dive_set = true;
         }
         else if (!strcmp(argv[i], "--corner_seeds") && i+1 < argc) {
             g_corner_seeds = atoi(argv[++i]);
             if (g_corner_seeds < 0 || g_corner_seeds > 64) fatal("--corner_seeds must be in 0..64");
         }
         else if (!strcmp(argv[i], "--end_polish") && i+1 < argc) {
-            g_end_polish = atoi(argv[++i]);
+            g_end_polish = atoi(argv[++i]); g_end_polish_set = true;
             if (g_end_polish < 0) fatal("--end_polish must be >= 0");
         }
         else if (!strcmp(argv[i], "--emit_score") && i+1 < argc) {
@@ -6857,6 +6808,22 @@ int main(int argc, char *argv[]) {
         else if (!strcmp(argv[i], "--print_cmd"))       g_print_cmd = true;
         else if (!strcmp(argv[i], "--verbose"))         g_verbose = true;
         else { fprintf(stderr, "Unknown argument: %s\n\n", argv[i]); usage(argv[0]); return 1; }
+    }
+    if (g_blackwood) {                   /* the preset: explicit flags win */
+        if (!g_random_edges) fatal("--blackwood samples its borders: it needs --random_edges");
+        if (g_exhaust_inner && g_exhaust_inner != 2)
+            fatal("--blackwood marks two colours (c%d, c%d): not with --exhaust_inner_color %u",
+                  BW_C1, BW_C2, g_exhaust_inner);
+        g_exhaust_inner = 2;
+        g_exhaust = true;
+        if (!g_stop_row_set) g_stop_row = 10;
+        if (!g_min_col_set && g_backtrack_row_set) { g_bt_min_col = 5; g_min_col_set = true; }
+        if (!g_end_dive_set) g_end_dive = 5000;
+        if (!g_end_polish_set) g_end_polish = 6000;
+        if (g_exin_ck_n < 0) {           /* the stop row only: the schedule replaces S-1 */
+            g_exin_ck_n = 0;
+            g_exin_ck_row[g_exin_ck_n] = (int)g_stop_row; g_exin_ck_tol[g_exin_ck_n++] = 3;
+        }
     }
 
     if (g_nthreads <= 0) g_nthreads = omp_get_max_threads();
@@ -7241,6 +7208,7 @@ int main(int argc, char *argv[]) {
     init_clue_tables();
     clue_dump_schedule();
     if (g_exhaust_inner) exin_init();
+    if (g_blackwood) bw_init();
     ext_fix_init();
     if (g_unlock_right) lx_init();
     if (g_random_edges) g_edge_left_n = edge_left_pool(&g_edge_left);

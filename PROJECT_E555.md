@@ -833,10 +833,10 @@ toward them, and every board is held to the rule.
 - **The stop-row tolerance** (`--exhaust_check S:k`, at most 32, default
   `S:2N`; `S:0` is the exact rule): up to k marked faces may stay above S,
   edges included. Measured with N = 2, S = 11, width 1000, 12
-  configurations: `S:0` gives no board, `S:4` 31 boards from 3 configurations. `[sum] exhaust outcome`
+  configurations: `S:0` gives no board, `S:4` 31 boards from 3 configurations. `[sum] exhaust_inner_color`
   then counts the stop-row boards by faces left, 0..k.
 - **The loose checkpoints** (`--exhaust_check ROW:TOL[,ROW:TOL]`, rows below S,
-  default `S-1:6`; up to 4 entries with S:k) prune earlier, heuristically, on the residual
+  default `S-1:6`; up to 16 entries with S:k) prune earlier, heuristically, on the residual
   `residual_c = R_c - F_c - Q_c = S_c + T_c - Q_c`: `R_c` the faces of c on
   unplaced inner pieces, `T_c` the frontier tops of c, `F_c = D_c - T_c` the
   demand the frame still owes (each frame face takes exactly one inner face, so
@@ -851,17 +851,30 @@ toward them, and every board is held to the rule.
   with different pasts compare fairly. On the stop row the frontier tops count
   as not yet placed (a top there can never pass). A right edge of the colour
   counts through its joint, the column-14 piece's right face, so the bias also
-  pulls the deficit edges into the right column early. With `--bc_window 7,7`
-  it picks among up to 49 B x C children per A record, and the window takes
-  its B chains in order of their marked faces, from the first 24
-  conflict-free ones (stable); a probe had found a skipped B with more marked
-  faces in 49% of the window picks (C: 9%). `E555_EXIN_PROBE=1` turns the
-  ordering off and prints that probe and the bonus spread by row.
-- `[sum] exhaust_inner_color N` gives the marks and the D_N histogram of the
-  borders run; `[sum] exhaust cuts by row` the boards tested and those cut by
-  the edge fit, the carriers, the residual and the stop-row rule; `[sum] exhaust residual by
-  row` the surviving boards' mean marked residual; `[sum] exhaust outcome` the
-  configurations reaching S, the stop-row boards and the dives.
+  pulls the deficit edges into the right column early.
+- **Colour-aware candidates.** The bias can only rank the children it is
+  given, so with it on the beam also builds them colour-first (stable orders,
+  ties keep the database's fan-out order):
+  - *A records:* a parent's first 4 x quota records (per slice) are tried in
+    order of the marked faces of their 5 pieces, so the parent's quota of
+    children goes to the colour's chains first; the rest of the cell follows
+    as usual (fan-out order, then a random tail);
+  - *B and C chains:* the window takes its nB B chains and its nC C chains in
+    order of their marked faces, from the first 32 conflict-free ones
+    (`EXIN_LOOK`); a probe had found a skipped B with more marked faces in 49%
+    of the window picks, a skipped C in 9%;
+  - *closure:* the demand part of the closure term (5.6) leaves the marked
+    colours out, so a marked colour running low while the frontier still
+    shows it is no longer penalised.
+
+  Without the flag nothing changes: the database order already is the plain
+  beam's ranking, and there is no colour to sort by. `E555_EXIN_PROBE=1`
+  turns the orderings off and prints the probe and the bonus spread by row.
+- `[sum] exhaust_inner_color N` gives the marks, the D_N histogram of the
+  borders run and the stop-row boards by marked faces left; `[sum] exhaust
+  cuts by row` the boards tested and those cut by the edge fit, the carriers,
+  the residual and the stop-row rule (the schedule first under `--blackwood`);
+  `[sum] exhaust residual by row` the surviving boards' mean marked residual.
   `E555_EXIN_MEASURE=K` prints the D_N table above for K bottoms and exits.
 - **Measured** (12 `--random_edges` configurations, width 1000,
   `--backtrack_row 6 --stop_row 11 --end_dive 100`, one seed): N = 1 reached
@@ -873,6 +886,38 @@ toward them, and every board is held to the rule.
   looser rule (used up but for faces the frame still owed, at S-1), the same
   borders gave: lambda 0, 1 configuration and 39 boards; lambda 0.15, 8 and
   163 (328 with the B ordering).
+
+**Blackwood preset (`--blackwood`, needs `--random_edges`).** After Joshua
+Blackwood's record solver (github.com/jblackwood345/EternityII_Solver, GPL-3.0;
+only its published numbers are used here). His solver prioritises the colours
+{13, 16, 10} of its own numbering (one frame colour, two inner ones) and, at
+every depth d of its row-by-row fill from the bottom-left, cuts a branch whose
+placed pieces carry fewer than `heuristic_array[d]` sides of them: 0 up to
+depth 16, then a piecewise-linear ramp to 119 of their 122 sides at depth 160.
+His piece list is E555's, in the same order, so the colour map is exact:
+13 -> 5, 16 -> 22, 10 -> 14. The preset keeps E555's search (rows to the stop
+row, then the column-major extension) and sets existing options:
+
+- `--exhaust_inner_color 2` with the marks fixed to c14 and c22 (the left
+  column is still the best of K by their p), `--exhaust_border_color` (its
+  usual random frame colour; colour 5 is not forced), `--stop_row 10`,
+  `--exhaust_check 10:3` (122 - 119), `--backtrack_min_col 5` with
+  `--backtrack_row` (his first block above row 10 is 5 columns wide),
+  `--end_dive 5000 --end_polish 6000` (the dives play his late breaks).
+  Any of these given explicitly wins.
+- **The schedule**, the one new rule: at the end of row r, the pieces on rows
+  0..r (edges included) must carry at least `floor_r` sides of c14 and c22,
+  his value at depth min(16 r + 15, 160) scaled by 98/122 (the two colours'
+  98 sides over his three colours' 122), checked in the beam and in the
+  exhaustive search:
+
+  | row | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | floor | 28 | 46 | 61 | 72 | 81 | 86 | 89 | 92 | 94 | 95 |
+
+  `[cfg] blackwood` lists the preset and the floors; `[sum] blackwood schedule
+  by row` gives the surviving boards' mean sides against each floor, and the
+  cuts line a `schedule` column.
 
 ### 5.10 Column-major extension (`--extend_nodes`, `--backtrack_min_col`)
 
@@ -1329,7 +1374,8 @@ boards or roots they write the same file at any thread count.
 | `--exhaust_border_color` | off | every random border uses up one frame colour within the bottom row and column 0 rows 1..S (5.3) |
 | `--exhaust_inner_color N` | 0 | use N inner colours up, inner and edge pieces, by the stop row: marked per border (edge commitment to bottom + left least likely by chance, hypergeometric p; best of (N+1)^3 lefts, x2 with `--exhaust_border_color`), beam bias, exact rules (5.9) |
 | `--lambda_exhaust_inner F` | 0.15 | the bias, in u_row per weighted face; 0 = off |
-| `--exhaust_check ROW:TOL,...` | S-1:6,S:2N | loose checkpoints below the stop row: marked-residual tolerances; `S:k` lets k marked faces stay at the stop row (`S:0` exact) |
+| `--exhaust_check ROW:TOL,...` | S-1:6,S:2N | up to 16 entries; loose checkpoints below the stop row: marked-residual tolerances; `S:k` lets k marked faces stay at the stop row (`S:0` exact) |
+| `--blackwood` | off | Blackwood preset (5.9): marks c14 c22 with his schedule; sets `--exhaust_border_color --stop_row 10 --exhaust_check 10:3 --backtrack_min_col 5 --end_dive 5000 --end_polish 6000` unless given |
 | `--incomplete_top` | off | also write stop-row boards with two of the three segments (`_partial.csv`) or segment B alone (`_partial_B.csv`); not with `--backtrack_row` |
 | `--beam_width K` | 250000 | boards per row |
 | `--stop_row R` | 11 | last row filled, 1..13 |

@@ -122,11 +122,14 @@ typedef struct {
     uint32_t  buf_n;
     /* --exhaust_inner_color: children tested, and cut by each rule (edge fit,
        residual, stop-row exhaustion); summed after each row. */
-    uint64_t  exin_checked, exin_cut[4];   /* the beamer's EXIN_CUTS */
+    uint64_t  exin_checked, exin_cut[5];   /* the beamer's EXIN_CUTS */
     /* Clue-row candidate chains. Touched only on the two or three rows that
        carry a clue, so it lives AFTER the hot fields: putting it between tmp and
        buf pushed them 30 KB apart and cost ~2.8x on expand. */
     uint16_t  seg[3][CLUE_SEG_CAP][CHAIN_LEN];
+    /* --exhaust_inner_color: a parent slice's look-ahead A records, slice-local
+       indices in marked-face order (the beamer's exin_order_A). Cold, so last. */
+    uint16_t  a_ord[1024];
 } Scratch;
 
 /* Shared per-run beam workspace (sized once from --beam_width x --beam_expand). */

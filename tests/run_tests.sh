@@ -3482,7 +3482,7 @@ assert b > a, f"--lambda_reserve 2 left {b} of 26 free, no more than {a} without
 print(f"ok: --lambda_reserve 2 with --lambda_corners keeps {b:.1f} of 26 reserve pieces free "
       f"at the stop row, against {a:.1f} without it; an old-format row is set aside")
 EOF
-    grep -q "^\[sum\] \*\*\* Output boards score: " "$OUT/btd_dive.log" || fail "no score line in the summary"
+    grep -q "^\[sum\] scores: " "$OUT/btd_dive.log" || fail "no score line in the summary"
     # The diver replaying the plain run's boards is the same finish (at the
     # beamer's --polish_top), so it must write the dived run's rows byte for
     # byte -- corner seeds included, and at another thread count.
@@ -3737,7 +3737,7 @@ for a, b in zip(nc, kc):
             capped += 1
     assert matched_broken(b)[1] == 0, "a --cap_top board has a broken edge"
 assert capped, "--cap_top placed nothing: the check would prove nothing"
-assert re.search(r"^\[sum\] top cap: [0-9.]+ cells per board on row 15", log("mc_k2"), re.M), "no top-cap line"
+assert re.search(r"^\[sum\] extension: .*, top cap [0-9.]+ cells per board", log("mc_k2"), re.M), "no top-cap figure"
 
 want = [content(l) for l in rows("mc_k0") if ext_cols(l) >= 2]
 got = [content(l) for l in rows("mc_k2")]
@@ -3755,7 +3755,7 @@ assert nd and int(nd.group(1)) > 0, "the near-duplicate filter reported no near-
 for d in ("mc_k2", "mc_dd", "mc_rnd2"):
     t = log(d)
     assert "[progress]" not in t, f"{d}: a [progress] line is back"
-    m = re.search(r"^\[sum\] \*\*\* Output boards score:(.*) \((\d+) written\)$", t, re.M)
+    m = re.search(r"^\[sum\] scores:(.*) \((\d+) written(?:, mean [0-9.]+)?\)$", t, re.M)
     assert m, f"{d}: no score line in the summary"
     assert "ext_max=" not in t and " near_dups=" not in t, f"{d}: the [sweep] line kept ext_max/near_dups"
     bs = list(rows(d))
