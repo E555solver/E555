@@ -6829,6 +6829,7 @@ int main(int argc, char *argv[]) {
         if (!g_min_col_set && g_backtrack_row_set) { g_bt_min_col = 5; g_min_col_set = true; }
         if (!g_end_dive_set) g_end_dive = 5000;
         if (!g_end_polish_set) g_end_polish = 6000;
+        g_top_dedup = false;             /* near-twin tops can extend differently */
         if (g_exin_ck_n < 0) {           /* the stop row only: the schedule replaces S-1 */
             g_exin_ck_n = 0;
             g_exin_ck_row[g_exin_ck_n] = (int)g_stop_row; g_exin_ck_tol[g_exin_ck_n++] = 3;
