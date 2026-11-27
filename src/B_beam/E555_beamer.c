@@ -967,17 +967,20 @@ static inline int exin_left4(const uint64_t m[4], const BeamEntry *t) {
 }
 /* --blackwood's schedule. Blackwood requires, at every depth d of his
    row-by-row fill, that the pieces placed carry at least heuristic_array[d]
-   sides of his three colours. Here, with only the two inner colours fixed,
-   the count is the sides of c14 and c22 on the pieces placed in rows 0..r,
-   edges included, and the floor at the end of row r is his value at depth
-   min(16 r + 15, 160) scaled by 98/122 (the two colours' sides over his
-   three's). g_bw_h[k]: pieces with k such sides; g_bw_x[r]: pieces the root
-   holds that are not on rows 0..r (the left column above r, the corners off
-   the board, clue pieces), set per configuration. */
+   sides of his three colours, one frame colour and two inner ones (122 sides
+   in all). Here they are the frame colour --exhaust_border_color used up for
+   this border (his 13 = E555 5 when the border is a plain one) and c14, c22:
+   also 24 + 98 = 122 sides, so his values apply as they are. The count is the
+   sides of the three on the pieces placed in rows 0..r, edges included; the
+   floor at the end of row r is his value at depth min(16 r + 15, 160).
+   g_bw_h[k]: pieces with k such sides; g_bw_x[r]: pieces the root holds that
+   are not on rows 0..r (the left column above r, the corners off the board,
+   clue pieces); both set per configuration. */
+#define BW_FRAME_DEFAULT 5
 static uint64_t g_bw_h[5][4];
 static uint64_t g_bw_x[PUZZLE_SIDE + 1][4];
 static int      g_bw_floor[PUZZLE_SIDE + 1];
-static int      g_bw_total = 0;
+static int      g_bw_total = 0, g_bw_frame = 0;
 static void bw_init(void) {
     int h_arr[256];
     for (int i = 0; i < 256; i++) {                /* his piecewise-linear ramp, as published */
@@ -989,28 +992,35 @@ static void bw_init(void) {
         else if (i <= 160) h_arr[i] = (int)((((float)i - 102) / (float)4.4615) + 106);
         else               h_arr[i] = 0;
     }
+    for (int r = 0; r <= PUZZLE_SIDE; r++) {
+        const int d = 16 * r + 15 < 160 ? 16 * r + 15 : 160;
+        g_bw_floor[r] = r ? h_arr[d] : 0;
+    }
+    /* E555_BW_SCALE=F (tuning only): floors at F times his values. */
+    const char *sc_env = getenv("E555_BW_SCALE");
+    if (sc_env) {
+        const double f = atof(sc_env);
+        for (int r = 0; r <= PUZZLE_SIDE; r++) g_bw_floor[r] = (int)(f * g_bw_floor[r]);
+    }
+    printf("[cfg] blackwood=1 (marks c%d c%d = Blackwood's 10 16, his frame colour 13 = the one "
+           "--exhaust_border_color uses up, c%d on a plain border; stop_row %u; backtrack_min_col %u; "
+           "end_dive %u end_polish %d; explicit flags win)\n",
+           BW_C1, BW_C2, BW_FRAME_DEFAULT, g_stop_row, g_bt_min_col, g_end_dive, g_end_polish);
+    printf("[cfg] blackwood schedule: sides of the three colours (122) on rows 0..r at the end of row r >=");
+    for (int r = 1; r < (int)g_stop_row && r <= PUZZLE_SIDE; r++) printf(" r%d %d", r, g_bw_floor[r]);
+    printf("; row %u: %d, and at most %d marked faces left\n", g_stop_row, g_bw_floor[g_stop_row], g_exin_tolS);
+}
+static void bw_config(const uint64_t root_used[4]) {
+    g_bw_frame = g_exhaust_colour > 0 ? g_exhaust_colour : BW_FRAME_DEFAULT;
     memset(g_bw_h, 0, sizeof g_bw_h);
     g_bw_total = 0;
     for (int pc = 0; pc < NUM_PIECES; pc++) {
         const int f[4] = { g_seed_top[pc], g_seed_right[pc], g_seed_bottom[pc], g_seed_left[pc] };
         int k = 0;
-        for (int d = 0; d < 4; d++) k += (f[d] == BW_C1) + (f[d] == BW_C2);
+        for (int d = 0; d < 4; d++) k += (f[d] == BW_C1) + (f[d] == BW_C2) + (f[d] == g_bw_frame);
         if (k) g_bw_h[k][pc >> 6] |= piece_bit((uint16_t)pc);
         g_bw_total += k;
     }
-    for (int r = 0; r <= PUZZLE_SIDE; r++) {
-        const int d = 16 * r + 15 < 160 ? 16 * r + 15 : 160;
-        g_bw_floor[r] = r ? (int)((long)h_arr[d] * g_bw_total / 122) : 0;
-    }
-    printf("[cfg] blackwood=1 (fixed marks c%d c%d = Blackwood's 10 16; --exhaust_border_color; "
-           "stop_row %u; backtrack_min_col %u; end_dive %u end_polish %d; explicit flags win)\n",
-           BW_C1, BW_C2, g_stop_row, g_bt_min_col, g_end_dive, g_end_polish);
-    printf("[cfg] blackwood schedule: sides of c%d+c%d (%d) on rows 0..r at the end of row r >=",
-           BW_C1, BW_C2, g_bw_total);
-    for (int r = 1; r < (int)g_stop_row && r <= PUZZLE_SIDE; r++) printf(" r%d %d", r, g_bw_floor[r]);
-    printf("; row %u: %d, and at most %d marked faces left\n", g_stop_row, g_bw_floor[g_stop_row], g_exin_tolS);
-}
-static void bw_config(const uint64_t root_used[4]) {
     uint64_t keep[4];
     for (int k = 0; k < 4; k++) keep[k] = g_cur_bottom->used[k];
     for (int r = 0; r <= PUZZLE_SIDE; r++) {
@@ -5322,7 +5332,7 @@ static void backtrack_emit(BeamCtx *ctx, const BeamEntry *beam, uint32_t kept,
         x->nodes = x->cut_parity = x->cut_corner = 0;
         x->cut_exhaust = 0;
         memset(x->exin_ck, 0, sizeof x->exin_ck); memset(x->exin_cut, 0, sizeof x->exin_cut);
-        memset(x->exin_res, 0, sizeof x->exin_res); memset(x->exin_resn, 0, sizeof x->exin_resn);
+        memset(x->exin_res, 0, sizeof x->exin_res); memset(x->exin_resn, 0, sizeof x->exin_resn); memset(x->bw_q, 0, sizeof x->bw_q);
         x->ext_nodes_cap = x->cut_mincol = x->cut_score = 0;
         x->cut_col = x->strip_unknown = x->near_dup = 0;
         memset(x->fill, 0, sizeof x->fill);
@@ -5974,8 +5984,7 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
                    g_exin.ck_cut[EXIN_CUT_RES][r], g_exin.ck_cut[EXIN_CUT_EXACT][r]);
         }
         if (g_blackwood) {
-            printf("\n[sum] blackwood schedule by row (surviving boards' mean sides of c%d+c%d placed / floor):",
-                   BW_C1, BW_C2);
+            printf("\n[sum] blackwood schedule by row (surviving boards' mean sides of the three colours placed / floor):");
             for (int r = 1; r <= (int)g_stop_row; r++)
                 if (g_exin.res_n[r]) printf(" r%d %.1f/%d", r, g_exin.bw_sum[r] / (double)g_exin.res_n[r], g_bw_floor[r]);
         }
