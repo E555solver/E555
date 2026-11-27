@@ -273,6 +273,7 @@ static uint32_t g_exin_dem_skip    = 0;      /* marked colours the closure's dem
    adds one rule, his colour schedule (exin_quota); see PROJECT_E555.md 5.9. */
 static bool     g_blackwood        = false;
 static bool     g_stop_row_set = false, g_end_dive_set = false, g_end_polish_set = false;
+static bool     g_bw_ck_default = false;   /* the preset chose the stop-row tolerance */
 #define BW_C1 14      /* E555 colours of his inner heuristic sides 10 and 16 */
 #define BW_C2 22
 static uint64_t g_exhaust_cfgs[MAX_EDGE_SIDE_COLOR + 1];  /* configs run, by colour used up (0 = plain) */
@@ -6858,6 +6859,7 @@ int main(int argc, char *argv[]) {
         if (!g_end_polish_set) g_end_polish = 6000;
         g_top_dedup = false;             /* near-twin tops can extend differently */
         if (g_exin_ck_n < 0) {           /* the stop row only: the schedule replaces S-1 */
+            g_bw_ck_default = true;
             g_exin_ck_n = 0;
             g_exin_ck_row[g_exin_ck_n] = (int)g_stop_row; g_exin_ck_tol[g_exin_ck_n++] = 3;
         }
@@ -7246,7 +7248,6 @@ int main(int argc, char *argv[]) {
     clue_dump_schedule();
     if (g_exhaust_inner) exin_init();
     if (g_blackwood) {
-        bw_init();
         /* A clue that stays above S keeps each face of c14/c22 it shows, and
            the inner neighbour facing it keeps its matching face: 2 per face. */
         int need = 0;
@@ -7262,12 +7263,18 @@ int main(int argc, char *argv[]) {
             }
             if (n > need) need = n;
         }
+        if (need && g_bw_ck_default) {   /* his 3 sides, plus the faces the clues hold */
+            g_exin_tolS += need;
+            g_exin_tol[g_stop_row] = g_exin_tolS;
+        }
         if (need > g_exin_tolS)
             fatal("--blackwood with these clues: the clues above row %u keep %d faces of c%d/c%d there, "
                   "so --exhaust_check %u:K needs K >= %d (got %d)", g_stop_row, need, BW_C1, BW_C2,
                   g_stop_row, need, g_exin_tolS);
-        if (need) printf("[cfg] blackwood: the clues above row %u keep up to %d faces of c%d/c%d there, "
-                         "within the stop-row tolerance %d\n", g_stop_row, need, BW_C1, BW_C2, g_exin_tolS);
+        if (need) printf("[cfg] blackwood: the clues above row %u keep up to %d faces of c%d/c%d there; "
+                         "stop-row tolerance %d%s\n", g_stop_row, need, BW_C1, BW_C2, g_exin_tolS,
+                         g_bw_ck_default ? " (3 + those faces)" : "");
+        bw_init();
     }
     ext_fix_init();
     if (g_unlock_right) lx_init();
