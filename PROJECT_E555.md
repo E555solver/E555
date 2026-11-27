@@ -934,6 +934,12 @@ and sets existing options:
   configurations), none: 15 died on the clue rows 1-2 and the row-10 boards
   all kept more than 5 marked faces. Five clues and this schedule do not mix
   well yet; Blackwood's own solver stalls with them too.
+- A border whose best left column still leaves c14 or c22 with more edges on
+  the left column above the stop row than the tolerance can never pass the
+  stop row: it is not run, and `[sum] exhaust_inner_color` counts it ("borders
+  skipped"). A bonus for the quota's sides on edge pieces and the right edge
+  in the C ordering were tried: no gain (the frame colour lives on the bottom
+  and left only), and the full quota still killed every configuration.
 - `[cfg] blackwood` lists the preset and the floors; `[sum] blackwood schedule
   by row` gives the surviving boards' mean sides against each floor, and the
   cuts line a `schedule` column.

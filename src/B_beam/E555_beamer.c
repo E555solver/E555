@@ -988,8 +988,6 @@ static uint64_t g_bw_h[5][4];
 static uint64_t g_bw_x[5][PUZZLE_SIDE + 1][4];   /* [clue frame + 1, 0 = none yet][row] */
 static int      g_bw_floor[PUZZLE_SIDE + 1];
 static int      g_bw_total = 0, g_bw_frame = 0;
-static uint64_t g_bw_edge[4];   /* edge pieces (one frame side): the quota sides the bonus rewards */
-#define BW_EDGE_W 2.0           /* bonus per such side, about one inner face of Phi */
 static void bw_init(void) {
     int h_arr[256];
     for (int i = 0; i < 256; i++) {                /* his piecewise-linear ramp, as published */
@@ -1005,11 +1003,7 @@ static void bw_init(void) {
         const int d = 16 * r + 15 < 160 ? 16 * r + 15 : 160;
         g_bw_floor[r] = r ? h_arr[d] : 0;
     }
-    memset(g_bw_edge, 0, sizeof g_bw_edge);
-    for (int pc = 0; pc < NUM_PIECES; pc++) {
-        const int ng = (g_seed_top[pc] == 0) + (g_seed_right[pc] == 0) + (g_seed_bottom[pc] == 0) + (g_seed_left[pc] == 0);
-        if (ng == 1) g_bw_edge[pc >> 6] |= piece_bit((uint16_t)pc);
-    }
+
     /* The floors are 0.95 of his values: his solver checks after every piece,
        E555 only at the end of a row, and at his own values every board sat on
        the floor and every configuration died by row 6 (12 configurations,
@@ -1064,16 +1058,14 @@ static void bw_config(const uint64_t root_used[4]) {
         }
     }
 }
-static inline int bw_count_in(const BeamEntry *t, int row, const uint64_t m[4]) {
+static inline int bw_count(const BeamEntry *t, int row) {
     const uint64_t *x = g_bw_x[ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) + 1 : 0][row];
     int q = 0;
     for (int k = 1; k <= 4; k++)
-        q += k * (__builtin_popcountll(t->used[0] & g_bw_h[k][0] & ~x[0] & m[0]) + __builtin_popcountll(t->used[1] & g_bw_h[k][1] & ~x[1] & m[1])
-                + __builtin_popcountll(t->used[2] & g_bw_h[k][2] & ~x[2] & m[2]) + __builtin_popcountll(t->used[3] & g_bw_h[k][3] & ~x[3] & m[3]));
+        q += k * (__builtin_popcountll(t->used[0] & g_bw_h[k][0] & ~x[0]) + __builtin_popcountll(t->used[1] & g_bw_h[k][1] & ~x[1])
+                + __builtin_popcountll(t->used[2] & g_bw_h[k][2] & ~x[2]) + __builtin_popcountll(t->used[3] & g_bw_h[k][3] & ~x[3]));
     return q;
 }
-static const uint64_t g_bw_all[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
-static inline int bw_count(const BeamEntry *t, int row) { return bw_count_in(t, row, g_bw_all); }
 
 static inline int exin_ok(const BeamEntry *t, int W, int row) {
     const int S = (int)g_stop_row;
@@ -1112,10 +1104,6 @@ static inline double exin_bonus(const BeamEntry *t, int row) {
         if (R >= EXIN_PHI_MAX) R = EXIN_PHI_MAX - 1;
         b += g_exin_phi[ci][R];
     }
-    /* --blackwood: the quota also counts sides on edge pieces, which Phi (inner
-       faces) never sees; reward them too. Only the right column's choice
-       differs between siblings. */
-    if (g_blackwood && row >= 1 && row <= PUZZLE_SIDE) b += BW_EDGE_W * bw_count_in(t, row, g_bw_edge);
     if (g_exin_probe && row >= 0 && row <= PUZZLE_SIDE) {
         #pragma omp atomic
         g_exin.bon_sum[row] += b;
@@ -3081,11 +3069,6 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
                 if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
                 int f = 0;
                 for (int i = 0; i < CHAIN_LEN - 1; i++) f += exin_faces(&g_cat[ciC[i]]);
-                if (g_blackwood) {         /* the right edge's frame sides of the quota colour */
-                    const Oriented *te = &g_edge_term[rterm];
-                    f += (te->top == g_bw_frame) + (te->right == g_bw_frame)
-                       + (te->bottom == g_bw_frame) + (te->left == g_bw_frame);
-                }
                 int k = nordC++;
                 while (k > 0 && fz[k - 1] < f) { ordC[k] = ordC[k - 1]; fz[k] = fz[k - 1]; k--; }
                 ordC[k] = jc; fz[k] = f;
