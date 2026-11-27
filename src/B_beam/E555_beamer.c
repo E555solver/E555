@@ -742,6 +742,7 @@ static struct {
     uint64_t marked[NUM_INNER_COLORS];             /* configurations per marked colour */
     uint64_t dn[5];                                /* configurations by D_N (4 = 4 or more) */
     uint64_t short_marks;                          /* configurations with fewer than N eligible */
+    uint64_t bw_skipped;                           /* --blackwood: borders where c14/c22 cannot be used up */
     uint64_t ck_checked[PUZZLE_SIDE + 1], ck_cut[EXIN_CUTS][PUZZLE_SIDE + 1];
     uint64_t left_s[EXIN_TOLS_MAX + 1];            /* stop-row boards passing, by marked faces left */
     double   res_sum[PUZZLE_SIDE + 1];             /* survivors' mean marked residual, summed */
@@ -987,6 +988,8 @@ static uint64_t g_bw_h[5][4];
 static uint64_t g_bw_x[5][PUZZLE_SIDE + 1][4];   /* [clue frame + 1, 0 = none yet][row] */
 static int      g_bw_floor[PUZZLE_SIDE + 1];
 static int      g_bw_total = 0, g_bw_frame = 0;
+static uint64_t g_bw_edge[4];   /* edge pieces (one frame side): the quota sides the bonus rewards */
+#define BW_EDGE_W 2.0           /* bonus per such side, about one inner face of Phi */
 static void bw_init(void) {
     int h_arr[256];
     for (int i = 0; i < 256; i++) {                /* his piecewise-linear ramp, as published */
@@ -1001,6 +1004,11 @@ static void bw_init(void) {
     for (int r = 0; r <= PUZZLE_SIDE; r++) {
         const int d = 16 * r + 15 < 160 ? 16 * r + 15 : 160;
         g_bw_floor[r] = r ? h_arr[d] : 0;
+    }
+    memset(g_bw_edge, 0, sizeof g_bw_edge);
+    for (int pc = 0; pc < NUM_PIECES; pc++) {
+        const int ng = (g_seed_top[pc] == 0) + (g_seed_right[pc] == 0) + (g_seed_bottom[pc] == 0) + (g_seed_left[pc] == 0);
+        if (ng == 1) g_bw_edge[pc >> 6] |= piece_bit((uint16_t)pc);
     }
     /* The floors are 0.95 of his values: his solver checks after every piece,
        E555 only at the end of a row, and at his own values every board sat on
@@ -1056,14 +1064,16 @@ static void bw_config(const uint64_t root_used[4]) {
         }
     }
 }
-static inline int bw_count(const BeamEntry *t, int row) {
+static inline int bw_count_in(const BeamEntry *t, int row, const uint64_t m[4]) {
     const uint64_t *x = g_bw_x[ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) + 1 : 0][row];
     int q = 0;
     for (int k = 1; k <= 4; k++)
-        q += k * (__builtin_popcountll(t->used[0] & g_bw_h[k][0] & ~x[0]) + __builtin_popcountll(t->used[1] & g_bw_h[k][1] & ~x[1])
-                + __builtin_popcountll(t->used[2] & g_bw_h[k][2] & ~x[2]) + __builtin_popcountll(t->used[3] & g_bw_h[k][3] & ~x[3]));
+        q += k * (__builtin_popcountll(t->used[0] & g_bw_h[k][0] & ~x[0] & m[0]) + __builtin_popcountll(t->used[1] & g_bw_h[k][1] & ~x[1] & m[1])
+                + __builtin_popcountll(t->used[2] & g_bw_h[k][2] & ~x[2] & m[2]) + __builtin_popcountll(t->used[3] & g_bw_h[k][3] & ~x[3] & m[3]));
     return q;
 }
+static const uint64_t g_bw_all[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
+static inline int bw_count(const BeamEntry *t, int row) { return bw_count_in(t, row, g_bw_all); }
 
 static inline int exin_ok(const BeamEntry *t, int W, int row) {
     const int S = (int)g_stop_row;
@@ -1102,6 +1112,10 @@ static inline double exin_bonus(const BeamEntry *t, int row) {
         if (R >= EXIN_PHI_MAX) R = EXIN_PHI_MAX - 1;
         b += g_exin_phi[ci][R];
     }
+    /* --blackwood: the quota also counts sides on edge pieces, which Phi (inner
+       faces) never sees; reward them too. Only the right column's choice
+       differs between siblings. */
+    if (g_blackwood && row >= 1 && row <= PUZZLE_SIDE) b += BW_EDGE_W * bw_count_in(t, row, g_bw_edge);
     if (g_exin_probe && row >= 0 && row <= PUZZLE_SIDE) {
         #pragma omp atomic
         g_exin.bon_sum[row] += b;
@@ -3067,6 +3081,11 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
                 if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
                 int f = 0;
                 for (int i = 0; i < CHAIN_LEN - 1; i++) f += exin_faces(&g_cat[ciC[i]]);
+                if (g_blackwood) {         /* the right edge's frame sides of the quota colour */
+                    const Oriented *te = &g_edge_term[rterm];
+                    f += (te->top == g_bw_frame) + (te->right == g_bw_frame)
+                       + (te->bottom == g_bw_frame) + (te->left == g_bw_frame);
+                }
                 int k = nordC++;
                 while (k > 0 && fz[k - 1] < f) { ordC[k] = ordC[k - 1]; fz[k] = fz[k - 1]; k--; }
                 ordC[k] = jc; fz[k] = f;
@@ -5999,6 +6018,7 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         printf("%s configs; edges left for the right column (D_N):", k ? "" : " none");
         for (int d = 0; d < 5; d++) printf(" %s%d:%" PRIu64, d == 4 ? ">=" : "", d, g_exin.dn[d]);
         if (g_exin.short_marks) printf("; %" PRIu64 " with fewer than N eligible colours", g_exin.short_marks);
+        if (g_exin.bw_skipped) printf("; %" PRIu64 " borders skipped (c%d/c%d cannot be used up)", g_exin.bw_skipped, BW_C1, BW_C2);
         printf("; stop-row boards by marked faces left:");
         for (int k = 0; k <= g_exin_tolS; k++) printf(" %d:%" PRIu64, k, g_exin.left_s[k]);
         printf("\n[sum] exhaust cuts by row (tested: %sedge fit / carriers / residual / not used up at row %u):",
@@ -7457,6 +7477,13 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 if (g_exhaust_inner && got_left) { lft = best_lft; bkey = best_key; }
+                if (g_blackwood && got_left && best_sc >= 1000.0) {
+                    /* c14 or c22 has more edges on the left column above the stop
+                       row than its tolerance on every column drawn: the stop row
+                       can never pass, so the configuration is not run. */
+                    g_exin.bw_skipped++;
+                    continue;
+                }
                 g_border_stats.clue_seconds += omp_get_wtime() - clue_t0;
                 if (out_of_columns) { g_border_stats.bottoms_left++; break; }
                 if (!got_left) {
