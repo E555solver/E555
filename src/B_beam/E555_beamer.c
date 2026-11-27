@@ -913,6 +913,7 @@ static inline double exin_score(const BottomOrder *bot, const LeftOrder *lft, in
 
 /* Configuration start: mark the N eligible colours least likely committed by chance. */
 static void bw_config(const uint64_t root_used[4]);
+static bool clue_row_pinned(int row);
 static void exin_mark(uint64_t cfg_hash, const uint64_t root_used[4]) {
     if (g_blackwood) bw_config(root_used);
     int d[NUM_INNER_COLORS], a[NUM_INNER_COLORS];
@@ -1008,6 +1009,20 @@ static void bw_init(void) {
     const char *sc_env = getenv("E555_BW_SCALE");
     const double f = sc_env ? atof(sc_env) : 0.95;
     for (int r = 0; r <= PUZZLE_SIDE; r++) g_bw_floor[r] = (int)(f * g_bw_floor[r]);
+    /* Clue-pinned rows (a clue's row and the one below it) leave the beam too
+       few children to also meet a floor: with the five clues every
+       configuration died by row 2, and lifting the floor on those rows only
+       moved the cut to row 3. So the schedule pauses on a pinned row (it
+       keeps the previous row's floor) and resumes one step later after it. */
+    if (g_clue_mask) {
+        int base[PUZZLE_SIDE + 1];
+        memcpy(base, g_bw_floor, sizeof base);
+        int p = 0;
+        for (int r = 1; r <= PUZZLE_SIDE; r++) {
+            if (clue_row_pinned(r)) p++;
+            g_bw_floor[r] = r - p > 0 ? base[r - p] : 0;
+        }
+    }
     printf("[cfg] blackwood=1 (marks c%d c%d = Blackwood's 10 16, his frame colour 13 = the one "
            "--exhaust_border_color uses up, c%d on a plain border; stop_row %u; backtrack_min_col %u; "
            "end_dive %u end_polish %d; explicit flags win)\n",
