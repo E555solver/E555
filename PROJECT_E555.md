@@ -895,29 +895,49 @@ every depth d of its row-by-row fill from the bottom-left, cuts a branch whose
 placed pieces carry fewer than `heuristic_array[d]` sides of them: 0 up to
 depth 16, then a piecewise-linear ramp to 119 of their 122 sides at depth 160.
 His piece list is E555's, in the same order, so the colour map is exact:
-13 -> 5, 16 -> 22, 10 -> 14. The preset keeps E555's search (rows to the stop
-row, then the column-major extension) and sets existing options:
+13 -> 5, 16 -> 22, 10 -> 14. He pins only the centre clue (piece 138 here, at
+(7,7), the frame of `--pin_clue 1`); his corners are drawn at random. The preset
+keeps E555's search (rows to the stop row, then the column-major extension)
+and sets existing options:
 
 - `--exhaust_inner_color 2` with the marks fixed to c14 and c22 (the left
   column is still the best of K by their p), `--exhaust_border_color` (its
-  usual random frame colour; colour 5 is not forced), `--stop_row 10`,
-  `--exhaust_check 10:3` (122 - 119), `--backtrack_min_col 5` with
-  `--backtrack_row` (his first block above row 10 is 5 columns wide),
-  `--end_dive 5000 --end_polish 6000` (the dives play his late breaks).
-  Any of these given explicitly wins.
+  usual random frame colour, which plays his 13), `--stop_row 10`,
+  `--exhaust_check 10:3` (122 - 119), `--backtrack_min_col 3` with
+  `--backtrack_row`, `--no_top_dedup` (tops one piece apart can extend very
+  differently), `--end_dive 5000 --end_polish 6000` (the dives play his late
+  breaks). Any of these given explicitly wins.
 - **The schedule**, the one new rule: at the end of row r, the pieces on rows
-  0..r (edges included) must carry at least `floor_r` sides of c14 and c22,
-  his value at depth min(16 r + 15, 160) scaled by 98/122 (the two colours'
-  98 sides over his three colours' 122), checked in the beam and in the
-  exhaustive search:
+  0..r (edges included; a clue piece once its row is reached) must carry at
+  least `floor_r` sides of the three colours: c14, c22 and the frame colour
+  the border used up (c5 on a plain border), 24 + 98 = 122 sides as in his
+  solver. `floor_r` is 0.95 of his value at depth min(16 r + 15, 160): he
+  checks after every piece, E555 only at the end of a row, and at his own
+  values every configuration died by row 6. It is checked in the beam (before
+  a child is scored) and in the exhaustive search (when a row closes):
 
   | row | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
   |---|---|---|---|---|---|---|---|---|---|---|
-  | floor | 28 | 46 | 61 | 72 | 81 | 86 | 89 | 92 | 94 | 95 |
+  | his quota | 35 | 58 | 77 | 90 | 101 | 108 | 111 | 115 | 118 | 119 |
+  | floor (0.95) | 33 | 55 | 73 | 85 | 95 | 102 | 105 | 109 | 112 | 113 |
 
-  `[cfg] blackwood` lists the preset and the floors; `[sum] blackwood schedule
+- **Clues.** Every clue frame puts a c22 piece on row 13 (254 or 180), so with
+  `--clue_corners` one c22 face and its neighbour's stay above the stop row:
+  2 faces, within `10:3`; a smaller tolerance is refused at startup. The other
+  clues sit below the stop row or carry neither colour, and none carries a
+  frame colour. To follow Blackwood, add `--pin_clue 1` (centre clue only);
+  any clue flag needs its own `--db_file`.
+- `[cfg] blackwood` lists the preset and the floors; `[sum] blackwood schedule
   by row` gives the surviving boards' mean sides against each floor, and the
   cuts line a `schedule` column.
+- **Measured** (12 configurations, width 1000, `--backtrack_row 6`, 100 dives
+  per board, min_col 3; boards >= 458 per hour of run): `--blackwood` 33 in
+  30 s (4,024/h), best 460, mean 453.6 over 3,253 written; at 0.9 of his quota
+  785/h; plain `--exhaust_inner_color 2` (`10:4`) none (best 455); no flag 160/h
+  (best 459, mean 451.1), with `--exhaust_border_color` 257/h. A second seed:
+  `--blackwood` 1,955/h against 241/h. The schedule kills some configurations
+  early (7 and 4 of 12 reached row 10), which is the price of the stronger
+  boards.
 
 ### 5.10 Column-major extension (`--extend_nodes`, `--backtrack_min_col`)
 
@@ -1375,7 +1395,7 @@ boards or roots they write the same file at any thread count.
 | `--exhaust_inner_color N` | 0 | use N inner colours up, inner and edge pieces, by the stop row: marked per border (edge commitment to bottom + left least likely by chance, hypergeometric p; best of (N+1)^3 lefts, x2 with `--exhaust_border_color`), beam bias, exact rules (5.9) |
 | `--lambda_exhaust_inner F` | 0.15 | the bias, in u_row per weighted face; 0 = off |
 | `--exhaust_check ROW:TOL,...` | S-1:6,S:2N | up to 16 entries; loose checkpoints below the stop row: marked-residual tolerances; `S:k` lets k marked faces stay at the stop row (`S:0` exact) |
-| `--blackwood` | off | Blackwood preset (5.9): marks c14 c22 with his schedule; sets `--exhaust_border_color --stop_row 10 --exhaust_check 10:3 --backtrack_min_col 5 --end_dive 5000 --end_polish 6000` unless given |
+| `--blackwood` | off | Blackwood preset (5.9): marks c14 c22 with his schedule; sets `--exhaust_border_color --stop_row 10 --exhaust_check 10:3 --backtrack_min_col 3 --no_top_dedup --end_dive 5000 --end_polish 6000` unless given |
 | `--incomplete_top` | off | also write stop-row boards with two of the three segments (`_partial.csv`) or segment B alone (`_partial_B.csv`); not with `--backtrack_row` |
 | `--beam_width K` | 250000 | boards per row |
 | `--stop_row R` | 11 | last row filled, 1..13 |

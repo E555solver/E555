@@ -1000,12 +1000,14 @@ static void bw_init(void) {
         const int d = 16 * r + 15 < 160 ? 16 * r + 15 : 160;
         g_bw_floor[r] = r ? h_arr[d] : 0;
     }
-    /* E555_BW_SCALE=F (tuning only): floors at F times his values. */
+    /* The floors are 0.95 of his values: his solver checks after every piece,
+       E555 only at the end of a row, and at his own values every board sat on
+       the floor and every configuration died by row 6 (12 configurations,
+       width 1000); 0.95 gave the most boards >= 458 per hour (0.9: 5x fewer).
+       E555_BW_SCALE=F (tuning only) sets another factor. */
     const char *sc_env = getenv("E555_BW_SCALE");
-    if (sc_env) {
-        const double f = atof(sc_env);
-        for (int r = 0; r <= PUZZLE_SIDE; r++) g_bw_floor[r] = (int)(f * g_bw_floor[r]);
-    }
+    const double f = sc_env ? atof(sc_env) : 0.95;
+    for (int r = 0; r <= PUZZLE_SIDE; r++) g_bw_floor[r] = (int)(f * g_bw_floor[r]);
     printf("[cfg] blackwood=1 (marks c%d c%d = Blackwood's 10 16, his frame colour 13 = the one "
            "--exhaust_border_color uses up, c%d on a plain border; stop_row %u; backtrack_min_col %u; "
            "end_dive %u end_polish %d; explicit flags win)\n",
@@ -6280,8 +6282,8 @@ static void usage(const char *a0) {
 "  --blackwood            preset after Joshua Blackwood's solver: marks c14 and c22,\n"
 "                         adds his colour schedule (a floor per row), and sets\n"
 "                         --exhaust_border_color --stop_row 10 --exhaust_check 10:3\n"
-"                         --backtrack_min_col 5 --end_dive 5000 --end_polish 6000;\n"
-"                         explicit flags win. Needs --random_edges\n"
+"                         --backtrack_min_col 3 --no_top_dedup --end_dive 5000\n"
+"                         --end_polish 6000; explicit flags win. Needs --random_edges\n"
 "\n"
 "Scoring:\n"
 "  --lambda_J F           weight of the closure term, the primary colour objective\n"
@@ -6836,7 +6838,7 @@ int main(int argc, char *argv[]) {
         g_exhaust_inner = 2;
         g_exhaust = true;
         if (!g_stop_row_set) g_stop_row = 10;
-        if (!g_min_col_set && g_backtrack_row_set) { g_bt_min_col = 5; g_min_col_set = true; }
+        if (!g_min_col_set && g_backtrack_row_set) { g_bt_min_col = 3; g_min_col_set = true; }
         if (!g_end_dive_set) g_end_dive = 5000;
         if (!g_end_polish_set) g_end_polish = 6000;
         g_top_dedup = false;             /* near-twin tops can extend differently */
