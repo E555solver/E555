@@ -826,6 +826,10 @@ static void exin_init(void) {
     g_exin_static_out = 0;
     for (int ci = 0; ci < NUM_INNER_COLORS; ci++)
         if (g_exin_n[ci] < EXIN_MIN_EDGES || g_exin_clue[g_stop_row][0][ci] > 0) g_exin_static_out |= 1u << ci;
+    /* --blackwood fixes its colours whatever the clues: a clue above S that
+       carries one keeps that face (and its neighbour's) above S, which the
+       stop-row tolerance must allow (checked at startup). */
+    if (g_blackwood) g_exin_static_out &= ~((1u << INNER_IDX(BW_C1)) | (1u << INNER_IDX(BW_C2)));
     g_exin_probe = getenv("E555_EXIN_PROBE") != NULL;
     g_exin_no_edge = getenv("E555_EXIN_NO_EDGE") != NULL;
 }
@@ -978,7 +982,7 @@ static inline int exin_left4(const uint64_t m[4], const BeamEntry *t) {
    clue pieces); both set per configuration. */
 #define BW_FRAME_DEFAULT 5
 static uint64_t g_bw_h[5][4];
-static uint64_t g_bw_x[PUZZLE_SIDE + 1][4];
+static uint64_t g_bw_x[5][PUZZLE_SIDE + 1][4];   /* [clue frame + 1, 0 = none yet][row] */
 static int      g_bw_floor[PUZZLE_SIDE + 1];
 static int      g_bw_total = 0, g_bw_frame = 0;
 static void bw_init(void) {
@@ -1021,15 +1025,21 @@ static void bw_config(const uint64_t root_used[4]) {
         if (k) g_bw_h[k][pc >> 6] |= piece_bit((uint16_t)pc);
         g_bw_total += k;
     }
-    uint64_t keep[4];
-    for (int k = 0; k < 4; k++) keep[k] = g_cur_bottom->used[k];
-    for (int r = 0; r <= PUZZLE_SIDE; r++) {
-        if (r >= 1 && r <= EDGE_LEN) used_set(keep, g_cur_left->p[r]->piece_id);
-        for (int k = 0; k < 4; k++) g_bw_x[r][k] = root_used[k] & ~keep[k];
+    for (int o = 0; o < 5; o++) {
+        uint64_t keep[4];
+        for (int k = 0; k < 4; k++) keep[k] = g_cur_bottom->used[k];
+        for (int r = 0; r <= PUZZLE_SIDE; r++) {
+            if (r >= 1 && r <= EDGE_LEN) used_set(keep, g_cur_left->p[r]->piece_id);
+            if (o > 0 && g_clue_mask)            /* this frame's clues on row r are placed */
+                for (int c = 0; c < CLUE_N; c++)
+                    if (((c == 0) ? (g_clue_mask & CLUE_CENTER) : (g_clue_mask & CLUE_CORNERS))
+                        && (int)g_clue[o - 1][c].row == r) used_set(keep, g_clue[o - 1][c].piece);
+            for (int k = 0; k < 4; k++) g_bw_x[o][r][k] = root_used[k] & ~keep[k];
+        }
     }
 }
 static inline int bw_count(const BeamEntry *t, int row) {
-    const uint64_t *x = g_bw_x[row];
+    const uint64_t *x = g_bw_x[ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) + 1 : 0][row];
     int q = 0;
     for (int k = 1; k <= 4; k++)
         q += k * (__builtin_popcountll(t->used[0] & g_bw_h[k][0] & ~x[0]) + __builtin_popcountll(t->used[1] & g_bw_h[k][1] & ~x[1])
@@ -7218,7 +7228,30 @@ int main(int argc, char *argv[]) {
     init_clue_tables();
     clue_dump_schedule();
     if (g_exhaust_inner) exin_init();
-    if (g_blackwood) bw_init();
+    if (g_blackwood) {
+        bw_init();
+        /* A clue that stays above S keeps each face of c14/c22 it shows, and
+           the inner neighbour facing it keeps its matching face: 2 per face. */
+        int need = 0;
+        for (int o = 0; o < 4; o++) {
+            if (!(g_clue_orients & (1u << o))) continue;
+            int n = 0;
+            for (int c = 0; c < CLUE_N; c++) {
+                if (!((c == 0) ? (g_clue_mask & CLUE_CENTER) : (g_clue_mask & CLUE_CORNERS))) continue;
+                if ((int)g_clue[o][c].row <= (int)g_stop_row) continue;
+                const int pc = g_clue[o][c].piece;
+                const int f[4] = { g_seed_top[pc], g_seed_right[pc], g_seed_bottom[pc], g_seed_left[pc] };
+                for (int d = 0; d < 4; d++) n += 2 * ((f[d] == BW_C1) + (f[d] == BW_C2));
+            }
+            if (n > need) need = n;
+        }
+        if (need > g_exin_tolS)
+            fatal("--blackwood with these clues: the clues above row %u keep %d faces of c%d/c%d there, "
+                  "so --exhaust_check %u:K needs K >= %d (got %d)", g_stop_row, need, BW_C1, BW_C2,
+                  g_stop_row, need, g_exin_tolS);
+        if (need) printf("[cfg] blackwood: the clues above row %u keep up to %d faces of c%d/c%d there, "
+                         "within the stop-row tolerance %d\n", g_stop_row, need, BW_C1, BW_C2, g_exin_tolS);
+    }
     ext_fix_init();
     if (g_unlock_right) lx_init();
     if (g_random_edges) g_edge_left_n = edge_left_pool(&g_edge_left);
