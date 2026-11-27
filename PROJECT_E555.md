@@ -923,10 +923,17 @@ and sets existing options:
 
 - **Clues.** Every clue frame puts a c22 piece on row 13 (254 or 180), so with
   `--clue_corners` one c22 face and its neighbour's stay above the stop row:
-  2 faces, within `10:3`; a smaller tolerance is refused at startup. The other
-  clues sit below the stop row or carry neither colour, and none carries a
-  frame colour. To follow Blackwood, add `--pin_clue 1` (centre clue only);
-  any clue flag needs its own `--db_file`.
+  the preset's tolerance becomes `10:5` (his 3 + those 2), and an explicit
+  tolerance below 2 is refused. The other clues sit below the stop row or
+  carry neither colour, and none carries a frame colour. On a clue-pinned row
+  (a clue's row and the one below it) the schedule pauses: it keeps the
+  previous row's floor and resumes one step later. To follow Blackwood, add
+  `--pin_clue 1` (centre clue only); any clue flag needs its own `--db_file`.
+  Measured (width 1000, 12 configurations): centre clue only, 1 configuration
+  reached row 10, 7 boards, best 455; all five clues (width 5000, 19
+  configurations), none: 15 died on the clue rows 1-2 and the row-10 boards
+  all kept more than 5 marked faces. Five clues and this schedule do not mix
+  well yet; Blackwood's own solver stalls with them too.
 - `[cfg] blackwood` lists the preset and the floors; `[sum] blackwood schedule
   by row` gives the surviving boards' mean sides against each floor, and the
   cuts line a `schedule` column.
@@ -978,7 +985,7 @@ cell of unknown orientation).
   row-14 cell is closed above and the top-left cannot break against the
   extension; a column that stops below row 14 still counts. Extensions can be
   shorter than with `--cap_top 0`, and "whole columns" (`--backtrack_min_col`,
-  the extension lines) are the capped ones. `[sum] top cap:` gives the row-15
+  the extension lines) are the capped ones. The `top cap` figure of `[sum] extension` gives the row-15
   cells per board. The diver's `--cap_top` is still the older tie-break (9.2).
 
 **The column check** (always on with `--backtrack_min_col K >= 1`). Most
@@ -1329,24 +1336,24 @@ pins the row under it too). `emitted` is the configuration's unique boards,
 ```
 ================= run summary =================
 [sum] time: init 45s, beam 11m08s, backtrack 12m10s, dives 38m12s
-[sum] configs: 144, 25.5 s each; 61 reached row 11
-[sum] extinct: r8:20 r9:41 r10:22
-[sum] backtrack: 1.23G nodes, 180 M/s; r9:5120 r10:880 r11:12345
-[sum] extension: mean 5.40 cols, max 9
-[sum] top cap: 2.31 cells per board; 41% of the boards with a whole column closed over all of them
+[sum] configs: 144, 25.5 s each; 61 reached row 11; extinct r8:20 r9:41 r10:22
+[sum] backtrack: 1.23G nodes, 180 M/s; boards completing r9:5120 r10:880 r11:12345
 [sum] min_col 5: column check cut 3.4M partial rows
 [sum] corners: TL 61%, TR 55%, both 40%, pair 31%
 [sum] reserve: 12.0 of 26 TOP pieces free
-[sum] boards: found 12345, near-dups 2345, repeats 12, below min_col 9000, dived 988
-[sum] *** Output boards score: 458:1  457:3  456:12  455:40  454:101  453:255 ... (412 written)
+[sum] boards: found 12345, near-dups 2345, repeats 12, below min_col 9000, dived 988, written 412
+[sum] scores: 458:1  457:3  456:12  455:40  454:101  453:255 ... (412 written, mean 452.9)
 [sum] best boards: 458 row 120, 457 row 7, 457 row 311, 457 row 390, 456 row 2 in beam_out/beam_completions_0_11.csv
-[sum] *** Output boards extension (cells above row 11, top cap not counted): 32:1  31:4 ...
+[sum] extension: mean 5.40 cols, max 9, top cap 2.31 cells per board; extended boards by cells above row 11: 32:1  31:4 ...
 [time] run ended 2026-10-01 14:03:11 UTC (wall 1:02:03)
 ```
 
-`backtrack` lists the boards completing each searched row; `corners` the share
+Each number appears once. `configs` gives the configurations, those reaching
+the stop row and the extinctions by row; `backtrack` the boards completing each
+searched row; `boards` the stop-row boards found and what became of them, down
+to the written ones; `corners` the share
 of written boards with a TL / TR block alive, both, and a piece-disjoint pair
-(5.12); `top cap` the row-15 cells `--cap_top` placed (5.10); under
+(5.12); `top cap` (on the extension line) the row-15 cells `--cap_top` placed per board (5.10); under
 `--backtrack_unlock_right`, `unlock_right` the block, the roots searched and
 dropped as repeats and the boards short of the asked layers or under
 `--emit_score`, and the extension lines count whole layers and band cells
@@ -1354,13 +1361,14 @@ dropped as repeats and the boards short of the asked layers or under
 TOP reserve left free at the stop row; `exhausted colour`
 the configs by the frame colour their border used up (`--exhaust_border_color`,
 5.3); `exhaust_*` the marks and the D_N histogram, the cuts by row and rule,
-the residual by row and the outcome (5.9). `Output boards score` counts the written boards by score, highest first
+and the residual by row (5.9). `scores` counts the written boards by score, highest first
 (at most six, `...` if there are more): the dives' matched edges under
 `--end_dive`, otherwise the matched edges of each written partial board, as
-`E555_rank` scores it. `best boards` says where the five best are: the 0-based
+`E555_rank` scores it, with their mean. `best boards` says where the five best are: the 0-based
 data row of the CSV, as `tools/E555_viewer.py FILE --row N` takes it (the file
-is appended to, so rows of earlier runs count). With the extension, the same
-two lines follow for its length; `longest extensions` (the row of each) is left
+is appended to, so rows of earlier runs count). With the extension,
+`extension` gives the mean and longest extension, the top cap and the extended
+boards by cells; `longest extensions` (the row of each) is left
 out under `--end_dive`, whose rows are the dived boards.
 `--verbose` first prints every detail line: time split, extinctions, row flow
 (`attempts:candidates/retained/selected` per row), backtrack and extension
