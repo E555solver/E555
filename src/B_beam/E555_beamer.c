@@ -6023,8 +6023,8 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         if (g_bt_run.ext_cap) printf(", node cap hit %" PRIu64, g_bt_run.ext_cap);
         if (g_cap_top && g_bt_run.cap_boards)
             printf(", top cap %.2f cells per board", (double)g_bt_run.cap_cells / (double)g_bt_run.cap_boards);
-        if (g_unlock_right) printf("; written boards by band cells:");
-        else printf("; written boards by cells above row %u:", g_stop_row);
+        if (g_unlock_right) printf("; extended boards by band cells:");
+        else printf("; extended boards by cells above row %u:", g_stop_row);
         shown = 0; more = false;
         for (int n = (int)(sizeof g_ext_hist / sizeof g_ext_hist[0]) - 1; n >= 0; n--) {
             if (!g_ext_hist[n]) continue;
