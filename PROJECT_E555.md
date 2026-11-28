@@ -905,7 +905,8 @@ and sets existing options:
   `--exhaust_check 10:3` (122 - 119), `--backtrack_min_col 3` with
   `--backtrack_row`, `--no_top_dedup` (tops one piece apart can extend very
   differently), `--end_dive 5000 --end_polish 6000` (the dives play his late
-  breaks). Any of these given explicitly wins.
+  breaks), `--parent_cap 16` (the few boards on schedule may fill more of the
+  beam). Any of these given explicitly wins.
 - **The schedule**, the one new rule: at the end of row r, the pieces on rows
   0..r (edges included; a clue piece once its row is reached) must carry at
   least `floor_r` sides of the three colours: c14, c22 and the frame colour
@@ -1408,7 +1409,7 @@ boards or roots they write the same file at any thread count.
 | `--exhaust_inner_color N` | 0 | use N inner colours up, inner and edge pieces, by the stop row: marked per border (edge commitment to bottom + left least likely by chance, hypergeometric p; best of (N+1)^3 lefts, x2 with `--exhaust_border_color`), beam bias, exact rules (5.9) |
 | `--lambda_exhaust_inner F` | 0.15 | the bias, in u_row per weighted face; 0 = off |
 | `--exhaust_check ROW:TOL,...` | S-1:6,S:2N | up to 16 entries; loose checkpoints below the stop row: marked-residual tolerances; `S:k` lets k marked faces stay at the stop row (`S:0` exact) |
-| `--blackwood` | off | Blackwood preset (5.9): marks c14 c22 with his schedule; sets `--exhaust_border_color --stop_row 10 --exhaust_check 10:3 --backtrack_min_col 3 --no_top_dedup --end_dive 5000 --end_polish 6000 --parent_cap 8` unless given |
+| `--blackwood` | off | Blackwood preset (5.9): marks c14 c22 with his schedule; sets `--exhaust_border_color --stop_row 10 --exhaust_check 10:3 --backtrack_min_col 3 --no_top_dedup --end_dive 5000 --end_polish 6000 --parent_cap 16` unless given |
 | `--incomplete_top` | off | also write stop-row boards with two of the three segments (`_partial.csv`) or segment B alone (`_partial_B.csv`); not with `--backtrack_row` |
 | `--beam_width K` | 250000 | boards per row |
 | `--stop_row R` | 11 | last row filled, 1..13 |
@@ -1432,7 +1433,7 @@ boards or roots they write the same file at any thread count.
 | `--emit_score S` | 450 | matched edges a finished board needs to be written; without `--end_dive`, under `--backtrack_unlock_right` only and when given, the extended board's |
 | `--corner_seeds N` | 4 | corner-seeded copies per board (with `--lambda_corners`) |
 | `--frac_rand F` | 0.10 | random selection band |
-| `--parent_cap N` | 4 (8 with `--blackwood`) | children per parent in the score band; 0 = uncapped |
+| `--parent_cap N` | 4 (16 with `--blackwood`) | children per parent in the score band; 0 = uncapped |
 | `--pool_factor N` | 64 | candidate pool, x beam width; at least min(8, N) children per parent |
 | `--bc_window nB,nC` | 7,7 | B/C completions scored per A record while the beam is full; each 1..128 |
 | `--bc_window_accept F` | 1 | probability of keeping the window's best child, else its second best |

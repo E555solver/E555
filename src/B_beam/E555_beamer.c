@@ -744,7 +744,6 @@ static struct {
     uint64_t dn[5];                                /* configurations by D_N (4 = 4 or more) */
     uint64_t short_marks;                          /* configurations with fewer than N eligible */
     uint64_t bw_skipped;                           /* --blackwood: borders where c14/c22 cannot be used up */
-    uint64_t bw_fill;                              /* --blackwood: beam boards below the floor (fill mode) */
     uint64_t ck_checked[PUZZLE_SIDE + 1], ck_cut[EXIN_CUTS][PUZZLE_SIDE + 1];
     uint64_t left_s[EXIN_TOLS_MAX + 1];            /* stop-row boards passing, by marked faces left */
     double   res_sum[PUZZLE_SIDE + 1];             /* survivors' mean marked residual, summed */
@@ -999,17 +998,6 @@ static uint64_t g_bw_h[5][4];
 static uint64_t g_bw_x[5][PUZZLE_SIDE + 1][4];   /* [clue frame + 1, 0 = none yet][row] */
 static int      g_bw_floor[PUZZLE_SIDE + 1];
 static int      g_bw_total = 0, g_bw_frame = 0;
-static int      g_bw_fill[PUZZLE_SIDE + 1];      /* the fill level: see bw_fill_on */
-/* Fill mode: the previous beam row kept fewer boards on schedule than its
-   width. A beam row below the backtrack (or stop) row then keeps children
-   down to the fill level. Such a child and all its descendants carry
-   FLAG_BW_FILL and score BW_FILL_PEN lower: they lose every window to a
-   sibling on schedule, take only the beam slots and backtracker roots that
-   boards on schedule leave empty, and get the floor quota as parents. The
-   backtrack row and the exhaustive rows always cut at the floor. */
-static bool     g_bw_short = false;
-#define BW_FILL_PEN 1e4f
-static inline bool bw_fill_on(int row) { return g_bw_short && row < (int)gen_stop_row(); }
 /* Under --backtrack_unlock_right the schedule holds on the beam rows only:
    from the backtrack row on, the roots give the band back. */
 static inline bool bw_row_on(int row) {
@@ -1037,29 +1025,21 @@ static void bw_init(void) {
         const int ng = (g_seed_top[pc] == 0) + (g_seed_right[pc] == 0) + (g_seed_bottom[pc] == 0) + (g_seed_left[pc] == 0);
         if (ng == 1) g_bw_edge[pc >> 6] |= piece_bit((uint16_t)pc);
     }
-    /* The floor is 0.95 of his value (he checks after every piece, E555 only at
-       the end of a row); the fill level, 0.90, is how far a child may lag and
-       still fill a beam that is short of boards on schedule (bw_fill_on).
-       E555_BW_SCALE=F[,G] (tuning only) sets other factors. */
-    double f = 0.95, g = 0.90;
+    /* The floor is 0.95 of his value: he checks after every piece, E555 only
+       at the end of a row. E555_BW_SCALE=F (tuning only) sets another factor. */
     const char *sc_env = getenv("E555_BW_SCALE");
-    if (sc_env) { f = atof(sc_env); const char *c = strchr(sc_env, ','); g = c ? atof(c + 1) : f; }
-    for (int r = 0; r <= PUZZLE_SIDE; r++) {
-        g_bw_fill[r]  = (int)(g * g_bw_floor[r]);
-        g_bw_floor[r] = (int)(f * g_bw_floor[r]);
-    }
+    const double f = sc_env ? atof(sc_env) : 0.95;
+    for (int r = 0; r <= PUZZLE_SIDE; r++) g_bw_floor[r] = (int)(f * g_bw_floor[r]);
     /* A clue-pinned row (a clue's row and the one below it) leaves the beam too
        few children to also meet a floor, so the schedule pauses there: it keeps
        the previous row's floor and resumes one step later. */
     if (g_clue_mask) {
-        int base[PUZZLE_SIDE + 1], bfill[PUZZLE_SIDE + 1];
+        int base[PUZZLE_SIDE + 1];
         memcpy(base, g_bw_floor, sizeof base);
-        memcpy(bfill, g_bw_fill, sizeof bfill);
         int p = 0;
         for (int r = 1; r <= PUZZLE_SIDE; r++) {
             if (clue_row_pinned(r)) p++;
             g_bw_floor[r] = r - p > 0 ? base[r - p] : 0;
-            g_bw_fill[r]  = r - p > 0 ? bfill[r - p] : 0;
         }
     }
     printf("[cfg] blackwood=1 (marks c%d c%d = Blackwood's 10 16, his frame colour 13 = the one "
@@ -1067,10 +1047,7 @@ static void bw_init(void) {
            "end_dive %u end_polish %d; parent_cap %u; explicit flags win)\n",
            BW_C1, BW_C2, BW_FRAME_DEFAULT, g_stop_row, g_bt_min_col, g_end_dive, g_end_polish, g_parent_cap);
     printf("[cfg] blackwood schedule: sides of the three colours (122) on rows 0..r at the end of row r >=");
-    for (int r = 1; r <= (int)g_stop_row && r <= PUZZLE_SIDE && bw_row_on(r); r++) {
-        printf(" r%d %d", r, g_bw_floor[r]);
-        if (r < (int)gen_stop_row()) printf(" (fill %d)", g_bw_fill[r]);
-    }
+    for (int r = 1; r <= (int)g_stop_row && r <= PUZZLE_SIDE && bw_row_on(r); r++) printf(" r%d %d", r, g_bw_floor[r]);
     if (g_unlock_right) printf("; none above row %u", g_backtrack_row);
     printf("; at most %d marked faces left at row %u\n", g_exin_tolS, g_stop_row);
 }
@@ -1111,8 +1088,7 @@ static inline int bw_count(const BeamEntry *t, int row) { return bw_count_in(t, 
 
 static inline int exin_ok(const BeamEntry *t, int W, int row) {
     const int S = (int)g_stop_row;
-    if (g_blackwood && bw_row_on(row)
-        && bw_count(t, row) < (bw_fill_on(row) ? g_bw_fill[row] : g_bw_floor[row])) return EXIN_CUT_QUOTA;
+    if (g_blackwood && bw_row_on(row) && bw_count(t, row) < g_bw_floor[row]) return EXIN_CUT_QUOTA;
     if (!g_exin_no_edge && !g_unlock_right) {     /* unlock: the border budget instead (exin_stay) */
         const int e = exin_left4(g_exin_eall, t);
         if (row < S ? e > S - row + g_exin_tolS - g_exin_above : (!g_exin_tolS && e > 0)) return EXIN_CUT_EDGE;
@@ -1163,13 +1139,10 @@ static inline double exin_bonus(const BeamEntry *t, int row) {
 }
 
 /* A beam child (full width: W = 14). */
-static bool exin_child_ok(BeamEntry *t, int row, Scratch *sc) {
+static bool exin_child_ok(const BeamEntry *t, int row, Scratch *sc) {
     sc->exin_checked++;
     const int why = exin_ok(t, EDGE_LEN, row);
-    if (why < 0) {
-        if (g_blackwood && bw_fill_on(row) && bw_count(t, row) < g_bw_floor[row]) t->flags |= FLAG_BW_FILL;
-        return true;
-    }
+    if (why < 0) return true;
     sc->exin_cut[why]++;
     return false;
 }
@@ -2336,7 +2309,6 @@ static inline double aux_term(const BeamEntry *t, int row, bool at_stop, double 
     if (g_lambda_reserve > 0.0 && g_top_n)
         s -= g_lambda_reserve * g_corner_u * (double)(g_top_n - top_free(t->used));
     if (g_exin_bias) s += g_lambda_exin * g_corner_u * exin_bonus(t, row);
-    if (t->flags & FLAG_BW_FILL) s -= BW_FILL_PEN;   /* --blackwood: after every board on schedule */
     return s;
 }
 
@@ -2887,7 +2859,7 @@ static void expand_clued(BeamCtx *ctx, const BeamEntry *p, uint32_t pi, int row,
                     mv.rterm = (uint8_t)ti;
 
                     *t = *p; commit_row(t, row, &mv);
-                    t->flags = oflags | (p->flags & FLAG_BW_FILL);   /* before pool_append: it hashes flags */
+                    t->flags = oflags;          /* before pool_append: it hashes flags */
                     if (!parity_ok(t)) continue;
                     if (g_exhaust_inner && !exin_child_ok(t, row, sc)) continue;
                     float score;
@@ -3257,16 +3229,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
         if (n_slices > 1024u) n_slices = 1024u;
     }
     uint64_t pool_target = (uint64_t)g_pool_factor * g_beam_width;
-    /* --blackwood: the boards that only fill the beam (below the floor of their
-       row) get the floor quota below; the others share the pool as if those
-       were not there, so filling never thins what the boards on schedule get. */
-    uint32_t n_good = beam_n;
-    if (g_blackwood) {
-        n_good = 0;
-        for (uint32_t b = 0; b < beam_n; b++) n_good += !(beam[b].flags & FLAG_BW_FILL);
-        if (n_good == 0) n_good = beam_n;
-    }
-    uint32_t quota_parent = (uint32_t)(pool_target / n_good);
+    uint32_t quota_parent = (uint32_t)(pool_target / beam_n);
     /* At least 8 children per parent (the pool target uses the base width, so
        the floor is what keeps the expanded rows' pool at 8 per board), but
        never more than --pool_factor asks: --pool_factor 1 keeps 1. */
@@ -3282,11 +3245,6 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
     if (n_slices > quota_parent) n_slices = quota_parent;
     uint32_t quota_slice = quota_parent / n_slices; if (quota_slice == 0) quota_slice = 1;
     uint64_t budget_slice = budget_parent / n_slices; if (budget_slice < 64) budget_slice = 64;
-    const uint32_t fq_parent = quota_floor < quota_parent ? quota_floor : quota_parent;
-    uint64_t fb_parent = (uint64_t)fq_parent * SCAN_FACTOR;
-    if (fb_parent < MIN_DECODE_BUDGET) fb_parent = MIN_DECODE_BUDGET;
-    uint32_t fq_slice = fq_parent / n_slices; if (fq_slice == 0) fq_slice = 1;
-    uint64_t fb_slice = fb_parent / n_slices; if (fb_slice < 64) fb_slice = 64;
     const bool at_stop = row_is_stop((uint32_t)row);
     /* Did the PREVIOUS row keep everything it generated? Then selection is not
        discarding anything -- select_beam early-returns on kept <= K -- and this
@@ -3323,7 +3281,6 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
         uint32_t pi = (uint32_t)(it / n_slices);
         uint32_t sl = (uint32_t)(it % n_slices);
         Scratch *sc = scratch[omp_get_thread_num()];
-        const bool filler = n_good < beam_n && (beam[pi].flags & FLAG_BW_FILL);
         /* Before expand_prepare, whose guard would drop this parent when its
            segment-A cell is empty -- exactly the case a B+C partial records.
            Once per parent, not once per slice. */
@@ -3337,7 +3294,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
                that ignore the clue. */
             if (sl != 0) continue;
             if (!expand_clue_row(ctx, &beam[pi], pi, row, at_stop, sc,
-                                 filler ? fq_parent : quota_parent, filler ? fb_parent : budget_parent))
+                                 quota_parent, budget_parent))
                 continue;                  /* this parent owes a clue it just placed */
         }
         Expand e;
@@ -3348,14 +3305,14 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
            so the shared key merely keeps a parent's randomness a function of the
            parent and the row rather than of where its work landed. */
         e.rng = rng_for(cfg_hash, (uint32_t)row, pi, 0xFFFFFFFFu);
-        e.quota = filler ? fq_slice : quota_slice; e.budget = filler ? fb_slice : budget_slice;
+        e.quota = quota_slice; e.budget = budget_slice;
         e.keep_all = keep_all;
         e.cfg_hash = cfg_hash;
 
         /* Phase 1: this slice's stride of the cell in promise order (the cell is
            fan-out sorted, so the prefix holds the most continuable chains),
            reserving a quarter of the budget for the randomized phase. */
-        const uint64_t rand_budget = e.budget / 4;
+        const uint64_t rand_budget = budget_slice / 4;
         const uint32_t n = e.cA->n;
         /* Slice sl owns the slice-local indices m = 0..n_sl-1, which are the
            global records sl, sl+n_slices, ... Phase 1 walks them in order; m_done
@@ -3368,7 +3325,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
            parent's quota goes to the colour's chains first; the rest of
            phase 1 and phase 2 continue past that look-ahead as usual. */
         if (g_exin_bias && g_exin_mark && !g_exin_probe && !keep_all) {
-            uint32_t L = 4u * e.quota;
+            uint32_t L = 4u * quota_slice;
             if (L > n_sl) L = n_sl;
             if (L > EXIN_A_LOOK_MAX) L = EXIN_A_LOOK_MAX;
             const uint32_t no = exin_order_A(&e, sl, n_slices, L, sc->a_ord);
@@ -3576,21 +3533,10 @@ static uint32_t rank_pool_raw(BeamCtx *ctx, uint64_t pool_n, int nt) {
     return n;
 }
 
-/* --blackwood: the ranked survivors before the first FLAG_BW_FILL one (all of
-   them otherwise); the flag's score penalty puts those last. */
-static uint32_t bw_good(const BeamCtx *ctx, uint32_t kept) {
-    uint32_t good = kept;
-    if (g_blackwood)
-        while (good && (ctx->pool[ctx->keep[good - 1]].flags & FLAG_BW_FILL)) good--;
-    return good;
-}
-
 /* Prune the ranked survivors to target_K: a score band (respecting the
    per-parent offspring cap) plus a random band of frac_rand_now * target_K,
-   then best-first fill of any remainder. The first `good` ranked survivors
-   are on --blackwood's schedule (all of them otherwise): the rest only fill
-   what they leave empty (bw_fill_on). */
-static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t good, uint32_t beam_n,
+   then best-first fill of any remainder. */
+static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t beam_n,
                             uint32_t target_K, uint32_t cap, double frac_rand_now,
                             RNG *rng) {
     const uint32_t K = target_K;
@@ -3598,11 +3544,6 @@ static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t good, uint32_t
     memset(ctx->taken, 0, kept);
     memset(ctx->offspring, 0, (size_t)beam_n*sizeof(uint32_t));
     uint32_t n_sel = 0, got = 0;
-    if (good >= K) kept = good;                    /* no filler needed */
-    else for (uint32_t i = 0; i < good; i++) {     /* all on schedule, then fillers */
-        ctx->offspring[ctx->pool[ctx->keep[i]].parent]++;
-        ctx->taken[i] = 1; ctx->sel[n_sel++] = i;
-    }
 
     /* Per-orientation floor. Each orientation is a different hypothesis about
        which puzzle side is our row 0, and the score cannot compare them -- left
@@ -3616,10 +3557,6 @@ static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t good, uint32_t
         const uint32_t floor_o = (uint32_t)(CLUE_FLOOR_FRAC * (double)K / 4.0);
         for (int o = 0; o < 4 && floor_o; o++) {
             uint32_t got_o = 0;
-            for (uint32_t i = 0; i < n_sel; i++) {     /* the pre-taken boards of o */
-                const PoolEntry *pe = &ctx->pool[ctx->keep[ctx->sel[i]]];
-                got_o += (pe->flags & FLAG_ORIENT_SET) && (pe->flags & FLAG_ORIENT_MASK) == (uint8_t)o;
-            }
             for (uint32_t i = 0; i < kept && got_o < floor_o; i++) {
                 if (ctx->taken[i]) continue;
                 const PoolEntry *pe = &ctx->pool[ctx->keep[i]];
@@ -3670,7 +3607,7 @@ static uint32_t select_roots(BeamCtx *ctx, uint32_t kept, uint32_t beam_n, int r
     uint64_t target = (uint64_t)g_bt_factor * beam_eff_K(row);
     if (target >= kept) return kept;
     RNG sel_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFFu, 1u);
-    uint32_t n = select_beam(ctx, kept, bw_good(ctx, kept), beam_n, (uint32_t)target,
+    uint32_t n = select_beam(ctx, kept, beam_n, (uint32_t)target,
                              parent_cap_eff(row), g_frac_rand, &sel_rng);
     qsort(ctx->sel, n, sizeof *ctx->sel, cmp_u32_asc);
     for (uint32_t i = 0; i < n; i++) ctx->keep[i] = ctx->keep[ctx->sel[i]];  /* sel[i] >= i */
@@ -5623,7 +5560,6 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
     beam_init_border(&cur[0], g_cur_bottom, g_cur_left);
     uint32_t beam_n = 1;
     g_beam_unpruned = false;          /* row 1 keeps the one-child economy */
-    g_bw_short = false;
     memset(ctx->log_n, 0, sizeof ctx->log_n);
     maha_reset_config();
     if (g_aux_on) corner_reset_config();
@@ -5712,13 +5648,8 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         RNG sel_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFFu, 1u);
         uint32_t eff_K = beam_eff_K(row);
         g_beam_unpruned = (kept <= eff_K);
-        const uint32_t good = bw_good(ctx, kept);
-        uint32_t n_sel = select_beam(ctx, kept, good, beam_n, eff_K,
+        uint32_t n_sel = select_beam(ctx, kept, beam_n, eff_K,
                                      parent_cap_eff(row), g_frac_rand, &sel_rng);
-        if (g_blackwood) {
-            if (n_sel > good) g_exin.bw_fill += n_sel - good;
-            g_bw_short = good < eff_K;
-        }
         g_stats.row_selected[row] += n_sel;
         double t0 = omp_get_wtime();
         materialize_beam(ctx, cur, nxt, n_sel, row);
@@ -6115,7 +6046,6 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
             printf("\n[sum] blackwood schedule by row (surviving boards' mean sides of the three colours placed / floor):");
             for (int r = 1; r <= (int)g_stop_row && bw_row_on(r); r++)
                 if (g_exin.res_n[r]) printf(" r%d %.1f/%d", r, g_exin.bw_sum[r] / (double)g_exin.res_n[r], g_bw_floor[r]);
-            printf("; %" PRIu64 " beam boards below the floor kept to fill the beam", g_exin.bw_fill);
         }
         printf("\n[sum] exhaust residual by row (mean over the marked colours, surviving boards):");
         for (int r = 1; r <= PUZZLE_SIDE; r++)
@@ -6402,8 +6332,9 @@ static void usage(const char *a0) {
 "                         adds his colour schedule (a floor per row), and sets\n"
 "                         --exhaust_border_color --stop_row 10 --exhaust_check 10:3\n"
 "                         --backtrack_min_col 3 --no_top_dedup --end_dive 5000\n"
-"                         --end_polish 6000 --parent_cap 8 (unlock: the first three\n"
-"                         and the cap only); explicit flags win. Needs --random_edges\n"
+"                         --end_polish 6000 --parent_cap 16 (with --backtrack_unlock_right\n"
+"                         not min_col and the dives); explicit flags win. Needs\n"
+"                         --random_edges\n"
 "\n"
 "Scoring:\n"
 "  --lambda_J F           weight of the closure term, the primary colour objective\n"
@@ -6439,7 +6370,8 @@ static void usage(const char *a0) {
 "Selection and expansion:\n"
 "  --frac_rand F          share of each row chosen at random (default 0.10)\n"
 "  --parent_cap N         children per parent in the score-chosen part; doubled from\n"
-"                         beam_expand_row-1 (default 4, 8 with --blackwood; 0 = uncapped)\n"
+"                         beam_expand_row-1 (default 4, 16 with --blackwood;\n"
+"                         0 = uncapped)\n"
 "  --pool_factor N        candidate pool, in multiples of beam_width (default 64)\n"
 "  --bc_window nB,nC      while the beam is full: score up to nB B chains x nC C\n"
 "                         chains per segment-A record and keep the best (default 7,7)\n"
@@ -6958,7 +6890,7 @@ int main(int argc, char *argv[]) {
         g_exhaust_inner = 2;
         g_exhaust = true;
         if (!g_stop_row_set) g_stop_row = 10;
-        if (!g_parent_cap_set) g_parent_cap = 8;    /* boards on schedule may fill more of the beam */
+        if (!g_parent_cap_set) g_parent_cap = 16;   /* the few boards on schedule may fill more of the beam */
         if (!g_unlock_right) {           /* unlock: its own min_col default; the halo fill dives */
             if (!g_min_col_set && g_backtrack_row_set) { g_bt_min_col = 3; g_min_col_set = true; }
             if (!g_end_dive_set) g_end_dive = 5000;
@@ -7097,7 +7029,7 @@ int main(int argc, char *argv[]) {
         g_exin_notop_row = (int)g_stop_row;
         g_exin_K = exin_K(g_exhaust_inner);
         g_exin_bias = g_lambda_exin > 0.0;
-        g_aux_on = g_aux_on || g_exin_bias || g_blackwood;   /* blackwood: the fill penalty */
+        g_aux_on = g_aux_on || g_exin_bias;
     }
     if (g_emit_score < 0 || g_emit_score > 480) fatal("--emit_score must be in 0..480");
     if (g_end_polish >= 0 && !g_end_dive)

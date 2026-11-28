@@ -52,8 +52,6 @@ typedef struct {
    also enter the dedup signature -- see frontier_sig. */
 #define FLAG_ORIENT_MASK    0x3u
 #define FLAG_ORIENT_SET     0x4u
-/* --blackwood: the board or an ancestor only filled a short beam (bw_fill_on). */
-#define FLAG_BW_FILL        0x8u
 #define ENTRY_ORIENT(e)     ((e)->flags & FLAG_ORIENT_MASK)
 #define ENTRY_HAS_ORIENT(e) (((e)->flags & FLAG_ORIENT_SET) != 0)
 
