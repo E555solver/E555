@@ -7457,6 +7457,7 @@ int main(int argc, char *argv[]) {
                 unsigned left_tries = ((g_clue_mask & CLUE_CORNERS) ? 64u : 1u) * want;
                 unsigned dup = 0, got = 0;
                 double best_sc = DBL_MAX;
+                int best_dn = 0;                /* its D_N: 100 per colour short of N */
                 uint64_t bkey = 0, best_key = 0;
                 LeftOrder best_lft;
                 for (unsigned tr = 0; tr < left_tries && got < want; ) {
@@ -7487,13 +7488,14 @@ int main(int argc, char *argv[]) {
                         got_left = true;
                         got++;
                         if (g_exhaust_inner) {
-                            const double sc = exin_score(&bot, &lft, NULL);
-                            if (sc < best_sc) { best_sc = sc; best_key = bkey; exin_keep_left(&lft, &best_lft); }
+                            int dn;
+                            const double sc = exin_score(&bot, &lft, &dn);
+                            if (sc < best_sc) { best_sc = sc; best_dn = dn; best_key = bkey; exin_keep_left(&lft, &best_lft); }
                         }
                     }
                 }
                 if (g_exhaust_inner && got_left) { lft = best_lft; bkey = best_key; }
-                if (g_blackwood && got_left && best_sc >= 1000.0) {
+                if (g_blackwood && got_left && best_dn >= 100) {
                     /* c14 or c22 has more edges on the left column above the stop
                        row than its tolerance on every column drawn: the stop row
                        can never pass, so the configuration is not run. */

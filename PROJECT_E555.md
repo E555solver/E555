@@ -943,14 +943,13 @@ and sets existing options:
 - `[cfg] blackwood` lists the preset and the floors; `[sum] blackwood schedule
   by row` gives the surviving boards' mean sides against each floor, and the
   cuts line a `schedule` column.
-- **Measured** (12 configurations, width 1000, `--backtrack_row 6`, 100 dives
-  per board, min_col 3; boards >= 458 per hour of run): `--blackwood` 33 in
-  30 s (4,024/h), best 460, mean 453.6 over 3,253 written; at 0.9 of his quota
-  785/h; plain `--exhaust_inner_color 2` (`10:4`) none (best 455); no flag 160/h
-  (best 459, mean 451.1), with `--exhaust_border_color` 257/h. A second seed:
-  `--blackwood` 1,955/h against 241/h. The schedule kills some configurations
-  early (7 and 4 of 12 reached row 10), which is the price of the stronger
-  boards.
+- **Measured** (width 1000, `--backtrack_row 6`, 100 dives per board,
+  min_col 3; boards >= 458): without clues, 12 configurations, `--blackwood`
+  4,024 an hour (best 460, mean 453.6 over 3,253 written), plain
+  `--exhaust_inner_color 2` (`10:4`) none, no flag 160 an hour. With the
+  centre clue unpinned and `--lambda_J 2 --lambda_Mahalanobis 2`, 2 x 192
+  configurations: 13 boards >= 458 at the default parent cap 16 against 11 at
+  cap 4 (best 460); about a quarter of the configurations reach row 10.
 
 ### 5.10 Column-major extension (`--extend_nodes`, `--backtrack_min_col`)
 

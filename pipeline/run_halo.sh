@@ -19,9 +19,10 @@
 #      written BOARDS boards. KEEP_BEAM=1 appends them, as the beam wrote them,
 #      to RUN_DIR/beam.csv.gz. EXHAUST_INNER=N uses N inner colours up inside
 #      the block by STOP_ROW (3x the left columns are drawn, so their edges
-#      sit on the bottom and left; what the open band keeps counts against
-#      --exhaust_check STOP_ROW:k, set by BEAM_EXTRA); BLACKWOOD=1 does it for
-#      c14 c22 with Blackwood's schedule on the beam rows (PROJECT 5.9).
+#      sit on the bottom and left); what the open band keeps counts against
+#      --exhaust_check STOP_ROW:k, about 8 here (BEAM_EXTRA="--exhaust_check
+#      12:8"). BLACKWOOD=1 does it for c14 c22, with Blackwood's schedule on
+#      the beam rows (PROJECT 5.9).
 #   B  Every board filled once per LIFT: none fills the open band as the beam
 #      left it; halo first lifts the halo (HALO=2: rows 0-1 and 14-15, columns
 #      0-1 and 14-15, 112 cells, around the 12 x 12 core; HALO=3: three wide,
