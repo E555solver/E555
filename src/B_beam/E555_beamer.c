@@ -1002,10 +1002,11 @@ static int      g_bw_total = 0, g_bw_frame = 0;
 static int      g_bw_fill[PUZZLE_SIDE + 1];      /* the fill level: see bw_fill_on */
 /* Fill mode: the previous beam row kept fewer boards on schedule than its
    width. A beam row below the backtrack (or stop) row then keeps children
-   down to the fill level, scored BW_FILL_PEN lower, so they lose every window
-   to a sibling on schedule and only fill what the beam would leave empty.
-   The lag of one row keeps them from taking a parent's quota while the beam
-   is full. The backtrack row and the exhaustive rows always cut at the floor. */
+   down to the fill level. Such a child and all its descendants carry
+   FLAG_BW_FILL and score BW_FILL_PEN lower: they lose every window to a
+   sibling on schedule, take only the beam slots and backtracker roots that
+   boards on schedule leave empty, and get the floor quota as parents. The
+   backtrack row and the exhaustive rows always cut at the floor. */
 static bool     g_bw_short = false;
 #define BW_FILL_PEN 1e4f
 static inline bool bw_fill_on(int row) { return g_bw_short && row < (int)gen_stop_row(); }
@@ -1162,10 +1163,13 @@ static inline double exin_bonus(const BeamEntry *t, int row) {
 }
 
 /* A beam child (full width: W = 14). */
-static bool exin_child_ok(const BeamEntry *t, int row, Scratch *sc) {
+static bool exin_child_ok(BeamEntry *t, int row, Scratch *sc) {
     sc->exin_checked++;
     const int why = exin_ok(t, EDGE_LEN, row);
-    if (why < 0) return true;
+    if (why < 0) {
+        if (g_blackwood && bw_fill_on(row) && bw_count(t, row) < g_bw_floor[row]) t->flags |= FLAG_BW_FILL;
+        return true;
+    }
     sc->exin_cut[why]++;
     return false;
 }
@@ -2332,7 +2336,7 @@ static inline double aux_term(const BeamEntry *t, int row, bool at_stop, double 
     if (g_lambda_reserve > 0.0 && g_top_n)
         s -= g_lambda_reserve * g_corner_u * (double)(g_top_n - top_free(t->used));
     if (g_exin_bias) s += g_lambda_exin * g_corner_u * exin_bonus(t, row);
-    if (g_blackwood && bw_fill_on(row) && bw_count(t, row) < g_bw_floor[row]) s -= BW_FILL_PEN;
+    if (t->flags & FLAG_BW_FILL) s -= BW_FILL_PEN;   /* --blackwood: after every board on schedule */
     return s;
 }
 
@@ -2883,7 +2887,7 @@ static void expand_clued(BeamCtx *ctx, const BeamEntry *p, uint32_t pi, int row,
                     mv.rterm = (uint8_t)ti;
 
                     *t = *p; commit_row(t, row, &mv);
-                    t->flags = oflags;          /* before pool_append: it hashes flags */
+                    t->flags = oflags | (p->flags & FLAG_BW_FILL);   /* before pool_append: it hashes flags */
                     if (!parity_ok(t)) continue;
                     if (g_exhaust_inner && !exin_child_ok(t, row, sc)) continue;
                     float score;
@@ -3257,9 +3261,9 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
        row) get the floor quota below; the others share the pool as if those
        were not there, so filling never thins what the boards on schedule get. */
     uint32_t n_good = beam_n;
-    if (g_blackwood && row - 1 >= 1 && row - 1 < (int)gen_stop_row() && bw_row_on(row - 1)) {
+    if (g_blackwood) {
         n_good = 0;
-        for (uint32_t b = 0; b < beam_n; b++) n_good += bw_count(&beam[b], row - 1) >= g_bw_floor[row - 1];
+        for (uint32_t b = 0; b < beam_n; b++) n_good += !(beam[b].flags & FLAG_BW_FILL);
         if (n_good == 0) n_good = beam_n;
     }
     uint32_t quota_parent = (uint32_t)(pool_target / n_good);
@@ -3319,7 +3323,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
         uint32_t pi = (uint32_t)(it / n_slices);
         uint32_t sl = (uint32_t)(it % n_slices);
         Scratch *sc = scratch[omp_get_thread_num()];
-        const bool filler = n_good < beam_n && bw_count(&beam[pi], row - 1) < g_bw_floor[row - 1];
+        const bool filler = n_good < beam_n && (beam[pi].flags & FLAG_BW_FILL);
         /* Before expand_prepare, whose guard would drop this parent when its
            segment-A cell is empty -- exactly the case a B+C partial records.
            Once per parent, not once per slice. */
@@ -3572,6 +3576,15 @@ static uint32_t rank_pool_raw(BeamCtx *ctx, uint64_t pool_n, int nt) {
     return n;
 }
 
+/* --blackwood: the ranked survivors before the first FLAG_BW_FILL one (all of
+   them otherwise); the flag's score penalty puts those last. */
+static uint32_t bw_good(const BeamCtx *ctx, uint32_t kept) {
+    uint32_t good = kept;
+    if (g_blackwood)
+        while (good && (ctx->pool[ctx->keep[good - 1]].flags & FLAG_BW_FILL)) good--;
+    return good;
+}
+
 /* Prune the ranked survivors to target_K: a score band (respecting the
    per-parent offspring cap) plus a random band of frac_rand_now * target_K,
    then best-first fill of any remainder. The first `good` ranked survivors
@@ -3657,7 +3670,7 @@ static uint32_t select_roots(BeamCtx *ctx, uint32_t kept, uint32_t beam_n, int r
     uint64_t target = (uint64_t)g_bt_factor * beam_eff_K(row);
     if (target >= kept) return kept;
     RNG sel_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFFu, 1u);
-    uint32_t n = select_beam(ctx, kept, kept, beam_n, (uint32_t)target,
+    uint32_t n = select_beam(ctx, kept, bw_good(ctx, kept), beam_n, (uint32_t)target,
                              parent_cap_eff(row), g_frac_rand, &sel_rng);
     qsort(ctx->sel, n, sizeof *ctx->sel, cmp_u32_asc);
     for (uint32_t i = 0; i < n; i++) ctx->keep[i] = ctx->keep[ctx->sel[i]];  /* sel[i] >= i */
@@ -5699,9 +5712,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         RNG sel_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFFu, 1u);
         uint32_t eff_K = beam_eff_K(row);
         g_beam_unpruned = (kept <= eff_K);
-        uint32_t good = kept;              /* --blackwood: those on schedule (the rest score BW_FILL_PEN less) */
-        if (g_blackwood)
-            while (good && ctx->pool[ctx->keep[good - 1]].score < -0.5f * BW_FILL_PEN) good--;
+        const uint32_t good = bw_good(ctx, kept);
         uint32_t n_sel = select_beam(ctx, kept, good, beam_n, eff_K,
                                      parent_cap_eff(row), g_frac_rand, &sel_rng);
         if (g_blackwood) {
