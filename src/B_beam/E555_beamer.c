@@ -238,6 +238,7 @@ static uint32_t g_bc_nB           = 7;      /* --bc_window nB,nC; 1,1 = legacy *
 static uint32_t g_bc_nC           = 7;
 static double   g_bc_accept       = 1.0;    /* --bc_window_accept F: P(keep the best) */
 static uint32_t g_parent_cap      = 4;
+static bool     g_parent_cap_set  = false;
 static uint32_t g_pool_factor     = 64;
 /* Segment-A decode budget per requested child. Was --scan_factor; a sweep found
    8192 BYTE-identical to 1024 over 219 beam rows, because the per-parent quota
@@ -732,7 +733,7 @@ static int8_t   g_exin_clue[PUZZLE_SIDE + 1][5][NUM_INNER_COLORS];
 static uint32_t g_exin_static_out = 0;   /* never eligible: a clue above S carries it */
 static int      g_exin_K = 0;            /* left columns drawn per border: exin_K(N) */
 static inline int exin_K(uint32_t N) {
-    const int c = (int)((N + 1) * (N + 1) * (N + 1));
+    const int c = (int)((N + 1) * (N + 1) * (N + 1)) * (g_unlock_right ? 3 : 1);
     return g_exhaust ? 2 * c : c;
 }
 
@@ -743,6 +744,7 @@ static struct {
     uint64_t dn[5];                                /* configurations by D_N (4 = 4 or more) */
     uint64_t short_marks;                          /* configurations with fewer than N eligible */
     uint64_t bw_skipped;                           /* --blackwood: borders where c14/c22 cannot be used up */
+    uint64_t bw_fill;                              /* --blackwood: beam boards below the floor (fill mode) */
     uint64_t ck_checked[PUZZLE_SIDE + 1], ck_cut[EXIN_CUTS][PUZZLE_SIDE + 1];
     uint64_t left_s[EXIN_TOLS_MAX + 1];            /* stop-row boards passing, by marked faces left */
     double   res_sum[PUZZLE_SIDE + 1];             /* survivors' mean marked residual, summed */
@@ -836,6 +838,15 @@ static void exin_init(void) {
     g_exin_no_edge = getenv("E555_EXIN_NO_EDGE") != NULL;
 }
 
+/* The marked edges of colour ci that stay off the board at the stop row, each
+   holding one of the k faces: those on the left column above S -- and under
+   --backtrack_unlock_right, whose right column is given back, every edge off
+   the bottom row and the left column up to S (the deficit, which counts the
+   former too). */
+static inline int exin_stay(const int d[NUM_INNER_COLORS], const int a[NUM_INNER_COLORS], int ci) {
+    return g_unlock_right ? d[ci] : a[ci];
+}
+
 /* A border's deficits d[c] and its eligible colours (INNER_IDX bits). */
 static uint32_t exin_deficits(const BottomOrder *bot, const LeftOrder *lft, int d[NUM_INNER_COLORS],
                               int a[NUM_INNER_COLORS]) {
@@ -850,7 +861,7 @@ static uint32_t exin_deficits(const BottomOrder *bot, const LeftOrder *lft, int 
         else a[INNER_IDX(c)]++;                    /* on the left column above S */
     }
     for (int ci = 0; ci < NUM_INNER_COLORS; ci++)
-        if (a[ci] > g_exin_tolS) out |= 1u << ci;   /* more than the stop-row budget */
+        if (exin_stay(d, a, ci) > g_exin_tolS) out |= 1u << ci;   /* more than the stop-row budget */
     if (!g_free_edges)                             /* fixed mode: on the top border */
         for (int c = COLOR_MIN; c <= COLOR_MAX; c++)
             if (g_top_border_inner_count[c] > 0) out |= 1u << INNER_IDX(c);
@@ -878,9 +889,9 @@ static double exin_pick(const int d[NUM_INNER_COLORS], const int a[NUM_INNER_COL
         const int fx[2] = { INNER_IDX(BW_C1), INNER_IDX(BW_C2) };
         for (int q = 0; q < 2; q++) {
             const int ci = fx[q];
-            if (!(ok >> ci & 1u) || above + a[ci] > g_exin_tolS) { sc += 1000.0; dsum += 100; }
+            if (!(ok >> ci & 1u) || above + exin_stay(d, a, ci) > g_exin_tolS) { sc += 1000.0; dsum += 100; }
             else { sc += exin_lp(d, ci); dsum += d[ci] - a[ci]; }
-            above += a[ci];
+            above += exin_stay(d, a, ci);
             m |= 1u << ci;
         }
         if (mark) *mark = m;
@@ -890,7 +901,7 @@ static double exin_pick(const int d[NUM_INNER_COLORS], const int a[NUM_INNER_COL
     for (uint32_t k = 0; k < g_exhaust_inner; k++) {
         int best = -1;
         for (int ci = 0; ci < NUM_INNER_COLORS; ci++) {
-            if (!(ok >> ci & 1u) || (m >> ci & 1u) || above + a[ci] > g_exin_tolS) continue;
+            if (!(ok >> ci & 1u) || (m >> ci & 1u) || above + exin_stay(d, a, ci) > g_exin_tolS) continue;
             if (best < 0) { best = ci; continue; }
             const double a = exin_lp(d, ci), b = exin_lp(d, best);
             if (a < b || (a == b && tb && tb[ci] > tb[best])) best = ci;
@@ -899,7 +910,7 @@ static double exin_pick(const int d[NUM_INNER_COLORS], const int a[NUM_INNER_COL
         m |= 1u << best;
         sc += exin_lp(d, best);
         dsum += d[best] - a[best];    /* the edges left for the right column */
-        above += a[best];
+        above += exin_stay(d, a, best);
     }
     if (mark) *mark = m;
     if (dn) *dn = dsum;
@@ -988,6 +999,23 @@ static uint64_t g_bw_h[5][4];
 static uint64_t g_bw_x[5][PUZZLE_SIDE + 1][4];   /* [clue frame + 1, 0 = none yet][row] */
 static int      g_bw_floor[PUZZLE_SIDE + 1];
 static int      g_bw_total = 0, g_bw_frame = 0;
+static int      g_bw_fill[PUZZLE_SIDE + 1];      /* the fill level: see bw_fill_on */
+/* Fill mode: the previous beam row kept fewer boards on schedule than its
+   width. A beam row below the backtrack (or stop) row then keeps children
+   down to the fill level, scored BW_FILL_PEN lower, so they lose every window
+   to a sibling on schedule and only fill what the beam would leave empty.
+   The lag of one row keeps them from taking a parent's quota while the beam
+   is full. The backtrack row and the exhaustive rows always cut at the floor. */
+static bool     g_bw_short = false;
+#define BW_FILL_PEN 1e4f
+static inline bool bw_fill_on(int row) { return g_bw_short && row < (int)gen_stop_row(); }
+/* Under --backtrack_unlock_right the schedule holds on the beam rows only:
+   from the backtrack row on, the roots give the band back. */
+static inline bool bw_row_on(int row) {
+    return row <= PUZZLE_SIDE && !(g_unlock_right && row > (int)g_backtrack_row);
+}
+static uint64_t g_bw_edge[4];   /* edge pieces (one frame side): the quota sides the bonus rewards */
+#define BW_EDGE_W 2.0           /* bonus per such side, about one inner face of Phi */
 static void bw_init(void) {
     int h_arr[256];
     for (int i = 0; i < 256; i++) {                /* his piecewise-linear ramp, as published */
@@ -1003,36 +1031,47 @@ static void bw_init(void) {
         const int d = 16 * r + 15 < 160 ? 16 * r + 15 : 160;
         g_bw_floor[r] = r ? h_arr[d] : 0;
     }
-
-    /* The floors are 0.95 of his values: his solver checks after every piece,
-       E555 only at the end of a row, and at his own values every board sat on
-       the floor and every configuration died by row 6 (12 configurations,
-       width 1000); 0.95 gave the most boards >= 458 per hour (0.9: 5x fewer).
-       E555_BW_SCALE=F (tuning only) sets another factor. */
+    memset(g_bw_edge, 0, sizeof g_bw_edge);
+    for (int pc = 0; pc < NUM_PIECES; pc++) {
+        const int ng = (g_seed_top[pc] == 0) + (g_seed_right[pc] == 0) + (g_seed_bottom[pc] == 0) + (g_seed_left[pc] == 0);
+        if (ng == 1) g_bw_edge[pc >> 6] |= piece_bit((uint16_t)pc);
+    }
+    /* The floor is 0.95 of his value (he checks after every piece, E555 only at
+       the end of a row); the fill level, 0.90, is how far a child may lag and
+       still fill a beam that is short of boards on schedule (bw_fill_on).
+       E555_BW_SCALE=F[,G] (tuning only) sets other factors. */
+    double f = 0.95, g = 0.90;
     const char *sc_env = getenv("E555_BW_SCALE");
-    const double f = sc_env ? atof(sc_env) : 0.95;
-    for (int r = 0; r <= PUZZLE_SIDE; r++) g_bw_floor[r] = (int)(f * g_bw_floor[r]);
-    /* Clue-pinned rows (a clue's row and the one below it) leave the beam too
-       few children to also meet a floor: with the five clues every
-       configuration died by row 2, and lifting the floor on those rows only
-       moved the cut to row 3. So the schedule pauses on a pinned row (it
-       keeps the previous row's floor) and resumes one step later after it. */
+    if (sc_env) { f = atof(sc_env); const char *c = strchr(sc_env, ','); g = c ? atof(c + 1) : f; }
+    for (int r = 0; r <= PUZZLE_SIDE; r++) {
+        g_bw_fill[r]  = (int)(g * g_bw_floor[r]);
+        g_bw_floor[r] = (int)(f * g_bw_floor[r]);
+    }
+    /* A clue-pinned row (a clue's row and the one below it) leaves the beam too
+       few children to also meet a floor, so the schedule pauses there: it keeps
+       the previous row's floor and resumes one step later. */
     if (g_clue_mask) {
-        int base[PUZZLE_SIDE + 1];
+        int base[PUZZLE_SIDE + 1], bfill[PUZZLE_SIDE + 1];
         memcpy(base, g_bw_floor, sizeof base);
+        memcpy(bfill, g_bw_fill, sizeof bfill);
         int p = 0;
         for (int r = 1; r <= PUZZLE_SIDE; r++) {
             if (clue_row_pinned(r)) p++;
             g_bw_floor[r] = r - p > 0 ? base[r - p] : 0;
+            g_bw_fill[r]  = r - p > 0 ? bfill[r - p] : 0;
         }
     }
     printf("[cfg] blackwood=1 (marks c%d c%d = Blackwood's 10 16, his frame colour 13 = the one "
            "--exhaust_border_color uses up, c%d on a plain border; stop_row %u; backtrack_min_col %u; "
-           "end_dive %u end_polish %d; explicit flags win)\n",
-           BW_C1, BW_C2, BW_FRAME_DEFAULT, g_stop_row, g_bt_min_col, g_end_dive, g_end_polish);
+           "end_dive %u end_polish %d; parent_cap %u; explicit flags win)\n",
+           BW_C1, BW_C2, BW_FRAME_DEFAULT, g_stop_row, g_bt_min_col, g_end_dive, g_end_polish, g_parent_cap);
     printf("[cfg] blackwood schedule: sides of the three colours (122) on rows 0..r at the end of row r >=");
-    for (int r = 1; r < (int)g_stop_row && r <= PUZZLE_SIDE; r++) printf(" r%d %d", r, g_bw_floor[r]);
-    printf("; row %u: %d, and at most %d marked faces left\n", g_stop_row, g_bw_floor[g_stop_row], g_exin_tolS);
+    for (int r = 1; r <= (int)g_stop_row && r <= PUZZLE_SIDE && bw_row_on(r); r++) {
+        printf(" r%d %d", r, g_bw_floor[r]);
+        if (r < (int)gen_stop_row()) printf(" (fill %d)", g_bw_fill[r]);
+    }
+    if (g_unlock_right) printf("; none above row %u", g_backtrack_row);
+    printf("; at most %d marked faces left at row %u\n", g_exin_tolS, g_stop_row);
 }
 static void bw_config(const uint64_t root_used[4]) {
     g_bw_frame = g_exhaust_colour > 0 ? g_exhaust_colour : BW_FRAME_DEFAULT;
@@ -1058,19 +1097,22 @@ static void bw_config(const uint64_t root_used[4]) {
         }
     }
 }
-static inline int bw_count(const BeamEntry *t, int row) {
+static inline int bw_count_in(const BeamEntry *t, int row, const uint64_t m[4]) {
     const uint64_t *x = g_bw_x[ENTRY_HAS_ORIENT(t) ? (int)ENTRY_ORIENT(t) + 1 : 0][row];
     int q = 0;
     for (int k = 1; k <= 4; k++)
-        q += k * (__builtin_popcountll(t->used[0] & g_bw_h[k][0] & ~x[0]) + __builtin_popcountll(t->used[1] & g_bw_h[k][1] & ~x[1])
-                + __builtin_popcountll(t->used[2] & g_bw_h[k][2] & ~x[2]) + __builtin_popcountll(t->used[3] & g_bw_h[k][3] & ~x[3]));
+        q += k * (__builtin_popcountll(t->used[0] & g_bw_h[k][0] & ~x[0] & m[0]) + __builtin_popcountll(t->used[1] & g_bw_h[k][1] & ~x[1] & m[1])
+                + __builtin_popcountll(t->used[2] & g_bw_h[k][2] & ~x[2] & m[2]) + __builtin_popcountll(t->used[3] & g_bw_h[k][3] & ~x[3] & m[3]));
     return q;
 }
+static const uint64_t g_bw_all[4] = { ~0ull, ~0ull, ~0ull, ~0ull };
+static inline int bw_count(const BeamEntry *t, int row) { return bw_count_in(t, row, g_bw_all); }
 
 static inline int exin_ok(const BeamEntry *t, int W, int row) {
     const int S = (int)g_stop_row;
-    if (g_blackwood && row <= PUZZLE_SIDE && bw_count(t, row) < g_bw_floor[row]) return EXIN_CUT_QUOTA;
-    if (!g_exin_no_edge) {
+    if (g_blackwood && bw_row_on(row)
+        && bw_count(t, row) < (bw_fill_on(row) ? g_bw_fill[row] : g_bw_floor[row])) return EXIN_CUT_QUOTA;
+    if (!g_exin_no_edge && !g_unlock_right) {     /* unlock: the border budget instead (exin_stay) */
         const int e = exin_left4(g_exin_eall, t);
         if (row < S ? e > S - row + g_exin_tolS - g_exin_above : (!g_exin_tolS && e > 0)) return EXIN_CUT_EDGE;
     }
@@ -1085,7 +1127,7 @@ static inline int exin_ok(const BeamEntry *t, int W, int row) {
         g_exin.left_s[left]++;
         return -1;
     }
-    if (exin_left4(g_exin_call, t) > EDGE_LEN * (S - row) + g_exin_tolS) return EXIN_CUT_CARRY;
+    if (exin_left4(g_exin_call, t) > g_last_inner * (S - row) + g_exin_tolS) return EXIN_CUT_CARRY;
     if (g_exin_tol[row] >= 0 && exin_worst(t, W, row, NULL) > g_exin_tol[row]) return EXIN_CUT_RES;
     return -1;
 }
@@ -1104,6 +1146,10 @@ static inline double exin_bonus(const BeamEntry *t, int row) {
         if (R >= EXIN_PHI_MAX) R = EXIN_PHI_MAX - 1;
         b += g_exin_phi[ci][R];
     }
+    /* --blackwood: the quota also counts sides on edge pieces, which Phi (inner
+       faces) never sees; reward them too. Only the right column's choice
+       differs between siblings. */
+    if (g_blackwood && row >= 1 && row <= PUZZLE_SIDE) b += BW_EDGE_W * bw_count_in(t, row, g_bw_edge);
     if (g_exin_probe && row >= 0 && row <= PUZZLE_SIDE) {
         #pragma omp atomic
         g_exin.bon_sum[row] += b;
@@ -2286,6 +2332,7 @@ static inline double aux_term(const BeamEntry *t, int row, bool at_stop, double 
     if (g_lambda_reserve > 0.0 && g_top_n)
         s -= g_lambda_reserve * g_corner_u * (double)(g_top_n - top_free(t->used));
     if (g_exin_bias) s += g_lambda_exin * g_corner_u * exin_bonus(t, row);
+    if (g_blackwood && bw_fill_on(row) && bw_count(t, row) < g_bw_floor[row]) s -= BW_FILL_PEN;
     return s;
 }
 
@@ -3069,6 +3116,11 @@ static void try_A(Expand *e, BeamCtx *ctx, uint32_t j, Scratch *sc) {
                 if (!pick_segC(cC, jc, rt + 11, forbidB, ciC, la_C, &rterm)) continue;
                 int f = 0;
                 for (int i = 0; i < CHAIN_LEN - 1; i++) f += exin_faces(&g_cat[ciC[i]]);
+                if (g_blackwood) {         /* the right edge's frame sides of the quota colour */
+                    const Oriented *te = &g_edge_term[rterm];
+                    f += (te->top == g_bw_frame) + (te->right == g_bw_frame)
+                       + (te->bottom == g_bw_frame) + (te->left == g_bw_frame);
+                }
                 int k = nordC++;
                 while (k > 0 && fz[k - 1] < f) { ordC[k] = ordC[k - 1]; fz[k] = fz[k - 1]; k--; }
                 ordC[k] = jc; fz[k] = f;
@@ -3507,8 +3559,10 @@ static uint32_t rank_pool_raw(BeamCtx *ctx, uint64_t pool_n, int nt) {
 
 /* Prune the ranked survivors to target_K: a score band (respecting the
    per-parent offspring cap) plus a random band of frac_rand_now * target_K,
-   then best-first fill of any remainder. */
-static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t beam_n,
+   then best-first fill of any remainder. The first `good` ranked survivors
+   are on --blackwood's schedule (all of them otherwise): the rest only fill
+   what they leave empty (bw_fill_on). */
+static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t good, uint32_t beam_n,
                             uint32_t target_K, uint32_t cap, double frac_rand_now,
                             RNG *rng) {
     const uint32_t K = target_K;
@@ -3516,6 +3570,11 @@ static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t beam_n,
     memset(ctx->taken, 0, kept);
     memset(ctx->offspring, 0, (size_t)beam_n*sizeof(uint32_t));
     uint32_t n_sel = 0, got = 0;
+    if (good >= K) kept = good;                    /* no filler needed */
+    else for (uint32_t i = 0; i < good; i++) {     /* all on schedule, then fillers */
+        ctx->offspring[ctx->pool[ctx->keep[i]].parent]++;
+        ctx->taken[i] = 1; ctx->sel[n_sel++] = i;
+    }
 
     /* Per-orientation floor. Each orientation is a different hypothesis about
        which puzzle side is our row 0, and the score cannot compare them -- left
@@ -3529,6 +3588,10 @@ static uint32_t select_beam(BeamCtx *ctx, uint32_t kept, uint32_t beam_n,
         const uint32_t floor_o = (uint32_t)(CLUE_FLOOR_FRAC * (double)K / 4.0);
         for (int o = 0; o < 4 && floor_o; o++) {
             uint32_t got_o = 0;
+            for (uint32_t i = 0; i < n_sel; i++) {     /* the pre-taken boards of o */
+                const PoolEntry *pe = &ctx->pool[ctx->keep[ctx->sel[i]]];
+                got_o += (pe->flags & FLAG_ORIENT_SET) && (pe->flags & FLAG_ORIENT_MASK) == (uint8_t)o;
+            }
             for (uint32_t i = 0; i < kept && got_o < floor_o; i++) {
                 if (ctx->taken[i]) continue;
                 const PoolEntry *pe = &ctx->pool[ctx->keep[i]];
@@ -3579,7 +3642,7 @@ static uint32_t select_roots(BeamCtx *ctx, uint32_t kept, uint32_t beam_n, int r
     uint64_t target = (uint64_t)g_bt_factor * beam_eff_K(row);
     if (target >= kept) return kept;
     RNG sel_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFFu, 1u);
-    uint32_t n = select_beam(ctx, kept, beam_n, (uint32_t)target,
+    uint32_t n = select_beam(ctx, kept, kept, beam_n, (uint32_t)target,
                              parent_cap_eff(row), g_frac_rand, &sel_rng);
     qsort(ctx->sel, n, sizeof *ctx->sel, cmp_u32_asc);
     for (uint32_t i = 0; i < n; i++) ctx->keep[i] = ctx->keep[ctx->sel[i]];  /* sel[i] >= i */
@@ -5532,6 +5595,7 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
     beam_init_border(&cur[0], g_cur_bottom, g_cur_left);
     uint32_t beam_n = 1;
     g_beam_unpruned = false;          /* row 1 keeps the one-child economy */
+    g_bw_short = false;
     memset(ctx->log_n, 0, sizeof ctx->log_n);
     maha_reset_config();
     if (g_aux_on) corner_reset_config();
@@ -5620,8 +5684,15 @@ static BeamResult beam_search_config(BeamCtx *ctx, Scratch **scratch,
         RNG sel_rng = rng_for(cfg_hash, (uint32_t)row, 0xFFFFFFFFu, 1u);
         uint32_t eff_K = beam_eff_K(row);
         g_beam_unpruned = (kept <= eff_K);
-        uint32_t n_sel = select_beam(ctx, kept, beam_n, eff_K,
+        uint32_t good = kept;              /* --blackwood: those on schedule (the rest score BW_FILL_PEN less) */
+        if (g_blackwood)
+            while (good && ctx->pool[ctx->keep[good - 1]].score < -0.5f * BW_FILL_PEN) good--;
+        uint32_t n_sel = select_beam(ctx, kept, good, beam_n, eff_K,
                                      parent_cap_eff(row), g_frac_rand, &sel_rng);
+        if (g_blackwood) {
+            if (n_sel > good) g_exin.bw_fill += n_sel - good;
+            g_bw_short = good < eff_K;
+        }
         g_stats.row_selected[row] += n_sel;
         double t0 = omp_get_wtime();
         materialize_beam(ctx, cur, nxt, n_sel, row);
@@ -6016,8 +6087,9 @@ static void print_summary(double wall_total, double init_s, double sweep_s) {
         }
         if (g_blackwood) {
             printf("\n[sum] blackwood schedule by row (surviving boards' mean sides of the three colours placed / floor):");
-            for (int r = 1; r <= (int)g_stop_row; r++)
+            for (int r = 1; r <= (int)g_stop_row && bw_row_on(r); r++)
                 if (g_exin.res_n[r]) printf(" r%d %.1f/%d", r, g_exin.bw_sum[r] / (double)g_exin.res_n[r], g_bw_floor[r]);
+            printf("; %" PRIu64 " beam boards below the floor kept to fill the beam", g_exin.bw_fill);
         }
         printf("\n[sum] exhaust residual by row (mean over the marked colours, surviving boards):");
         for (int r = 1; r <= PUZZLE_SIDE; r++)
@@ -6275,8 +6347,10 @@ static void usage(const char *a0) {
 "  --backtrack_unlock_right R\n"
 "                         leave the right R columns (2..13) and the top as a band\n"
 "                         grown by the extension (default 0 = off; not with\n"
-"                         --lambda_corners, --free_top_clue, --cap_top,\n"
-"                         --exhaust_inner_color)\n"
+"                         --lambda_corners, --free_top_clue, --cap_top). With\n"
+"                         --exhaust_inner_color: 3x the left columns, and the\n"
+"                         marked edges left to the band count against S:k;\n"
+"                         --blackwood's schedule holds on the beam rows only\n"
 "  --incomplete_top       also write stop-row boards with only two segments, or only\n"
 "                         segment B, of the stop row (<...>_partial*.csv)\n"
 "  --beam_expand E        width multiplier late in the search (default 1)\n"
@@ -6302,7 +6376,8 @@ static void usage(const char *a0) {
 "                         adds his colour schedule (a floor per row), and sets\n"
 "                         --exhaust_border_color --stop_row 10 --exhaust_check 10:3\n"
 "                         --backtrack_min_col 3 --no_top_dedup --end_dive 5000\n"
-"                         --end_polish 6000; explicit flags win. Needs --random_edges\n"
+"                         --end_polish 6000 --parent_cap 8 (unlock: the first three\n"
+"                         and the cap only); explicit flags win. Needs --random_edges\n"
 "\n"
 "Scoring:\n"
 "  --lambda_J F           weight of the closure term, the primary colour objective\n"
@@ -6338,7 +6413,7 @@ static void usage(const char *a0) {
 "Selection and expansion:\n"
 "  --frac_rand F          share of each row chosen at random (default 0.10)\n"
 "  --parent_cap N         children per parent in the score-chosen part; doubled from\n"
-"                         beam_expand_row-1 (default 4; 0 = uncapped)\n"
+"                         beam_expand_row-1 (default 4, 8 with --blackwood; 0 = uncapped)\n"
 "  --pool_factor N        candidate pool, in multiples of beam_width (default 64)\n"
 "  --bc_window nB,nC      while the beam is full: score up to nB B chains x nC C\n"
 "                         chains per segment-A record and keep the best (default 7,7)\n"
@@ -6832,7 +6907,7 @@ int main(int argc, char *argv[]) {
                 fatal("--bc_window_accept needs F in [0,1]");
         }
         else if (!strcmp(argv[i], "--frac_rand")   && i+1 < argc) g_frac_rand = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--parent_cap")  && i+1 < argc) g_parent_cap = (uint32_t)atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--parent_cap")  && i+1 < argc) { g_parent_cap = (uint32_t)atoi(argv[++i]); g_parent_cap_set = true; }
         else if (!strcmp(argv[i], "--pool_factor") && i+1 < argc) g_pool_factor = (uint32_t)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--top_bottoms") && i+1 < argc) g_top_bottoms = atol(argv[++i]);
         else if (!strcmp(argv[i], "--top_columns") && i+1 < argc) g_top_columns = atol(argv[++i]);
@@ -6857,9 +6932,12 @@ int main(int argc, char *argv[]) {
         g_exhaust_inner = 2;
         g_exhaust = true;
         if (!g_stop_row_set) g_stop_row = 10;
-        if (!g_min_col_set && g_backtrack_row_set) { g_bt_min_col = 3; g_min_col_set = true; }
-        if (!g_end_dive_set) g_end_dive = 5000;
-        if (!g_end_polish_set) g_end_polish = 6000;
+        if (!g_parent_cap_set) g_parent_cap = 8;    /* boards on schedule may fill more of the beam */
+        if (!g_unlock_right) {           /* unlock: its own min_col default; the halo fill dives */
+            if (!g_min_col_set && g_backtrack_row_set) { g_bt_min_col = 3; g_min_col_set = true; }
+            if (!g_end_dive_set) g_end_dive = 5000;
+            if (!g_end_polish_set) g_end_polish = 6000;
+        }
         g_top_dedup = false;             /* near-twin tops can extend differently */
         if (g_exin_ck_n < 0) {           /* the stop row only: the schedule replaces S-1 */
             g_bw_ck_default = true;
@@ -6975,9 +7053,6 @@ int main(int argc, char *argv[]) {
             fatal("--exhaust_inner_color checks row stop_row-1: it needs --stop_row 2 or more");
         if (g_free_edges && !g_free_demand)
             fatal("--exhaust_inner_color needs exact demands: not with --no_free_demand");
-        if (g_unlock_right)
-            fatal("--exhaust_inner_color uses its colours up by the stop row, right column included: "
-                  "not with --backtrack_unlock_right, whose band is filled later");
         if (g_exin_ck_n < 0) {                    /* the default: S-1 loose (S itself is exact) */
             g_exin_ck_n = 0;
             g_exin_ck_row[g_exin_ck_n] = (int)g_stop_row - 1; g_exin_ck_tol[g_exin_ck_n++] = 6;
@@ -6996,7 +7071,7 @@ int main(int argc, char *argv[]) {
         g_exin_notop_row = (int)g_stop_row;
         g_exin_K = exin_K(g_exhaust_inner);
         g_exin_bias = g_lambda_exin > 0.0;
-        g_aux_on = g_aux_on || g_exin_bias;
+        g_aux_on = g_aux_on || g_exin_bias || g_blackwood;   /* blackwood: the fill penalty */
     }
     if (g_emit_score < 0 || g_emit_score > 480) fatal("--emit_score must be in 0..480");
     if (g_end_polish >= 0 && !g_end_dive)

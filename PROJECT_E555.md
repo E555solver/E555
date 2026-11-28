@@ -828,8 +828,7 @@ toward them, and every board is held to the rule.
   owes a demand, so this one check also leaves at most k marked edges above S:
   the edge rules are exact for any k. With k = 0, `R_c = 0` forces `D_c = 0`:
   no edge, no left interface above S and no top of row S shows the colour. Needs exact demands (not with
-  `--no_free_demand`); refused with `--backtrack_unlock_right`, whose band is
-  filled after the stop row.
+  `--no_free_demand`).
 - **The stop-row tolerance** (`--exhaust_check S:k`, at most 32, default
   `S:2N`; `S:0` is the exact rule): up to k marked faces may stay above S,
   edges included. Measured with N = 2, S = 11, width 1000, 12
@@ -937,9 +936,9 @@ and sets existing options:
 - A border whose best left column still leaves c14 or c22 with more edges on
   the left column above the stop row than the tolerance can never pass the
   stop row: it is not run, and `[sum] exhaust_inner_color` counts it ("borders
-  skipped"). A bonus for the quota's sides on edge pieces and the right edge
-  in the C ordering were tried: no gain (the frame colour lives on the bottom
-  and left only), and the full quota still killed every configuration.
+  skipped"). The bias also rewards the quota's sides on edge pieces, and the
+  C chains are tried in order of marked faces with the right edge's frame
+  sides counted.
 - `[cfg] blackwood` lists the preset and the floors; `[sum] blackwood schedule
   by row` gives the surviving boards' mean sides against each floor, and the
   cuts line a `schedule` column.
@@ -1409,7 +1408,7 @@ boards or roots they write the same file at any thread count.
 | `--exhaust_inner_color N` | 0 | use N inner colours up, inner and edge pieces, by the stop row: marked per border (edge commitment to bottom + left least likely by chance, hypergeometric p; best of (N+1)^3 lefts, x2 with `--exhaust_border_color`), beam bias, exact rules (5.9) |
 | `--lambda_exhaust_inner F` | 0.15 | the bias, in u_row per weighted face; 0 = off |
 | `--exhaust_check ROW:TOL,...` | S-1:6,S:2N | up to 16 entries; loose checkpoints below the stop row: marked-residual tolerances; `S:k` lets k marked faces stay at the stop row (`S:0` exact) |
-| `--blackwood` | off | Blackwood preset (5.9): marks c14 c22 with his schedule; sets `--exhaust_border_color --stop_row 10 --exhaust_check 10:3 --backtrack_min_col 3 --no_top_dedup --end_dive 5000 --end_polish 6000` unless given |
+| `--blackwood` | off | Blackwood preset (5.9): marks c14 c22 with his schedule; sets `--exhaust_border_color --stop_row 10 --exhaust_check 10:3 --backtrack_min_col 3 --no_top_dedup --end_dive 5000 --end_polish 6000 --parent_cap 8` unless given |
 | `--incomplete_top` | off | also write stop-row boards with two of the three segments (`_partial.csv`) or segment B alone (`_partial_B.csv`); not with `--backtrack_row` |
 | `--beam_width K` | 250000 | boards per row |
 | `--stop_row R` | 11 | last row filled, 1..13 |
@@ -1419,7 +1418,7 @@ boards or roots they write the same file at any thread count.
 | `--cap_top [N]` | 1 | the extension places the top-left border: every row-14 cell it fills is closed above; 0 = off (5.10) |
 | `--backtrack_min_col K` | 0 | write only boards whose extension fills K columns; cuts partial rows whose column 1 cannot reach row 14 (5.10). Under `--backtrack_unlock_right R`: band columns left open, 0..R, default R (5.9) |
 | `--no_top_dedup` | -- | keep top-row near duplicates (5.9) |
-| `--backtrack_unlock_right R` | 0 | from the backtrack row, the board is the block rows 0..S x columns 0..15-R; rows N+1..S are searched over those columns and the layered extension grows the band (5.9, 5.10) |
+| `--backtrack_unlock_right R` | 0 | from the backtrack row, the board is the block rows 0..S x columns 0..15-R; rows N+1..S are searched over those columns and the layered extension grows the band (5.9, 5.10). With `--exhaust_inner_color`: 3x the left columns are drawn, and the marked edges the band keeps count against `S:k`; `--blackwood`'s schedule holds on the beam rows only, and it leaves min_col and the dives alone |
 | `--beam_expand E`, `--beam_expand_row R` | 1, 7 | late width multiplier (1 = none) and its row |
 | `--lambda_J F` | 1.0 | closure weight |
 | `--lambda_Mahalanobis F` | 1.0 | Mahalanobis correction, in its own SD units |
@@ -1433,7 +1432,7 @@ boards or roots they write the same file at any thread count.
 | `--emit_score S` | 450 | matched edges a finished board needs to be written; without `--end_dive`, under `--backtrack_unlock_right` only and when given, the extended board's |
 | `--corner_seeds N` | 4 | corner-seeded copies per board (with `--lambda_corners`) |
 | `--frac_rand F` | 0.10 | random selection band |
-| `--parent_cap N` | 4 | children per parent in the score band; 0 = uncapped |
+| `--parent_cap N` | 4 (8 with `--blackwood`) | children per parent in the score band; 0 = uncapped |
 | `--pool_factor N` | 64 | candidate pool, x beam width; at least min(8, N) children per parent |
 | `--bc_window nB,nC` | 7,7 | B/C completions scored per A record while the beam is full; each 1..128 |
 | `--bc_window_accept F` | 1 | probability of keeping the window's best child, else its second best |

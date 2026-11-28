@@ -17,7 +17,11 @@
 #      STOP_ROW over columns 0..15-HALO (--backtrack_unlock_right HALO, no
 #      extension): break-free blocks, rows 0-12. The beam stops once it has
 #      written BOARDS boards. KEEP_BEAM=1 appends them, as the beam wrote them,
-#      to RUN_DIR/beam.csv.gz.
+#      to RUN_DIR/beam.csv.gz. EXHAUST_INNER=N uses N inner colours up inside
+#      the block by STOP_ROW (3x the left columns are drawn, so their edges
+#      sit on the bottom and left; what the open band keeps counts against
+#      --exhaust_check STOP_ROW:k, set by BEAM_EXTRA); BLACKWOOD=1 does it for
+#      c14 c22 with Blackwood's schedule on the beam rows (PROJECT 5.9).
 #   B  Every board filled once per LIFT: none fills the open band as the beam
 #      left it; halo first lifts the halo (HALO=2: rows 0-1 and 14-15, columns
 #      0-1 and 14-15, 112 cells, around the 12 x 12 core; HALO=3: three wide,
@@ -99,6 +103,7 @@ BC_WINDOW=7,7
 POOL=64                 # --pool_factor
 TAU=0.1                 # --tau_bottoms and --tau_columns
 EXHAUST_INNER=0         # --exhaust_inner_color N: use N colours up, inner and edge pieces, by the stop row (PROJECT 5.9)
+BLACKWOOD=0             # 1 = --blackwood: c14 c22 used up, his schedule on the beam rows
 BEAM_WALL=1800          # cap on one beamer call, seconds
 BEAM_EXTRA=             # more beamer flags
 BOARDS=                 # boards a round: the beam stops once it has written them
@@ -178,7 +183,7 @@ case "$LIFT" in
     both)      LIFTS=(none halo) ;;
     *) die "LIFT must be none, halo or both (got: $LIFT)" ;;
 esac
-for v in SAMPLES COLUMNS BEAM_WIDTH BACKTRACK_ROW STOP_ROW POOL EXHAUST_INNER BEAM_WALL BOARDS \
+for v in SAMPLES COLUMNS BEAM_WIDTH BACKTRACK_ROW STOP_ROW POOL EXHAUST_INNER BLACKWOOD BEAM_WALL BOARDS \
          KEEP_BEAM DIVES DIVE_POLISH BREAKS RATCHET_NODES ROLLOUTS RATCHET_TIME POLISH_TOP \
          POLISH_TIME POLISH_DIVES POLISH_STEPS RECORD COMPLETE_KEEP BEST_KEEP KEEP_LOGS RNG_SEED; do
     [[ ${!v} =~ ^[0-9]+$ ]] || die "$v must be a whole number (got: ${!v})"
@@ -189,7 +194,8 @@ for v in SAMPLES COLUMNS BOARDS DIVES BREAKS RATCHET_TIME POLISH_DIVES COMPLETE_
 done
 [ "$BACKTRACK_ROW" -ge 1 ] && [ "$BACKTRACK_ROW" -lt "$STOP_ROW" ] ||
     die "BACKTRACK_ROW must be at least 1 and below STOP_ROW=$STOP_ROW"
-[ "$KEEP_LOGS" -le 1 ] && [ "$KEEP_BEAM" -le 1 ] || die "KEEP_LOGS and KEEP_BEAM must be 0 or 1"
+[ "$KEEP_LOGS" -le 1 ] && [ "$KEEP_BEAM" -le 1 ] && [ "$BLACKWOOD" -le 1 ] ||
+    die "KEEP_LOGS, KEEP_BEAM and BLACKWOOD must be 0 or 1"
 
 case "$RUN_DIR" in /*) ;; *) RUN_DIR="$PWD/$RUN_DIR" ;; esac
 cd "$REPO" || die "REPO=$REPO does not exist"
@@ -276,11 +282,12 @@ read -r -a BEAM_MORE <<< "$BEAM_EXTRA"
 read -r -a DIVE_MORE <<< "$DIVE_EXTRA"
 read -r -a RATCHET_MORE <<< "$RATCHET_EXTRA"
 read -r -a POLISH_MORE <<< "$POLISH_EXTRA"
+BW_ARG=(); [ "$BLACKWOOD" = 1 ] && BW_ARG=(--blackwood)
 BEAM=(--random_edges --samples "$SAMPLES" --top_columns "$COLUMNS" --beam_width "$BEAM_WIDTH"
       --backtrack_row "$BACKTRACK_ROW" --stop_row "$STOP_ROW" --backtrack_unlock_right "$HALO"
       --extend_nodes 0 --bc_window "$BC_WINDOW" --pool_factor "$POOL" --tau_bottoms "$TAU"
       --tau_columns "$TAU" --exhaust_inner_color "$EXHAUST_INNER" --max_emitted "$BOARDS"
-      "${CLUE_ARG[@]}" "${DB_ARG[@]}" --threads "$THREADS" --print_cmd "${BEAM_MORE[@]}")
+      "${BW_ARG[@]}" "${CLUE_ARG[@]}" "${DB_ARG[@]}" --threads "$THREADS" --print_cmd "${BEAM_MORE[@]}")
 DIVE=(--end_dive "$DIVES" --end_polish "$DIVE_POLISH" --emit_score 0 --threads "$THREADS"
       --print_cmd "${DIVE_MORE[@]}")
 RATCHET=("${CLUE_ARG[@]}" --break_mode ratchet --breaks "$BREAKS"
