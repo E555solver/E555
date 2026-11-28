@@ -3253,7 +3253,16 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
         if (n_slices > 1024u) n_slices = 1024u;
     }
     uint64_t pool_target = (uint64_t)g_pool_factor * g_beam_width;
-    uint32_t quota_parent = (uint32_t)(pool_target / beam_n);
+    /* --blackwood: the boards that only fill the beam (below the floor of their
+       row) get the floor quota below; the others share the pool as if those
+       were not there, so filling never thins what the boards on schedule get. */
+    uint32_t n_good = beam_n;
+    if (g_blackwood && row - 1 >= 1 && row - 1 < (int)gen_stop_row() && bw_row_on(row - 1)) {
+        n_good = 0;
+        for (uint32_t b = 0; b < beam_n; b++) n_good += bw_count(&beam[b], row - 1) >= g_bw_floor[row - 1];
+        if (n_good == 0) n_good = beam_n;
+    }
+    uint32_t quota_parent = (uint32_t)(pool_target / n_good);
     /* At least 8 children per parent (the pool target uses the base width, so
        the floor is what keeps the expanded rows' pool at 8 per board), but
        never more than --pool_factor asks: --pool_factor 1 keeps 1. */
@@ -3269,6 +3278,11 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
     if (n_slices > quota_parent) n_slices = quota_parent;
     uint32_t quota_slice = quota_parent / n_slices; if (quota_slice == 0) quota_slice = 1;
     uint64_t budget_slice = budget_parent / n_slices; if (budget_slice < 64) budget_slice = 64;
+    const uint32_t fq_parent = quota_floor < quota_parent ? quota_floor : quota_parent;
+    uint64_t fb_parent = (uint64_t)fq_parent * SCAN_FACTOR;
+    if (fb_parent < MIN_DECODE_BUDGET) fb_parent = MIN_DECODE_BUDGET;
+    uint32_t fq_slice = fq_parent / n_slices; if (fq_slice == 0) fq_slice = 1;
+    uint64_t fb_slice = fb_parent / n_slices; if (fb_slice < 64) fb_slice = 64;
     const bool at_stop = row_is_stop((uint32_t)row);
     /* Did the PREVIOUS row keep everything it generated? Then selection is not
        discarding anything -- select_beam early-returns on kept <= K -- and this
@@ -3305,6 +3319,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
         uint32_t pi = (uint32_t)(it / n_slices);
         uint32_t sl = (uint32_t)(it % n_slices);
         Scratch *sc = scratch[omp_get_thread_num()];
+        const bool filler = n_good < beam_n && bw_count(&beam[pi], row - 1) < g_bw_floor[row - 1];
         /* Before expand_prepare, whose guard would drop this parent when its
            segment-A cell is empty -- exactly the case a B+C partial records.
            Once per parent, not once per slice. */
@@ -3318,7 +3333,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
                that ignore the clue. */
             if (sl != 0) continue;
             if (!expand_clue_row(ctx, &beam[pi], pi, row, at_stop, sc,
-                                 quota_parent, budget_parent))
+                                 filler ? fq_parent : quota_parent, filler ? fb_parent : budget_parent))
                 continue;                  /* this parent owes a clue it just placed */
         }
         Expand e;
@@ -3329,14 +3344,14 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
            so the shared key merely keeps a parent's randomness a function of the
            parent and the row rather than of where its work landed. */
         e.rng = rng_for(cfg_hash, (uint32_t)row, pi, 0xFFFFFFFFu);
-        e.quota = quota_slice; e.budget = budget_slice;
+        e.quota = filler ? fq_slice : quota_slice; e.budget = filler ? fb_slice : budget_slice;
         e.keep_all = keep_all;
         e.cfg_hash = cfg_hash;
 
         /* Phase 1: this slice's stride of the cell in promise order (the cell is
            fan-out sorted, so the prefix holds the most continuable chains),
            reserving a quarter of the budget for the randomized phase. */
-        const uint64_t rand_budget = budget_slice / 4;
+        const uint64_t rand_budget = e.budget / 4;
         const uint32_t n = e.cA->n;
         /* Slice sl owns the slice-local indices m = 0..n_sl-1, which are the
            global records sl, sl+n_slices, ... Phase 1 walks them in order; m_done
@@ -3349,7 +3364,7 @@ static void expand_row(BeamCtx *ctx, const BeamEntry *beam, uint32_t beam_n,
            parent's quota goes to the colour's chains first; the rest of
            phase 1 and phase 2 continue past that look-ahead as usual. */
         if (g_exin_bias && g_exin_mark && !g_exin_probe && !keep_all) {
-            uint32_t L = 4u * quota_slice;
+            uint32_t L = 4u * e.quota;
             if (L > n_sl) L = n_sl;
             if (L > EXIN_A_LOOK_MAX) L = EXIN_A_LOOK_MAX;
             const uint32_t no = exin_order_A(&e, sl, n_slices, L, sc->a_ord);
